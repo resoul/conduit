@@ -1,5 +1,3 @@
-// 07_loops_and_pipes.cdt — Demonstrates break/continue in loops and the |> pipe operator
-
 func add_one(x: Int) -> Int {
     return x + 1
 }

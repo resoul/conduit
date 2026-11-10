@@ -8,7 +8,12 @@ pub enum Value {
     Nil,
     Void,
     List(Vec<Value>),
+    Tuple(Vec<Value>),
     Struct {
+        name: String,
+        fields: HashMap<String, Value>,
+    },
+    Error {
         name: String,
         fields: HashMap<String, Value>,
     },
@@ -32,7 +37,17 @@ impl std::fmt::Display for Value {
                 }
                 write!(f, "]")
             }
-            Value::Struct { name, fields } => {
+            Value::Tuple(items) => {
+                write!(f, "(")?;
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", item)?;
+                }
+                write!(f, ")")
+            }
+            Value::Struct { name, fields } | Value::Error { name, fields } => {
                 write!(f, "{}(", name)?;
                 let mut first = true;
                 for (k, v) in fields {
@@ -56,7 +71,8 @@ impl Value {
             Value::Int(n) => *n != 0,
             Value::String(s) => !s.is_empty(),
             Value::List(l) => !l.is_empty(),
-            Value::Struct { .. } => true,
+            Value::Tuple(_) => true,
+            Value::Struct { .. } | Value::Error { .. } => true,
         }
     }
 
@@ -68,8 +84,14 @@ impl Value {
             Value::Nil => "Nil",
             Value::Void => "Void",
             Value::List(_) => "List",
+            Value::Tuple(_) => "Tuple",
             Value::Struct { .. } => "Struct",
+            Value::Error { .. } => "Error",
         }
+    }
+
+    pub fn is_error(&self) -> bool {
+        matches!(self, Value::Error { .. })
     }
 }
 

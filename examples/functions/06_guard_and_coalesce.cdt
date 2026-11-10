@@ -1,5 +1,3 @@
-// 06_guard_and_coalesce.cdt — Demonstrates guard clauses and the null-coalescing ?? operator
-
 func process_order(user_id: Int, amount: Int) -> String {
     guard user_id > 0 else {
         return "Error: Invalid user ID"

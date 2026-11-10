@@ -172,6 +172,9 @@ fn handle_hover(msg: &str, id: &str, documents: &HashMap<String, String>) -> Str
     let hover_text = match word.as_str() {
         "func" => "**func** — Function declaration\n```conduit\nfunc name(param: Type) -> ReturnType\n```",
         "type" => "**type** — Custom structure definition\n```conduit\ntype User {\n    name: String\n    age: Int\n}\n```",
+        "error" => "**error** — Typed error definition\n```conduit\nerror InvalidUserName {\n    message: String\n}\n```",
+        "switch" => "**switch** — Exhaustive pattern matching statement\n```conduit\nswitch result {\n    case User(u):\n        ...\n    case InvalidUserName(e):\n        ...\n}\n```",
+        "case" => "**case** — Pattern branch inside switch statement",
         "var" => "**var** — Mutable variable declaration\n```conduit\nvar counter: Int = 0\n```",
         "guard" => "**guard** — Early exit condition check\n```conduit\nguard condition else {\n    return error_or_default\n}\n```",
         "return" => "**return** — Return a value from the current function",
@@ -208,6 +211,9 @@ fn handle_completion(id: &str) -> String {
     let items = r#"[
         {"label":"func","kind":14,"detail":"Function declaration","insertText":"func ${1:name}(${2:params}) -> ${3:Type} {\n\t${0}\n}","insertTextFormat":2},
         {"label":"type","kind":7,"detail":"Custom structure","insertText":"type ${1:Name} {\n\t${2:field}: ${3:Type}\n}","insertTextFormat":2},
+        {"label":"error","kind":7,"detail":"Typed error definition","insertText":"error ${1:Name} {\n\t${2:message}: String\n}","insertTextFormat":2},
+        {"label":"switch","kind":14,"detail":"Switch pattern matching","insertText":"switch ${1:expr} {\n    case ${2:Pattern}:\n        ${0}\n}","insertTextFormat":2},
+        {"label":"case","kind":14,"detail":"Case branch","insertText":"case ${1:Pattern}:\n    ${0}","insertTextFormat":2},
         {"label":"return","kind":14,"detail":"Return value"},
         {"label":"if","kind":14,"detail":"If condition"},
         {"label":"guard","kind":14,"detail":"Guard early exit","insertText":"guard ${1:condition} else {\n\treturn ${2:value}\n}","insertTextFormat":2},

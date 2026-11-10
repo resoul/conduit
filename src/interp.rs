@@ -25,8 +25,21 @@ enum ControlFlow {
     Continue,
 }
 
+enum InterpFlow {
+    Return(Value),
+    Error(RuntimeError),
+}
+
+impl From<RuntimeError> for InterpFlow {
+    fn from(e: RuntimeError) -> Self {
+        InterpFlow::Error(e)
+    }
+}
+
 pub struct Interpreter {
     functions: HashMap<String, (Vec<Param>, Block)>,
+    structs: std::collections::HashSet<String>,
+    errors: std::collections::HashSet<String>,
     env: Vec<HashMap<String, Value>>,
 }
 
@@ -34,6 +47,8 @@ impl Interpreter {
     pub fn new() -> Self {
         Self {
             functions: HashMap::new(),
+            structs: std::collections::HashSet::new(),
+            errors: std::collections::HashSet::new(),
             env: vec![HashMap::new()],
         }
     }
@@ -94,7 +109,7 @@ impl Interpreter {
                         let mut resolved = true;
                         for part in &parts[1..] {
                             match current {
-                                Value::Struct { ref fields, .. } => {
+                                Value::Struct { ref fields, .. } | Value::Error { ref fields, .. } => {
                                     if let Some(val) = fields.get(*part) {
                                         current = val.clone();
                                     } else {
@@ -132,8 +147,16 @@ impl Interpreter {
 
     pub fn run_program(&mut self, program: &Program) -> Result<(), RuntimeError> {
         for item in &program.items {
-            if let ItemKind::Func { name, params, body, .. } = &item.kind {
-                self.functions.insert(name.clone(), (params.clone(), body.clone()));
+            match &item.kind {
+                ItemKind::Func { name, params, body, .. } => {
+                    self.functions.insert(name.clone(), (params.clone(), body.clone()));
+                }
+                ItemKind::Type { name, .. } => {
+                    self.structs.insert(name.clone());
+                }
+                ItemKind::Error { name, .. } => {
+                    self.errors.insert(name.clone());
+                }
             }
         }
 
@@ -193,13 +216,42 @@ impl Interpreter {
     fn eval_stmt(&mut self, stmt: &Stmt) -> Result<ControlFlow, RuntimeError> {
         match &stmt.kind {
             StmtKind::Define { name, value } => {
-                let val = self.eval_expr(value)?;
+                let val = match self.eval_expr(value) {
+                    Ok(v) => v,
+                    Err(InterpFlow::Return(ret)) => return Ok(ControlFlow::Return(ret)),
+                    Err(InterpFlow::Error(err)) => return Err(err),
+                };
                 self.define_variable(name.clone(), val);
+                Ok(ControlFlow::Next)
+            }
+            StmtKind::DestructureDefine { pattern, value } => {
+                let val = match self.eval_expr(value) {
+                    Ok(v) => v,
+                    Err(InterpFlow::Return(ret)) => return Ok(ControlFlow::Return(ret)),
+                    Err(InterpFlow::Error(err)) => return Err(err),
+                };
+                if let PatternKind::Tuple(pats) = &pattern.kind {
+                    if let Value::Tuple(items) = val {
+                        for (pat, item) in pats.iter().zip(items) {
+                            match &pat.kind {
+                                PatternKind::Ident(var_name) => {
+                                    self.define_variable(var_name.clone(), item);
+                                }
+                                PatternKind::Wildcard => {}
+                                _ => {}
+                            }
+                        }
+                    }
+                }
                 Ok(ControlFlow::Next)
             }
             StmtKind::VarDecl { name, init, .. } => {
                 let val = if let Some(init_expr) = init {
-                    self.eval_expr(init_expr)?
+                    match self.eval_expr(init_expr) {
+                        Ok(v) => v,
+                        Err(InterpFlow::Return(ret)) => return Ok(ControlFlow::Return(ret)),
+                        Err(InterpFlow::Error(err)) => return Err(err),
+                    }
                 } else {
                     Value::Nil
                 };
@@ -207,7 +259,11 @@ impl Interpreter {
                 Ok(ControlFlow::Next)
             }
             StmtKind::Assign { target, value } => {
-                let val = self.eval_expr(value)?;
+                let val = match self.eval_expr(value) {
+                    Ok(v) => v,
+                    Err(InterpFlow::Return(ret)) => return Ok(ControlFlow::Return(ret)),
+                    Err(InterpFlow::Error(err)) => return Err(err),
+                };
                 if let ExprKind::Ident(ref name) = target.kind {
                     self.assign_variable(name, val, target.span)?;
                 }
@@ -215,14 +271,22 @@ impl Interpreter {
             }
             StmtKind::Return(opt_expr) => {
                 let val = if let Some(expr) = opt_expr {
-                    self.eval_expr(expr)?
+                    match self.eval_expr(expr) {
+                        Ok(v) => v,
+                        Err(InterpFlow::Return(ret)) => return Ok(ControlFlow::Return(ret)),
+                        Err(InterpFlow::Error(err)) => return Err(err),
+                    }
                 } else {
                     Value::Void
                 };
                 Ok(ControlFlow::Return(val))
             }
             StmtKind::If { condition, then_block, else_block } => {
-                let cond_val = self.eval_expr(condition)?;
+                let cond_val = match self.eval_expr(condition) {
+                    Ok(v) => v,
+                    Err(InterpFlow::Return(ret)) => return Ok(ControlFlow::Return(ret)),
+                    Err(InterpFlow::Error(err)) => return Err(err),
+                };
                 if cond_val.is_truthy() {
                     self.eval_block(then_block)
                 } else if let Some(eb) = else_block {
@@ -232,7 +296,11 @@ impl Interpreter {
                 }
             }
             StmtKind::Guard { condition, else_block } => {
-                let cond_val = self.eval_expr(condition)?;
+                let cond_val = match self.eval_expr(condition) {
+                    Ok(v) => v,
+                    Err(InterpFlow::Return(ret)) => return Ok(ControlFlow::Return(ret)),
+                    Err(InterpFlow::Error(err)) => return Err(err),
+                };
                 if !cond_val.is_truthy() {
                     self.eval_block(else_block)
                 } else {
@@ -240,7 +308,11 @@ impl Interpreter {
                 }
             }
             StmtKind::ForIn { variable, iterable, body } => {
-                let iter_val = self.eval_expr(iterable)?;
+                let iter_val = match self.eval_expr(iterable) {
+                    Ok(v) => v,
+                    Err(InterpFlow::Return(ret)) => return Ok(ControlFlow::Return(ret)),
+                    Err(InterpFlow::Error(err)) => return Err(err),
+                };
                 if let Value::List(items) = iter_val {
                     for item in items {
                         self.enter_scope();
@@ -265,26 +337,65 @@ impl Interpreter {
                 }
                 Ok(ControlFlow::Next)
             }
+            StmtKind::Switch { expr, cases } => {
+                let val = match self.eval_expr(expr) {
+                    Ok(v) => v,
+                    Err(InterpFlow::Return(ret)) => return Ok(ControlFlow::Return(ret)),
+                    Err(InterpFlow::Error(err)) => return Err(err),
+                };
+                for case in cases {
+                    if let Some(bindings) = match_pattern(&case.pattern, &val) {
+                        self.enter_scope();
+                        for (k, v) in bindings {
+                            self.define_variable(k, v);
+                        }
+                        let flow = self.eval_block(&case.body)?;
+                        self.exit_scope();
+                        match flow {
+                            ControlFlow::Next => return Ok(ControlFlow::Next),
+                            other => return Ok(other),
+                        }
+                    }
+                }
+                Ok(ControlFlow::Next)
+            }
             StmtKind::Break => Ok(ControlFlow::Break),
             StmtKind::Continue => Ok(ControlFlow::Continue),
             StmtKind::Expr(expr) => {
-                self.eval_expr(expr)?;
-                Ok(ControlFlow::Next)
+                match self.eval_expr(expr) {
+                    Ok(_) => Ok(ControlFlow::Next),
+                    Err(InterpFlow::Return(ret)) => Ok(ControlFlow::Return(ret)),
+                    Err(InterpFlow::Error(err)) => Err(err),
+                }
             }
         }
     }
 
-    pub fn eval_expr(&mut self, expr: &Expr) -> Result<Value, RuntimeError> {
+    fn eval_expr(&mut self, expr: &Expr) -> Result<Value, InterpFlow> {
         match &expr.kind {
             ExprKind::Int(n) => Ok(Value::Int(*n)),
             ExprKind::String(s) => Ok(Value::String(self.interpolate(s))),
             ExprKind::Bool(b) => Ok(Value::Bool(*b)),
             ExprKind::Nil => Ok(Value::Nil),
+            ExprKind::Tuple(elements) => {
+                let mut vals = Vec::new();
+                for e in elements {
+                    vals.push(self.eval_expr(e)?);
+                }
+                Ok(Value::Tuple(vals))
+            }
+            ExprKind::Try(inner) => {
+                let val = self.eval_expr(inner)?;
+                if val.is_error() {
+                    return Err(InterpFlow::Return(val));
+                }
+                Ok(val)
+            }
             ExprKind::Ident(name) => {
                 self.lookup_variable(name).ok_or_else(|| RuntimeError {
                     message: format!("Unknown variable '{}'", name),
                     span: expr.span,
-                })
+                }.into())
             }
             ExprKind::List(elements) => {
                 let mut vals = Vec::new();
@@ -301,7 +412,7 @@ impl Interpreter {
                         _ => Err(RuntimeError {
                             message: "Unary '-' requires Int".to_string(),
                             span: expr.span,
-                        }),
+                        }.into()),
                     },
                     UnaryOp::Not => Ok(Value::Bool(!val.is_truthy())),
                 }
@@ -326,43 +437,43 @@ impl Interpreter {
                         _ => Err(RuntimeError {
                             message: "Operator '+' requires Int or String".to_string(),
                             span: expr.span,
-                        }),
+                        }.into()),
                     },
                     BinaryOp::Sub => match (l, r) {
                         (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a - b)),
                         _ => Err(RuntimeError {
                             message: "Operator '-' requires Int".to_string(),
                             span: expr.span,
-                        }),
+                        }.into()),
                     },
                     BinaryOp::Mul => match (l, r) {
                         (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a * b)),
                         _ => Err(RuntimeError {
                             message: "Operator '*' requires Int".to_string(),
                             span: expr.span,
-                        }),
+                        }.into()),
                     },
                     BinaryOp::Div => match (l, r) {
                         (Value::Int(_), Value::Int(0)) => Err(RuntimeError {
                             message: "Division by zero".to_string(),
                             span: expr.span,
-                        }),
+                        }.into()),
                         (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a / b)),
                         _ => Err(RuntimeError {
                             message: "Operator '/' requires Int".to_string(),
                             span: expr.span,
-                        }),
+                        }.into()),
                     },
                     BinaryOp::Mod => match (l, r) {
                         (Value::Int(_), Value::Int(0)) => Err(RuntimeError {
                             message: "Division by zero".to_string(),
                             span: expr.span,
-                        }),
+                        }.into()),
                         (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a % b)),
                         _ => Err(RuntimeError {
                             message: "Operator '%' requires Int".to_string(),
                             span: expr.span,
-                        }),
+                        }.into()),
                     },
                     BinaryOp::Eq => Ok(Value::Bool(l == r)),
                     BinaryOp::NotEq => Ok(Value::Bool(l != r)),
@@ -392,7 +503,7 @@ impl Interpreter {
                         _ => Err(RuntimeError {
                             message: "Range '..' requires Int bounds".to_string(),
                             span: expr.span,
-                        }),
+                        }.into()),
                     },
                     BinaryOp::Coalesce => match l {
                         Value::Nil => Ok(r),
@@ -402,16 +513,67 @@ impl Interpreter {
             }
             ExprKind::Call { callee, args, named_args } => {
                 if let ExprKind::Ident(ref type_name) = callee.kind {
-                    if !named_args.is_empty() {
+                    if self.errors.contains(type_name) || self.structs.contains(type_name) || !named_args.is_empty() {
                         let mut fields = HashMap::new();
                         for arg in named_args {
                             let val = self.eval_expr(&arg.value)?;
                             fields.insert(arg.name.clone(), val);
                         }
-                        return Ok(Value::Struct {
-                            name: type_name.clone(),
-                            fields,
+                        return Ok(if self.errors.contains(type_name) {
+                            Value::Error {
+                                name: type_name.clone(),
+                                fields,
+                            }
+                        } else {
+                            Value::Struct {
+                                name: type_name.clone(),
+                                fields,
+                            }
                         });
+                    }
+
+                    if type_name == "map" && args.len() == 2 {
+                        let list_val = self.eval_expr(&args[0])?;
+                        let fn_name = match &args[1].kind {
+                            ExprKind::Ident(f) => f.clone(),
+                            _ => {
+                                return Err(RuntimeError {
+                                    message: "Second argument to 'map' must be a function name".to_string(),
+                                    span: args[1].span,
+                                }.into());
+                            }
+                        };
+                        if let Value::List(items) = list_val {
+                            let mut results = Vec::new();
+                            for item in items {
+                                let res = self.call_function(&fn_name, vec![item], args[1].span)?;
+                                results.push(res);
+                            }
+                            return Ok(Value::List(results));
+                        }
+                    }
+
+                    if type_name == "filter" && args.len() == 2 {
+                        let list_val = self.eval_expr(&args[0])?;
+                        let fn_name = match &args[1].kind {
+                            ExprKind::Ident(f) => f.clone(),
+                            _ => {
+                                return Err(RuntimeError {
+                                    message: "Second argument to 'filter' must be a function name".to_string(),
+                                    span: args[1].span,
+                                }.into());
+                            }
+                        };
+                        if let Value::List(items) = list_val {
+                            let mut filtered = Vec::new();
+                            for item in items {
+                                let res = self.call_function(&fn_name, vec![item.clone()], args[1].span)?;
+                                if res.is_truthy() {
+                                    filtered.push(item);
+                                }
+                            }
+                            return Ok(Value::List(filtered));
+                        }
                     }
                 }
 
@@ -474,34 +636,243 @@ impl Interpreter {
                     for a in args {
                         evaluated_args.push(self.eval_expr(a)?);
                     }
-                    return self.call_function(name, evaluated_args, callee.span);
+                    return self.call_function(name, evaluated_args, callee.span).map_err(Into::into);
                 }
 
                 Err(RuntimeError {
                     message: "Unsupported call expression".to_string(),
                     span: callee.span,
-                })
+                }.into())
             }
             ExprKind::Member { target, field } => {
                 let target_val = self.eval_expr(target)?;
                 match target_val {
-                    Value::Struct { ref fields, .. } => {
+                    Value::Struct { ref fields, .. } | Value::Error { ref fields, .. } => {
                         if let Some(val) = fields.get(field) {
                             Ok(val.clone())
                         } else {
                             Err(RuntimeError {
-                                message: format!("Field '{}' not found in struct", field),
+                                message: format!("Field '{}' not found in struct or error", field),
                                 span: expr.span,
-                            })
+                            }.into())
                         }
                     }
                     _ => Err(RuntimeError {
                         message: format!("Field access not supported on {}", target_val.type_name()),
                         span: expr.span,
-                    }),
+                    }.into()),
                 }
             }
         }
+    }
+}
+
+fn match_pattern(pattern: &Pattern, val: &Value) -> Option<Vec<(String, Value)>> {
+    match &pattern.kind {
+        PatternKind::Nil => {
+            if val == &Value::Nil {
+                Some(Vec::new())
+            } else {
+                None
+            }
+        }
+        PatternKind::Type { name, binding } => {
+            match val {
+                Value::Int(_) if name == "Int" => {
+                    Some(vec![(binding.clone(), val.clone())])
+                }
+                Value::String(_) if name == "String" => {
+                    Some(vec![(binding.clone(), val.clone())])
+                }
+                Value::Bool(_) if name == "Bool" => {
+                    Some(vec![(binding.clone(), val.clone())])
+                }
+                Value::Struct { name: sname, .. } if sname == name => {
+                    Some(vec![(binding.clone(), val.clone())])
+                }
+                Value::Error { name: ename, .. } if ename == name => {
+                    Some(vec![(binding.clone(), val.clone())])
+                }
+                _ => None,
+            }
+        }
+        PatternKind::Tuple(pats) => {
+            if let Value::Tuple(items) = val {
+                if pats.len() == items.len() {
+                    let mut bindings = Vec::new();
+                    for (pat, item) in pats.iter().zip(items) {
+                        match &pat.kind {
+                            PatternKind::Ident(var_name) => {
+                                bindings.push((var_name.clone(), item.clone()));
+                            }
+                            PatternKind::Wildcard => {}
+                            _ => return None,
+                        }
+                    }
+                    return Some(bindings);
+                }
+            }
+            None
+        }
+        PatternKind::Ident(var_name) => {
+            Some(vec![(var_name.clone(), val.clone())])
+        }
+        PatternKind::Wildcard => {
+            Some(Vec::new())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::check::TypeChecker;
+    use crate::lexer::Lexer;
+    use crate::parser::Parser;
+
+    fn run_code(src: &str) -> Result<Interpreter, String> {
+        let mut lexer = Lexer::new(src);
+        let tokens = lexer.tokenize_all().map_err(|e| e.to_string())?;
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().map_err(|e| e.to_string())?;
+        let mut checker = TypeChecker::new();
+        checker.check_program(&program).map_err(|e| e.to_string())?;
+        let mut interp = Interpreter::new();
+        interp.run_program(&program).map_err(|e| e.to_string())?;
+        Ok(interp)
+    }
+
+    #[test]
+    fn test_error_return_and_switch() {
+        let src = r#"
+            type User { name: String }
+            error InvalidName { msg: String }
+
+            func make_user(n: String) -> User | InvalidName {
+                guard n.len() > 0 else {
+                    return InvalidName(msg: "empty name")
+                }
+                return User(name: n)
+            }
+
+            func main() {
+                u1 := make_user("Alice")
+                var out1 = ""
+                switch u1 {
+                    case User(u):
+                        out1 = u.name
+                    case InvalidName(e):
+                        out1 = e.msg
+                }
+
+                u2 := make_user("")
+                var out2 = ""
+                switch u2 {
+                    case User(u):
+                        out2 = u.name
+                    case InvalidName(e):
+                        out2 = e.msg
+                }
+
+                print(out1)
+                print(out2)
+            }
+        "#;
+        assert!(run_code(src).is_ok());
+    }
+
+    #[test]
+    fn test_try_operator_flow() {
+        let src = r#"
+            type User { name: String }
+            error InvalidName { msg: String }
+
+            func make_user(n: String) -> User | InvalidName {
+                guard n.len() > 0 else {
+                    return InvalidName(msg: "empty name")
+                }
+                return User(name: n)
+            }
+
+            func register(n: String) -> User | InvalidName {
+                u := make_user(n)?
+                return u
+            }
+
+            func main() {
+                res_ok := register("Bob")
+                switch res_ok {
+                    case User(u):
+                        print(u.name)
+                    case InvalidName(e):
+                        print(e.msg)
+                }
+
+                res_err := register("")
+                switch res_err {
+                    case User(u):
+                        print(u.name)
+                    case InvalidName(e):
+                        print(e.msg)
+                }
+            }
+        "#;
+        assert!(run_code(src).is_ok());
+    }
+
+    #[test]
+    fn test_tuples_and_destructuring() {
+        let src = r#"
+            error DivZero {}
+
+            func divide(a: Int, b: Int) -> (Int, Int) | DivZero {
+                guard b != 0 else {
+                    return DivZero()
+                }
+                return (a / b, a % b)
+            }
+
+            func main() {
+                res := divide(17, 5)
+                switch res {
+                    case (q, r):
+                        print(q)
+                        print(r)
+                    case DivZero(e):
+                        print("error")
+                }
+            }
+        "#;
+        assert!(run_code(src).is_ok());
+    }
+
+    #[test]
+    fn test_map_preserves_errors_as_values() {
+        let src = r#"
+            type User { name: String }
+            error InvalidName { msg: String }
+
+            func create_user(name: String) -> User | InvalidName {
+                guard name.len() > 0 else {
+                    return InvalidName(msg: "empty")
+                }
+                return User(name: name)
+            }
+
+            func main() {
+                names := ["Alice", "", "Charlie"]
+                results := map(names, create_user)
+                for r in results {
+                    switch r {
+                        case User(u):
+                            print(u.name)
+                        case InvalidName(e):
+                            print(e.msg)
+                    }
+                }
+            }
+        "#;
+        assert!(run_code(src).is_ok());
     }
 }
 

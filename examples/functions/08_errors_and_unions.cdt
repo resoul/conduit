@@ -1,0 +1,74 @@
+type User {
+    name: String
+    email: String
+}
+
+error InvalidUserName {
+    message: String
+}
+
+error DuplicateEmail {
+    email: String
+}
+
+func create_user(name: String, email: String) -> User | InvalidUserName | DuplicateEmail {
+    guard name.trim().len() > 0 else {
+        return InvalidUserName(message: "Name is required")
+    }
+
+    guard email.contains("@") else {
+        return DuplicateEmail(email: email)
+    }
+
+    return User(name: name, email: email)
+}
+
+func register(name: String, email: String) -> User | InvalidUserName | DuplicateEmail {
+    // Postfix '?' propagates any error variant directly out of register()
+    user := create_user(name, email)?
+    return user
+}
+
+func main() {
+    print("=== Testing successful registration ===")
+    res1 := register("Alice", "alice@example.com")
+    switch res1 {
+        case User(u):
+            print("Registered user: {u.name} <{u.email}>")
+        case InvalidUserName(err):
+            print("Validation error: {err.message}")
+        case DuplicateEmail(err):
+            print("Email error: {err.email}")
+    }
+
+    print("=== Testing InvalidUserName error ===")
+    res2 := register("", "test@example.com")
+    switch res2 {
+        case User(u):
+            print("User: {u.name}")
+        case InvalidUserName(err):
+            print("Validation failed: {err.message}")
+        case DuplicateEmail(err):
+            print("Email failed: {err.email}")
+    }
+
+    print("=== Testing map() preserving error values ===")
+    raw_names := ["Bob", "", "Charlie"]
+    users := map(raw_names, create_user_from_name)
+    for u in users {
+        switch u {
+            case User(valid):
+                print("Active user: {valid.name}")
+            case InvalidUserName(err):
+                print("Skipped invalid entry: {err.message}")
+        }
+    }
+}
+
+func create_user_from_name(name: String) -> User | InvalidUserName {
+    guard name.len() > 0 else {
+        return InvalidUserName(message: "Name cannot be empty")
+    }
+    return User(name: name, email: "{name}@conduit.lang")
+}
+
