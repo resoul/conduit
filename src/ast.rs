@@ -5,6 +5,8 @@ pub enum TypeExpr {
     Named(String),
     List(Box<TypeExpr>),
     Optional(Box<TypeExpr>),
+    Union(Vec<TypeExpr>),
+    Tuple(Vec<TypeExpr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +57,8 @@ pub enum ExprKind {
         expr: Box<Expr>,
     },
     List(Vec<Expr>),
+    Tuple(Vec<Expr>),
+    Try(Box<Expr>),
     Call {
         callee: Box<Expr>,
         args: Vec<Expr>,
@@ -79,9 +83,44 @@ impl Expr {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum PatternKind {
+    Type {
+        name: String,
+        binding: String,
+    },
+    Tuple(Vec<Pattern>),
+    Nil,
+    Wildcard,
+    Ident(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pattern {
+    pub kind: PatternKind,
+    pub span: Span,
+}
+
+impl Pattern {
+    pub fn new(kind: PatternKind, span: Span) -> Self {
+        Self { kind, span }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SwitchCase {
+    pub pattern: Pattern,
+    pub body: Block,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum StmtKind {
     Define {
         name: String,
+        value: Expr,
+    },
+    DestructureDefine {
+        pattern: Pattern,
         value: Expr,
     },
     VarDecl {
@@ -107,6 +146,10 @@ pub enum StmtKind {
         variable: String,
         iterable: Expr,
         body: Block,
+    },
+    Switch {
+        expr: Expr,
+        cases: Vec<SwitchCase>,
     },
     Break,
     Continue,
@@ -154,6 +197,10 @@ pub enum ItemKind {
         body: Block,
     },
     Type {
+        name: String,
+        fields: Vec<FieldDef>,
+    },
+    Error {
         name: String,
         fields: Vec<FieldDef>,
     },

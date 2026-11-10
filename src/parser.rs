@@ -102,8 +102,9 @@ impl Parser {
         match tok.kind {
             TokenKind::KwFunc => self.parse_func_item(),
             TokenKind::KwType => self.parse_type_item(),
+            TokenKind::KwError => self.parse_error_item(),
             _ => Err(ParserError {
-                message: format!("Expected 'func' or 'type', got '{:?}'", tok.kind),
+                message: format!("Expected 'func', 'type', or 'error', got '{:?}'", tok.kind),
                 span: tok.span,
             }),
         }
@@ -173,21 +174,70 @@ impl Parser {
         Ok(Item::new(ItemKind::Type { name, fields }, start_span))
     }
 
+    fn parse_error_item(&mut self) -> Result<Item, ParserError> {
+        let start_span = self.expect(&TokenKind::KwError)?.span;
+        let (name, _) = self.expect_ident()?;
+
+        self.expect(&TokenKind::LBrace)?;
+        let mut fields = Vec::new();
+        while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
+            let (field_name, field_span) = self.expect_ident()?;
+            self.expect(&TokenKind::Colon)?;
+            let field_ty = self.parse_type_expr()?;
+            fields.push(FieldDef {
+                name: field_name,
+                ty: field_ty,
+                span: field_span,
+            });
+
+            self.match_token(&TokenKind::Comma);
+        }
+        self.expect(&TokenKind::RBrace)?;
+
+        Ok(Item::new(ItemKind::Error { name, fields }, start_span))
+    }
+
     fn parse_type_expr(&mut self) -> Result<TypeExpr, ParserError> {
-        let base_type = if self.match_token(&TokenKind::LBracket) {
+        let mut types = vec![self.parse_primary_type()?];
+        while self.match_token(&TokenKind::Bar) {
+            types.push(self.parse_primary_type()?);
+        }
+        if types.len() == 1 {
+            Ok(types.pop().unwrap())
+        } else {
+            Ok(TypeExpr::Union(types))
+        }
+    }
+
+    fn parse_primary_type(&mut self) -> Result<TypeExpr, ParserError> {
+        let mut base_type = if self.match_token(&TokenKind::LBracket) {
             let inner = self.parse_type_expr()?;
             self.expect(&TokenKind::RBracket)?;
             TypeExpr::List(Box::new(inner))
+        } else if self.match_token(&TokenKind::LParen) {
+            let mut types = Vec::new();
+            while !self.check(&TokenKind::RParen) && !self.check(&TokenKind::Eof) {
+                types.push(self.parse_type_expr()?);
+                if !self.match_token(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(&TokenKind::RParen)?;
+            if types.len() == 1 {
+                types.pop().unwrap()
+            } else {
+                TypeExpr::Tuple(types)
+            }
         } else {
             let (name, _) = self.expect_ident()?;
             TypeExpr::Named(name)
         };
 
-        if self.match_token(&TokenKind::Question) {
-            Ok(TypeExpr::Optional(Box::new(base_type)))
-        } else {
-            Ok(base_type)
+        while self.match_token(&TokenKind::Question) {
+            base_type = TypeExpr::Optional(Box::new(base_type));
         }
+
+        Ok(base_type)
     }
 
     fn parse_block(&mut self) -> Result<Block, ParserError> {
@@ -210,6 +260,7 @@ impl Parser {
             TokenKind::KwIf => self.parse_if_stmt(),
             TokenKind::KwGuard => self.parse_guard_stmt(),
             TokenKind::KwFor => self.parse_for_stmt(),
+            TokenKind::KwSwitch => self.parse_switch_stmt(),
             TokenKind::KwBreak => {
                 let span = self.bump().span;
                 Ok(Stmt::new(StmtKind::Break, span))
@@ -220,6 +271,14 @@ impl Parser {
             }
             TokenKind::KwVar => self.parse_var_decl_stmt(),
             _ => {
+                if self.is_tuple_destructure() {
+                    let span = self.peek().span;
+                    let pattern = self.parse_pattern()?;
+                    self.expect(&TokenKind::ColonAssign)?;
+                    let value = self.parse_expr()?;
+                    return Ok(Stmt::new(StmtKind::DestructureDefine { pattern, value }, span));
+                }
+
                 if let TokenKind::Ident(ref name) = self.peek().kind {
                     if self.peek_ahead(1).kind == TokenKind::ColonAssign {
                         let span = self.peek().span;
@@ -326,6 +385,90 @@ impl Parser {
             },
             span,
         ))
+    }
+
+    fn parse_switch_stmt(&mut self) -> Result<Stmt, ParserError> {
+        let span = self.expect(&TokenKind::KwSwitch)?.span;
+        let expr = self.parse_expr()?;
+        self.expect(&TokenKind::LBrace)?;
+        let mut cases = Vec::new();
+        while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
+            let case_span = self.expect(&TokenKind::KwCase)?.span;
+            let pattern = self.parse_pattern()?;
+            self.expect(&TokenKind::Colon)?;
+
+            let mut stmts = Vec::new();
+            while !self.check(&TokenKind::KwCase) && !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
+                stmts.push(self.parse_stmt()?);
+            }
+            let body = Block { stmts, span: case_span };
+            cases.push(SwitchCase { pattern, body, span: case_span });
+        }
+        self.expect(&TokenKind::RBrace)?;
+        Ok(Stmt::new(StmtKind::Switch { expr, cases }, span))
+    }
+
+    fn parse_pattern(&mut self) -> Result<Pattern, ParserError> {
+        let tok = self.peek().clone();
+        match tok.kind {
+            TokenKind::KwNil => {
+                self.bump();
+                Ok(Pattern::new(PatternKind::Nil, tok.span))
+            }
+            TokenKind::Underscore => {
+                self.bump();
+                Ok(Pattern::new(PatternKind::Wildcard, tok.span))
+            }
+            TokenKind::LParen => {
+                self.bump();
+                let mut pats = Vec::new();
+                while !self.check(&TokenKind::RParen) && !self.check(&TokenKind::Eof) {
+                    pats.push(self.parse_pattern()?);
+                    if !self.match_token(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                self.expect(&TokenKind::RParen)?;
+                Ok(Pattern::new(PatternKind::Tuple(pats), tok.span))
+            }
+            TokenKind::Ident(name) => {
+                self.bump();
+                if self.match_token(&TokenKind::LParen) {
+                    let (binding, _) = self.expect_ident()?;
+                    self.expect(&TokenKind::RParen)?;
+                    Ok(Pattern::new(PatternKind::Type { name, binding }, tok.span))
+                } else {
+                    Ok(Pattern::new(PatternKind::Ident(name), tok.span))
+                }
+            }
+            _ => Err(ParserError {
+                message: format!("Expected pattern, got '{:?}'", tok.kind),
+                span: tok.span,
+            }),
+        }
+    }
+
+    fn is_tuple_destructure(&self) -> bool {
+        if !self.check(&TokenKind::LParen) {
+            return false;
+        }
+        let mut depth = 0;
+        let mut idx = self.cursor;
+        while idx < self.tokens.len() {
+            match &self.tokens[idx].kind {
+                TokenKind::LParen => depth += 1,
+                TokenKind::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return idx + 1 < self.tokens.len()
+                            && self.tokens[idx + 1].kind == TokenKind::ColonAssign;
+                    }
+                }
+                _ => {}
+            }
+            idx += 1;
+        }
+        false
     }
 
     fn parse_var_decl_stmt(&mut self) -> Result<Stmt, ParserError> {
@@ -564,6 +707,9 @@ impl Parser {
                     },
                     span,
                 );
+            } else if self.match_token(&TokenKind::Question) {
+                let span = expr.span;
+                expr = Expr::new(ExprKind::Try(Box::new(expr)), span);
             } else {
                 break;
             }
@@ -612,10 +758,25 @@ impl Parser {
                 Ok(Expr::new(ExprKind::List(elements), span))
             }
             TokenKind::LParen => {
-                self.bump();
-                let expr = self.parse_expr()?;
-                self.expect(&TokenKind::RParen)?;
-                Ok(expr)
+                let span = self.bump().span;
+                if self.match_token(&TokenKind::RParen) {
+                    return Ok(Expr::new(ExprKind::Tuple(Vec::new()), span));
+                }
+                let first = self.parse_expr()?;
+                if self.match_token(&TokenKind::Comma) {
+                    let mut elements = vec![first];
+                    while !self.check(&TokenKind::RParen) && !self.check(&TokenKind::Eof) {
+                        elements.push(self.parse_expr()?);
+                        if !self.match_token(&TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                    self.expect(&TokenKind::RParen)?;
+                    Ok(Expr::new(ExprKind::Tuple(elements), span))
+                } else {
+                    self.expect(&TokenKind::RParen)?;
+                    Ok(first)
+                }
             }
             _ => Err(ParserError {
                 message: format!("Expected expression, got '{:?}'", tok.kind),

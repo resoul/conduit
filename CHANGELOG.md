@@ -5,6 +5,54 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
+## [0.1.3] - 2026-11-10
+
+### Added
+
+* **Typed Errors as Return Values (`error Name { ... }`)**:
+  * Errors are regular typed values declared via `error Name { fields }` and returned via `return`.
+  * Zero exceptions (`throw`/`try`/`catch`) and no implicit inheritance.
+  * Static diagnostics prohibiting discarded error expressions at statement level and requiring all local error variables to be handled.
+  * Static validation of constructor fields, types, and named arguments.
+
+* **Union Types (`A | B`)**:
+  * First-class union types supporting order independence, deduplication, and nested union flattening (`Type::union`).
+  * Full static subtyping: `A` is assignable to `A | B`, and union `A | B` is assignable if every source variant satisfies a target variant.
+  * Support in variable declarations, parameters, return types, and collections.
+  * Direct field access on union types is disallowed without narrowing.
+
+* **Exhaustive Pattern Matching (`switch`)**:
+  * Pattern matching statement over typed values, primitives (`Int`, `String`, `Bool`), tuples, and `nil`.
+  * Binding syntax: `case User(user):` binds `user` with narrowed type.
+  * Static exhaustiveness check requiring all union variants to be covered.
+  * Rejection of redundant, shadowed, or impossible branches.
+  * Control flow analysis: if all branches of an exhaustive `switch` return, the statement is treated as guaranteed return.
+
+* **Error Propagation Operator (`?`)**:
+  * Postfix `?` evaluating expression once, immediately returning any error variant from the enclosing function, and narrowing expression to success variants.
+  * Static return type validation ensuring all error variants are assignable to current function's return type.
+  * Preserves `nil` when propagating from optional unions `(User?) | InvalidUserName -> User?`.
+  * Strictly rejects propagation on pure optionals without error variants.
+
+* **Tuples & Destructuring (`(A, B)`)**:
+  * Multi-element tuples (2+ elements) with positional access and static type checking.
+  * Tuple destructuring definition `(a, b) := expr` and `(a, _) := expr`.
+  * Static check prohibiting wildcard `_` from discarding error-carrying elements.
+  * Tuple patterns inside `switch` cases with automatic union type inference for matched positions.
+
+* **Higher-Order Functions & Collection Pipelines**:
+  * `map(list, callback)` and `filter(list, callback)` support function values and preserve error elements as values.
+
+* **Language Server Protocol & TextMate Grammar**:
+  * LSP hover and autocompletion for `error`, `switch`, and `case`.
+  * TextMate syntax grammar updated for `error`, `switch`, `case`, and union operator `|`.
+
+* **Examples (`examples/functions/`)**:
+  * [08_errors_and_unions.cdt](examples/functions/08_errors_and_unions.cdt): Demonstrates error declarations, union return types, `?` operator, and exhaustive `switch`.
+  * [09_tuples_and_guards.cdt](examples/functions/09_tuples_and_guards.cdt): Demonstrates tuples, destructuring, guard validation, and pattern matching.
+
+---
+
 ## [0.1.2] - 2026-11-10
 
 ### Added

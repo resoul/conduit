@@ -30,10 +30,15 @@ pub enum TokenKind {
     KwGuard,
     KwBreak,
     KwContinue,
+    KwError,
+    KwSwitch,
+    KwCase,
 
     ColonAssign,
     Arrow,
     Pipe,
+    Bar,
+    Underscore,
     Eq,
     NotEq,
     LtEq,
@@ -251,6 +256,10 @@ impl<'a> Lexer<'a> {
             "guard" => TokenKind::KwGuard,
             "break" => TokenKind::KwBreak,
             "continue" => TokenKind::KwContinue,
+            "error" => TokenKind::KwError,
+            "switch" => TokenKind::KwSwitch,
+            "case" => TokenKind::KwCase,
+            "_" => TokenKind::Underscore,
             _ => TokenKind::Ident(word.to_string()),
         };
 
@@ -374,10 +383,7 @@ impl<'a> Lexer<'a> {
                     self.bump_char();
                     TokenKind::Pipe
                 } else {
-                    return Err(LexerError {
-                        message: "Unexpected character '|', expected '||' or '|>'".to_string(),
-                        span: start_span,
-                    });
+                    TokenKind::Bar
                 }
             }
             other => {
@@ -433,6 +439,18 @@ mod tests {
         assert!(tokens.iter().any(|t| t.kind == TokenKind::KwContinue));
         assert!(tokens.iter().any(|t| t.kind == TokenKind::KwBreak));
         assert!(tokens.iter().any(|t| t.kind == TokenKind::Pipe));
+    }
+
+    #[test]
+    fn test_lex_error_switch_tuples_bar() {
+        let code = "error NotFound { id: Int } switch res { case (val, _): return val } A | B";
+        let mut lexer = Lexer::new(code);
+        let tokens = lexer.tokenize_all().unwrap();
+        assert_eq!(tokens[0].kind, TokenKind::KwError);
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::KwSwitch));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::KwCase));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::Underscore));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::Bar));
     }
 }
 
