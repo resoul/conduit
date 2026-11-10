@@ -28,9 +28,12 @@ pub enum TokenKind {
     KwFalse,
     KwNil,
     KwGuard,
+    KwBreak,
+    KwContinue,
 
     ColonAssign,
     Arrow,
+    Pipe,
     Eq,
     NotEq,
     LtEq,
@@ -246,6 +249,8 @@ impl<'a> Lexer<'a> {
             "false" => TokenKind::KwFalse,
             "nil" => TokenKind::KwNil,
             "guard" => TokenKind::KwGuard,
+            "break" => TokenKind::KwBreak,
+            "continue" => TokenKind::KwContinue,
             _ => TokenKind::Ident(word.to_string()),
         };
 
@@ -365,9 +370,12 @@ impl<'a> Lexer<'a> {
                 if self.peek_char() == Some('|') {
                     self.bump_char();
                     TokenKind::Or
+                } else if self.peek_char() == Some('>') {
+                    self.bump_char();
+                    TokenKind::Pipe
                 } else {
                     return Err(LexerError {
-                        message: "Unexpected character '|', expected '||'".to_string(),
+                        message: "Unexpected character '|', expected '||' or '|>'".to_string(),
                         span: start_span,
                     });
                 }
@@ -416,6 +424,15 @@ mod tests {
         assert_eq!(tokens[8].kind, TokenKind::QuestionQuestion);
         assert_eq!(tokens[9].kind, TokenKind::Int(10));
         assert_eq!(tokens[10].kind, TokenKind::RBrace);
+    }
+
+    #[test]
+    fn test_lex_break_continue_pipe() {
+        let mut lexer = Lexer::new("for x in list { if x == 1 { continue } break } data |> process()");
+        let tokens = lexer.tokenize_all().unwrap();
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::KwContinue));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::KwBreak));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::Pipe));
     }
 }
 

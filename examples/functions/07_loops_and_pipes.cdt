@@ -1,0 +1,39 @@
+// 07_loops_and_pipes.cdt — Demonstrates break/continue in loops and the |> pipe operator
+
+func add_one(x: Int) -> Int {
+    return x + 1
+}
+
+func double(x: Int) -> Int {
+    return x * 2
+}
+
+func multiply(x: Int, factor: Int) -> Int {
+    return x * factor
+}
+
+func main() {
+    print("=== Testing break and continue ===")
+    for n in [1, 2, 3, 4, 5, 6, 7, 8] {
+        if n % 2 == 0 {
+            continue
+        }
+        if n > 5 {
+            break
+        }
+        print("Loop odd item: {n}")
+    }
+
+    print("=== Testing pipe |> operator ===")
+    // 5 -> add_one (6) -> double (12) -> multiply(3) (36)
+    res1 := 5 |> add_one() |> double() |> multiply(3)
+    print("Pipe chain result: {res1}")
+
+    // Pipe with function names (without parens)
+    res2 := 10 |> double |> add_one
+    print("Pipe without parens: {res2}")
+
+    // Direct piping into print
+    "Hello from Conduit pipeline!" |> print()
+}
+

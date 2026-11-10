@@ -21,7 +21,7 @@
     },
     {
       "name": "keyword.control.conduit",
-      "match": "\\b(func|return|if|else|guard|for|in|var|type)\\b"
+      "match": "\\b(func|return|if|else|guard|for|in|break|continue|var|type)\\b"
     },
     {
       "name": "constant.language.boolean.conduit",
@@ -49,7 +49,7 @@
     },
     {
       "name": "keyword.operator.conduit",
-      "match": "(:=|->|==|!=|<=|>=|[+\\-*/=<>?])"
+      "match": "(:=|->|\\|>|\\?\\?|==|!=|<=|>=|[+\\-*/=<>?])"
     }
   ]
 }

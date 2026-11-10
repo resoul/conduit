@@ -210,6 +210,14 @@ impl Parser {
             TokenKind::KwIf => self.parse_if_stmt(),
             TokenKind::KwGuard => self.parse_guard_stmt(),
             TokenKind::KwFor => self.parse_for_stmt(),
+            TokenKind::KwBreak => {
+                let span = self.bump().span;
+                Ok(Stmt::new(StmtKind::Break, span))
+            }
+            TokenKind::KwContinue => {
+                let span = self.bump().span;
+                Ok(Stmt::new(StmtKind::Continue, span))
+            }
             TokenKind::KwVar => self.parse_var_decl_stmt(),
             _ => {
                 if let TokenKind::Ident(ref name) = self.peek().kind {
@@ -340,7 +348,43 @@ impl Parser {
     }
 
     pub fn parse_expr(&mut self) -> Result<Expr, ParserError> {
-        self.parse_or()
+        self.parse_pipe()
+    }
+
+    fn parse_pipe(&mut self) -> Result<Expr, ParserError> {
+        let mut left = self.parse_or()?;
+        while self.match_token(&TokenKind::Pipe) {
+            let span = left.span;
+            let right = self.parse_or()?;
+            left = self.desugar_pipe(left, right, span)?;
+        }
+        Ok(left)
+    }
+
+    fn desugar_pipe(&self, left: Expr, right: Expr, span: Span) -> Result<Expr, ParserError> {
+        match right.kind {
+            ExprKind::Call { callee, mut args, named_args } => {
+                args.insert(0, left);
+                Ok(Expr::new(
+                    ExprKind::Call { callee, args, named_args },
+                    span,
+                ))
+            }
+            ExprKind::Ident(_) => {
+                Ok(Expr::new(
+                    ExprKind::Call {
+                        callee: Box::new(right),
+                        args: vec![left],
+                        named_args: Vec::new(),
+                    },
+                    span,
+                ))
+            }
+            _ => Err(ParserError {
+                message: "Pipe operator '|>' requires a function or call on the right side".to_string(),
+                span: right.span,
+            }),
+        }
     }
 
     fn parse_binary_op(
