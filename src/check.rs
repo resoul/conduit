@@ -1,7 +1,10 @@
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use crate::ast::*;
 use crate::lexer::Span;
+use crate::loader::{ModuleLoader, ModuleTarget};
+use crate::native::NativeRegistry;
 use crate::types::Type;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -22,17 +25,32 @@ impl std::error::Error for TypeError {}
 pub struct FuncSignature {
     pub params: Vec<(String, Type)>,
     pub return_type: Type,
+    pub is_exported: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct StructSignature {
     pub fields: HashMap<String, Type>,
+    pub is_exported: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ModuleInfo {
+    pub exports: HashSet<String>,
+    pub functions: HashMap<String, FuncSignature>,
+    pub structs: HashMap<String, StructSignature>,
+    pub errors: HashSet<String>,
+    pub imports: HashMap<String, ModuleTarget>,
 }
 
 pub struct TypeChecker {
-    functions: HashMap<String, FuncSignature>,
-    structs: HashMap<String, StructSignature>,
-    errors: HashSet<String>,
+    pub native_registry: NativeRegistry,
+    pub module_info: HashMap<PathBuf, ModuleInfo>,
+    pub current_module_path: Option<PathBuf>,
+    pub functions: HashMap<String, FuncSignature>,
+    pub structs: HashMap<String, StructSignature>,
+    pub errors: HashSet<String>,
+    pub imports: HashMap<String, ModuleTarget>,
     scopes: Vec<HashMap<String, (Type, Span, bool)>>,
     current_return_type: Option<Type>,
     loop_depth: usize,
@@ -41,9 +59,13 @@ pub struct TypeChecker {
 impl TypeChecker {
     pub fn new() -> Self {
         let mut checker = Self {
+            native_registry: NativeRegistry::new(),
+            module_info: HashMap::new(),
+            current_module_path: None,
             functions: HashMap::new(),
             structs: HashMap::new(),
             errors: HashSet::new(),
+            imports: HashMap::new(),
             scopes: Vec::new(),
             current_return_type: None,
             loop_depth: 0,
@@ -54,6 +76,7 @@ impl TypeChecker {
             FuncSignature {
                 params: vec![("msg".to_string(), Type::Any)],
                 return_type: Type::Void,
+                is_exported: false,
             },
         );
 
@@ -96,7 +119,34 @@ impl TypeChecker {
 
     pub fn is_error_type(&self, ty: &Type) -> bool {
         match ty {
-            Type::Custom(name) => self.errors.contains(name),
+            Type::Custom(name) => {
+                if self.errors.contains(name) {
+                    return true;
+                }
+                if let Some((alias, field)) = name.split_once('.') {
+                    if let Some(target) = self.imports.get(alias) {
+                        match target {
+                            ModuleTarget::Native(nat_name) => {
+                                if let Some(m) = self.native_registry.get_module(nat_name) {
+                                    if let Some(t) = m.types.get(field) {
+                                        return t.is_error;
+                                    }
+                                }
+                            }
+                            ModuleTarget::Local(path) => {
+                                if let Some(info) = self.module_info.get(path) {
+                                    return info.errors.contains(field);
+                                }
+                            }
+                        }
+                    } else if let Some(m) = self.native_registry.get_module(alias) {
+                        if let Some(t) = m.types.get(field) {
+                            return t.is_error;
+                        }
+                    }
+                }
+                false
+            }
             _ => false,
         }
     }
@@ -129,6 +179,259 @@ impl TypeChecker {
         !self.split_success_and_errors(ty).1.is_empty()
     }
 
+    /// Checks if a type exposes any private types defined in the current module.
+    fn contains_private_type(&self, ty: &Type, current_mod: Option<&Path>) -> Option<String> {
+        match ty {
+            Type::Custom(name) => {
+                // If it's a simple name without a dot, it refers to a type in the current module
+                if !name.contains('.') {
+                    let (exists, is_exported) = if let Some(path) = current_mod {
+                        if let Some(info) = self.module_info.get(path) {
+                            (
+                                info.structs.contains_key(name) || info.errors.contains(name),
+                                info.exports.contains(name),
+                            )
+                        } else {
+                            (false, false)
+                        }
+                    } else {
+                        (
+                            self.structs.contains_key(name) || self.errors.contains(name),
+                            self.structs.get(name).map(|s| s.is_exported).unwrap_or(false),
+                        )
+                    };
+                    if exists && !is_exported {
+                        return Some(name.clone());
+                    }
+                }
+                None
+            }
+            Type::List(inner) | Type::Optional(inner) => self.contains_private_type(inner, current_mod),
+            Type::Tuple(elems) => {
+                for e in elems {
+                    if let Some(leak) = self.contains_private_type(e, current_mod) {
+                        return Some(leak);
+                    }
+                }
+                None
+            }
+            Type::Union(vars) => {
+                for v in vars {
+                    if let Some(leak) = self.contains_private_type(v, current_mod) {
+                        return Some(leak);
+                    }
+                }
+                None
+            }
+            Type::Function { params, return_type } => {
+                for p in params {
+                    if let Some(leak) = self.contains_private_type(p, current_mod) {
+                        return Some(leak);
+                    }
+                }
+                self.contains_private_type(return_type, current_mod)
+            }
+            _ => None,
+        }
+    }
+
+    /// Checks all modules in a loaded project.
+    pub fn check_project(&mut self, root_path: &Path, loader: &ModuleLoader) -> Result<(), TypeError> {
+        // Step 1: Register top-level items for all modules (Pass 1)
+        for (path, loaded_mod) in &loader.modules {
+            let mut info = ModuleInfo::default();
+            for (alias, (target, _)) in &loaded_mod.imports {
+                info.imports.insert(alias.clone(), target.clone());
+            }
+
+            for item in &loaded_mod.program.items {
+                match &item.kind {
+                    ItemKind::Type { name, fields } => {
+                        let mut field_map = HashMap::new();
+                        for f in fields {
+                            field_map.insert(f.name.clone(), Type::from_type_expr(&f.ty));
+                        }
+                        if info.structs.contains_key(name) || info.errors.contains(name) {
+                            return Err(TypeError {
+                                message: format!("Duplicate type definition '{}'", name),
+                                span: item.span,
+                            });
+                        }
+                        if item.is_exported {
+                            info.exports.insert(name.clone());
+                        }
+                        info.structs.insert(
+                            name.clone(),
+                            StructSignature {
+                                fields: field_map,
+                                is_exported: item.is_exported,
+                            },
+                        );
+                    }
+                    ItemKind::Error { name, fields } => {
+                        let mut field_map = HashMap::new();
+                        for f in fields {
+                            field_map.insert(f.name.clone(), Type::from_type_expr(&f.ty));
+                        }
+                        if info.structs.contains_key(name) || info.errors.contains(name) {
+                            return Err(TypeError {
+                                message: format!("Duplicate error definition '{}'", name),
+                                span: item.span,
+                            });
+                        }
+                        if item.is_exported {
+                            info.exports.insert(name.clone());
+                        }
+                        info.structs.insert(
+                            name.clone(),
+                            StructSignature {
+                                fields: field_map,
+                                is_exported: item.is_exported,
+                            },
+                        );
+                        info.errors.insert(name.clone());
+                    }
+                    ItemKind::Func { name, params, return_type, .. } => {
+                        let param_types = params
+                            .iter()
+                            .map(|p| (p.name.clone(), Type::from_type_expr(&p.ty)))
+                            .collect();
+                        let ret_type = return_type
+                            .as_ref()
+                            .map(Type::from_type_expr)
+                            .unwrap_or(Type::Void);
+
+                        if info.functions.contains_key(name) {
+                            return Err(TypeError {
+                                message: format!("Duplicate function definition '{}'", name),
+                                span: item.span,
+                            });
+                        }
+                        if item.is_exported {
+                            info.exports.insert(name.clone());
+                        }
+                        info.functions.insert(
+                            name.clone(),
+                            FuncSignature {
+                                params: param_types,
+                                return_type: ret_type,
+                                is_exported: item.is_exported,
+                            },
+                        );
+                    }
+                    ItemKind::Import { .. } => {}
+                }
+            }
+
+            self.module_info.insert(path.clone(), info);
+        }
+
+        // Step 2: Validate private type leaks for all exported declarations
+        for (path, info) in &self.module_info {
+            for (fn_name, sig) in &info.functions {
+                if sig.is_exported {
+                    for (param_name, param_ty) in &sig.params {
+                        if let Some(leak) = self.contains_private_type(param_ty, Some(path)) {
+                            return Err(TypeError {
+                                message: format!(
+                                    "Exported function '{}' exposes private type '{}' in parameter '{}'",
+                                    fn_name, leak, param_name
+                                ),
+                                span: Span::new(1, 1),
+                            });
+                        }
+                    }
+                    if let Some(leak) = self.contains_private_type(&sig.return_type, Some(path)) {
+                        return Err(TypeError {
+                            message: format!(
+                                "Exported function '{}' exposes private type '{}' in return type",
+                                fn_name, leak
+                            ),
+                            span: Span::new(1, 1),
+                        });
+                    }
+                }
+            }
+
+            for (type_name, sig) in &info.structs {
+                if sig.is_exported {
+                    for (field_name, field_ty) in &sig.fields {
+                        if let Some(leak) = self.contains_private_type(field_ty, Some(path)) {
+                            return Err(TypeError {
+                                message: format!(
+                                    "Exported type '{}' exposes private type '{}' in field '{}'",
+                                    type_name, leak, field_name
+                                ),
+                                span: Span::new(1, 1),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Step 3: Type check bodies of all modules
+        for (path, loaded_mod) in &loader.modules {
+            self.current_module_path = Some(path.clone());
+            if let Some(info) = self.module_info.get(path) {
+                self.functions = info.functions.clone();
+                self.structs = info.structs.clone();
+                self.errors = info.errors.clone();
+                self.imports = info.imports.clone();
+            }
+
+            // Always add built-in print
+            self.functions.insert(
+                "print".to_string(),
+                FuncSignature {
+                    params: vec![("msg".to_string(), Type::Any)],
+                    return_type: Type::Void,
+                    is_exported: false,
+                },
+            );
+
+            for item in &loaded_mod.program.items {
+                if let ItemKind::Func { name, body, return_type, .. } = &item.kind {
+                    let sig = self.functions.get(name).unwrap().clone();
+                    let ret_ty = return_type
+                        .as_ref()
+                        .map(Type::from_type_expr)
+                        .unwrap_or(Type::Void);
+
+                    let can_fallthrough_void = match &ret_ty {
+                        Type::Void => true,
+                        Type::Union(vars) => vars.contains(&Type::Void),
+                        _ => false,
+                    };
+                    if !can_fallthrough_void && !block_always_returns(body) {
+                        return Err(TypeError {
+                            message: format!(
+                                "Function '{}' must return a value of type '{}' on all reachable paths",
+                                name, ret_ty
+                            ),
+                            span: item.span,
+                        });
+                    }
+
+                    self.current_return_type = Some(sig.return_type.clone());
+
+                    self.enter_scope();
+                    for (param_name, param_ty) in sig.params {
+                        self.define_variable(param_name, param_ty, item.span);
+                    }
+
+                    self.check_block(body)?;
+                    self.exit_scope()?;
+
+                    self.current_return_type = None;
+                }
+            }
+        }
+
+        self.current_module_path = Some(root_path.to_path_buf());
+        Ok(())
+    }
+
     pub fn check_program(&mut self, program: &Program) -> Result<(), TypeError> {
         for item in &program.items {
             match &item.kind {
@@ -143,7 +446,13 @@ impl TypeChecker {
                             span: item.span,
                         });
                     }
-                    self.structs.insert(name.clone(), StructSignature { fields: field_map });
+                    self.structs.insert(
+                        name.clone(),
+                        StructSignature {
+                            fields: field_map,
+                            is_exported: item.is_exported,
+                        },
+                    );
                 }
                 ItemKind::Error { name, fields } => {
                     let mut field_map = HashMap::new();
@@ -156,7 +465,13 @@ impl TypeChecker {
                             span: item.span,
                         });
                     }
-                    self.structs.insert(name.clone(), StructSignature { fields: field_map });
+                    self.structs.insert(
+                        name.clone(),
+                        StructSignature {
+                            fields: field_map,
+                            is_exported: item.is_exported,
+                        },
+                    );
                     self.errors.insert(name.clone());
                 }
                 ItemKind::Func { name, params, return_type, .. } => {
@@ -180,8 +495,16 @@ impl TypeChecker {
                         FuncSignature {
                             params: param_types,
                             return_type: ret_type,
+                            is_exported: item.is_exported,
                         },
                     );
+                }
+                ItemKind::Import { path, alias } => {
+                    if path.starts_with("cdt.") {
+                        self.imports.insert(alias.clone(), ModuleTarget::Native(path.clone()));
+                    } else {
+                        self.imports.insert(alias.clone(), ModuleTarget::Local(PathBuf::from(path)));
+                    }
                 }
             }
         }
@@ -194,7 +517,12 @@ impl TypeChecker {
                     .map(Type::from_type_expr)
                     .unwrap_or(Type::Void);
 
-                if ret_ty != Type::Void && !block_always_returns(body) {
+                let can_fallthrough_void = match &ret_ty {
+                    Type::Void => true,
+                    Type::Union(vars) => vars.contains(&Type::Void),
+                    _ => false,
+                };
+                if !can_fallthrough_void && !block_always_returns(body) {
                     return Err(TypeError {
                         message: format!("Function '{}' must return a value of type '{}' on all reachable paths", name, ret_ty),
                         span: item.span,
@@ -407,14 +735,34 @@ impl TypeChecker {
                                 "Int" => Type::Int,
                                 "String" => Type::String,
                                 "Bool" => Type::Bool,
-                                other => Type::Custom(other.to_string()),
+                                "Void" => Type::Void,
+                                other => {
+                                    let item_suffix = other.split('.').last().unwrap_or(other);
+                                    let matched = remaining.iter().find(|t| match t {
+                                        Type::Custom(c) => {
+                                            let c_suffix = c.split('.').last().unwrap_or(c);
+                                            c == other
+                                                || c.ends_with(&format!(".{}", other))
+                                                || other.ends_with(&format!(".{}", c))
+                                                || (item_suffix == c_suffix && (!c.contains('.') || !other.contains('.') || {
+                                                    let (a1, _) = c.split_once('.').unwrap();
+                                                    let (a2, _) = other.split_once('.').unwrap();
+                                                    a1 == a2 || self.imports.get(a2).map(|t| match t {
+                                                        ModuleTarget::Native(n) => n == "cdt.time" && a1 == "time",
+                                                        _ => false,
+                                                    }).unwrap_or(false)
+                                                }))
+                                        }
+                                        _ => false,
+                                    }).cloned();
+                                    matched.unwrap_or_else(|| Type::Custom(other.to_string()))
+                                }
                             };
                             let idx = remaining.iter().position(|t| t == &custom_ty).ok_or_else(|| TypeError {
                                 message: format!("Redundant or impossible case '{}(...)' for type '{}'", name, expr_ty),
                                 span: case.pattern.span,
                             })?;
                             remaining.remove(idx);
-                            // In switch pattern matching, the case branch handles the variant
                             if let Some(scope) = self.scopes.last_mut() {
                                 scope.insert(binding.clone(), (custom_ty, case.pattern.span, true));
                             }
@@ -554,10 +902,118 @@ impl TypeChecker {
             }
         }
 
+        if let Type::Custom(type_name) = target_ty {
+            let short_name = type_name.split('.').last().unwrap_or(type_name);
+            let method_def = {
+                let mut found = None;
+                for m in self.native_registry.modules() {
+                    if let Some(md) = m.methods.get(&(short_name, field)) {
+                        found = Some(md.clone());
+                        break;
+                    }
+                }
+                found
+            };
+
+            if let Some(method_def) = method_def {
+                if args.len() != method_def.params.len() {
+                    return Err(TypeError {
+                        message: format!(
+                            "Method '{}.{}()' expects {} arguments, got {}",
+                            type_name, field, method_def.params.len(), args.len()
+                        ),
+                        span,
+                    });
+                }
+                for (i, (arg_expr, (_, expected_ty))) in args.iter().zip(method_def.params.iter()).enumerate() {
+                    let actual_ty = self.check_expr(arg_expr)?;
+                    if !actual_ty.is_assignable_to(expected_ty) {
+                        return Err(TypeError {
+                            message: format!(
+                                "Argument {} of method '{}.{}()' expects {}, got {}",
+                                i + 1, type_name, field, expected_ty, actual_ty
+                            ),
+                            span: arg_expr.span,
+                        });
+                    }
+                }
+                return Ok(method_def.return_type.clone());
+            }
+        }
+
         Err(TypeError {
             message: format!("Unknown method or invalid arguments for '{}.{}()'", target_ty, field),
             span,
         })
+    }
+
+    fn resolve_module_member(
+        &mut self,
+        alias: &str,
+        mod_target: &ModuleTarget,
+        field: &str,
+        span: Span,
+    ) -> Result<Type, TypeError> {
+        match mod_target {
+            ModuleTarget::Native(nat_name) => {
+                let m = self.native_registry.get_module(nat_name).ok_or_else(|| TypeError {
+                    message: format!("Unknown native module '{}'", nat_name),
+                    span,
+                })?;
+
+                if let Some(f) = m.functions.get(field) {
+                    let p = f.params.iter().map(|p| p.1.clone()).collect();
+                    return Ok(Type::Function {
+                        params: p,
+                        return_type: Box::new(f.return_type.clone()),
+                    });
+                }
+
+                if let Some(t) = m.types.get(field) {
+                    return Ok(Type::Custom(t.qualified_name.to_string()));
+                }
+
+                Err(TypeError {
+                    message: format!("Module '{}' has no exported item '{}'", nat_name, field),
+                    span,
+                })
+            }
+            ModuleTarget::Local(path) => {
+                let info = self.module_info.get(path).cloned().ok_or_else(|| TypeError {
+                    message: format!("Module '{}' not loaded", path.display()),
+                    span,
+                })?;
+
+                if let Some(f) = info.functions.get(field) {
+                    if !f.is_exported {
+                        return Err(TypeError {
+                            message: format!("Item '{}' is private in module '{}'", field, alias),
+                            span,
+                        });
+                    }
+                    let p = f.params.iter().map(|p| p.1.clone()).collect();
+                    return Ok(Type::Function {
+                        params: p,
+                        return_type: Box::new(f.return_type.clone()),
+                    });
+                }
+
+                if let Some(s) = info.structs.get(field) {
+                    if !s.is_exported {
+                        return Err(TypeError {
+                            message: format!("Item '{}' is private in module '{}'", field, alias),
+                            span,
+                        });
+                    }
+                    return Ok(Type::Custom(format!("{}.{}", alias, field)));
+                }
+
+                Err(TypeError {
+                    message: format!("Module '{}' has no exported item '{}'", alias, field),
+                    span,
+                })
+            }
+        }
     }
 
     pub fn check_expr(&mut self, expr: &Expr) -> Result<Type, TypeError> {
@@ -569,6 +1025,12 @@ impl TypeChecker {
             ExprKind::Ident(name) => {
                 if let Some(ty) = self.lookup_variable(name) {
                     Ok(ty)
+                } else if let Some(sig) = self.functions.get(name).cloned() {
+                    let param_types = sig.params.iter().map(|p| p.1.clone()).collect();
+                    Ok(Type::Function {
+                        params: param_types,
+                        return_type: Box::new(sig.return_type),
+                    })
                 } else if self.structs.contains_key(name) {
                     Ok(Type::Custom(name.clone()))
                 } else {
@@ -760,6 +1222,7 @@ impl TypeChecker {
                 Ok(Type::union(successes))
             }
             ExprKind::Call { callee, args, named_args } => {
+                // 1. Direct local struct constructor
                 if let ExprKind::Ident(ref type_name) = callee.kind {
                     if let Some(struct_sig) = self.structs.get(type_name).cloned() {
                         if !args.is_empty() {
@@ -799,6 +1262,7 @@ impl TypeChecker {
                         return Ok(Type::Custom(type_name.clone()));
                     }
 
+                    // map(list, callback)
                     if type_name == "map" {
                         if args.len() != 2 {
                             return Err(TypeError {
@@ -816,34 +1280,30 @@ impl TypeChecker {
                                 });
                             }
                         };
-                        let fn_name = match &args[1].kind {
-                            ExprKind::Ident(f) => f,
-                            _ => {
+                        let callback_ty = self.check_expr(&args[1])?;
+                        if let Type::Function { params, return_type } = callback_ty {
+                            if params.len() != 1 {
                                 return Err(TypeError {
-                                    message: "Second argument to 'map' must be a function name".to_string(),
+                                    message: format!("Function passed to 'map' must take 1 argument, but takes {}", params.len()),
                                     span: args[1].span,
                                 });
                             }
-                        };
-                        let sig = self.functions.get(fn_name).cloned().ok_or_else(|| TypeError {
-                            message: format!("Unknown function '{}' in 'map'", fn_name),
-                            span: args[1].span,
-                        })?;
-                        if sig.params.len() != 1 {
+                            if !item_ty.is_assignable_to(&params[0]) {
+                                return Err(TypeError {
+                                    message: format!("List element type '{}' is not assignable to parameter type '{}'", item_ty, params[0]),
+                                    span: args[1].span,
+                                });
+                            }
+                            return Ok(Type::List(Box::new(*return_type)));
+                        } else {
                             return Err(TypeError {
-                                message: format!("Function '{}' passed to 'map' must take 1 argument, but takes {}", fn_name, sig.params.len()),
+                                message: "Second argument to 'map' must be a callable function".to_string(),
                                 span: args[1].span,
                             });
                         }
-                        if !item_ty.is_assignable_to(&sig.params[0].1) {
-                            return Err(TypeError {
-                                message: format!("List element type '{}' is not assignable to parameter type '{}' of function '{}'", item_ty, sig.params[0].1, fn_name),
-                                span: args[1].span,
-                            });
-                        }
-                        return Ok(Type::List(Box::new(sig.return_type)));
                     }
 
+                    // filter(list, callback)
                     if type_name == "filter" {
                         if args.len() != 2 {
                             return Err(TypeError {
@@ -861,88 +1321,207 @@ impl TypeChecker {
                                 });
                             }
                         };
-                        let fn_name = match &args[1].kind {
-                            ExprKind::Ident(f) => f,
-                            _ => {
+                        let callback_ty = self.check_expr(&args[1])?;
+                        if let Type::Function { params, return_type } = callback_ty {
+                            if params.len() != 1 {
                                 return Err(TypeError {
-                                    message: "Second argument to 'filter' must be a function name".to_string(),
+                                    message: format!("Function passed to 'filter' must take 1 argument, but takes {}", params.len()),
                                     span: args[1].span,
                                 });
                             }
-                        };
-                        let sig = self.functions.get(fn_name).cloned().ok_or_else(|| TypeError {
-                            message: format!("Unknown function '{}' in 'filter'", fn_name),
-                            span: args[1].span,
-                        })?;
-                        if sig.params.len() != 1 {
+                            if !item_ty.is_assignable_to(&params[0]) {
+                                return Err(TypeError {
+                                    message: format!("List element type '{}' is not assignable to parameter type '{}'", item_ty, params[0]),
+                                    span: args[1].span,
+                                });
+                            }
+                            if *return_type != Type::Bool {
+                                return Err(TypeError {
+                                    message: format!("Function passed to 'filter' must return 'Bool', got '{}'", return_type),
+                                    span: args[1].span,
+                                });
+                            }
+                            return Ok(Type::List(Box::new(item_ty)));
+                        } else {
                             return Err(TypeError {
-                                message: format!("Function '{}' passed to 'filter' must take 1 argument, but takes {}", fn_name, sig.params.len()),
+                                message: "Second argument to 'filter' must be a callable function".to_string(),
                                 span: args[1].span,
                             });
                         }
-                        if !item_ty.is_assignable_to(&sig.params[0].1) {
-                            return Err(TypeError {
-                                message: format!("List element type '{}' is not assignable to parameter type '{}' of function '{}'", item_ty, sig.params[0].1, fn_name),
-                                span: args[1].span,
-                            });
-                        }
-                        if sig.return_type != Type::Bool {
-                            return Err(TypeError {
-                                message: format!("Function '{}' passed to 'filter' must return 'Bool', got '{}'", fn_name, sig.return_type),
-                                span: args[1].span,
-                            });
-                        }
-                        return Ok(Type::List(Box::new(item_ty)));
                     }
                 }
 
+                // 2. Check if callee is an imported module member call or constructor: `alias.foo(...)`
                 if let ExprKind::Member { target, field } = &callee.kind {
+                    if let ExprKind::Ident(ref alias) = target.kind {
+                        if let Some(mod_target) = self.imports.get(alias).cloned() {
+                            match mod_target {
+                                ModuleTarget::Native(nat_name) => {
+                                    let (is_type, func_def) = {
+                                        let m = self.native_registry.get_module(&nat_name).ok_or_else(|| TypeError {
+                                            message: format!("Unknown native module '{}'", nat_name),
+                                            span: callee.span,
+                                        })?;
+                                        (m.types.contains_key(field.as_str()), m.functions.get(field.as_str()).cloned())
+                                    };
+
+                                    if is_type {
+                                        return Err(TypeError {
+                                            message: format!("Native type '{}.{}' cannot be constructed directly", alias, field),
+                                            span: callee.span,
+                                        });
+                                    }
+
+                                    if let Some(f) = func_def {
+                                        if !named_args.is_empty() {
+                                            return Err(TypeError {
+                                                message: format!("Function '{}.{}' does not accept named arguments", alias, field),
+                                                span: callee.span,
+                                            });
+                                        }
+                                        if args.len() != f.params.len() {
+                                            return Err(TypeError {
+                                                message: format!("Function '{}.{}' expects {} arguments, got {}", alias, field, f.params.len(), args.len()),
+                                                span: expr.span,
+                                            });
+                                        }
+                                        for (i, (arg_expr, (_, expected_ty))) in args.iter().zip(f.params.iter()).enumerate() {
+                                            let actual_ty = self.check_expr(arg_expr)?;
+                                            if !actual_ty.is_assignable_to(expected_ty) {
+                                                return Err(TypeError {
+                                                    message: format!("Argument {} of function '{}.{}' expects {}, got {}", i + 1, alias, field, expected_ty, actual_ty),
+                                                    span: arg_expr.span,
+                                                });
+                                            }
+                                        }
+                                        return Ok(f.return_type);
+                                    }
+                                }
+                                ModuleTarget::Local(path) => {
+                                    let info = self.module_info.get(&path).cloned().ok_or_else(|| TypeError {
+                                        message: format!("Module '{}' not loaded", path.display()),
+                                        span: callee.span,
+                                    })?;
+
+                                    // Check constructor of imported struct / error
+                                    if let Some(struct_sig) = info.structs.get(field) {
+                                        if !struct_sig.is_exported {
+                                            return Err(TypeError {
+                                                message: format!("Type '{}' is private in module '{}'", field, alias),
+                                                span: callee.span,
+                                            });
+                                        }
+                                        if !args.is_empty() {
+                                            return Err(TypeError {
+                                                message: format!("Type '{}.{}' must be constructed using named arguments", alias, field),
+                                                span: callee.span,
+                                            });
+                                        }
+                                        let mut provided_fields = HashSet::new();
+                                        for arg in named_args {
+                                            if !provided_fields.insert(arg.name.clone()) {
+                                                return Err(TypeError {
+                                                    message: format!("Duplicate field '{}' in construction of '{}.{}'", arg.name, alias, field),
+                                                    span: callee.span,
+                                                });
+                                            }
+                                            let expected_field_ty = struct_sig.fields.get(&arg.name).ok_or_else(|| TypeError {
+                                                message: format!("Type '{}.{}' has no field '{}'", alias, field, arg.name),
+                                                span: callee.span,
+                                            })?;
+                                            let actual_arg_ty = self.check_expr(&arg.value)?;
+                                            if !actual_arg_ty.is_assignable_to(expected_field_ty) {
+                                                return Err(TypeError {
+                                                    message: format!("Field '{}' expects {}, got {}", arg.name, expected_field_ty, actual_arg_ty),
+                                                    span: arg.value.span,
+                                                });
+                                            }
+                                        }
+                                        for required_field in struct_sig.fields.keys() {
+                                            if !provided_fields.contains(required_field) {
+                                                return Err(TypeError {
+                                                    message: format!("Missing required field '{}' in construction of '{}.{}'", required_field, alias, field),
+                                                    span: callee.span,
+                                                });
+                                            }
+                                        }
+                                        return Ok(Type::Custom(format!("{}.{}", alias, field)));
+                                    }
+
+                                    // Check imported function call
+                                    if let Some(fn_sig) = info.functions.get(field) {
+                                        if !fn_sig.is_exported {
+                                            return Err(TypeError {
+                                                message: format!("Function '{}' is private in module '{}'", field, alias),
+                                                span: callee.span,
+                                            });
+                                        }
+                                        if args.len() != fn_sig.params.len() {
+                                            return Err(TypeError {
+                                                message: format!("Function '{}.{}' expects {} arguments, got {}", alias, field, fn_sig.params.len(), args.len()),
+                                                span: expr.span,
+                                            });
+                                        }
+                                        for (i, (arg_expr, (_, expected_ty))) in args.iter().zip(fn_sig.params.iter()).enumerate() {
+                                            let actual_ty = self.check_expr(arg_expr)?;
+                                            if !actual_ty.is_assignable_to(expected_ty) {
+                                                return Err(TypeError {
+                                                    message: format!("Argument {} expects {}, got {}", i + 1, expected_ty, actual_ty),
+                                                    span: arg_expr.span,
+                                                });
+                                            }
+                                        }
+                                        return Ok(fn_sig.return_type.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // 3. Method call on value
                     let target_ty = self.check_expr(target)?;
                     return self.check_method_call(&target_ty, field, args, callee.span);
                 }
 
-                let func_name = match callee.kind {
-                    ExprKind::Ident(ref name) => name.clone(),
-                    _ => {
+                // 4. Function call (by name or through function-typed expression)
+                let callee_ty = self.check_expr(callee)?;
+                if let Type::Function { params, return_type } = callee_ty {
+                    if !named_args.is_empty() {
                         return Err(TypeError {
-                            message: "Calling non-identifier expressions is not supported".to_string(),
+                            message: "Function calls do not support named arguments".to_string(),
                             span: callee.span,
                         });
                     }
-                };
-
-                let sig = self.functions.get(&func_name).cloned().ok_or_else(|| TypeError {
-                    message: format!("Unknown function '{}'", func_name),
-                    span: callee.span,
-                })?;
-
-                if func_name != "print" {
-                    if args.len() != sig.params.len() {
+                    if args.len() != params.len() {
                         return Err(TypeError {
-                            message: format!("Function '{}' expects {} arguments, got {}", func_name, sig.params.len(), args.len()),
+                            message: format!("Function expects {} arguments, got {}", params.len(), args.len()),
                             span: expr.span,
                         });
                     }
-
-                    for (i, arg_expr) in args.iter().enumerate() {
+                    for (i, (arg_expr, expected_ty)) in args.iter().zip(params.iter()).enumerate() {
                         let actual_ty = self.check_expr(arg_expr)?;
-                        let expected_ty = &sig.params[i].1;
                         if !actual_ty.is_assignable_to(expected_ty) {
                             return Err(TypeError {
-                                message: format!("Argument {} of function '{}' expects {}, got {}", i + 1, func_name, expected_ty, actual_ty),
+                                message: format!("Argument {} expects {}, got {}", i + 1, expected_ty, actual_ty),
                                 span: arg_expr.span,
                             });
                         }
                     }
-                } else {
-                    for a in args {
-                        self.check_expr(a)?;
+                    return Ok(*return_type);
+                }
+
+                Err(TypeError {
+                    message: format!("Cannot call non-function expression of type '{}'", callee_ty),
+                    span: callee.span,
+                })
+            }
+            ExprKind::Member { target, field } => {
+                if let ExprKind::Ident(ref alias) = target.kind {
+                    if let Some(mod_target) = self.imports.get(alias).cloned() {
+                        return self.resolve_module_member(alias, &mod_target, field, expr.span);
                     }
                 }
 
-                Ok(sig.return_type)
-            }
-            ExprKind::Member { target, field } => {
                 let target_ty = self.check_expr(target)?;
 
                 if let Type::Union(_) = target_ty {
@@ -963,6 +1542,70 @@ impl TypeChecker {
                             });
                         }
                     }
+
+                    // Check if imported struct: `alias.Type`
+                    if let Some((alias, item_name)) = struct_name.split_once('.') {
+                        if let Some(mod_target) = self.imports.get(alias) {
+                            match mod_target {
+                                ModuleTarget::Local(path) => {
+                                    if let Some(info) = self.module_info.get(path) {
+                                        if let Some(struct_sig) = info.structs.get(item_name) {
+                                            if let Some(field_ty) = struct_sig.fields.get(field) {
+                                                return Ok(field_ty.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                                ModuleTarget::Native(nat_name) => {
+                                    if let Some(m) = self.native_registry.get_module(nat_name) {
+                                        if let Some(t) = m.types.get(item_name) {
+                                            for (f_name, f_ty) in &t.fields {
+                                                if *f_name == field {
+                                                    return Ok(f_ty.clone());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else if let Some(m) = self.native_registry.get_module(alias) {
+                            if let Some(t) = m.types.get(item_name) {
+                                for (f_name, f_ty) in &t.fields {
+                                    if *f_name == field {
+                                        return Ok(f_ty.clone());
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        // Check if struct_name is an exported type from any imported module
+                        for (_, mod_target) in &self.imports {
+                            match mod_target {
+                                ModuleTarget::Local(path) => {
+                                    if let Some(info) = self.module_info.get(path) {
+                                        if let Some(struct_sig) = info.structs.get(struct_name) {
+                                            if struct_sig.is_exported {
+                                                if let Some(field_ty) = struct_sig.fields.get(field) {
+                                                    return Ok(field_ty.clone());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                ModuleTarget::Native(nat_name) => {
+                                    if let Some(m) = self.native_registry.get_module(nat_name) {
+                                        if let Some(t) = m.types.get(struct_name.as_str()) {
+                                            for (f_name, f_ty) in &t.fields {
+                                                if *f_name == field {
+                                                    return Ok(f_ty.clone());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
 
                 Err(TypeError {
@@ -974,11 +1617,11 @@ impl TypeChecker {
     }
 }
 
-fn block_always_returns(block: &crate::ast::Block) -> bool {
+fn block_always_returns(block: &Block) -> bool {
     for stmt in &block.stmts {
         match &stmt.kind {
-            crate::ast::StmtKind::Return(_) => return true,
-            crate::ast::StmtKind::If {
+            StmtKind::Return(_) => return true,
+            StmtKind::If {
                 then_block,
                 else_block: Some(else_b),
                 ..
@@ -987,7 +1630,7 @@ fn block_always_returns(block: &crate::ast::Block) -> bool {
                     return true;
                 }
             }
-            crate::ast::StmtKind::Switch { cases, .. } => {
+            StmtKind::Switch { cases, .. } => {
                 if !cases.is_empty() && cases.iter().all(|c| block_always_returns(&c.body)) {
                     return true;
                 }
@@ -1003,6 +1646,8 @@ mod tests {
     use super::*;
     use crate::lexer::Lexer;
     use crate::parser::Parser;
+    use crate::loader::ModuleLoader;
+    use std::path::PathBuf;
 
     fn check_source(source: &str) -> Result<(), TypeError> {
         let mut lexer = Lexer::new(source);
@@ -1321,5 +1966,77 @@ mod tests {
         "#;
         let err = check_source(src).unwrap_err();
         assert!(err.message.contains("Unused variable 'err' of error type 'MyError'"));
+    }
+
+    #[test]
+    fn test_private_type_leakage_in_exported_function() {
+        let mut loader = ModuleLoader::new();
+        let root = PathBuf::from("/virtual/main.cdt");
+        loader.with_virtual_file(&root, r#"
+            type SecretConfig { key: String }
+
+            export func get_config() -> SecretConfig {
+                return SecretConfig(key: "secret")
+            }
+
+            func main() {}
+        "#);
+
+        let root_canon = loader.load_project(&root).unwrap();
+        let mut checker = TypeChecker::new();
+        let err = checker.check_project(&root_canon, &loader).unwrap_err();
+
+        assert!(err.to_string().contains("Exported function 'get_config' exposes private type 'SecretConfig'"));
+    }
+
+    #[test]
+    fn test_cannot_access_private_item_from_imported_module() {
+        let mut loader = ModuleLoader::new();
+        let helper = PathBuf::from("/virtual/helper.cdt");
+        let root = PathBuf::from("/virtual/main.cdt");
+
+        loader.with_virtual_file(&helper, r#"
+            func secret() -> Int {
+                return 42
+            }
+
+            export func public_fn() -> Int {
+                return secret()
+            }
+        "#);
+
+        loader.with_virtual_file(&root, r#"
+            import "./helper" as helper
+
+            func main() {
+                x := helper.secret()
+            }
+        "#);
+
+        let root_canon = loader.load_project(&root).unwrap();
+        let mut checker = TypeChecker::new();
+        let err = checker.check_project(&root_canon, &loader).unwrap_err();
+
+        assert!(err.to_string().contains("is private in module 'helper'"));
+    }
+
+    #[test]
+    fn test_cyclic_import_detection() {
+        let mut loader = ModuleLoader::new();
+        let a = PathBuf::from("/virtual/a.cdt");
+        let b = PathBuf::from("/virtual/b.cdt");
+
+        loader.with_virtual_file(&a, r#"
+            import "./b" as b
+            export func fa() {}
+        "#);
+
+        loader.with_virtual_file(&b, r#"
+            import "./a" as a
+            export func fb() {}
+        "#);
+
+        let err = loader.load_project(&a).unwrap_err();
+        assert!(err.to_string().contains("Cyclic import detected"));
     }
 }

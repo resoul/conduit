@@ -1,0 +1,47 @@
+// main.cdt - Module imports, qualified calls, and callbacks
+
+import "./users" as users
+import cdt.time as clock
+
+func main() {
+    print("=== Conduit Modules and Exports Demo ===")
+
+    // Direct call to imported exported function
+    res := users.find(42)
+    switch res {
+        case users.User(u):
+            print("Found user:")
+            print(u.name)
+        case users.UserNotFound(e):
+            print("User not found:")
+            print(e.id)
+    }
+
+    // Function as a first-class value
+    finder := users.find
+    res2 := finder(0)
+    switch res2 {
+        case users.User(u):
+            print(u.name)
+        case users.UserNotFound(e):
+            print("Successfully caught expected error for id:")
+            print(e.id)
+    }
+
+    // Native time module alias call
+    inst := clock.monotonic()
+    dur := clock.elapsed(inst)
+    switch dur {
+        case clock.Duration(d):
+            ns := d.nanoseconds()
+            switch ns {
+                case Int(val):
+                    print("Elapsed nanoseconds:")
+                    print(val)
+                case clock.TimeError(e):
+                    print(e.message)
+            }
+        case clock.TimeError(e):
+            print(e.message)
+    }
+}
