@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::ast::{Block, Expr, ExprKind, ItemKind, Stmt, StmtKind};
-use crate::loader::{LoadedModule, ModuleTarget};
+use crate::loader::{normalize_path, LoadedModule, ModuleTarget};
 use crate::native::NativeRegistry;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -18,11 +18,26 @@ pub struct ReachabilityReport {
 
 impl ReachabilityReport {
     pub fn is_function_reachable(&self, module: &Path, func_name: &str) -> bool {
-        self.reachable_functions.contains(&(module.to_path_buf(), func_name.to_string()))
+        if self.reachable_functions.contains(&(module.to_path_buf(), func_name.to_string())) {
+            return true;
+        }
+        let norm_module = normalize_path(module);
+        self.reachable_functions.iter().any(|(p, name)| {
+            name == func_name
+                && (p == module
+                    || p == &norm_module
+                    || normalize_path(p) == norm_module
+                    || p.ends_with(module)
+                    || module.ends_with(p)
+                    || (p.file_name().is_some() && p.file_name() == module.file_name()))
+        })
     }
 
     pub fn is_native_function_reachable(&self, module_name: &str, func_name: &str) -> bool {
         self.reachable_native_functions.contains(&(module_name.to_string(), func_name.to_string()))
+            || self.reachable_native_functions.iter().any(|(m, f)| {
+                f == func_name && (m == module_name || m.ends_with(module_name) || module_name.ends_with(m))
+            })
     }
 }
 
@@ -32,6 +47,28 @@ pub struct ReachabilityAnalyzer<'a> {
     reachable_functions: HashSet<(PathBuf, String)>,
     reachable_native_functions: HashSet<(String, String)>,
     reachable_native_methods: HashSet<(String, String)>,
+}
+
+fn lookup_module<'m>(modules: &'m HashMap<PathBuf, LoadedModule>, path: &Path) -> Option<&'m LoadedModule> {
+    if let Some(m) = modules.get(path) {
+        return Some(m);
+    }
+    let norm = normalize_path(path);
+    if let Some(m) = modules.get(&norm) {
+        return Some(m);
+    }
+    for (p, m) in modules {
+        if p == path
+            || p == &norm
+            || normalize_path(p) == norm
+            || p.ends_with(path)
+            || path.ends_with(p)
+            || (p.file_name().is_some() && p.file_name() == path.file_name())
+        {
+            return Some(m);
+        }
+    }
+    None
 }
 
 impl<'a> ReachabilityAnalyzer<'a> {
@@ -52,11 +89,20 @@ impl<'a> ReachabilityAnalyzer<'a> {
         let mut worklist: Vec<(PathBuf, String)> = Vec::new();
 
         // 1. Root main() entry point
-        worklist.push((root_path.to_path_buf(), "main".to_string()));
+        let canonical_root = lookup_module(self.modules, root_path)
+            .map(|m| m.canonical_path.clone())
+            .unwrap_or_else(|| root_path.to_path_buf());
+        worklist.push((canonical_root.clone(), "main".to_string()));
+        if canonical_root != root_path {
+            worklist.push((root_path.to_path_buf(), "main".to_string()));
+        }
 
         // Extra entry points (e.g. for future HTTP / RPC handlers)
         for &(mod_path, fn_name) in extra_entry_points {
-            worklist.push((mod_path.to_path_buf(), fn_name.to_string()));
+            let canon = lookup_module(self.modules, mod_path)
+                .map(|m| m.canonical_path.clone())
+                .unwrap_or_else(|| mod_path.to_path_buf());
+            worklist.push((canon, fn_name.to_string()));
         }
 
         let mut total_functions: usize = 0;
@@ -64,7 +110,6 @@ impl<'a> ReachabilityAnalyzer<'a> {
             for item in &loaded_mod.program.items {
                 if let ItemKind::Func { ref name, .. } = item.kind {
                     total_functions += 1;
-                    // If function is exported in a non-root library, note total count
                     let _ = mod_path;
                     let _ = name;
                 }
@@ -76,11 +121,14 @@ impl<'a> ReachabilityAnalyzer<'a> {
                 continue;
             }
 
-            if let Some(loaded_mod) = self.modules.get(&mod_path) {
+            if let Some(loaded_mod) = lookup_module(self.modules, &mod_path) {
+                // Ensure the canonical path is also marked reachable
+                self.reachable_functions.insert((loaded_mod.canonical_path.clone(), func_name.clone()));
+
                 for item in &loaded_mod.program.items {
                     if let ItemKind::Func { ref name, ref body, .. } = item.kind {
                         if name == &func_name {
-                            self.scan_block(body, &mod_path, loaded_mod, &mut worklist);
+                            self.scan_block(body, &loaded_mod.canonical_path, loaded_mod, &mut worklist);
                             break;
                         }
                     }
@@ -88,11 +136,16 @@ impl<'a> ReachabilityAnalyzer<'a> {
             }
         }
 
-        let reachable_count = self.reachable_functions.len();
+        let mut unique_reachable = HashSet::new();
+        for (p, f) in &self.reachable_functions {
+            let file_key = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| p.display().to_string());
+            unique_reachable.insert((file_key, f.clone()));
+        }
+        let reachable_count = unique_reachable.len().min(total_functions);
         let unused_count = total_functions.saturating_sub(reachable_count);
 
         ReachabilityReport {
-            root_module: root_path.to_path_buf(),
+            root_module: canonical_root,
             reachable_functions: self.reachable_functions.clone(),
             reachable_native_functions: self.reachable_native_functions.clone(),
             reachable_native_methods: self.reachable_native_methods.clone(),
@@ -243,7 +296,7 @@ impl<'a> ReachabilityAnalyzer<'a> {
     }
 
     fn is_func_in_module(&self, mod_path: &Path, name: &str) -> bool {
-        if let Some(m) = self.modules.get(mod_path) {
+        if let Some(m) = lookup_module(self.modules, mod_path) {
             m.program.items.iter().any(|item| {
                 if let ItemKind::Func { name: ref fn_name, .. } = item.kind {
                     fn_name == name

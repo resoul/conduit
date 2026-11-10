@@ -34,6 +34,20 @@ pub struct LoadedModule {
     pub imports: HashMap<String, (ModuleTarget, Span)>, // alias -> (target, span)
 }
 
+pub fn normalize_path(path: &Path) -> PathBuf {
+    let mut components = Vec::new();
+    for c in path.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                components.pop();
+            }
+            c => components.push(c),
+        }
+    }
+    components.into_iter().collect()
+}
+
 pub struct ModuleLoader {
     native_registry: NativeRegistry,
     virtual_files: HashMap<PathBuf, String>,
@@ -50,13 +64,20 @@ impl ModuleLoader {
     }
 
     pub fn with_virtual_file(&mut self, path: impl AsRef<Path>, content: impl Into<String>) {
-        let p = path.as_ref();
-        let canon = if p.is_absolute() {
-            p.to_path_buf()
+        let p = path.as_ref().to_path_buf();
+        let s = content.into();
+        let norm = normalize_path(&p);
+        self.virtual_files.insert(p.clone(), s.clone());
+        self.virtual_files.insert(norm.clone(), s.clone());
+
+        let abs = if p.is_absolute() {
+            p
         } else {
-            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(p)
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(&p)
         };
-        self.virtual_files.insert(canon, content.into());
+        let abs_norm = normalize_path(&abs);
+        self.virtual_files.insert(abs, s.clone());
+        self.virtual_files.insert(abs_norm, s);
     }
 
     pub fn load_project(&mut self, root_path: &Path) -> Result<PathBuf, LoaderError> {
@@ -67,33 +88,60 @@ impl ModuleLoader {
     }
 
     fn canonicalize_path(&self, path: &Path, span: Span) -> Result<PathBuf, LoaderError> {
+        let norm = normalize_path(path);
+        if self.virtual_files.contains_key(&norm) {
+            return Ok(norm);
+        }
         if self.virtual_files.contains_key(path) {
             return Ok(path.to_path_buf());
         }
 
-        match fs::canonicalize(path) {
-            Ok(p) => Ok(p),
-            Err(err) => {
-                // If path is in virtual_files after resolving against current dir
-                let abs = if path.is_absolute() {
-                    path.to_path_buf()
-                } else {
-                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(path)
-                };
-                if self.virtual_files.contains_key(&abs) {
-                    return Ok(abs);
-                }
-                Err(LoaderError {
-                    message: format!("Cannot resolve path '{}': {}", path.display(), err),
-                    span,
-                })
+        for (vpath, _) in &self.virtual_files {
+            if normalize_path(vpath) == norm {
+                return Ok(vpath.clone());
             }
         }
+
+        if let Ok(canon) = fs::canonicalize(path) {
+            return Ok(canon);
+        }
+        if let Ok(canon) = fs::canonicalize(&norm) {
+            return Ok(canon);
+        }
+
+        let abs = if norm.is_absolute() {
+            norm.clone()
+        } else {
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(&norm)
+        };
+        let abs_norm = normalize_path(&abs);
+        if self.virtual_files.contains_key(&abs_norm) {
+            return Ok(abs_norm);
+        }
+        for (vpath, _) in &self.virtual_files {
+            if normalize_path(vpath) == abs_norm {
+                return Ok(vpath.clone());
+            }
+        }
+
+        Err(LoaderError {
+            message: format!("Cannot resolve path '{}'", path.display()),
+            span,
+        })
     }
 
     fn read_content(&self, path: &Path, span: Span) -> Result<String, LoaderError> {
         if let Some(content) = self.virtual_files.get(path) {
             return Ok(content.clone());
+        }
+        let norm = normalize_path(path);
+        if let Some(content) = self.virtual_files.get(&norm) {
+            return Ok(content.clone());
+        }
+        for (vpath, content) in &self.virtual_files {
+            if normalize_path(vpath) == norm {
+                return Ok(content.clone());
+            }
         }
 
         fs::read_to_string(path).map_err(|err| LoaderError {

@@ -540,13 +540,13 @@ fn test_criterion_11_reachability_analysis_unused_code() {
     let mut analyzer = ReachabilityAnalyzer::new(&loader.modules, &registry);
     let report = analyzer.analyze(&root, &[]);
 
-    assert!(report.is_function_reachable(&main, "main"));
+    assert!(report.is_function_reachable(&root, "main"));
     assert!(report.is_function_reachable(&helper, "used_function"));
     assert!(report.is_function_reachable(&helper, "helper_internal"));
 
     // Unused functions are NOT reachable
     assert!(!report.is_function_reachable(&helper, "unused_exported_function"));
-    assert!(!report.is_function_reachable(&main, "unused_local_function"));
+    assert!(!report.is_function_reachable(&root, "unused_local_function"));
 
     // Native dependencies
     assert!(report.is_native_function_reachable("cdt.time", "now"));
