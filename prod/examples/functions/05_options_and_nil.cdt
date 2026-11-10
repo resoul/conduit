@@ -1,0 +1,41 @@
+func find_first_negative(numbers: [Int]) -> Int? {
+    for n in numbers {
+        if n < 0 {
+            return n
+        }
+    }
+    return nil
+}
+
+func describe_optional(val: Int?) -> String {
+    if val != nil {
+        return "Found value: {val}"
+    }
+    return "Value not found (nil)"
+}
+
+func safe_divide(numerator: Int, denominator: Int) -> Int? {
+    if denominator == 0 {
+        return nil
+    }
+    return numerator / denominator
+}
+
+func main() {
+    list1 := [10, 20, -5, 30]
+    res1 := find_first_negative(list1)
+    desc1 := describe_optional(res1)
+    print("Search in [10, 20, -5, 30]: {desc1}")
+
+    list2 := [1, 2, 3, 4]
+    res2 := find_first_negative(list2)
+    desc2 := describe_optional(res2)
+    print("Search in [1, 2, 3, 4]: {desc2}")
+
+    div1 := safe_divide(100, 4)
+    print("100 / 4: {div1}")
+
+    div2 := safe_divide(100, 0)
+    print("100 / 0: {div2}")
+}
+

@@ -1,0 +1,54 @@
+type User {
+    id: Int
+    username: String
+    is_admin: Bool
+}
+
+type OrderItem {
+    product: String
+    price: Int
+    qty: Int
+}
+
+type OrderSummary {
+    user_name: String
+    total_amount: Int
+    item_count: Int
+}
+
+func calculate_order(user: User, items: [OrderItem]) -> OrderSummary {
+    var total = 0
+    var count = 0
+    for item in items {
+        item_total := item.price * item.qty
+        total = total + item_total
+        count = count + item.qty
+    }
+
+    if user.is_admin {
+        total = total - (total * 10 / 100)
+    }
+
+    return OrderSummary(
+        user_name: user.username,
+        total_amount: total,
+        item_count: count
+    )
+}
+
+func main() {
+    admin := User(id: 1, username: "Alice", is_admin: true)
+    regular := User(id: 2, username: "Bob", is_admin: false)
+
+    items := [
+        OrderItem(product: "Monitor", price: 20000, qty: 1),
+        OrderItem(product: "Cable", price: 500, qty: 3)
+    ]
+
+    admin_order := calculate_order(admin, items)
+    print("Admin order: user={admin_order.user_name}, total={admin_order.total_amount} (with 10% discount)")
+
+    bob_order := calculate_order(regular, items)
+    print("Bob order: user={bob_order.user_name}, total={bob_order.total_amount}")
+}
+

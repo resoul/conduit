@@ -1,0 +1,52 @@
+func filter_positive(numbers: [Int]) -> [Int] {
+    var result: [Int] = []
+    for n in numbers {
+        if n > 0 {
+            result.append(n)
+        }
+    }
+    return result
+}
+
+func sum(numbers: [Int]) -> Int {
+    var total = 0
+    for n in numbers {
+        total = total + n
+    }
+    return total
+}
+
+func count_occurrences(items: [String], target: String) -> Int {
+    var count = 0
+    for it in items {
+        if it == target {
+            count = count + 1
+        }
+    }
+    return count
+}
+
+func generate_squares(count: Int) -> [Int] {
+    var squares: [Int] = []
+    for i in 1..count {
+        squares.append(i * i)
+    }
+    return squares
+}
+
+func main() {
+    nums := [-10, 5, -2, 8, 0, 15, -1]
+    positives := filter_positive(nums)
+    print("Positives: {positives}")
+
+    total := sum(positives)
+    print("Sum of positives: {total}")
+
+    tags := ["rust", "api", "conduit", "rust", "web", "rust"]
+    rust_count := count_occurrences(tags, "rust")
+    print("Count of 'rust': {rust_count}")
+
+    squares := generate_squares(6)
+    print("Squares (1..6): {squares}")
+}
+
