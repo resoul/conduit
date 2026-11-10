@@ -21,6 +21,8 @@ impl std::error::Error for RuntimeError {}
 enum ControlFlow {
     Next,
     Return(Value),
+    Break,
+    Continue,
 }
 
 pub struct Interpreter {
@@ -161,7 +163,7 @@ impl Interpreter {
         let mut return_val = Value::Void;
         for stmt in &body.stmts {
             match self.eval_stmt(stmt)? {
-                ControlFlow::Next => {}
+                ControlFlow::Next | ControlFlow::Break | ControlFlow::Continue => {}
                 ControlFlow::Return(val) => {
                     return_val = val;
                     break;
@@ -176,9 +178,12 @@ impl Interpreter {
     fn eval_block(&mut self, block: &crate::ast::Block) -> Result<ControlFlow, RuntimeError> {
         self.enter_scope();
         for s in &block.stmts {
-            if let ControlFlow::Return(v) = self.eval_stmt(s)? {
-                self.exit_scope();
-                return Ok(ControlFlow::Return(v));
+            match self.eval_stmt(s)? {
+                ControlFlow::Next => {}
+                flow => {
+                    self.exit_scope();
+                    return Ok(flow);
+                }
             }
         }
         self.exit_scope();
@@ -240,21 +245,28 @@ impl Interpreter {
                     for item in items {
                         self.enter_scope();
                         self.define_variable(variable.clone(), item);
-                        let mut returned = None;
+                        let mut flow = ControlFlow::Next;
                         for s in &body.stmts {
-                            if let ControlFlow::Return(v) = self.eval_stmt(s)? {
-                                returned = Some(v);
-                                break;
+                            match self.eval_stmt(s)? {
+                                ControlFlow::Next => {}
+                                other => {
+                                    flow = other;
+                                    break;
+                                }
                             }
                         }
                         self.exit_scope();
-                        if let Some(v) = returned {
-                            return Ok(ControlFlow::Return(v));
+                        match flow {
+                            ControlFlow::Break => break,
+                            ControlFlow::Return(v) => return Ok(ControlFlow::Return(v)),
+                            _ => {}
                         }
                     }
                 }
                 Ok(ControlFlow::Next)
             }
+            StmtKind::Break => Ok(ControlFlow::Break),
+            StmtKind::Continue => Ok(ControlFlow::Continue),
             StmtKind::Expr(expr) => {
                 self.eval_expr(expr)?;
                 Ok(ControlFlow::Next)

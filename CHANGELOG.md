@@ -5,7 +5,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
-## [Unreleased]
+## [0.1.2] - 2026-11-10
+
+### Added
+
+* **Loop Control Statements (`break` and `continue`)**:
+  * Added `break` and `continue` keywords to lexer, AST, and parser.
+  * Static control flow analysis in `check.rs` preventing `break` or `continue` outside of `for` loops.
+  * Runtime loop flow termination and step progression in `interp.rs`.
+  * LSP hover information and autocompletion snippets for loop keywords.
+
+* **Pipeline Operator (`|>`)**:
+  * Pipe operator `|>` allowing sequential data processing chains (e.g. `data |> filter() |> double() |> print()`).
+  * Elegant compile-time AST desugaring in `parser.rs`: `left |> right_call(args...)` desugars into `right_call(left, args...)`, and `left |> right_ident` desugars into `right_ident(left)`.
+  * Zero runtime overhead with full static type safety.
+
+* **Examples (`examples/functions/`)**:
+  * [07_loops_and_pipes.cdt](examples/functions/07_loops_and_pipes.cdt): Demonstrates `break`, `continue`, and data processing pipelines using `|>`.
 
 ---
 

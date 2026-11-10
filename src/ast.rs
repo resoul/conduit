@@ -108,6 +108,8 @@ pub enum StmtKind {
         iterable: Expr,
         body: Block,
     },
+    Break,
+    Continue,
     Expr(Expr),
 }
 

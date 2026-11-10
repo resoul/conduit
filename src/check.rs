@@ -34,6 +34,7 @@ pub struct TypeChecker {
     structs: HashMap<String, StructSignature>,
     scopes: Vec<HashMap<String, Type>>,
     current_return_type: Option<Type>,
+    loop_depth: usize,
 }
 
 impl TypeChecker {
@@ -43,6 +44,7 @@ impl TypeChecker {
             structs: HashMap::new(),
             scopes: Vec::new(),
             current_return_type: None,
+            loop_depth: 0,
         };
 
         checker.functions.insert(
@@ -251,10 +253,29 @@ impl TypeChecker {
                     }
                 };
 
+                self.loop_depth += 1;
                 self.enter_scope();
                 self.define_variable(variable.clone(), item_ty);
-                self.check_block(body)?;
+                let res = self.check_block(body);
                 self.exit_scope();
+                self.loop_depth -= 1;
+                res?;
+            }
+            StmtKind::Break => {
+                if self.loop_depth == 0 {
+                    return Err(TypeError {
+                        message: "'break' outside of loop".to_string(),
+                        span: stmt.span,
+                    });
+                }
+            }
+            StmtKind::Continue => {
+                if self.loop_depth == 0 {
+                    return Err(TypeError {
+                        message: "'continue' outside of loop".to_string(),
+                        span: stmt.span,
+                    });
+                }
             }
             StmtKind::Expr(expr) => {
                 self.check_expr(expr)?;
@@ -610,5 +631,32 @@ mod tests {
         let src = "func f(x: Int?) -> Int {\n    return x ?? \"wrong\"\n}\n";
         let err = check_source(src).unwrap_err();
         assert!(err.message.contains("Coalesce operator '??' default value must match optional inner type"));
+    }
+
+    #[test]
+    fn test_break_outside_loop_error() {
+        let src = "func f() {\n    break\n}\n";
+        let err = check_source(src).unwrap_err();
+        assert!(err.message.contains("'break' outside of loop"));
+    }
+
+    #[test]
+    fn test_continue_outside_loop_error() {
+        let src = "func f() {\n    continue\n}\n";
+        let err = check_source(src).unwrap_err();
+        assert!(err.message.contains("'continue' outside of loop"));
+    }
+
+    #[test]
+    fn test_pipe_valid() {
+        let src = "func double(x: Int) -> Int { return x * 2 }\nfunc f() -> Int { return 5 |> double() }\n";
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn test_pipe_type_mismatch() {
+        let src = "func double(x: Int) -> Int { return x * 2 }\nfunc f() -> Int { return \"str\" |> double() }\n";
+        let err = check_source(src).unwrap_err();
+        assert!(err.message.contains("expects Int"));
     }
 }
