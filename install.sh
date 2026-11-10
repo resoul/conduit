@@ -1,7 +1,7 @@
 #!/bin/sh
 # Installer for Conduit (macOS & Linux).
 #
-#   curl -fsSL https://raw.githubusercontent.com/resoul/conduit/main/prod/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/resoul/conduit/main/install.sh | sh
 #
 set -eu
 

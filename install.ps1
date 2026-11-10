@@ -1,6 +1,6 @@
 # Installer for Conduit on Windows (PowerShell 5.1+).
 #
-#   irm https://raw.githubusercontent.com/resoul/conduit/main/prod/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/resoul/conduit/main/install.ps1 | iex
 #
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'

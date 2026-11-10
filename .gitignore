@@ -1,0 +1,9 @@
+/target
+.idea/
+**/.idea/
+**/*.DS_Store
+*.swp
+*.log
+
+# Educational materials (kept locally, ignored by git)
+/learn/

@@ -16,12 +16,12 @@ Rust and Cargo are **not required** to use Conduit.
 
 ### macOS & Linux
 ```bash
-curl -fsSL https://raw.githubusercontent.com/resoul/conduit/main/prod/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/resoul/conduit/main/install.sh | sh
 ```
 
 ### Windows (PowerShell)
 ```powershell
-irm https://raw.githubusercontent.com/resoul/conduit/main/prod/install.ps1 | iex
+irm https://raw.githubusercontent.com/resoul/conduit/main/install.ps1 | iex
 ```
 
 ## Usage
