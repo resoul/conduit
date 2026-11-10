@@ -1,0 +1,58 @@
+// errors.cdt - Typed errors, propagation with '?', and switch pattern matching
+error NotFound {
+    id: Int
+}
+
+error PermissionDenied {
+    user: String
+}
+
+func fetch_resource(id: Int) -> String | NotFound {
+    guard id > 0 else {
+        return NotFound(id: id)
+    }
+    return "Resource data"
+}
+
+func authorize_and_fetch(id: Int, user: String) -> String | NotFound | PermissionDenied {
+    guard user == "admin" else {
+        return PermissionDenied(user: user)
+    }
+    // Propagate NotFound early with '?'
+    data := fetch_resource(id)?
+    return data
+}
+
+func main() {
+    res1 := authorize_and_fetch(42, "admin")
+    switch res1 {
+        case String(data):
+            print("Success: " + data)
+        case NotFound(e):
+            print("Missing item")
+        case PermissionDenied(e):
+            print("Access denied for " + e.user)
+    }
+
+    res2 := authorize_and_fetch(-1, "admin")
+    switch res2 {
+        case String(data):
+            print("Success: " + data)
+        case NotFound(e):
+            print("Missing item id:")
+            print(e.id)
+        case PermissionDenied(e):
+            print("Access denied")
+    }
+
+    res3 := authorize_and_fetch(42, "guest")
+    switch res3 {
+        case String(data):
+            print("Success: " + data)
+        case NotFound(e):
+            print("Missing item")
+        case PermissionDenied(e):
+            print("Access denied for " + e.user)
+    }
+}
+

@@ -26,11 +26,13 @@ pub struct FuncSignature {
     pub params: Vec<(String, Type)>,
     pub return_type: Type,
     pub is_exported: bool,
+    pub is_validator: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct StructSignature {
     pub fields: HashMap<String, Type>,
+    pub field_annotations: HashMap<String, Vec<crate::ast::FieldAnnotation>>,
     pub is_exported: bool,
 }
 
@@ -77,6 +79,7 @@ impl TypeChecker {
                 params: vec![("msg".to_string(), Type::Any)],
                 return_type: Type::Void,
                 is_exported: false,
+                is_validator: false,
             },
         );
 
@@ -179,7 +182,6 @@ impl TypeChecker {
         !self.split_success_and_errors(ty).1.is_empty()
     }
 
-    /// Checks if a type exposes any private types defined in the current module.
     fn contains_private_type(&self, ty: &Type, current_mod: Option<&Path>) -> Option<String> {
         match ty {
             Type::Custom(name) => {
@@ -235,7 +237,6 @@ impl TypeChecker {
         }
     }
 
-    /// Checks all modules in a loaded project.
     pub fn check_project(&mut self, root_path: &Path, loader: &ModuleLoader) -> Result<(), TypeError> {
         // Step 1: Register top-level items for all modules (Pass 1)
         for (path, loaded_mod) in &loader.modules {
@@ -248,8 +249,10 @@ impl TypeChecker {
                 match &item.kind {
                     ItemKind::Type { name, fields } => {
                         let mut field_map = HashMap::new();
+                        let mut ann_map = HashMap::new();
                         for f in fields {
                             field_map.insert(f.name.clone(), Type::from_type_expr(&f.ty));
+                            ann_map.insert(f.name.clone(), f.annotations.clone());
                         }
                         if info.structs.contains_key(name) || info.errors.contains(name) {
                             return Err(TypeError {
@@ -264,14 +267,17 @@ impl TypeChecker {
                             name.clone(),
                             StructSignature {
                                 fields: field_map,
+                                field_annotations: ann_map,
                                 is_exported: item.is_exported,
                             },
                         );
                     }
                     ItemKind::Error { name, fields } => {
                         let mut field_map = HashMap::new();
+                        let mut ann_map = HashMap::new();
                         for f in fields {
                             field_map.insert(f.name.clone(), Type::from_type_expr(&f.ty));
+                            ann_map.insert(f.name.clone(), f.annotations.clone());
                         }
                         if info.structs.contains_key(name) || info.errors.contains(name) {
                             return Err(TypeError {
@@ -286,12 +292,13 @@ impl TypeChecker {
                             name.clone(),
                             StructSignature {
                                 fields: field_map,
+                                field_annotations: ann_map,
                                 is_exported: item.is_exported,
                             },
                         );
                         info.errors.insert(name.clone());
                     }
-                    ItemKind::Func { name, params, return_type, .. } => {
+                    ItemKind::Func { name, params, return_type, is_validator, .. } => {
                         let param_types = params
                             .iter()
                             .map(|p| (p.name.clone(), Type::from_type_expr(&p.ty)))
@@ -316,6 +323,7 @@ impl TypeChecker {
                                 params: param_types,
                                 return_type: ret_type,
                                 is_exported: item.is_exported,
+                                is_validator: *is_validator,
                             },
                         );
                     }
@@ -387,16 +395,50 @@ impl TypeChecker {
                     params: vec![("msg".to_string(), Type::Any)],
                     return_type: Type::Void,
                     is_exported: false,
+                    is_validator: false,
                 },
             );
 
             for item in &loaded_mod.program.items {
-                if let ItemKind::Func { name, body, return_type, .. } = &item.kind {
+                if let ItemKind::Func { name, body, return_type, is_validator, params } = &item.kind {
                     let sig = self.functions.get(name).unwrap().clone();
                     let ret_ty = return_type
                         .as_ref()
                         .map(Type::from_type_expr)
                         .unwrap_or(Type::Void);
+
+                    if *is_validator {
+                        if params.is_empty() {
+                            return Err(TypeError {
+                                message: format!("Validator function '{}' must have at least one parameter (the value to validate)", name),
+                                span: item.span,
+                            });
+                        }
+                        let ret = sig.return_type.clone();
+                        let has_void = match &ret {
+                            Type::Void => true,
+                            Type::Union(vars) => vars.contains(&Type::Void),
+                            _ => false,
+                        };
+                        let has_issue = match &ret {
+                            Type::Custom(s) => s == "Issue" || s.ends_with(".Issue"),
+                            Type::Union(vars) => vars.iter().any(|v| match v {
+                                Type::Custom(s) => s == "Issue" || s.ends_with(".Issue"),
+                                _ => false,
+                            }),
+                            _ => false,
+                        };
+                        let is_valid_ret = match &ret {
+                            Type::Union(vars) if vars.len() == 2 => has_void && has_issue,
+                            _ => false,
+                        };
+                        if !is_valid_ret {
+                            return Err(TypeError {
+                                message: format!("Validator function '{}' must return 'Void | validation.Issue', got '{}'", name, ret),
+                                span: item.span,
+                            });
+                        }
+                    }
 
                     let can_fallthrough_void = match &ret_ty {
                         Type::Void => true,
@@ -425,6 +467,14 @@ impl TypeChecker {
 
                     self.current_return_type = None;
                 }
+
+                if let ItemKind::Type { fields, .. } = &item.kind {
+                    for f in fields {
+                        for ann in &f.annotations {
+                            self.check_field_annotation(&f.name, f, ann, Some(loader))?;
+                        }
+                    }
+                }
             }
         }
 
@@ -437,8 +487,10 @@ impl TypeChecker {
             match &item.kind {
                 ItemKind::Type { name, fields } => {
                     let mut field_map = HashMap::new();
+                    let mut ann_map = HashMap::new();
                     for f in fields {
                         field_map.insert(f.name.clone(), Type::from_type_expr(&f.ty));
+                        ann_map.insert(f.name.clone(), f.annotations.clone());
                     }
                     if self.structs.contains_key(name) || self.errors.contains(name) {
                         return Err(TypeError {
@@ -450,14 +502,17 @@ impl TypeChecker {
                         name.clone(),
                         StructSignature {
                             fields: field_map,
+                            field_annotations: ann_map,
                             is_exported: item.is_exported,
                         },
                     );
                 }
                 ItemKind::Error { name, fields } => {
                     let mut field_map = HashMap::new();
+                    let mut ann_map = HashMap::new();
                     for f in fields {
                         field_map.insert(f.name.clone(), Type::from_type_expr(&f.ty));
+                        ann_map.insert(f.name.clone(), f.annotations.clone());
                     }
                     if self.structs.contains_key(name) || self.errors.contains(name) {
                         return Err(TypeError {
@@ -469,12 +524,13 @@ impl TypeChecker {
                         name.clone(),
                         StructSignature {
                             fields: field_map,
+                            field_annotations: ann_map,
                             is_exported: item.is_exported,
                         },
                     );
                     self.errors.insert(name.clone());
                 }
-                ItemKind::Func { name, params, return_type, .. } => {
+                ItemKind::Func { name, params, return_type, is_validator, .. } => {
                     let param_types = params
                         .iter()
                         .map(|p| (p.name.clone(), Type::from_type_expr(&p.ty)))
@@ -496,6 +552,7 @@ impl TypeChecker {
                             params: param_types,
                             return_type: ret_type,
                             is_exported: item.is_exported,
+                            is_validator: *is_validator,
                         },
                     );
                 }
@@ -510,12 +567,41 @@ impl TypeChecker {
         }
 
         for item in &program.items {
-            if let ItemKind::Func { name, body, return_type, .. } = &item.kind {
+            if let ItemKind::Func { name, body, return_type, is_validator, params } = &item.kind {
                 let sig = self.functions.get(name).unwrap().clone();
                 let ret_ty = return_type
                     .as_ref()
                     .map(Type::from_type_expr)
                     .unwrap_or(Type::Void);
+
+                if *is_validator {
+                    if params.is_empty() {
+                        return Err(TypeError {
+                            message: format!("Validator function '{}' must have at least one parameter (the value to validate)", name),
+                            span: item.span,
+                        });
+                    }
+                    let ret = sig.return_type.clone();
+                    let has_void = match &ret {
+                        Type::Void => true,
+                        Type::Union(vars) => vars.contains(&Type::Void),
+                        _ => false,
+                    };
+                    let has_issue = match &ret {
+                        Type::Custom(s) => s == "Issue" || s.ends_with(".Issue"),
+                        Type::Union(vars) => vars.iter().any(|v| match v {
+                            Type::Custom(s) => s == "Issue" || s.ends_with(".Issue"),
+                            _ => false,
+                        }),
+                        _ => false,
+                    };
+                    if !has_void || !has_issue {
+                        return Err(TypeError {
+                            message: format!("Validator function '{}' must return 'Void | validation.Issue', got '{}'", name, ret),
+                            span: item.span,
+                        });
+                    }
+                }
 
                 let can_fallthrough_void = match &ret_ty {
                     Type::Void => true,
@@ -540,6 +626,157 @@ impl TypeChecker {
                 self.exit_scope()?;
 
                 self.current_return_type = None;
+            }
+
+            if let ItemKind::Type { fields, .. } = &item.kind {
+                for f in fields {
+                    for ann in &f.annotations {
+                        self.check_field_annotation(&f.name, f, ann, None)?;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn check_field_annotation(
+        &mut self,
+        field_name: &str,
+        field: &crate::ast::FieldDef,
+        ann: &crate::ast::FieldAnnotation,
+        loader: Option<&ModuleLoader>,
+    ) -> Result<(), TypeError> {
+        let (target_alias, func_name) = if let Some((alias, name)) = ann.target.split_once('.') {
+            (Some(alias), name)
+        } else {
+            (None, ann.target.as_str())
+        };
+
+        let (params, _return_type, is_validator, is_exported) = if let Some(alias) = target_alias {
+            if let Some(target) = self.imports.get(alias) {
+                match target {
+                    ModuleTarget::Native(nat_mod) => {
+                        let m = self.native_registry.get_module(nat_mod).ok_or_else(|| TypeError {
+                            message: format!("Unknown native module '{}'", nat_mod),
+                            span: ann.span,
+                        })?;
+                        let f = m.functions.get(func_name).ok_or_else(|| TypeError {
+                            message: format!("Native module '{}' has no validator '{}'", alias, func_name),
+                            span: ann.span,
+                        })?;
+                        (
+                            f.params.iter().map(|(p, t)| (p.to_string(), t.clone())).collect::<Vec<_>>(),
+                            f.return_type.clone(),
+                            f.is_validator,
+                            true,
+                        )
+                    }
+                    ModuleTarget::Local(path) => {
+                        if let Some(loader) = loader {
+                            let loaded = loader.modules.get(path).ok_or_else(|| TypeError {
+                                message: format!("Module '{}' not found", path.display()),
+                                span: ann.span,
+                            })?;
+                            let item = loaded.program.items.iter().find(|it| {
+                                if let ItemKind::Func { name, .. } = &it.kind {
+                                    name == func_name
+                                } else {
+                                    false
+                                }
+                            }).ok_or_else(|| TypeError {
+                                message: format!("Module '{}' has no function '{}'", alias, func_name),
+                                span: ann.span,
+                            })?;
+
+                            if let ItemKind::Func { params, return_type, is_validator, .. } = &item.kind {
+                                let param_types = params.iter().map(|p| (p.name.clone(), Type::from_type_expr(&p.ty))).collect();
+                                let ret = return_type.as_ref().map(Type::from_type_expr).unwrap_or(Type::Void);
+                                let is_val: bool = *is_validator;
+                                (param_types, ret, is_val, item.is_exported)
+                            } else {
+                                unreachable!()
+                            }
+                        } else {
+                            return Err(TypeError {
+                                message: format!("Cannot resolve imported module '{}'", alias),
+                                span: ann.span,
+                            });
+                        }
+                    }
+                }
+            } else {
+                return Err(TypeError {
+                    message: format!("Unknown module alias '{}' in annotation '@{}'", alias, ann.target),
+                    span: ann.span,
+                });
+            }
+        } else {
+            if let Some(sig) = self.functions.get(func_name) {
+                (sig.params.clone(), sig.return_type.clone(), sig.is_validator, sig.is_exported)
+            } else {
+                return Err(TypeError {
+                    message: format!("Unknown validator '{}' referenced in field annotation", ann.target),
+                    span: ann.span,
+                });
+            }
+        };
+
+        if target_alias.is_some() && !is_exported {
+            return Err(TypeError {
+                message: format!("Cannot use private validator '{}' in field annotation", ann.target),
+                span: ann.span,
+            });
+        }
+
+        if !is_validator {
+            return Err(TypeError {
+                message: format!(
+                    "Function '{}' cannot be used as an annotation because it is not marked with '[#validator]'",
+                    ann.target
+                ),
+                span: ann.span,
+            });
+        }
+
+        let expected_extra = if params.is_empty() { 0 } else { params.len() - 1 };
+        if ann.args.len() != expected_extra {
+            return Err(TypeError {
+                message: format!(
+                    "Validator '{}' expects {} additional argument(s), but {} were provided",
+                    ann.target, expected_extra, ann.args.len()
+                ),
+                span: ann.span,
+            });
+        }
+
+        let raw_field_ty = Type::from_type_expr(&field.ty);
+        let effective_field_ty = match raw_field_ty {
+            Type::Optional(inner) => *inner,
+            other => other,
+        };
+        let first_param_ty = &params[0].1;
+        if !effective_field_ty.is_assignable_to(first_param_ty) {
+            return Err(TypeError {
+                message: format!(
+                    "Field '{}' of type '{}' is not compatible with validator parameter type '{}'",
+                    field_name, effective_field_ty, first_param_ty
+                ),
+                span: ann.span,
+            });
+        }
+
+        for (idx, arg_expr) in ann.args.iter().enumerate() {
+            let arg_ty = self.check_expr(arg_expr)?;
+            let expected_param_ty = &params[idx + 1].1;
+            if !arg_ty.is_assignable_to(expected_param_ty) {
+                return Err(TypeError {
+                    message: format!(
+                        "Argument {} for validator '{}': expected type '{}', got '{}'",
+                        idx + 1, ann.target, expected_param_ty, arg_ty
+                    ),
+                    span: arg_expr.span,
+                });
             }
         }
 
@@ -748,7 +985,7 @@ impl TypeChecker {
                                                     let (a1, _) = c.split_once('.').unwrap();
                                                     let (a2, _) = other.split_once('.').unwrap();
                                                     a1 == a2 || self.imports.get(a2).map(|t| match t {
-                                                        ModuleTarget::Native(n) => n == "cdt.time" && a1 == "time",
+                                                        ModuleTarget::Native(n) => n.ends_with(a1) || a1 == n.split('.').last().unwrap_or(n),
                                                         _ => false,
                                                     }).unwrap_or(false)
                                                 }))
@@ -1357,22 +1594,75 @@ impl TypeChecker {
                         if let Some(mod_target) = self.imports.get(alias).cloned() {
                             match mod_target {
                                 ModuleTarget::Native(nat_name) => {
-                                    let (is_type, func_def) = {
+                                    let (type_def, func_def) = {
                                         let m = self.native_registry.get_module(&nat_name).ok_or_else(|| TypeError {
                                             message: format!("Unknown native module '{}'", nat_name),
                                             span: callee.span,
                                         })?;
-                                        (m.types.contains_key(field.as_str()), m.functions.get(field.as_str()).cloned())
+                                        (m.types.get(field.as_str()).cloned(), m.functions.get(field.as_str()).cloned())
                                     };
 
-                                    if is_type {
-                                        return Err(TypeError {
-                                            message: format!("Native type '{}.{}' cannot be constructed directly", alias, field),
-                                            span: callee.span,
-                                        });
+                                    if let Some(ty_def) = type_def {
+                                        if ty_def.fields.is_empty() {
+                                            return Err(TypeError {
+                                                message: format!("Native type '{}.{}' cannot be constructed directly", alias, field),
+                                                span: callee.span,
+                                            });
+                                        }
+                                        if !args.is_empty() {
+                                            return Err(TypeError {
+                                                message: format!("Constructor for '{}.{}' does not accept positional arguments", alias, field),
+                                                span: expr.span,
+                                            });
+                                        }
+                                        let mut provided_fields = HashSet::new();
+                                        for na in named_args {
+                                            let arg_ty = self.check_expr(&na.value)?;
+                                            if let Some((_, expected_ty)) = ty_def.fields.iter().find(|(name, _)| *name == na.name.as_str()) {
+                                                if !arg_ty.is_assignable_to(expected_ty) {
+                                                    return Err(TypeError {
+                                                        message: format!("Type mismatch for field '{}' in construction of '{}.{}': expected {}, got {}", na.name, alias, field, expected_ty, arg_ty),
+                                                        span: na.value.span,
+                                                    });
+                                                }
+                                                provided_fields.insert(na.name.clone());
+                                            } else {
+                                                return Err(TypeError {
+                                                    message: format!("Unknown field '{}' in construction of '{}.{}'", na.name, alias, field),
+                                                    span: na.value.span,
+                                                });
+                                            }
+                                        }
+                                        for (required_field, _) in &ty_def.fields {
+                                            if !provided_fields.contains(*required_field) {
+                                                return Err(TypeError {
+                                                    message: format!("Missing required field '{}' in construction of '{}.{}'", required_field, alias, field),
+                                                    span: callee.span,
+                                                });
+                                            }
+                                        }
+                                        return Ok(Type::Custom(format!("{}.{}", alias, field)));
                                     }
 
                                     if let Some(f) = func_def {
+                                        if nat_name == "cdt.validation" && field == "check" {
+                                            if !named_args.is_empty() {
+                                                return Err(TypeError {
+                                                    message: format!("Function '{}.{}' does not accept named arguments", alias, field),
+                                                    span: callee.span,
+                                                });
+                                            }
+                                            if args.len() != 1 {
+                                                return Err(TypeError {
+                                                    message: format!("Function '{}.{}' expects 1 argument, got {}", alias, field, args.len()),
+                                                    span: expr.span,
+                                                });
+                                            }
+                                            let val_ty = self.check_expr(&args[0])?;
+                                            let err_ty = Type::Custom(format!("{}.ValidationError", alias));
+                                            return Ok(Type::union(vec![val_ty, err_ty]));
+                                        }
+
                                         if !named_args.is_empty() {
                                             return Err(TypeError {
                                                 message: format!("Function '{}.{}' does not accept named arguments", alias, field),

@@ -1,0 +1,26 @@
+// modules_user.cdt - Module with explicit exports
+export type User {
+    id: Int
+    name: String
+}
+
+export error UserNotFound {
+    id: Int
+}
+
+// Private helper not accessible from other modules
+func format_greeting(name: String) -> String {
+    return "Hello, " + name
+}
+
+export func find_user(id: Int) -> User | UserNotFound {
+    guard id > 0 else {
+        return UserNotFound(id: id)
+    }
+    return User(id: id, name: "Alice")
+}
+
+export func greet_user(user: User) -> String {
+    return format_greeting(user.name)
+}
+

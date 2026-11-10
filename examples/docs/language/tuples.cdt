@@ -1,0 +1,32 @@
+// tuples.cdt - Tuple creation, destructuring, and pattern matching
+func get_dimensions() -> (Int, Int, String) {
+    return (1920, 1080, "16:9")
+}
+
+func main() {
+    // Constructing a tuple
+    coords := (10, 20)
+    (x, y) := coords
+    print(x)
+    print(y)
+
+    // Destructuring into variables
+    dims := get_dimensions()
+    (width, height, aspect) := dims
+    print(width)
+    print(height)
+    print(aspect)
+
+    // Destructuring with wildcard _
+    (w, _, _) := dims
+    print(w)
+
+    // Matching tuples in switch
+    pair := (100, 200)
+    switch pair {
+        case (first, second):
+            print("Matched pair:")
+            print(first)
+            print(second)
+    }
+}

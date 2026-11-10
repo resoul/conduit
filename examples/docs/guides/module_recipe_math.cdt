@@ -1,0 +1,32 @@
+// module_recipe_math.cdt - Module export recipe
+export type Stats {
+    count: Int
+    sum: Int
+}
+
+export error EmptyData {}
+
+func internal_sum(items: [Int]) -> Int {
+    var total: Int = 0
+    for x in items {
+        total = total + x
+    }
+    return total
+}
+
+func count_items(items: [Int]) -> Int {
+    var c: Int = 0
+    for item in items {
+        c = c + 1
+    }
+    return c
+}
+
+export func compute_stats(items: [Int]) -> Stats | EmptyData {
+    c := count_items(items)
+    guard c > 0 else {
+        return EmptyData()
+    }
+    total := internal_sum(items)
+    return Stats(count: c, sum: total)
+}

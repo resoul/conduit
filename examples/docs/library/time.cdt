@@ -1,0 +1,28 @@
+// time.cdt - Using the cdt.time standard library
+import cdt.time as time
+
+func measure() -> Void | time.TimeError {
+    start := time.monotonic()
+
+    now_ts := time.now()?
+    print("Timestamp seconds:")
+    print(now_ts.unix_seconds()?)
+
+    // Create a 5-second duration
+    dur5 := time.seconds(5)?
+    print("Duration seconds:")
+    print(dur5.seconds()?)
+
+    elapsed_dur := time.elapsed(start)?
+    print("Elapsed duration measured.")
+}
+
+func main() {
+    switch measure() {
+        case Void(v):
+            print("Time measurement completed successfully.")
+        case time.TimeError(err):
+            print(err.message)
+    }
+}
+

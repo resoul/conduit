@@ -1,0 +1,19 @@
+// variables.cdt - Variable declarations and immutability
+func main() {
+    // Inferred type definition with :=
+    name := "Conduit"
+    version := 1
+
+    print(name)
+    print(version)
+
+    // Explicit type declaration with var
+    var count: Int = 10
+    print(count)
+
+    // Mutable variable assignment
+    var score: Int = 0
+    score = score + 5
+    score = score * 2
+    print(score)
+}

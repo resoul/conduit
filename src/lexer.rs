@@ -61,6 +61,8 @@ pub enum TokenKind {
     Question,
     DotDot,
     Dot,
+    Hash,
+    At,
 
     LParen,
     RParen,
@@ -301,6 +303,8 @@ impl<'a> Lexer<'a> {
             '}' => TokenKind::RBrace,
             '[' => TokenKind::LBracket,
             ']' => TokenKind::RBracket,
+            '#' => TokenKind::Hash,
+            '@' => TokenKind::At,
             ',' => TokenKind::Comma,
             '?' => {
                 if self.peek_char() == Some('?') {
@@ -467,6 +471,18 @@ mod tests {
         assert_eq!(tokens[1].kind, TokenKind::KwFunc);
         assert!(tokens.iter().any(|t| t.kind == TokenKind::KwImport));
         assert!(tokens.iter().any(|t| t.kind == TokenKind::KwAs));
+    }
+
+    #[test]
+    fn test_lex_validator_marker_and_annotation() {
+        let code = "[#validator] func check(v: String) {} name: String @validation.min(3)";
+        let mut lexer = Lexer::new(code);
+        let tokens = lexer.tokenize_all().unwrap();
+        assert_eq!(tokens[0].kind, TokenKind::LBracket);
+        assert_eq!(tokens[1].kind, TokenKind::Hash);
+        assert_eq!(tokens[2].kind, TokenKind::Ident("validator".to_string()));
+        assert_eq!(tokens[3].kind, TokenKind::RBracket);
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::At));
     }
 }
 

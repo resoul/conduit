@@ -186,9 +186,17 @@ pub struct Param {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct FieldAnnotation {
+    pub target: String,
+    pub args: Vec<Expr>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct FieldDef {
     pub name: String,
     pub ty: TypeExpr,
+    pub annotations: Vec<FieldAnnotation>,
     pub span: Span,
 }
 
@@ -199,6 +207,7 @@ pub enum ItemKind {
         params: Vec<Param>,
         return_type: Option<TypeExpr>,
         body: Block,
+        is_validator: bool,
     },
     Type {
         name: String,

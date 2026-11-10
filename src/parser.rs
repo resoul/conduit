@@ -98,6 +98,34 @@ impl Parser {
     }
 
     fn parse_item(&mut self) -> Result<Item, ParserError> {
+        let mut is_validator = false;
+        let mut validator_span = None;
+
+        if self.check(&TokenKind::LBracket) {
+            let marker_span = self.peek().span;
+            self.bump(); // [
+            self.expect(&TokenKind::Hash)?;
+            let (marker_name, _) = self.expect_ident()?;
+            self.expect(&TokenKind::RBracket)?;
+
+            if !marker_name.eq_ignore_ascii_case("validator") {
+                return Err(ParserError {
+                    message: format!("Unknown marker '[#{}]'", marker_name),
+                    span: marker_span,
+                });
+            }
+
+            if self.check(&TokenKind::LBracket) {
+                return Err(ParserError {
+                    message: "Duplicate marker '[#validator]'".to_string(),
+                    span: self.peek().span,
+                });
+            }
+
+            is_validator = true;
+            validator_span = Some(marker_span);
+        }
+
         let mut is_exported = false;
         let mut export_span = None;
 
@@ -122,10 +150,32 @@ impl Parser {
 
         let tok = self.peek();
         match tok.kind {
-            TokenKind::KwFunc => self.parse_func_item(is_exported),
-            TokenKind::KwType => self.parse_type_item(is_exported),
-            TokenKind::KwError => self.parse_error_item(is_exported),
+            TokenKind::KwFunc => self.parse_func_item(is_exported, is_validator),
+            TokenKind::KwType => {
+                if is_validator {
+                    return Err(ParserError {
+                        message: "Marker '[#validator]' is only allowed on function declarations".to_string(),
+                        span: validator_span.unwrap_or(tok.span),
+                    });
+                }
+                self.parse_type_item(is_exported)
+            }
+            TokenKind::KwError => {
+                if is_validator {
+                    return Err(ParserError {
+                        message: "Marker '[#validator]' is only allowed on function declarations".to_string(),
+                        span: validator_span.unwrap_or(tok.span),
+                    });
+                }
+                self.parse_error_item(is_exported)
+            }
             TokenKind::KwImport => {
+                if is_validator {
+                    return Err(ParserError {
+                        message: "Marker '[#validator]' is only allowed on function declarations".to_string(),
+                        span: validator_span.unwrap_or(tok.span),
+                    });
+                }
                 if is_exported {
                     return Err(ParserError {
                         message: "'export' cannot be applied to 'import'".to_string(),
@@ -135,6 +185,12 @@ impl Parser {
                 self.parse_import_item()
             }
             _ => {
+                if is_validator {
+                    return Err(ParserError {
+                        message: "Marker '[#validator]' is only allowed on function declarations".to_string(),
+                        span: validator_span.unwrap_or(tok.span),
+                    });
+                }
                 if is_exported {
                     return Err(ParserError {
                         message: format!("'export' can only be applied to 'func', 'type', or 'error', got '{:?}'", tok.kind),
@@ -203,7 +259,7 @@ impl Parser {
         }
     }
 
-    fn parse_func_item(&mut self, is_exported: bool) -> Result<Item, ParserError> {
+    fn parse_func_item(&mut self, is_exported: bool, is_validator: bool) -> Result<Item, ParserError> {
         let start_span = self.expect(&TokenKind::KwFunc)?.span;
         let (name, _) = self.expect_ident()?;
 
@@ -239,6 +295,7 @@ impl Parser {
                 params,
                 return_type,
                 body,
+                is_validator,
             },
             start_span,
             is_exported,
@@ -255,9 +312,38 @@ impl Parser {
             let (field_name, field_span) = self.expect_ident()?;
             self.expect(&TokenKind::Colon)?;
             let field_ty = self.parse_type_expr()?;
+
+            let mut annotations = Vec::new();
+            while self.match_token(&TokenKind::At) {
+                let ann_span = self.tokens[self.cursor - 1].span;
+                let (target_first, _) = self.expect_ident()?;
+                let target = if self.match_token(&TokenKind::Dot) {
+                    let (sub, _) = self.expect_ident()?;
+                    format!("{}.{}", target_first, sub)
+                } else {
+                    target_first
+                };
+                let mut args = Vec::new();
+                if self.match_token(&TokenKind::LParen) {
+                    while !self.check(&TokenKind::RParen) && !self.check(&TokenKind::Eof) {
+                        args.push(self.parse_annotation_arg()?);
+                        if !self.match_token(&TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                    self.expect(&TokenKind::RParen)?;
+                }
+                annotations.push(FieldAnnotation {
+                    target,
+                    args,
+                    span: ann_span,
+                });
+            }
+
             fields.push(FieldDef {
                 name: field_name,
                 ty: field_ty,
+                annotations,
                 span: field_span,
             });
 
@@ -266,6 +352,55 @@ impl Parser {
         self.expect(&TokenKind::RBrace)?;
 
         Ok(Item::new_exported(ItemKind::Type { name, fields }, start_span, is_exported))
+    }
+
+    fn parse_annotation_arg(&mut self) -> Result<Expr, ParserError> {
+        let tok = self.peek().clone();
+        match tok.kind {
+            TokenKind::Int(n) => {
+                self.bump();
+                Ok(Expr::new(ExprKind::Int(n), tok.span))
+            }
+            TokenKind::Minus => {
+                self.bump();
+                let next = self.peek().clone();
+                if let TokenKind::Int(n) = next.kind {
+                    self.bump();
+                    Ok(Expr::new(ExprKind::Int(-n), tok.span))
+                } else {
+                    Err(ParserError {
+                        message: "Expected integer literal after '-' in annotation argument".to_string(),
+                        span: next.span,
+                    })
+                }
+            }
+            TokenKind::String(ref s) => {
+                let s_val = s.clone();
+                self.bump();
+                Ok(Expr::new(ExprKind::String(s_val), tok.span))
+            }
+            TokenKind::KwTrue => {
+                self.bump();
+                Ok(Expr::new(ExprKind::Bool(true), tok.span))
+            }
+            TokenKind::KwFalse => {
+                self.bump();
+                Ok(Expr::new(ExprKind::Bool(false), tok.span))
+            }
+            TokenKind::KwNil => {
+                self.bump();
+                Ok(Expr::new(ExprKind::Nil, tok.span))
+            }
+            TokenKind::Ident(ref id) => {
+                let id_val = id.clone();
+                self.bump();
+                Ok(Expr::new(ExprKind::Ident(id_val), tok.span))
+            }
+            _ => Err(ParserError {
+                message: format!("Annotation arguments must be literal constants, got '{:?}'", tok.kind),
+                span: tok.span,
+            }),
+        }
     }
 
     fn parse_error_item(&mut self, is_exported: bool) -> Result<Item, ParserError> {
@@ -281,6 +416,7 @@ impl Parser {
             fields.push(FieldDef {
                 name: field_name,
                 ty: field_ty,
+                annotations: Vec::new(),
                 span: field_span,
             });
 
@@ -775,6 +911,9 @@ impl Parser {
         let mut expr = self.parse_primary()?;
 
         loop {
+            if self.check(&TokenKind::LParen) && self.is_tuple_destructure() {
+                break;
+            }
             if self.match_token(&TokenKind::LParen) {
                 let span = expr.span;
                 let mut args = Vec::new();

@@ -1,0 +1,11 @@
+// private_leak.err.cdt - Intentional error: exporting private type
+type PrivateData {
+    secret: String
+}
+
+export func leak() -> PrivateData {
+    return PrivateData(secret: "shh")
+}
+
+func main() {}
+

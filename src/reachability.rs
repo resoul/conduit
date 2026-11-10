@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::ast::{Block, Expr, ExprKind, ItemKind, Stmt, StmtKind};
+use crate::ast::{Block, Expr, ExprKind, ItemKind, PatternKind, Stmt, StmtKind, TypeExpr};
 use crate::loader::{normalize_path, LoadedModule, ModuleTarget};
 use crate::native::NativeRegistry;
 
@@ -47,6 +47,7 @@ pub struct ReachabilityAnalyzer<'a> {
     reachable_functions: HashSet<(PathBuf, String)>,
     reachable_native_functions: HashSet<(String, String)>,
     reachable_native_methods: HashSet<(String, String)>,
+    reachable_structs: HashSet<(PathBuf, String)>,
 }
 
 fn lookup_module<'m>(modules: &'m HashMap<PathBuf, LoadedModule>, path: &Path) -> Option<&'m LoadedModule> {
@@ -82,6 +83,7 @@ impl<'a> ReachabilityAnalyzer<'a> {
             reachable_functions: HashSet::new(),
             reachable_native_functions: HashSet::new(),
             reachable_native_methods: HashSet::new(),
+            reachable_structs: HashSet::new(),
         }
     }
 
@@ -126,8 +128,14 @@ impl<'a> ReachabilityAnalyzer<'a> {
                 self.reachable_functions.insert((loaded_mod.canonical_path.clone(), func_name.clone()));
 
                 for item in &loaded_mod.program.items {
-                    if let ItemKind::Func { ref name, ref body, .. } = item.kind {
+                    if let ItemKind::Func { ref name, ref body, ref params, ref return_type, .. } = item.kind {
                         if name == &func_name {
+                            for p in params {
+                                self.scan_type_expr(&p.ty, &loaded_mod.canonical_path, loaded_mod, &mut worklist);
+                            }
+                            if let Some(ret) = return_type {
+                                self.scan_type_expr(ret, &loaded_mod.canonical_path, loaded_mod, &mut worklist);
+                            }
                             self.scan_block(body, &loaded_mod.canonical_path, loaded_mod, &mut worklist);
                             break;
                         }
@@ -178,7 +186,10 @@ impl<'a> ReachabilityAnalyzer<'a> {
             StmtKind::Define { value, .. } | StmtKind::DestructureDefine { value, .. } => {
                 self.scan_expr(value, current_mod_path, loaded_mod, worklist);
             }
-            StmtKind::VarDecl { init, .. } => {
+            StmtKind::VarDecl { ty, init, .. } => {
+                if let Some(t) = ty {
+                    self.scan_type_expr(t, current_mod_path, loaded_mod, worklist);
+                }
                 if let Some(expr) = init {
                     self.scan_expr(expr, current_mod_path, loaded_mod, worklist);
                 }
@@ -208,6 +219,7 @@ impl<'a> ReachabilityAnalyzer<'a> {
             StmtKind::Switch { expr, cases } => {
                 self.scan_expr(expr, current_mod_path, loaded_mod, worklist);
                 for case in cases {
+                    self.scan_pattern(&case.pattern, current_mod_path, loaded_mod, worklist);
                     self.scan_block(&case.body, current_mod_path, loaded_mod, worklist);
                 }
             }
@@ -228,6 +240,7 @@ impl<'a> ReachabilityAnalyzer<'a> {
                 if self.is_func_in_module(current_mod_path, name) {
                     worklist.push((current_mod_path.to_path_buf(), name.clone()));
                 }
+                self.mark_struct_reachable(current_mod_path, name, worklist);
             }
             ExprKind::Call { callee, args, named_args } => {
                 // Check if direct local call `foo()`
@@ -235,6 +248,7 @@ impl<'a> ReachabilityAnalyzer<'a> {
                     if self.is_func_in_module(current_mod_path, name) {
                         worklist.push((current_mod_path.to_path_buf(), name.clone()));
                     }
+                    self.mark_struct_reachable(current_mod_path, name, worklist);
                 }
                 // Check if qualified call `alias.func()`
                 else if let ExprKind::Member { target, field } = &callee.kind {
@@ -243,6 +257,7 @@ impl<'a> ReachabilityAnalyzer<'a> {
                             match mod_target {
                                 ModuleTarget::Local(target_path) => {
                                     worklist.push((target_path.clone(), field.clone()));
+                                    self.mark_struct_reachable(target_path, field, worklist);
                                 }
                                 ModuleTarget::Native(native_name) => {
                                     self.reachable_native_functions.insert((native_name.clone(), field.clone()));
@@ -267,6 +282,7 @@ impl<'a> ReachabilityAnalyzer<'a> {
                         match mod_target {
                             ModuleTarget::Local(target_path) => {
                                 worklist.push((target_path.clone(), field.clone()));
+                                self.mark_struct_reachable(target_path, field, worklist);
                             }
                             ModuleTarget::Native(native_name) => {
                                 self.reachable_native_functions.insert((native_name.clone(), field.clone()));
@@ -306,6 +322,113 @@ impl<'a> ReachabilityAnalyzer<'a> {
             })
         } else {
             false
+        }
+    }
+
+    fn mark_struct_reachable(
+        &mut self,
+        mod_path: &Path,
+        type_name: &str,
+        worklist: &mut Vec<(PathBuf, String)>,
+    ) {
+        let canon = lookup_module(self.modules, mod_path)
+            .map(|m| m.canonical_path.clone())
+            .unwrap_or_else(|| mod_path.to_path_buf());
+
+        if !self.reachable_structs.insert((canon.clone(), type_name.to_string())) {
+            return;
+        }
+
+        let loaded_mod = match lookup_module(self.modules, &canon) {
+            Some(m) => m,
+            None => return,
+        };
+
+        for item in &loaded_mod.program.items {
+            if let ItemKind::Type { name, fields } = &item.kind {
+                if name == type_name {
+                    for f in fields {
+                        self.scan_type_expr(&f.ty, &canon, loaded_mod, worklist);
+                        for ann in &f.annotations {
+                            if let Some((alias, func_name)) = ann.target.split_once('.') {
+                                if let Some((mod_target, _)) = loaded_mod.imports.get(alias) {
+                                    match mod_target {
+                                        ModuleTarget::Local(target_path) => {
+                                            worklist.push((target_path.clone(), func_name.to_string()));
+                                        }
+                                        ModuleTarget::Native(nat_name) => {
+                                            self.reachable_native_functions.insert((nat_name.clone(), func_name.to_string()));
+                                        }
+                                    }
+                                }
+                            } else {
+                                worklist.push((canon.clone(), ann.target.clone()));
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    fn scan_type_expr(
+        &mut self,
+        ty: &TypeExpr,
+        current_mod_path: &Path,
+        loaded_mod: &LoadedModule,
+        worklist: &mut Vec<(PathBuf, String)>,
+    ) {
+        match ty {
+            TypeExpr::Named(name) => {
+                if let Some((alias, type_name)) = name.split_once('.') {
+                    if let Some((ModuleTarget::Local(target_path), _)) = loaded_mod.imports.get(alias) {
+                        self.mark_struct_reachable(target_path, type_name, worklist);
+                    }
+                } else {
+                    self.mark_struct_reachable(current_mod_path, name, worklist);
+                }
+            }
+            TypeExpr::List(inner) | TypeExpr::Optional(inner) => {
+                self.scan_type_expr(inner, current_mod_path, loaded_mod, worklist);
+            }
+            TypeExpr::Union(variants) | TypeExpr::Tuple(variants) => {
+                for v in variants {
+                    self.scan_type_expr(v, current_mod_path, loaded_mod, worklist);
+                }
+            }
+            TypeExpr::Func { params, return_type } => {
+                for p in params {
+                    self.scan_type_expr(p, current_mod_path, loaded_mod, worklist);
+                }
+                self.scan_type_expr(return_type, current_mod_path, loaded_mod, worklist);
+            }
+        }
+    }
+
+    fn scan_pattern(
+        &mut self,
+        pattern: &crate::ast::Pattern,
+        current_mod_path: &Path,
+        loaded_mod: &LoadedModule,
+        worklist: &mut Vec<(PathBuf, String)>,
+    ) {
+        match &pattern.kind {
+            PatternKind::Type { name, .. } => {
+                if let Some((alias, type_name)) = name.split_once('.') {
+                    if let Some((ModuleTarget::Local(target_path), _)) = loaded_mod.imports.get(alias) {
+                        self.mark_struct_reachable(target_path, type_name, worklist);
+                    }
+                } else {
+                    self.mark_struct_reachable(current_mod_path, name, worklist);
+                }
+            }
+            PatternKind::Tuple(pats) => {
+                for p in pats {
+                    self.scan_pattern(p, current_mod_path, loaded_mod, worklist);
+                }
+            }
+            _ => {}
         }
     }
 }

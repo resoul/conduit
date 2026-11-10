@@ -1,0 +1,8 @@
+// try_optional.err.cdt - Intentional error: using '?' on pure optional
+func test_try(val: Int?) -> Int {
+    x := val?
+    return x
+}
+
+func main() {}
+

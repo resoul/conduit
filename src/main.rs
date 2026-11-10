@@ -130,6 +130,22 @@ fn main() {
                 process::exit(1);
             }
         }
+        "doc" => {
+            let native_reg = NativeRegistry::new();
+            if args.len() < 3 {
+                for module in native_reg.modules() {
+                    print!("{}", module.generate_markdown_docs());
+                }
+            } else {
+                let mod_name = &args[2];
+                if let Some(module) = native_reg.get_module(mod_name) {
+                    print!("{}", module.generate_markdown_docs());
+                } else {
+                    eprintln!("Error: native module '{}' not found in registry", mod_name);
+                    process::exit(1);
+                }
+            }
+        }
         cmd => {
             eprintln!("Unknown command: '{}'", cmd);
             print_usage();
@@ -175,6 +191,7 @@ fn print_usage() {
     println!("  conduit run <file.cdt>          Type-check and execute a source file");
     println!("  conduit check <file.cdt>        Type-check a source file and its imports");
     println!("  conduit reachability <file.cdt> Analyze reachable functions and native dependencies");
+    println!("  conduit doc [module]            Generate Markdown API documentation from NativeRegistry");
     println!("  conduit ast <file.cdt>          Parse and display the AST of a source file");
     println!("  conduit tokens <file.cdt>       Print tokens of a source file");
     println!("  conduit lsp                     Start the Language Server Protocol (LSP) server");

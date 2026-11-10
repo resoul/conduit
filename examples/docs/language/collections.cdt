@@ -1,0 +1,37 @@
+// collections.cdt - Lists, map, filter, and error preservation
+error InvalidItem {
+    id: Int
+}
+
+func square(n: Int) -> Int {
+    return n * n
+}
+
+func is_positive(n: Int) -> Bool {
+    return n > 0
+}
+
+func validate_positive(n: Int) -> Int | InvalidItem {
+    guard n > 0 else {
+        return InvalidItem(id: n)
+    }
+    return n
+}
+
+func main() {
+    nums := [1, 2, 3, 4, 5]
+    print(nums)
+
+    // map applies a function to every item
+    squared := map(nums, square)
+    print(squared)
+
+    // filter keeps elements matching a boolean predicate
+    positives := filter([-2, 5, -1, 8], is_positive)
+    print(positives)
+
+    // map preserves errors as first-class elements in the returned list
+    validated := map([-1, 10, -2], validate_positive)
+    print(validated)
+}
+

@@ -1,0 +1,29 @@
+// module_recipe_main.cdt - Multi-module recipe application
+import "./module_recipe_math" as math
+import cdt.time as clock
+
+func main() {
+    start := clock.monotonic()
+
+    numbers := [10, 25, 35, 30]
+    res := math.compute_stats(numbers)
+
+    switch res {
+        case math.Stats(s):
+            print("Item count:")
+            print(s.count)
+            print("Total sum:")
+            print(s.sum)
+        case math.EmptyData(e):
+            print("List was empty")
+    }
+
+    elapsed := clock.elapsed(start)
+    switch elapsed {
+        case clock.Duration(d):
+            print("Benchmark completed successfully.")
+        case clock.TimeError(err):
+            print(err.message)
+    }
+}
+

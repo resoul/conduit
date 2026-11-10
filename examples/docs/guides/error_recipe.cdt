@@ -1,0 +1,47 @@
+// error_recipe.cdt - Comprehensive error handling recipe
+export error ValidationError {
+    field: String
+    detail: String
+}
+
+export error ParseError {
+    input: String
+}
+
+func parse_positive_int(s: String) -> Int | ParseError | ValidationError {
+    guard s != "" else {
+        return ValidationError(field: "input", detail: "empty string")
+    }
+
+    // In Conduit, domain validation returns typed errors
+    if s == "42" {
+        return 42
+    }
+    if s == "100" {
+        return 100
+    }
+    return ParseError(input: s)
+}
+
+func process_input(s: String) -> Int | ValidationError | ParseError {
+    val := parse_positive_int(s)?
+    return val * 2
+}
+
+func main() {
+    inputs := ["42", "", "unknown"]
+
+    for raw in inputs {
+        res := process_input(raw)
+        switch res {
+            case Int(num):
+                print("Processed integer:")
+                print(num)
+            case ValidationError(ve):
+                print("Validation failed on " + ve.field + ": " + ve.detail)
+            case ParseError(pe):
+                print("Could not parse: " + pe.input)
+        }
+    }
+}
+

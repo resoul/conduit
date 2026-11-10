@@ -1,0 +1,13 @@
+// discard_error.err.cdt - Intentional error: discarding error-returning function result
+error MyError {
+    msg: String
+}
+
+func might_fail() -> Int | MyError {
+    return MyError(msg: "fail")
+}
+
+func main() {
+    might_fail()
+}
+

@@ -135,6 +135,7 @@ pub fn create_time_module() -> NativeModule {
         doc: "Reads the current system clock time",
         params: vec![],
         return_type: Type::union(vec![timestamp_ty.clone(), time_error_ty.clone()]),
+        is_validator: false,
         implementation: |_args| {
             Ok(Value::Native(Arc::new(Timestamp(SystemTime::now()))))
         },
@@ -145,6 +146,7 @@ pub fn create_time_module() -> NativeModule {
         doc: "Reads the current monotonic clock instant",
         params: vec![],
         return_type: instant_ty.clone(),
+        is_validator: false,
         implementation: |_args| {
             Ok(Value::Native(Arc::new(Instant(StdInstant::now()))))
         },
@@ -155,6 +157,7 @@ pub fn create_time_module() -> NativeModule {
         doc: "Calculates the duration elapsed since the given monotonic instant",
         params: vec![("start", instant_ty.clone())],
         return_type: Type::union(vec![duration_ty.clone(), time_error_ty.clone()]),
+        is_validator: false,
         implementation: |args| {
             let start_val = args.into_iter().next().unwrap();
             if let Value::Native(ref nat) = start_val {
@@ -176,6 +179,7 @@ pub fn create_time_module() -> NativeModule {
         doc: "Creates a duration from the given number of seconds",
         params: vec![("value", Type::Int)],
         return_type: Type::union(vec![duration_ty.clone(), time_error_ty.clone()]),
+        is_validator: false,
         implementation: |args| {
             let val = match args.into_iter().next().unwrap() {
                 Value::Int(n) => n,
@@ -193,6 +197,7 @@ pub fn create_time_module() -> NativeModule {
         doc: "Creates a duration from the given number of milliseconds",
         params: vec![("value", Type::Int)],
         return_type: Type::union(vec![duration_ty.clone(), time_error_ty.clone()]),
+        is_validator: false,
         implementation: |args| {
             let val = match args.into_iter().next().unwrap() {
                 Value::Int(n) => n,

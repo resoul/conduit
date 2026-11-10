@@ -9,6 +9,14 @@
       "match": "//.*$"
     },
     {
+      "name": "meta.annotation.marker.conduit",
+      "match": "\\[#[a-zA-Z_][a-zA-Z0-9_]*\\]"
+    },
+    {
+      "name": "entity.other.attribute-name.conduit",
+      "match": "@[a-zA-Z_][a-zA-Z0-9_]*(\\.[a-zA-Z_][a-zA-Z0-9_]*)?"
+    },
+    {
       "name": "string.quoted.double.conduit",
       "begin": "\"",
       "end": "\"",
@@ -33,7 +41,7 @@
     },
     {
       "name": "support.type.conduit",
-      "match": "\\b(Int|String|Bool)\\b"
+      "match": "\\b(Int|String|Bool|Void)\\b"
     },
     {
       "name": "support.function.builtin.conduit",

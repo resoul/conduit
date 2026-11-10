@@ -5,6 +5,7 @@ use crate::types::Type;
 use crate::value::Value;
 
 pub mod time;
+pub mod validation;
 
 pub trait NativeValue: std::fmt::Debug + Send + Sync {
     fn type_name(&self) -> &'static str;
@@ -31,6 +32,7 @@ pub struct NativeFuncDef {
     pub doc: &'static str,
     pub params: Vec<(&'static str, Type)>,
     pub return_type: Type,
+    pub is_validator: bool,
     pub implementation: NativeFuncImpl,
 }
 
@@ -76,6 +78,80 @@ impl NativeModule {
     pub fn add_method(&mut self, target_type: &'static str, method_def: NativeMethodDef) {
         self.methods.insert((target_type, method_def.name), method_def);
     }
+
+    pub fn generate_markdown_docs(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!("# {}\n\n", self.name));
+        out.push_str(&format!("{}\n\n", self.doc));
+        out.push_str("```conduit\n");
+        out.push_str(&format!("import {} as {}\n", self.name, self.default_alias));
+        out.push_str("```\n\n");
+
+        out.push_str("## Types\n\n");
+        let mut sorted_types: Vec<_> = self.types.values().collect();
+        sorted_types.sort_by_key(|t| t.name);
+        for t in sorted_types {
+            let cat = if t.is_error {
+                "Error Type"
+            } else {
+                "Opaque Type"
+            };
+            out.push_str(&format!("### {}\n\n", t.name));
+            out.push_str(&format!("- **Qualified Name:** `{}`\n", t.qualified_name));
+            out.push_str(&format!("- **Category:** {}\n", cat));
+            out.push_str(&format!("- **Description:** {}\n", t.doc));
+            if !t.fields.is_empty() {
+                out.push_str("- **Fields:**\n");
+                for (fname, fty) in &t.fields {
+                    out.push_str(&format!("  - `{}: {}`\n", fname, fty));
+                }
+            }
+            out.push('\n');
+        }
+
+        out.push_str("## Functions\n\n");
+        let mut sorted_funcs: Vec<_> = self.functions.values().collect();
+        sorted_funcs.sort_by_key(|f| f.name);
+        out.push_str("| Function | Signature | Description |\n");
+        out.push_str("| :--- | :--- | :--- |\n");
+        for f in sorted_funcs {
+            let params = f
+                .params
+                .iter()
+                .map(|(pname, pty)| format!("{}: {}", pname, pty))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sig = format!("{}({}) -> {}", f.name, params, f.return_type);
+            let escaped_sig = sig.replace('|', "\\|");
+            out.push_str(&format!(
+                "| `{}` | `{}` | {} |\n",
+                f.name, escaped_sig, f.doc
+            ));
+        }
+        out.push('\n');
+
+        out.push_str("## Methods\n\n");
+        let mut sorted_methods: Vec<_> = self.methods.iter().collect();
+        sorted_methods.sort_by_key(|((target, name), _)| (*target, *name));
+        out.push_str("| Type | Method | Signature | Description |\n");
+        out.push_str("| :--- | :--- | :--- | :--- |\n");
+        for ((target, name), m) in sorted_methods {
+            let params = m
+                .params
+                .iter()
+                .map(|(pname, pty)| format!("{}: {}", pname, pty))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sig = format!("{}({}) -> {}", name, params, m.return_type);
+            let escaped_sig = sig.replace('|', "\\|");
+            out.push_str(&format!(
+                "| `{}` | `{}` | `{}` | {} |\n",
+                target, name, escaped_sig, m.doc
+            ));
+        }
+
+        out
+    }
 }
 
 pub struct NativeRegistry {
@@ -88,6 +164,7 @@ impl NativeRegistry {
             modules: HashMap::new(),
         };
         reg.register_module(time::create_time_module());
+        reg.register_module(validation::create_validation_module());
         reg
     }
 

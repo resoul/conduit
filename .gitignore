@@ -7,3 +7,7 @@
 
 # Educational materials (kept locally, ignored by git)
 /learn/
+
+# mdBook build output
+/docs/book/
+

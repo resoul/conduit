@@ -1,0 +1,30 @@
+// types.cdt - Primitive, optional, and custom record types
+type Point {
+    x: Int
+    y: Int
+}
+
+func main() {
+    // Primitives
+    a := 42
+    b := "hello"
+    c := true
+    print(a)
+    print(b)
+    print(c)
+
+    // Optional types and null-coalescing ??
+    var maybe_num: Int? = nil
+    fallback := maybe_num ?? 100
+    print(fallback)
+
+    maybe_num = 25
+    present := maybe_num ?? 100
+    print(present)
+
+    // Struct instantiation and field access
+    pt := Point(x: 10, y: 20)
+    print(pt.x)
+    print(pt.y)
+}
+

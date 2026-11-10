@@ -5,6 +5,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
+## [0.1.5] - 2026-11-10
+
+### Added
+
+* **Custom Validators and Field Annotations**:
+  * Function marker `[#validator]` (case-insensitive) to declare validator functions directly preceding `func` or `export func`.
+  * Strict validator function contract: `func rule(value: T, extra_params...) -> Void | validation.Issue`.
+  * Struct field annotations: `@rule` or `@module.rule(args...)` executed in declaration order.
+  * Parameterized validator annotations supporting positional literals, including negative integer literals (e.g. `@range(-10, 100)`).
+  * Optional field skipping: fields of type `T?` validate `T` when present and automatically skip validation when `nil`.
+  * Preserved first-class function semantics: validators can be passed as callbacks or invoked directly.
+
+* **Standard Validation Library (`cdt.validation`)**:
+  * Public types:
+    * `error Issue { code: String, message: String }`: Single rule violation.
+    * `type Violation { path: String, code: String, message: String }`: Attributed field violation with path (e.g. `user.profile.email` or `items[0].code`).
+    * `error ValidationError { issues: [Violation] }`: Aggregated errors for `switch` and `?` handling.
+  * Standard rules:
+    * `min(value, min_val)` and `max(value, max_val)`: bounds checking for `Int`, Unicode scalar count for `String`, and element count for `List`.
+    * `email(value: String)`: format validation for email addresses.
+    * `check(value: T) -> T | validation.ValidationError`: explicit recursive validation preserving value and types on success without mutation.
+  * Reachability analysis integration: struct field annotations are traced as function references, ensuring referenced validators and their transitive dependencies are preserved.
+
+* **Official Documentation on mdBook**:
+  * Complete documentation site structure in `docs/` written entirely in English.
+  * Verified runnable documentation examples under `examples/docs/` covering getting started, core language, standard library, and practical recipes.
+  * Negative example tests (`examples/docs/negative/`) verifying diagnostics for discarded errors, private type leakage, and invalid `?` on optionals.
+  * Automated documentation example verification test suite (`tests/doc_examples_test.rs`).
+  * Deterministic API markdown documentation generator from `NativeRegistry` (`conduit doc [module]`).
+  * Custom syntax highlighting script for mdBook (`docs/theme/conduit-highlight.js`) supporting `conduit` and `cdt` code blocks.
+  * Dedicated GitHub Actions workflow (`.github/workflows/docs.yml`) for building, verifying, and publishing documentation to GitHub Pages.
+
 ## [0.1.4] - 2026-11-10
 
 ### Added

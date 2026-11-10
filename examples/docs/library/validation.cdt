@@ -1,0 +1,53 @@
+import cdt.validation as validation
+
+[#validator]
+func check_reserved(name: String) -> Void | validation.Issue {
+    if name == "admin" {
+        return validation.Issue(code: "reserved", message: "Username 'admin' is reserved")
+    }
+    return
+}
+
+type UserRegistration {
+    username: String @validation.min(3) @check_reserved
+    email: String @validation.email
+    age: Int @validation.min(18)
+}
+
+func main() {
+    print("Testing validation library...")
+
+    // 1. Valid user passes check
+    valid_user := UserRegistration(
+        username: "alice",
+        email: "alice@example.com",
+        age: 24
+    )
+
+    res1 := validation.check(valid_user)
+    switch res1 {
+        case UserRegistration(u):
+            print("Valid user successfully registered: " + u.username)
+        case validation.ValidationError(err):
+            print("Unexpected validation failure")
+    }
+
+    // 2. Invalid user fails with collected violations
+    invalid_user := UserRegistration(
+        username: "admin",
+        email: "invalid-email-address",
+        age: 15
+    )
+
+    res2 := validation.check(invalid_user)
+    switch res2 {
+        case UserRegistration(u):
+            print("Unexpected validation success")
+        case validation.ValidationError(err):
+            print("Validation caught violations:")
+            for issue in err.issues {
+                print("  [" + issue.path + "] " + issue.code + ": " + issue.message)
+            }
+    }
+}
+

@@ -44,6 +44,7 @@ pub struct Interpreter {
     module_functions: HashMap<(Option<PathBuf>, String), (Vec<Param>, Block)>,
     module_imports: HashMap<Option<PathBuf>, HashMap<String, ModuleTarget>>,
     module_structs: HashMap<Option<PathBuf>, HashSet<String>>,
+    module_struct_fields: HashMap<(Option<PathBuf>, String), Vec<crate::ast::FieldDef>>,
     module_errors: HashMap<Option<PathBuf>, HashSet<String>>,
     current_module: Option<PathBuf>,
     env: Vec<HashMap<String, Value>>,
@@ -56,6 +57,7 @@ impl Interpreter {
             module_functions: HashMap::new(),
             module_imports: HashMap::new(),
             module_structs: HashMap::new(),
+            module_struct_fields: HashMap::new(),
             module_errors: HashMap::new(),
             current_module: None,
             env: vec![HashMap::new()],
@@ -173,8 +175,10 @@ impl Interpreter {
                             (params.clone(), body.clone()),
                         );
                     }
-                    ItemKind::Type { name, .. } => {
+                    ItemKind::Type { name, fields } => {
                         structs_set.insert(name.clone());
+                        self.module_struct_fields
+                            .insert((Some(path.clone()), name.clone()), fields.clone());
                     }
                     ItemKind::Error { name, .. } => {
                         errors_set.insert(name.clone());
@@ -209,8 +213,10 @@ impl Interpreter {
                 ItemKind::Func { name, params, body, .. } => {
                     self.module_functions.insert((None, name.clone()), (params.clone(), body.clone()));
                 }
-                ItemKind::Type { name, .. } => {
+                ItemKind::Type { name, fields } => {
                     structs_set.insert(name.clone());
+                    self.module_struct_fields
+                        .insert((None, name.clone()), fields.clone());
                 }
                 ItemKind::Error { name, .. } => {
                     errors_set.insert(name.clone());
@@ -238,6 +244,169 @@ impl Interpreter {
 
         self.call_module_function(None, "main", vec![], Span::new(1, 1))?;
         Ok(())
+    }
+
+    pub fn execute_validation_check(&mut self, val: Value, span: Span) -> Result<Value, RuntimeError> {
+        let mut violations = Vec::new();
+        self.validate_value_recursive(&val, "", &mut violations, 0, span)?;
+        if violations.is_empty() {
+            Ok(val)
+        } else {
+            Ok(crate::native::validation::make_validation_error(violations))
+        }
+    }
+
+    fn find_struct_fields(&self, name: &str) -> Option<(Option<PathBuf>, Vec<crate::ast::FieldDef>)> {
+        let short_name = name.split('.').last().unwrap_or(name);
+        for ((decl_mod, s_name), fields) in &self.module_struct_fields {
+            if s_name == short_name {
+                return Some((decl_mod.clone(), fields.clone()));
+            }
+        }
+        None
+    }
+
+    fn validate_value_recursive(
+        &mut self,
+        val: &Value,
+        path: &str,
+        violations: &mut Vec<Value>,
+        depth: usize,
+        span: Span,
+    ) -> Result<(), RuntimeError> {
+        if depth > 256 {
+            return Ok(());
+        }
+
+        match val {
+            Value::Struct { name, fields } => {
+                if let Some((decl_mod, field_defs)) = self.find_struct_fields(name) {
+                    for f in &field_defs {
+                        let field_path = if path.is_empty() {
+                            f.name.clone()
+                        } else {
+                            format!("{}.{}", path, f.name)
+                        };
+
+                        if let Some(f_val) = fields.get(&f.name) {
+                            self.validate_value_recursive(f_val, &field_path, violations, depth + 1, span)?;
+
+                            if let Value::Nil = f_val {
+                                continue;
+                            }
+
+                            for ann in &f.annotations {
+                                let mut eval_args = vec![f_val.clone()];
+                                for arg_expr in &ann.args {
+                                    let arg_val = self.eval_expr(arg_expr).map_err(|f| match f {
+                                        InterpFlow::Error(e) => e,
+                                        _ => RuntimeError {
+                                            message: "Unexpected flow in annotation argument".to_string(),
+                                            span,
+                                        },
+                                    })?;
+                                    eval_args.push(arg_val);
+                                }
+
+                                let res = self.invoke_validator(&decl_mod, &ann.target, eval_args, span)?;
+                                match res {
+                                    Value::Void | Value::Nil => {}
+                                    Value::Error { ref fields, .. } => {
+                                        if let (Some(Value::String(code)), Some(Value::String(msg))) =
+                                            (fields.get("code"), fields.get("message"))
+                                        {
+                                            let violation = crate::native::validation::make_violation(
+                                                &field_path,
+                                                code,
+                                                msg,
+                                            );
+                                            violations.push(violation);
+                                        } else {
+                                            return Err(RuntimeError {
+                                                message: format!("Validator '@{}' returned an unexpected error format", ann.target),
+                                                span,
+                                            });
+                                        }
+                                    }
+                                    other => {
+                                        return Err(RuntimeError {
+                                            message: format!(
+                                                "Validator '@{}' must return Void or Issue, got '{:?}'",
+                                                ann.target, other
+                                            ),
+                                            span,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Value::List(items) => {
+                for (i, item) in items.iter().enumerate() {
+                    let item_path = format!("{}[{}]", path, i);
+                    self.validate_value_recursive(item, &item_path, violations, depth + 1, span)?;
+                }
+            }
+            Value::Tuple(items) => {
+                for (i, item) in items.iter().enumerate() {
+                    let item_path = if path.is_empty() {
+                        format!("{}", i)
+                    } else {
+                        format!("{}.{}", path, i)
+                    };
+                    self.validate_value_recursive(item, &item_path, violations, depth + 1, span)?;
+                }
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    fn invoke_validator(
+        &mut self,
+        decl_mod: &Option<PathBuf>,
+        target: &str,
+        eval_args: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, RuntimeError> {
+        if let Some((alias, func_name)) = target.split_once('.') {
+            let mod_imports = self.module_imports.get(decl_mod).cloned()
+                .or_else(|| self.module_imports.get(&self.current_module).cloned());
+
+            if let Some(target_mod) = mod_imports.and_then(|m| m.get(alias).cloned()) {
+                match target_mod {
+                    ModuleTarget::Native(nat_name) => {
+                        let func_impl = {
+                            let m = self.native_registry.get_module(&nat_name).ok_or_else(|| RuntimeError {
+                                message: format!("Unknown native module '{}'", nat_name),
+                                span,
+                            })?;
+                            m.functions.get(func_name).map(|f| f.implementation).ok_or_else(|| RuntimeError {
+                                message: format!("Native module '{}' has no validator '{}'", alias, func_name),
+                                span,
+                            })?
+                        };
+                        match (func_impl)(eval_args) {
+                            Ok(v) => Ok(v),
+                            Err(e) => Ok(e),
+                        }
+                    }
+                    ModuleTarget::Local(path) => {
+                        self.call_module_function(Some(path), func_name, eval_args, span)
+                    }
+                }
+            } else {
+                Err(RuntimeError {
+                    message: format!("Unknown module alias '{}' in validator '@{}'", alias, target),
+                    span,
+                })
+            }
+        } else {
+            self.call_module_function(decl_mod.clone().or_else(|| self.current_module.clone()), target, eval_args, span)
+        }
     }
 
     pub fn call_module_function(
@@ -296,6 +465,10 @@ impl Interpreter {
                 }
             }
             Value::NativeFunction { module, name } => {
+                if module == "cdt.validation" && name == "check" {
+                    let target_val = args.into_iter().next().unwrap_or(Value::Nil);
+                    return self.execute_validation_check(target_val, span);
+                }
                 let m = self.native_registry.get_module(module).ok_or_else(|| RuntimeError {
                     message: format!("Unknown native module '{}'", module),
                     span,
@@ -733,6 +906,45 @@ impl Interpreter {
                         if let Some(target_mod) = cur_imports.and_then(|m| m.get(alias).cloned()) {
                             match target_mod {
                                 ModuleTarget::Native(nat_name) => {
+                                    if nat_name == "cdt.validation" && field == "check" {
+                                        let target_val = if !args.is_empty() {
+                                            self.eval_expr(&args[0])?
+                                        } else {
+                                            Value::Nil
+                                        };
+                                        return self.execute_validation_check(target_val, callee.span).map_err(InterpFlow::Error);
+                                    }
+
+                                    let (is_constructible, is_error) = {
+                                        let m = self.native_registry.get_module(&nat_name).ok_or_else(|| RuntimeError {
+                                            message: format!("Unknown native module '{}'", nat_name),
+                                            span: callee.span,
+                                        })?;
+                                        if let Some(td) = m.types.get(field.as_str()) {
+                                            (!td.fields.is_empty(), td.is_error)
+                                        } else {
+                                            (false, false)
+                                        }
+                                    };
+
+                                    if is_constructible {
+                                        let mut fields = HashMap::new();
+                                        for arg in named_args {
+                                            fields.insert(arg.name.clone(), self.eval_expr(&arg.value)?);
+                                        }
+                                        if is_error {
+                                            return Ok(Value::Error {
+                                                name: format!("{}.{}", alias, field),
+                                                fields,
+                                            });
+                                        } else {
+                                            return Ok(Value::Struct {
+                                                name: format!("{}.{}", alias, field),
+                                                fields,
+                                            });
+                                        }
+                                    }
+
                                     let func_impl = {
                                         let m = self.native_registry.get_module(&nat_name).ok_or_else(|| RuntimeError {
                                             message: format!("Unknown native module '{}'", nat_name),

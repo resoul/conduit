@@ -99,8 +99,11 @@ impl Type {
                         if m1 == m2 {
                             return true;
                         }
-                        let time_aliases = ["time", "clock"];
-                        if time_aliases.contains(&m1) && time_aliases.contains(&m2) {
+                        let native_types = [
+                            "Timestamp", "Instant", "Duration", "TimeError",
+                            "Issue", "Violation", "ValidationError",
+                        ];
+                        if native_types.contains(&s_item) {
                             return true;
                         }
                     }

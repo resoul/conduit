@@ -1,0 +1,5 @@
+// hello.cdt - First Conduit program
+func main() {
+    print("Hello, Conduit!")
+}
+

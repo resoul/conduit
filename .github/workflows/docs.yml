@@ -1,0 +1,75 @@
+name: docs
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build-and-test:
+    name: Build & Verify Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        run: rustup default stable
+
+      - name: Run doc examples verification
+        run: cargo test --test doc_examples_test
+
+      - name: Verify deterministic library doc generator
+        run: |
+          cargo run -- doc cdt.time
+          cargo run -- doc cdt.validation
+
+      - name: Install mdBook (v0.4.40)
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -sSL "https://github.com/rust-lang/mdBook/releases/download/v0.4.40/mdbook-v0.4.40-x86_64-unknown-linux-gnu.tar.gz" | tar -xz -C "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Verify mdBook version
+        run: mdbook --version
+
+      - name: Build mdBook documentation
+        run: mdbook build docs
+
+      - name: Verify build artifacts
+        run: |
+          test -f docs/book/index.html
+          test -f docs/book/getting-started/first-program.html
+          test -f docs/book/language/variables.html
+          test -f docs/book/library/time.html
+          test -f docs/book/library/validation.html
+
+      - name: Upload Pages artifact
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/book
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build-and-test
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+

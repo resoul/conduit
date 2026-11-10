@@ -1,0 +1,21 @@
+// modules_main.cdt - Importing local modules and using aliases
+import "./modules_user" as users
+
+func main() {
+    res := users.find_user(42)
+    switch res {
+        case users.User(u):
+            print(users.greet_user(u))
+        case users.UserNotFound(e):
+            print("User not found")
+    }
+
+    missing := users.find_user(0)
+    switch missing {
+        case users.User(u):
+            print(u.name)
+        case users.UserNotFound(e):
+            print("Successfully caught missing user error")
+    }
+}
+

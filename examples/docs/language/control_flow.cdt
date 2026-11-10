@@ -1,0 +1,45 @@
+// control_flow.cdt - Conditionals, loops, guard, and pipelines
+func double(x: Int) -> Int {
+    return x * 2
+}
+
+func add_ten(x: Int) -> Int {
+    return x + 10
+}
+
+func check_positive(n: Int) -> Int {
+    guard n > 0 else {
+        return 0
+    }
+    return n
+}
+
+func main() {
+    // If-else
+    num := 15
+    if num > 20 {
+        print("High")
+    } else {
+        print("Normal")
+    }
+
+    // For loop with break and continue
+    for item in [1, 2, 3, 4, 5] {
+        if item == 2 {
+            continue
+        }
+        if item > 4 {
+            break
+        }
+        print(item)
+    }
+
+    // Guard clause early return
+    print(check_positive(-5))
+    print(check_positive(7))
+
+    // Pipeline operator |>
+    result := 5 |> double |> add_ten
+    print(result)
+}
+
