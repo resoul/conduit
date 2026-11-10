@@ -22,6 +22,7 @@ pub enum BinaryOp {
     GtEq,
     And,
     Or,
+    Coalesce,
     Range,
 }
 
@@ -97,6 +98,10 @@ pub enum StmtKind {
         condition: Expr,
         then_block: Block,
         else_block: Option<Block>,
+    },
+    Guard {
+        condition: Expr,
+        else_block: Block,
     },
     ForIn {
         variable: String,

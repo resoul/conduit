@@ -32,4 +32,11 @@ conduit check examples/functions/01_math_and_logic.cdt
 
 # Run a Conduit file
 conduit run examples/functions/01_math_and_logic.cdt
+
+# Start the Language Server for editors (RustRover, VS Code, etc.)
+conduit lsp
 ```
+
+## Editor Support
+
+Conduit provides native editor support via LSP and TextMate bundles for JetBrains (RustRover), VS Code, and others. See [editors/README.md](editors/README.md) for quick 1-minute setup instructions.

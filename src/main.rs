@@ -103,6 +103,12 @@ fn main() {
                 process::exit(1);
             }
         }
+        "lsp" => {
+            if let Err(err) = conduit::lsp::run_lsp_server() {
+                eprintln!("LSP server error: {}", err);
+                process::exit(1);
+            }
+        }
         cmd => {
             eprintln!("Unknown command: '{}'", cmd);
             print_usage();
@@ -157,6 +163,7 @@ fn print_usage() {
     println!("  conduit check <file.cdt>     Type-check a source file");
     println!("  conduit ast <file.cdt>       Parse and display the AST of a source file");
     println!("  conduit tokens <file.cdt>    Print tokens of a source file");
+    println!("  conduit lsp                  Start the Language Server Protocol (LSP) server");
     println!("  conduit --version            Show version");
     println!("  conduit --help               Show this help message");
 }

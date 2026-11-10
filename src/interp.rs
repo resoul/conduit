@@ -173,6 +173,18 @@ impl Interpreter {
         Ok(return_val)
     }
 
+    fn eval_block(&mut self, block: &crate::ast::Block) -> Result<ControlFlow, RuntimeError> {
+        self.enter_scope();
+        for s in &block.stmts {
+            if let ControlFlow::Return(v) = self.eval_stmt(s)? {
+                self.exit_scope();
+                return Ok(ControlFlow::Return(v));
+            }
+        }
+        self.exit_scope();
+        Ok(ControlFlow::Next)
+    }
+
     fn eval_stmt(&mut self, stmt: &Stmt) -> Result<ControlFlow, RuntimeError> {
         match &stmt.kind {
             StmtKind::Define { name, value } => {
@@ -207,25 +219,20 @@ impl Interpreter {
             StmtKind::If { condition, then_block, else_block } => {
                 let cond_val = self.eval_expr(condition)?;
                 if cond_val.is_truthy() {
-                    self.enter_scope();
-                    for s in &then_block.stmts {
-                        if let ControlFlow::Return(v) = self.eval_stmt(s)? {
-                            self.exit_scope();
-                            return Ok(ControlFlow::Return(v));
-                        }
-                    }
-                    self.exit_scope();
+                    self.eval_block(then_block)
                 } else if let Some(eb) = else_block {
-                    self.enter_scope();
-                    for s in &eb.stmts {
-                        if let ControlFlow::Return(v) = self.eval_stmt(s)? {
-                            self.exit_scope();
-                            return Ok(ControlFlow::Return(v));
-                        }
-                    }
-                    self.exit_scope();
+                    self.eval_block(eb)
+                } else {
+                    Ok(ControlFlow::Next)
                 }
-                Ok(ControlFlow::Next)
+            }
+            StmtKind::Guard { condition, else_block } => {
+                let cond_val = self.eval_expr(condition)?;
+                if !cond_val.is_truthy() {
+                    self.eval_block(else_block)
+                } else {
+                    Ok(ControlFlow::Next)
+                }
             }
             StmtKind::ForIn { variable, iterable, body } => {
                 let iter_val = self.eval_expr(iterable)?;
@@ -288,6 +295,15 @@ impl Interpreter {
                 }
             }
             ExprKind::Binary { op, left, right } => {
+                if *op == BinaryOp::Coalesce {
+                    let l = self.eval_expr(left)?;
+                    return if l != Value::Nil {
+                        Ok(l)
+                    } else {
+                        self.eval_expr(right)
+                    };
+                }
+
                 let l = self.eval_expr(left)?;
                 let r = self.eval_expr(right)?;
 
@@ -365,6 +381,10 @@ impl Interpreter {
                             message: "Range '..' requires Int bounds".to_string(),
                             span: expr.span,
                         }),
+                    },
+                    BinaryOp::Coalesce => match l {
+                        Value::Nil => Ok(r),
+                        other => Ok(other),
                     },
                 }
             }

@@ -27,6 +27,7 @@ pub enum TokenKind {
     KwTrue,
     KwFalse,
     KwNil,
+    KwGuard,
 
     ColonAssign,
     Arrow,
@@ -45,6 +46,7 @@ pub enum TokenKind {
     Star,
     Slash,
     Percent,
+    QuestionQuestion,
     Question,
     DotDot,
     Dot,
@@ -243,6 +245,7 @@ impl<'a> Lexer<'a> {
             "true" => TokenKind::KwTrue,
             "false" => TokenKind::KwFalse,
             "nil" => TokenKind::KwNil,
+            "guard" => TokenKind::KwGuard,
             _ => TokenKind::Ident(word.to_string()),
         };
 
@@ -279,7 +282,14 @@ impl<'a> Lexer<'a> {
             '[' => TokenKind::LBracket,
             ']' => TokenKind::RBracket,
             ',' => TokenKind::Comma,
-            '?' => TokenKind::Question,
+            '?' => {
+                if self.peek_char() == Some('?') {
+                    self.bump_char();
+                    TokenKind::QuestionQuestion
+                } else {
+                    TokenKind::Question
+                }
+            }
             '+' => TokenKind::Plus,
             '*' => TokenKind::Star,
             '/' => TokenKind::Slash,
@@ -384,6 +394,28 @@ impl<'a> Lexer<'a> {
             }
         }
         Ok(tokens)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_lex_guard_and_coalesce() {
+        let mut lexer = Lexer::new("guard x > 0 else { return a ?? 10 }");
+        let tokens = lexer.tokenize_all().unwrap();
+        assert_eq!(tokens[0].kind, TokenKind::KwGuard);
+        assert_eq!(tokens[1].kind, TokenKind::Ident("x".to_string()));
+        assert_eq!(tokens[2].kind, TokenKind::Gt);
+        assert_eq!(tokens[3].kind, TokenKind::Int(0));
+        assert_eq!(tokens[4].kind, TokenKind::KwElse);
+        assert_eq!(tokens[5].kind, TokenKind::LBrace);
+        assert_eq!(tokens[6].kind, TokenKind::KwReturn);
+        assert_eq!(tokens[7].kind, TokenKind::Ident("a".to_string()));
+        assert_eq!(tokens[8].kind, TokenKind::QuestionQuestion);
+        assert_eq!(tokens[9].kind, TokenKind::Int(10));
+        assert_eq!(tokens[10].kind, TokenKind::RBrace);
     }
 }
 

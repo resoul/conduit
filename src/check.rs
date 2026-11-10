@@ -220,6 +220,25 @@ impl TypeChecker {
                     self.exit_scope();
                 }
             }
+            StmtKind::Guard { condition, else_block } => {
+                let cond_ty = self.check_expr(condition)?;
+                if cond_ty != Type::Bool {
+                    return Err(TypeError {
+                        message: format!("Condition in 'guard' must be Bool, got {}", cond_ty),
+                        span: condition.span,
+                    });
+                }
+                self.enter_scope();
+                self.check_block(else_block)?;
+                self.exit_scope();
+
+                if !block_always_returns(else_block) {
+                    return Err(TypeError {
+                        message: "Guard 'else' block must terminate with a 'return' statement".to_string(),
+                        span: else_block.span,
+                    });
+                }
+            }
             StmtKind::ForIn { variable, iterable, body } => {
                 let iter_ty = self.check_expr(iterable)?;
                 let item_ty = match iter_ty {
@@ -401,6 +420,35 @@ impl TypeChecker {
                             })
                         }
                     }
+                    BinaryOp::Coalesce => match left_ty {
+                        Type::Optional(inner) => {
+                            if right_ty.is_assignable_to(&inner) {
+                                Ok(*inner)
+                            } else {
+                                Err(TypeError {
+                                    message: format!(
+                                        "Coalesce operator '??' default value must match optional inner type {}, got {}",
+                                        inner, right_ty
+                                    ),
+                                    span: expr.span,
+                                })
+                            }
+                        }
+                        Type::Nil => Ok(right_ty),
+                        other => {
+                            if right_ty.is_assignable_to(&other) {
+                                Ok(other)
+                            } else {
+                                Err(TypeError {
+                                    message: format!(
+                                        "Operator '??' requires compatible operands, got {} and {}",
+                                        other, right_ty
+                                    ),
+                                    span: expr.span,
+                                })
+                            }
+                        }
+                    },
                     BinaryOp::Range => {
                         if left_ty == Type::Int && right_ty == Type::Int {
                             Ok(Type::List(Box::new(Type::Int)))
@@ -501,5 +549,66 @@ impl TypeChecker {
                 })
             }
         }
+    }
+}
+
+fn block_always_returns(block: &crate::ast::Block) -> bool {
+    for stmt in &block.stmts {
+        match &stmt.kind {
+            crate::ast::StmtKind::Return(_) => return true,
+            crate::ast::StmtKind::If {
+                then_block,
+                else_block: Some(else_b),
+                ..
+            } => {
+                if block_always_returns(then_block) && block_always_returns(else_b) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lexer::Lexer;
+    use crate::parser::Parser;
+
+    fn check_source(source: &str) -> Result<(), TypeError> {
+        let mut lexer = Lexer::new(source);
+        let tokens = lexer.tokenize_all().unwrap();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        let mut checker = TypeChecker::new();
+        checker.check_program(&program)
+    }
+
+    #[test]
+    fn test_guard_valid_return() {
+        let src = "func f(x: Int) -> Int {\n    guard x > 0 else {\n        return 0\n    }\n    return x\n}\n";
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn test_guard_missing_return_error() {
+        let src = "func f(x: Int) -> Int {\n    guard x > 0 else {\n        var a = 1\n    }\n    return x\n}\n";
+        let err = check_source(src).unwrap_err();
+        assert!(err.message.contains("must terminate with a 'return'"));
+    }
+
+    #[test]
+    fn test_coalesce_valid() {
+        let src = "func f(x: Int?) -> Int {\n    return x ?? 10\n}\n";
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn test_coalesce_type_mismatch() {
+        let src = "func f(x: Int?) -> Int {\n    return x ?? \"wrong\"\n}\n";
+        let err = check_source(src).unwrap_err();
+        assert!(err.message.contains("Coalesce operator '??' default value must match optional inner type"));
     }
 }

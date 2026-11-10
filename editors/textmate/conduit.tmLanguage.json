@@ -1,0 +1,56 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Conduit",
+  "scopeName": "source.conduit",
+  "fileTypes": ["cdt"],
+  "patterns": [
+    {
+      "name": "comment.line.double-slash.conduit",
+      "match": "//.*$"
+    },
+    {
+      "name": "string.quoted.double.conduit",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        {
+          "name": "constant.character.escape.conduit",
+          "match": "\\\\."
+        }
+      ]
+    },
+    {
+      "name": "keyword.control.conduit",
+      "match": "\\b(func|return|if|else|guard|for|in|var|type)\\b"
+    },
+    {
+      "name": "constant.language.boolean.conduit",
+      "match": "\\b(true|false)\\b"
+    },
+    {
+      "name": "constant.language.nil.conduit",
+      "match": "\\bnil\\b"
+    },
+    {
+      "name": "support.type.conduit",
+      "match": "\\b(Int|String|Bool)\\b"
+    },
+    {
+      "name": "support.function.builtin.conduit",
+      "match": "\\b(print)\\b"
+    },
+    {
+      "name": "constant.numeric.integer.conduit",
+      "match": "\\b[0-9]+\\b"
+    },
+    {
+      "name": "entity.name.function.conduit",
+      "match": "\\bfunc\\s+([a-zA-Z_][a-zA-Z0-9_]*)"
+    },
+    {
+      "name": "keyword.operator.conduit",
+      "match": "(:=|->|==|!=|<=|>=|[+\\-*/=<>?])"
+    }
+  ]
+}
+
