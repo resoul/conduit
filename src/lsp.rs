@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Write};
+use std::path::PathBuf;
 
 use crate::check::TypeChecker;
-use crate::lexer::Lexer;
-use crate::parser::Parser;
+use crate::loader::ModuleLoader;
+use crate::native::NativeRegistry;
 
 pub fn run_lsp_server() -> io::Result<()> {
     let stdin = io::stdin();
@@ -37,14 +38,14 @@ pub fn run_server_loop(mut reader: impl BufRead, mut writer: impl Write) -> io::
             "textDocument/didOpen" => {
                 if let (Some(uri), Some(text)) = (extract_uri(&msg), extract_open_text(&msg)) {
                     documents.insert(uri.clone(), text.clone());
-                    let diag = validate_document(&uri, &text);
+                    let diag = validate_document_with_env(&uri, &text, &documents);
                     send_message(&mut writer, &diag)?;
                 }
             }
             "textDocument/didChange" => {
                 if let (Some(uri), Some(text)) = (extract_uri(&msg), extract_change_text(&msg)) {
                     documents.insert(uri.clone(), text.clone());
-                    let diag = validate_document(&uri, &text);
+                    let diag = validate_document_with_env(&uri, &text, &documents);
                     send_message(&mut writer, &diag)?;
                 }
             }
@@ -53,7 +54,7 @@ pub fn run_server_loop(mut reader: impl BufRead, mut writer: impl Write) -> io::
                 send_message(&mut writer, &hover_resp)?;
             }
             "textDocument/completion" => {
-                let comp_resp = handle_completion(&id);
+                let comp_resp = handle_completion(&msg, &id, &documents);
                 send_message(&mut writer, &comp_resp)?;
             }
             "shutdown" => {
@@ -112,25 +113,37 @@ fn send_message(writer: &mut impl Write, payload: &str) -> io::Result<()> {
     writer.flush()
 }
 
-fn validate_document(uri: &str, text: &str) -> String {
-    let mut lexer = Lexer::new(text);
-    let tokens = match lexer.tokenize_all() {
-        Ok(t) => t,
-        Err(err) => {
-            return format_diagnostic(uri, err.span.line, err.span.col, &err.message);
-        }
-    };
+fn uri_to_path(uri: &str) -> PathBuf {
+    if let Some(stripped) = uri.strip_prefix("file://") {
+        PathBuf::from(stripped)
+    } else {
+        PathBuf::from(uri)
+    }
+}
 
-    let mut parser = Parser::new(tokens);
-    let program = match parser.parse_program() {
-        Ok(p) => p,
+pub fn validate_document(uri: &str, text: &str) -> String {
+    validate_document_with_env(uri, text, &HashMap::new())
+}
+
+pub fn validate_document_with_env(uri: &str, text: &str, documents: &HashMap<String, String>) -> String {
+    let file_path = uri_to_path(uri);
+    let mut loader = ModuleLoader::new();
+
+    // Register unsaved open documents
+    for (doc_uri, doc_text) in documents {
+        loader.with_virtual_file(uri_to_path(doc_uri), doc_text.clone());
+    }
+    loader.with_virtual_file(&file_path, text.to_string());
+
+    let root_canon = match loader.load_project(&file_path) {
+        Ok(c) => c,
         Err(err) => {
             return format_diagnostic(uri, err.span.line, err.span.col, &err.message);
         }
     };
 
     let mut checker = TypeChecker::new();
-    if let Err(err) = checker.check_program(&program) {
+    if let Err(err) = checker.check_project(&root_canon, &loader) {
         return format_diagnostic(uri, err.span.line, err.span.col, &err.message);
     }
 
@@ -159,42 +172,79 @@ fn handle_hover(msg: &str, id: &str, documents: &HashMap<String, String>) -> Str
     let line = extract_json_num(msg, "line").unwrap_or(0);
     let character = extract_json_num(msg, "character").unwrap_or(0);
 
-    let word = if let Some(uri) = extract_uri(msg) {
+    let (word, qualified_word) = if let Some(uri) = extract_uri(msg) {
         if let Some(doc) = documents.get(&uri) {
-            get_word_at_position(doc, line, character)
+            get_words_at_position(doc, line, character)
         } else {
-            String::new()
+            (String::new(), String::new())
         }
     } else {
-        String::new()
+        (String::new(), String::new())
     };
 
-    let hover_text = match word.as_str() {
-        "func" => "**func** — Function declaration\n```conduit\nfunc name(param: Type) -> ReturnType\n```",
-        "type" => "**type** — Custom structure definition\n```conduit\ntype User {\n    name: String\n    age: Int\n}\n```",
-        "error" => "**error** — Typed error definition\n```conduit\nerror InvalidUserName {\n    message: String\n}\n```",
-        "switch" => "**switch** — Exhaustive pattern matching statement\n```conduit\nswitch result {\n    case User(u):\n        ...\n    case InvalidUserName(e):\n        ...\n}\n```",
-        "case" => "**case** — Pattern branch inside switch statement",
-        "var" => "**var** — Mutable variable declaration\n```conduit\nvar counter: Int = 0\n```",
-        "guard" => "**guard** — Early exit condition check\n```conduit\nguard condition else {\n    return error_or_default\n}\n```",
-        "return" => "**return** — Return a value from the current function",
-        "if" => "**if** — Conditional branching statement",
-        "for" => "**for** — Iteration loop over lists or ranges\n```conduit\nfor item in list { ... }\n```",
-        "break" => "**break** — Immediately terminate the innermost loop",
-        "continue" => "**continue** — Skip the rest of the current iteration and jump to the next item",
-        "print" => "**print(msg)** — Built-in console output function",
-        "Int" => "**Int** — 64-bit signed integer type",
-        "String" => "**String** — UTF-8 encoded text string type",
-        "Bool" => "**Bool** — Boolean type (`true` or `false`)",
-        "nil" => "**nil** — Represents the absence of a value in optional types (`T?`)",
-        "trim" => "`.trim() -> String` — Returns a string slice with leading and trailing whitespace removed",
-        "lower" => "`.lower() -> String` — Returns a lowercase copy of the string",
-        "upper" => "`.upper() -> String` — Returns an uppercase copy of the string",
-        "len" => "`.len() -> Int` — Returns the length of the string or collection",
-        "append" => "`.append(item)` — Appends an element to the end of the list",
-        "contains" => "`.contains(item) -> Bool` — Checks whether the element or substring exists",
-        _ => "",
-    };
+    let registry = NativeRegistry::new();
+    let mut hover_text = String::new();
+
+    // 1. Check native registry for time module
+    if let Some(time_mod) = registry.get_module("time") {
+        for ty in time_mod.types.values() {
+            if ty.name == word || ty.qualified_name == qualified_word || ty.qualified_name == word {
+                hover_text = format!("**{}** ({})\n\n{}", ty.qualified_name, if ty.is_error { "error" } else { "type" }, ty.doc);
+                break;
+            }
+        }
+        if hover_text.is_empty() {
+            for f in time_mod.functions.values() {
+                let qname = format!("time.{}", f.name);
+                if f.name == word || qname == qualified_word || qname == word {
+                    let params_str = f.params.iter().map(|(p, t)| format!("{}: {}", p, t)).collect::<Vec<_>>().join(", ");
+                    hover_text = format!("**func {}({}) -> {}**\n\n{}", qname, params_str, f.return_type, f.doc);
+                    break;
+                }
+            }
+        }
+        if hover_text.is_empty() {
+            for ((target_type, _), m) in &time_mod.methods {
+                if m.name == word || format!("{}.{}", target_type, m.name) == qualified_word {
+                    let params_str = m.params.iter().map(|(p, t)| format!("{}: {}", p, t)).collect::<Vec<_>>().join(", ");
+                    hover_text = format!("**method {}.{}({}) -> {}**\n\n{}", target_type, m.name, params_str, m.return_type, m.doc);
+                    break;
+                }
+            }
+        }
+    }
+
+    if hover_text.is_empty() {
+        hover_text = match word.as_str() {
+            "export" => "**export** — Export a top-level function, type, or error to make it accessible to other modules\n```conduit\nexport func find(id: Int) -> User\nexport type User { name: String }\nexport error NotFound {}\n```".to_string(),
+            "import" => "**import** — Import a module from standard library (`cdt.*`) or local file path\n```conduit\nimport cdt.time\nimport \"./users\" as users\n```".to_string(),
+            "as" => "**as** — Alias an imported module\n```conduit\nimport cdt.time as clock\nimport \"./users\" as users\n```".to_string(),
+            "func" => "**func** — Function declaration\n```conduit\nfunc name(param: Type) -> ReturnType\n```".to_string(),
+            "type" => "**type** — Custom structure definition\n```conduit\ntype User {\n    name: String\n    age: Int\n}\n```".to_string(),
+            "error" => "**error** — Typed error definition\n```conduit\nerror InvalidUserName {\n    message: String\n}\n```".to_string(),
+            "switch" => "**switch** — Exhaustive pattern matching statement\n```conduit\nswitch result {\n    case User(u):\n        ...\n    case InvalidUserName(e):\n        ...\n}\n```".to_string(),
+            "case" => "**case** — Pattern branch inside switch statement".to_string(),
+            "var" => "**var** — Mutable variable declaration\n```conduit\nvar counter: Int = 0\n```".to_string(),
+            "guard" => "**guard** — Early exit condition check\n```conduit\nguard condition else {\n    return error_or_default\n}\n```".to_string(),
+            "return" => "**return** — Return a value from the current function".to_string(),
+            "if" => "**if** — Conditional branching statement".to_string(),
+            "for" => "**for** — Iteration loop over lists or ranges\n```conduit\nfor item in list { ... }\n```".to_string(),
+            "break" => "**break** — Immediately terminate the innermost loop".to_string(),
+            "continue" => "**continue** — Skip the rest of the current iteration and jump to the next item".to_string(),
+            "print" => "**print(msg)** — Built-in console output function".to_string(),
+            "Int" => "**Int** — 64-bit signed integer type".to_string(),
+            "String" => "**String** — UTF-8 encoded text string type".to_string(),
+            "Bool" => "**Bool** — Boolean type (`true` or `false`)".to_string(),
+            "nil" => "**nil** — Represents the absence of a value in optional types (`T?`)".to_string(),
+            "trim" => "`.trim() -> String` — Returns a string slice with leading and trailing whitespace removed".to_string(),
+            "lower" => "`.lower() -> String` — Returns a lowercase copy of the string".to_string(),
+            "upper" => "`.upper() -> String` — Returns an uppercase copy of the string".to_string(),
+            "len" => "`.len() -> Int` — Returns the length of the string or collection".to_string(),
+            "append" => "`.append(item)` — Appends an element to the end of the list".to_string(),
+            "contains" => "`.contains(item) -> Bool` — Checks whether the element or substring exists".to_string(),
+            _ => String::new(),
+        };
+    }
 
     if hover_text.is_empty() {
         format!(r#"{{"jsonrpc":"2.0","id":{},"result":null}}"#, id)
@@ -202,13 +252,86 @@ fn handle_hover(msg: &str, id: &str, documents: &HashMap<String, String>) -> Str
         format!(
             r#"{{"jsonrpc":"2.0","id":{},"result":{{"contents":{{"kind":"markdown","value":"{}"}}}}}}"#,
             id,
-            escape_json(hover_text)
+            escape_json(&hover_text)
         )
     }
 }
 
-fn handle_completion(id: &str) -> String {
+fn handle_completion(msg: &str, id: &str, documents: &HashMap<String, String>) -> String {
+    let line = extract_json_num(msg, "line").unwrap_or(0);
+    let character = extract_json_num(msg, "character").unwrap_or(0);
+
+    let prefix_alias = if let Some(uri) = extract_uri(msg) {
+        if let Some(doc) = documents.get(&uri) {
+            get_dot_prefix_alias(doc, line, character)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some(alias) = prefix_alias {
+        if alias == "time" {
+            let items = r#"[
+                {"label":"now","kind":3,"detail":"time.now() -> time.Timestamp | time.TimeError","insertText":"now()"},
+                {"label":"monotonic","kind":3,"detail":"time.monotonic() -> time.Instant","insertText":"monotonic()"},
+                {"label":"elapsed","kind":3,"detail":"time.elapsed(start: time.Instant) -> time.Duration | time.TimeError","insertText":"elapsed(${1:start})","insertTextFormat":2},
+                {"label":"seconds","kind":3,"detail":"time.seconds(value: Int) -> time.Duration | time.TimeError","insertText":"seconds(${1:val})","insertTextFormat":2},
+                {"label":"milliseconds","kind":3,"detail":"time.milliseconds(value: Int) -> time.Duration | time.TimeError","insertText":"milliseconds(${1:val})","insertTextFormat":2},
+                {"label":"Timestamp","kind":7,"detail":"time.Timestamp type"},
+                {"label":"Instant","kind":7,"detail":"time.Instant type"},
+                {"label":"Duration","kind":7,"detail":"time.Duration type"},
+                {"label":"TimeError","kind":7,"detail":"time.TimeError error"}
+            ]"#;
+            return format!(r#"{{"jsonrpc":"2.0","id":{},"result":{}}}"#, id, items);
+        } else if let Some(uri) = extract_uri(msg) {
+            // Check if alias is imported from a local module in current document
+            if let Some(doc) = documents.get(&uri) {
+                let file_path = uri_to_path(&uri);
+                let mut loader = ModuleLoader::new();
+                for (doc_uri, doc_text) in documents {
+                    loader.with_virtual_file(uri_to_path(doc_uri), doc_text.clone());
+                }
+                loader.with_virtual_file(&file_path, doc.clone());
+                if let Ok(root_canon) = loader.load_project(&file_path) {
+                    if let Some(loaded_mod) = loader.modules.get(&root_canon) {
+                        if let Some((target, _)) = loaded_mod.imports.get(&alias) {
+                            if let crate::loader::ModuleTarget::Local(path) = target {
+                                if let Some(target_mod) = loader.modules.get(path) {
+                                    let mut items = Vec::new();
+                                    for item in &target_mod.program.items {
+                                        if item.is_exported {
+                                            match &item.kind {
+                                                crate::ast::ItemKind::Func { name, .. } => {
+                                                    items.push(format!(r#"{{"label":"{}","kind":3,"detail":"Exported function"}}"#, name));
+                                                }
+                                                crate::ast::ItemKind::Type { name, .. } => {
+                                                    items.push(format!(r#"{{"label":"{}","kind":7,"detail":"Exported type"}}"#, name));
+                                                }
+                                                crate::ast::ItemKind::Error { name, .. } => {
+                                                    items.push(format!(r#"{{"label":"{}","kind":7,"detail":"Exported error"}}"#, name));
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                    let json_arr = format!("[{}]", items.join(","));
+                                    return format!(r#"{{"jsonrpc":"2.0","id":{},"result":{}}}"#, id, json_arr);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let items = r#"[
+        {"label":"export","kind":14,"detail":"Export declaration","insertText":"export "},
+        {"label":"import","kind":14,"detail":"Import module","insertText":"import "},
+        {"label":"import cdt.time","kind":14,"detail":"Import time library","insertText":"import cdt.time\n"},
+        {"label":"as","kind":14,"detail":"Import alias keyword"},
         {"label":"func","kind":14,"detail":"Function declaration","insertText":"func ${1:name}(${2:params}) -> ${3:Type} {\n\t${0}\n}","insertTextFormat":2},
         {"label":"type","kind":7,"detail":"Custom structure","insertText":"type ${1:Name} {\n\t${2:field}: ${3:Type}\n}","insertTextFormat":2},
         {"label":"error","kind":7,"detail":"Typed error definition","insertText":"error ${1:Name} {\n\t${2:message}: String\n}","insertTextFormat":2},
@@ -236,15 +359,39 @@ fn handle_completion(id: &str) -> String {
     format!(r#"{{"jsonrpc":"2.0","id":{},"result":{}}}"#, id, items)
 }
 
-fn get_word_at_position(text: &str, line_idx: usize, char_idx: usize) -> String {
+fn get_dot_prefix_alias(text: &str, line_idx: usize, char_idx: usize) -> Option<String> {
+    let line = text.lines().nth(line_idx)?;
+    let chars: Vec<char> = line.chars().collect();
+    if char_idx == 0 || char_idx > chars.len() {
+        return None;
+    }
+
+    let before: String = chars[..char_idx].iter().collect();
+    let trimmed = before.trim_end();
+    if trimmed.ends_with('.') {
+        let without_dot = &trimmed[..trimmed.len() - 1];
+        let mut start = without_dot.len();
+        let bytes = without_dot.as_bytes();
+        while start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_') {
+            start -= 1;
+        }
+        let alias = &without_dot[start..];
+        if !alias.is_empty() {
+            return Some(alias.to_string());
+        }
+    }
+    None
+}
+
+fn get_words_at_position(text: &str, line_idx: usize, char_idx: usize) -> (String, String) {
     let line = match text.lines().nth(line_idx) {
         Some(l) => l,
-        None => return String::new(),
+        None => return (String::new(), String::new()),
     };
 
     let chars: Vec<char> = line.chars().collect();
     if char_idx >= chars.len() {
-        return String::new();
+        return (String::new(), String::new());
     }
 
     let mut start = char_idx;
@@ -257,7 +404,29 @@ fn get_word_at_position(text: &str, line_idx: usize, char_idx: usize) -> String 
         end += 1;
     }
 
-    chars[start..end].iter().collect()
+    let simple_word: String = chars[start..end].iter().collect();
+
+    // Check for qualified word (e.g. prefix before '.')
+    let mut qstart = start;
+    if qstart > 1 && chars[qstart - 1] == '.' {
+        let mut prev = qstart - 1;
+        while prev > 0 && (chars[prev - 1].is_alphanumeric() || chars[prev - 1] == '_') {
+            prev -= 1;
+        }
+        qstart = prev;
+    }
+
+    let mut qend = end;
+    if qend < chars.len() && chars[qend] == '.' {
+        let mut next = qend + 1;
+        while next < chars.len() && (chars[next].is_alphanumeric() || chars[next] == '_') {
+            next += 1;
+        }
+        qend = next;
+    }
+
+    let qualified_word: String = chars[qstart..qend].iter().collect();
+    (simple_word, qualified_word)
 }
 
 fn extract_json_string(json: &str, key: &str) -> Option<String> {

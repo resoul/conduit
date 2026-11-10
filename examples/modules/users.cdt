@@ -1,0 +1,24 @@
+// users.cdt - User management module demonstrating exports
+
+export type User {
+    id: Int
+    name: String
+}
+
+export error UserNotFound {
+    id: Int
+}
+
+// Exported function returning union of User and UserNotFound
+export func find(id: Int) -> User | UserNotFound {
+    guard id > 0 else {
+        return UserNotFound(id: id)
+    }
+    return User(id: id, name: "Alice")
+}
+
+// Private helper function (not exported)
+func internal_helper() -> Int {
+    return 100
+}
+

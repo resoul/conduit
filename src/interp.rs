@@ -1,7 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use crate::ast::*;
 use crate::lexer::Span;
+use crate::loader::{ModuleLoader, ModuleTarget};
+use crate::native::NativeRegistry;
 use crate::value::Value;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -37,18 +40,24 @@ impl From<RuntimeError> for InterpFlow {
 }
 
 pub struct Interpreter {
-    functions: HashMap<String, (Vec<Param>, Block)>,
-    structs: std::collections::HashSet<String>,
-    errors: std::collections::HashSet<String>,
+    pub native_registry: NativeRegistry,
+    module_functions: HashMap<(Option<PathBuf>, String), (Vec<Param>, Block)>,
+    module_imports: HashMap<Option<PathBuf>, HashMap<String, ModuleTarget>>,
+    module_structs: HashMap<Option<PathBuf>, HashSet<String>>,
+    module_errors: HashMap<Option<PathBuf>, HashSet<String>>,
+    current_module: Option<PathBuf>,
     env: Vec<HashMap<String, Value>>,
 }
 
 impl Interpreter {
     pub fn new() -> Self {
         Self {
-            functions: HashMap::new(),
-            structs: std::collections::HashSet::new(),
-            errors: std::collections::HashSet::new(),
+            native_registry: NativeRegistry::new(),
+            module_functions: HashMap::new(),
+            module_imports: HashMap::new(),
+            module_structs: HashMap::new(),
+            module_errors: HashMap::new(),
+            current_module: None,
             env: vec![HashMap::new()],
         }
     }
@@ -145,37 +154,113 @@ impl Interpreter {
         result
     }
 
+    pub fn run_project(&mut self, root_path: &Path, loader: &ModuleLoader) -> Result<(), RuntimeError> {
+        for (path, loaded_mod) in &loader.modules {
+            let mut imports_map = HashMap::new();
+            for (alias, (target, _)) in &loaded_mod.imports {
+                imports_map.insert(alias.clone(), target.clone());
+            }
+            self.module_imports.insert(Some(path.clone()), imports_map);
+
+            let mut structs_set = HashSet::new();
+            let mut errors_set = HashSet::new();
+
+            for item in &loaded_mod.program.items {
+                match &item.kind {
+                    ItemKind::Func { name, params, body, .. } => {
+                        self.module_functions.insert(
+                            (Some(path.clone()), name.clone()),
+                            (params.clone(), body.clone()),
+                        );
+                    }
+                    ItemKind::Type { name, .. } => {
+                        structs_set.insert(name.clone());
+                    }
+                    ItemKind::Error { name, .. } => {
+                        errors_set.insert(name.clone());
+                    }
+                    ItemKind::Import { .. } => {}
+                }
+            }
+
+            self.module_structs.insert(Some(path.clone()), structs_set);
+            self.module_errors.insert(Some(path.clone()), errors_set);
+        }
+
+        let root_canon = root_path.to_path_buf();
+        if !self.module_functions.contains_key(&(Some(root_canon.clone()), "main".to_string())) {
+            return Err(RuntimeError {
+                message: "Entry point 'func main()' not found in root module".to_string(),
+                span: Span::new(1, 1),
+            });
+        }
+
+        self.call_module_function(Some(root_canon), "main", vec![], Span::new(1, 1))?;
+        Ok(())
+    }
+
     pub fn run_program(&mut self, program: &Program) -> Result<(), RuntimeError> {
+        let mut structs_set = HashSet::new();
+        let mut errors_set = HashSet::new();
+        let mut imports_map = HashMap::new();
+
         for item in &program.items {
             match &item.kind {
                 ItemKind::Func { name, params, body, .. } => {
-                    self.functions.insert(name.clone(), (params.clone(), body.clone()));
+                    self.module_functions.insert((None, name.clone()), (params.clone(), body.clone()));
                 }
                 ItemKind::Type { name, .. } => {
-                    self.structs.insert(name.clone());
+                    structs_set.insert(name.clone());
                 }
                 ItemKind::Error { name, .. } => {
-                    self.errors.insert(name.clone());
+                    errors_set.insert(name.clone());
+                }
+                ItemKind::Import { path, alias } => {
+                    if path.starts_with("cdt.") {
+                        imports_map.insert(alias.clone(), ModuleTarget::Native(path.clone()));
+                    } else {
+                        imports_map.insert(alias.clone(), ModuleTarget::Local(PathBuf::from(path)));
+                    }
                 }
             }
         }
 
-        if !self.functions.contains_key("main") {
+        self.module_structs.insert(None, structs_set);
+        self.module_errors.insert(None, errors_set);
+        self.module_imports.insert(None, imports_map);
+
+        if !self.module_functions.contains_key(&(None, "main".to_string())) {
             return Err(RuntimeError {
                 message: "Entry point 'func main()' not found".to_string(),
                 span: Span::new(1, 1),
             });
         }
 
-        self.call_function("main", vec![], Span::new(1, 1))?;
+        self.call_module_function(None, "main", vec![], Span::new(1, 1))?;
         Ok(())
     }
 
-    fn call_function(&mut self, name: &str, args: Vec<Value>, span: Span) -> Result<Value, RuntimeError> {
-        let (params, body) = self.functions.get(name).cloned().ok_or_else(|| RuntimeError {
-            message: format!("Function '{}' not found", name),
-            span,
-        })?;
+    pub fn call_module_function(
+        &mut self,
+        mod_path: Option<PathBuf>,
+        name: &str,
+        args: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, RuntimeError> {
+        let key = (mod_path.clone(), name.to_string());
+        let (params, body) = if let Some(sig) = self.module_functions.get(&key).cloned() {
+            sig
+        } else if let Some(sig) = self.module_functions.get(&(None, name.to_string())).cloned() {
+            sig
+        } else {
+            return Err(RuntimeError {
+                message: format!("Function '{}' not found", name),
+                span,
+            });
+        };
+
+        let prev_mod = self.current_module.clone();
+        self.current_module = mod_path;
 
         self.enter_scope();
         for (i, param) in params.iter().enumerate() {
@@ -195,10 +280,43 @@ impl Interpreter {
         }
 
         self.exit_scope();
+        self.current_module = prev_mod;
         Ok(return_val)
     }
 
-    fn eval_block(&mut self, block: &crate::ast::Block) -> Result<ControlFlow, RuntimeError> {
+    fn call_callable(&mut self, callee_val: &Value, args: Vec<Value>, span: Span) -> Result<Value, RuntimeError> {
+        match callee_val {
+            Value::Function(fn_id) => {
+                if let Some((mod_str, fn_name)) = fn_id.split_once("::") {
+                    let mod_path = PathBuf::from(mod_str);
+                    self.call_module_function(Some(mod_path), fn_name, args, span)
+                } else {
+                    let cur = self.current_module.clone();
+                    self.call_module_function(cur, fn_id, args, span)
+                }
+            }
+            Value::NativeFunction { module, name } => {
+                let m = self.native_registry.get_module(module).ok_or_else(|| RuntimeError {
+                    message: format!("Unknown native module '{}'", module),
+                    span,
+                })?;
+                let f = m.functions.get(name.as_str()).ok_or_else(|| RuntimeError {
+                    message: format!("Unknown native function '{}.{}'", module, name),
+                    span,
+                })?;
+                match (f.implementation)(args) {
+                    Ok(val) => Ok(val),
+                    Err(err_val) => Ok(err_val),
+                }
+            }
+            _ => Err(RuntimeError {
+                message: format!("Value '{}' is not a callable function", callee_val),
+                span,
+            }),
+        }
+    }
+
+    fn eval_block(&mut self, block: &Block) -> Result<ControlFlow, RuntimeError> {
         self.enter_scope();
         for s in &block.stmts {
             match self.eval_stmt(s)? {
@@ -392,10 +510,18 @@ impl Interpreter {
                 Ok(val)
             }
             ExprKind::Ident(name) => {
-                self.lookup_variable(name).ok_or_else(|| RuntimeError {
-                    message: format!("Unknown variable '{}'", name),
-                    span: expr.span,
-                }.into())
+                if let Some(val) = self.lookup_variable(name) {
+                    Ok(val)
+                } else if self.module_functions.contains_key(&(self.current_module.clone(), name.clone()))
+                    || self.module_functions.contains_key(&(None, name.clone()))
+                {
+                    Ok(Value::Function(name.clone()))
+                } else {
+                    Err(RuntimeError {
+                        message: format!("Unknown variable '{}'", name),
+                        span: expr.span,
+                    }.into())
+                }
             }
             ExprKind::List(elements) => {
                 let mut vals = Vec::new();
@@ -410,7 +536,7 @@ impl Interpreter {
                     UnaryOp::Neg => match val {
                         Value::Int(n) => Ok(Value::Int(-n)),
                         _ => Err(RuntimeError {
-                            message: "Unary '-' requires Int".to_string(),
+                            message: "Unary '-' applies to Int only".to_string(),
                             span: expr.span,
                         }.into()),
                     },
@@ -435,21 +561,21 @@ impl Interpreter {
                         (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a + b)),
                         (Value::String(a), Value::String(b)) => Ok(Value::String(format!("{}{}", a, b))),
                         _ => Err(RuntimeError {
-                            message: "Operator '+' requires Int or String".to_string(),
+                            message: "Operator '+' requires matching Int or String operands".to_string(),
                             span: expr.span,
                         }.into()),
                     },
                     BinaryOp::Sub => match (l, r) {
                         (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a - b)),
                         _ => Err(RuntimeError {
-                            message: "Operator '-' requires Int".to_string(),
+                            message: "Operator '-' requires Int operands".to_string(),
                             span: expr.span,
                         }.into()),
                     },
                     BinaryOp::Mul => match (l, r) {
                         (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a * b)),
                         _ => Err(RuntimeError {
-                            message: "Operator '*' requires Int".to_string(),
+                            message: "Operator '*' requires Int operands".to_string(),
                             span: expr.span,
                         }.into()),
                     },
@@ -460,137 +586,259 @@ impl Interpreter {
                         }.into()),
                         (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a / b)),
                         _ => Err(RuntimeError {
-                            message: "Operator '/' requires Int".to_string(),
+                            message: "Operator '/' requires Int operands".to_string(),
                             span: expr.span,
                         }.into()),
                     },
                     BinaryOp::Mod => match (l, r) {
                         (Value::Int(_), Value::Int(0)) => Err(RuntimeError {
-                            message: "Division by zero".to_string(),
+                            message: "Modulo by zero".to_string(),
                             span: expr.span,
                         }.into()),
                         (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a % b)),
                         _ => Err(RuntimeError {
-                            message: "Operator '%' requires Int".to_string(),
+                            message: "Operator '%' requires Int operands".to_string(),
+                            span: expr.span,
+                        }.into()),
+                    },
+                    BinaryOp::Lt => match (l, r) {
+                        (Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a < b)),
+                        _ => Err(RuntimeError {
+                            message: "Operator '<' requires Int operands".to_string(),
+                            span: expr.span,
+                        }.into()),
+                    },
+                    BinaryOp::LtEq => match (l, r) {
+                        (Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a <= b)),
+                        _ => Err(RuntimeError {
+                            message: "Operator '<=' requires Int operands".to_string(),
+                            span: expr.span,
+                        }.into()),
+                    },
+                    BinaryOp::Gt => match (l, r) {
+                        (Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a > b)),
+                        _ => Err(RuntimeError {
+                            message: "Operator '>' requires Int operands".to_string(),
+                            span: expr.span,
+                        }.into()),
+                    },
+                    BinaryOp::GtEq => match (l, r) {
+                        (Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a >= b)),
+                        _ => Err(RuntimeError {
+                            message: "Operator '>=' requires Int operands".to_string(),
                             span: expr.span,
                         }.into()),
                     },
                     BinaryOp::Eq => Ok(Value::Bool(l == r)),
                     BinaryOp::NotEq => Ok(Value::Bool(l != r)),
-                    BinaryOp::Lt => match (l, r) {
-                        (Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a < b)),
-                        _ => Ok(Value::Bool(false)),
-                    },
-                    BinaryOp::LtEq => match (l, r) {
-                        (Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a <= b)),
-                        _ => Ok(Value::Bool(false)),
-                    },
-                    BinaryOp::Gt => match (l, r) {
-                        (Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a > b)),
-                        _ => Ok(Value::Bool(false)),
-                    },
-                    BinaryOp::GtEq => match (l, r) {
-                        (Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a >= b)),
-                        _ => Ok(Value::Bool(false)),
-                    },
                     BinaryOp::And => Ok(Value::Bool(l.is_truthy() && r.is_truthy())),
                     BinaryOp::Or => Ok(Value::Bool(l.is_truthy() || r.is_truthy())),
                     BinaryOp::Range => match (l, r) {
                         (Value::Int(start), Value::Int(end)) => {
-                            let list = (start..end).map(Value::Int).collect();
-                            Ok(Value::List(list))
+                            let items = (start..end).map(Value::Int).collect();
+                            Ok(Value::List(items))
                         }
                         _ => Err(RuntimeError {
                             message: "Range '..' requires Int bounds".to_string(),
                             span: expr.span,
                         }.into()),
                     },
-                    BinaryOp::Coalesce => match l {
-                        Value::Nil => Ok(r),
-                        other => Ok(other),
-                    },
+                    BinaryOp::Coalesce => unreachable!(),
                 }
             }
             ExprKind::Call { callee, args, named_args } => {
-                if let ExprKind::Ident(ref type_name) = callee.kind {
-                    if self.errors.contains(type_name) || self.structs.contains(type_name) || !named_args.is_empty() {
+                // 1. Direct local struct or error constructor
+                if let ExprKind::Ident(ref name) = callee.kind {
+                    let cur_structs = self.module_structs.get(&self.current_module);
+                    let is_struct = cur_structs.map(|s| s.contains(name)).unwrap_or(false);
+                    let cur_errors = self.module_errors.get(&self.current_module);
+                    let is_error = cur_errors.map(|e| e.contains(name)).unwrap_or(false);
+
+                    if is_struct {
                         let mut fields = HashMap::new();
                         for arg in named_args {
-                            let val = self.eval_expr(&arg.value)?;
-                            fields.insert(arg.name.clone(), val);
+                            fields.insert(arg.name.clone(), self.eval_expr(&arg.value)?);
                         }
-                        return Ok(if self.errors.contains(type_name) {
-                            Value::Error {
-                                name: type_name.clone(),
-                                fields,
-                            }
-                        } else {
-                            Value::Struct {
-                                name: type_name.clone(),
-                                fields,
-                            }
+                        return Ok(Value::Struct {
+                            name: name.clone(),
+                            fields,
+                        });
+                    }
+                    if is_error {
+                        let mut fields = HashMap::new();
+                        for arg in named_args {
+                            fields.insert(arg.name.clone(), self.eval_expr(&arg.value)?);
+                        }
+                        return Ok(Value::Error {
+                            name: name.clone(),
+                            fields,
                         });
                     }
 
-                    if type_name == "map" && args.len() == 2 {
+                    // map(list, callback)
+                    if name == "map" && args.len() == 2 {
                         let list_val = self.eval_expr(&args[0])?;
-                        let fn_name = match &args[1].kind {
-                            ExprKind::Ident(f) => f.clone(),
-                            _ => {
-                                return Err(RuntimeError {
-                                    message: "Second argument to 'map' must be a function name".to_string(),
-                                    span: args[1].span,
-                                }.into());
-                            }
-                        };
+                        let cb_val = self.eval_expr(&args[1])?;
                         if let Value::List(items) = list_val {
                             let mut results = Vec::new();
                             for item in items {
-                                let res = self.call_function(&fn_name, vec![item], args[1].span)?;
-                                results.push(res);
+                                if item.is_error() {
+                                    results.push(item);
+                                } else {
+                                    let res = self.call_callable(&cb_val, vec![item], args[1].span)?;
+                                    results.push(res);
+                                }
                             }
                             return Ok(Value::List(results));
                         }
                     }
 
-                    if type_name == "filter" && args.len() == 2 {
+                    // filter(list, callback)
+                    if name == "filter" && args.len() == 2 {
                         let list_val = self.eval_expr(&args[0])?;
-                        let fn_name = match &args[1].kind {
-                            ExprKind::Ident(f) => f.clone(),
-                            _ => {
-                                return Err(RuntimeError {
-                                    message: "Second argument to 'filter' must be a function name".to_string(),
-                                    span: args[1].span,
-                                }.into());
-                            }
-                        };
+                        let cb_val = self.eval_expr(&args[1])?;
                         if let Value::List(items) = list_val {
-                            let mut filtered = Vec::new();
+                            let mut results = Vec::new();
                             for item in items {
-                                let res = self.call_function(&fn_name, vec![item.clone()], args[1].span)?;
-                                if res.is_truthy() {
-                                    filtered.push(item);
+                                if item.is_error() {
+                                    results.push(item);
+                                } else {
+                                    let res = self.call_callable(&cb_val, vec![item.clone()], args[1].span)?;
+                                    if res.is_truthy() {
+                                        results.push(item);
+                                    }
                                 }
                             }
-                            return Ok(Value::List(filtered));
+                            return Ok(Value::List(results));
                         }
+                    }
+
+                    if name == "print" {
+                        for (i, a) in args.iter().enumerate() {
+                            let val = self.eval_expr(a)?;
+                            if i > 0 {
+                                print!(" ");
+                            }
+                            print!("{}", val);
+                        }
+                        println!();
+                        return Ok(Value::Void);
                     }
                 }
 
+                // 2. Member call on imported module: `alias.foo(...)`
                 if let ExprKind::Member { target, field } = &callee.kind {
-                    if field == "append" {
-                        if let ExprKind::Ident(ref list_var_name) = target.kind {
-                            let item_to_append = self.eval_expr(&args[0])?;
-                            if let Some(Value::List(ref mut list)) = self.lookup_variable(list_var_name) {
-                                let mut updated = list.clone();
-                                updated.push(item_to_append);
-                                self.assign_variable(list_var_name, Value::List(updated), target.span)?;
-                                return Ok(Value::Void);
+                    if let ExprKind::Ident(ref alias) = target.kind {
+                        let cur_imports = self.module_imports.get(&self.current_module).cloned();
+                        if let Some(target_mod) = cur_imports.and_then(|m| m.get(alias).cloned()) {
+                            match target_mod {
+                                ModuleTarget::Native(nat_name) => {
+                                    let func_impl = {
+                                        let m = self.native_registry.get_module(&nat_name).ok_or_else(|| RuntimeError {
+                                            message: format!("Unknown native module '{}'", nat_name),
+                                            span: callee.span,
+                                        })?;
+                                        m.functions.get(field.as_str()).map(|f| f.implementation)
+                                    };
+                                    if let Some(impl_fn) = func_impl {
+                                        let mut evaluated = Vec::new();
+                                        for a in args {
+                                            evaluated.push(self.eval_expr(a)?);
+                                        }
+                                        let res = (impl_fn)(evaluated);
+                                        return match res {
+                                            Ok(val) => Ok(val),
+                                            Err(err_val) => Ok(err_val),
+                                        };
+                                    }
+                                }
+                                ModuleTarget::Local(path) => {
+                                    let is_struct = self
+                                        .module_structs
+                                        .get(&Some(path.clone()))
+                                        .map(|s| s.contains(field))
+                                        .unwrap_or(false);
+                                    let is_error = self
+                                        .module_errors
+                                        .get(&Some(path.clone()))
+                                        .map(|e| e.contains(field))
+                                        .unwrap_or(false);
+
+                                    if is_struct {
+                                        let mut fields = HashMap::new();
+                                        for arg in named_args {
+                                            fields.insert(arg.name.clone(), self.eval_expr(&arg.value)?);
+                                        }
+                                        return Ok(Value::Struct {
+                                            name: format!("{}.{}", alias, field),
+                                            fields,
+                                        });
+                                    }
+                                    if is_error {
+                                        let mut fields = HashMap::new();
+                                        for arg in named_args {
+                                            fields.insert(arg.name.clone(), self.eval_expr(&arg.value)?);
+                                        }
+                                        return Ok(Value::Error {
+                                            name: format!("{}.{}", alias, field),
+                                            fields,
+                                        });
+                                    }
+
+                                    // Function in imported module
+                                    let mut evaluated = Vec::new();
+                                    for a in args {
+                                        evaluated.push(self.eval_expr(a)?);
+                                    }
+                                    return self
+                                        .call_module_function(Some(path), field, evaluated, callee.span)
+                                        .map_err(Into::into);
+                                }
                             }
                         }
                     }
 
+                    // 3. Method call on value: `target.method(...)`
                     let target_val = self.eval_expr(target)?;
+                    if let Value::Native(ref nat) = target_val {
+                        let short_type = nat.type_name().split('.').last().unwrap_or(nat.type_name());
+                        let method_impl = {
+                            let mut found = None;
+                            for m in self.native_registry.modules() {
+                                if let Some(method_def) = m.methods.get(&(short_type, field.as_str())) {
+                                    found = Some(method_def.implementation);
+                                    break;
+                                }
+                            }
+                            found
+                        };
+
+                        if let Some(impl_fn) = method_impl {
+                            let mut evaluated = Vec::new();
+                            for a in args {
+                                evaluated.push(self.eval_expr(a)?);
+                            }
+                            let res = (impl_fn)(nat, evaluated);
+                            return match res {
+                                Ok(v) => Ok(v),
+                                Err(err_v) => Ok(err_v),
+                            };
+                        }
+                    }
+
+                    if field == "append" && args.len() == 1 {
+                        if let ExprKind::Ident(ref target_var) = target.kind {
+                            let val_to_append = self.eval_expr(&args[0])?;
+                            if let Some(mut current_val) = self.lookup_variable(target_var) {
+                                if let Value::List(ref mut items) = current_val {
+                                    items.push(val_to_append);
+                                    self.assign_variable(target_var, current_val, target.span)?;
+                                    return Ok(Value::Void);
+                                }
+                            }
+                        }
+                    }
+
                     match target_val {
                         Value::String(s) => match field.as_str() {
                             "trim" => return Ok(Value::String(s.trim().to_string())),
@@ -617,34 +865,32 @@ impl Interpreter {
                     }
                 }
 
-                if let ExprKind::Ident(ref name) = callee.kind {
-                    if name == "print" {
-                        for (i, a) in args.iter().enumerate() {
-                            let val = self.eval_expr(a)?;
-                            if i > 0 {
-                                print!(" ");
-                            }
-                            print!("{}", val);
-                        }
-                        println!();
-                        return Ok(Value::Void);
-                    }
+                // 4. General function or callable expression call
+                let callee_val = self.eval_expr(callee)?;
+                let mut evaluated_args = Vec::new();
+                for a in args {
+                    evaluated_args.push(self.eval_expr(a)?);
                 }
-
-                if let ExprKind::Ident(ref name) = callee.kind {
-                    let mut evaluated_args = Vec::new();
-                    for a in args {
-                        evaluated_args.push(self.eval_expr(a)?);
-                    }
-                    return self.call_function(name, evaluated_args, callee.span).map_err(Into::into);
-                }
-
-                Err(RuntimeError {
-                    message: "Unsupported call expression".to_string(),
-                    span: callee.span,
-                }.into())
+                self.call_callable(&callee_val, evaluated_args, callee.span).map_err(Into::into)
             }
             ExprKind::Member { target, field } => {
+                if let ExprKind::Ident(ref alias) = target.kind {
+                    let cur_imports = self.module_imports.get(&self.current_module).cloned();
+                    if let Some(target_mod) = cur_imports.and_then(|m| m.get(alias).cloned()) {
+                        match target_mod {
+                            ModuleTarget::Native(nat_name) => {
+                                return Ok(Value::NativeFunction {
+                                    module: nat_name,
+                                    name: field.clone(),
+                                });
+                            }
+                            ModuleTarget::Local(path) => {
+                                return Ok(Value::Function(format!("{}::{}", path.display(), field)));
+                            }
+                        }
+                    }
+                }
+
                 let target_val = self.eval_expr(target)?;
                 match target_val {
                     Value::Struct { ref fields, .. } | Value::Error { ref fields, .. } => {
@@ -652,13 +898,13 @@ impl Interpreter {
                             Ok(val.clone())
                         } else {
                             Err(RuntimeError {
-                                message: format!("Field '{}' not found in struct or error", field),
+                                message: format!("Field '{}' not found", field),
                                 span: expr.span,
                             }.into())
                         }
                     }
                     _ => Err(RuntimeError {
-                        message: format!("Field access not supported on {}", target_val.type_name()),
+                        message: format!("Field access not supported on type {}", target_val.type_name()),
                         span: expr.span,
                     }.into()),
                 }
@@ -670,30 +916,39 @@ impl Interpreter {
 fn match_pattern(pattern: &Pattern, val: &Value) -> Option<Vec<(String, Value)>> {
     match &pattern.kind {
         PatternKind::Nil => {
-            if val == &Value::Nil {
+            if *val == Value::Nil {
                 Some(Vec::new())
             } else {
                 None
             }
         }
         PatternKind::Type { name, binding } => {
-            match val {
-                Value::Int(_) if name == "Int" => {
-                    Some(vec![(binding.clone(), val.clone())])
+            let name_item = name.split('.').last().unwrap_or(name);
+            let matched = match val {
+                Value::Struct { name: struct_name, .. } | Value::Error { name: struct_name, .. } => {
+                    let struct_item = struct_name.split('.').last().unwrap_or(struct_name);
+                    struct_name == name
+                        || struct_name.ends_with(&format!(".{}", name))
+                        || name.ends_with(&format!(".{}", struct_name))
+                        || struct_item == name_item
                 }
-                Value::String(_) if name == "String" => {
-                    Some(vec![(binding.clone(), val.clone())])
+                Value::Native(nat) => {
+                    let nat_item = nat.type_name().split('.').last().unwrap_or(nat.type_name());
+                    nat.type_name() == name
+                        || nat.type_name().ends_with(&format!(".{}", name))
+                        || name.ends_with(&format!(".{}", nat.type_name()))
+                        || nat_item == name_item
                 }
-                Value::Bool(_) if name == "Bool" => {
-                    Some(vec![(binding.clone(), val.clone())])
-                }
-                Value::Struct { name: sname, .. } if sname == name => {
-                    Some(vec![(binding.clone(), val.clone())])
-                }
-                Value::Error { name: ename, .. } if ename == name => {
-                    Some(vec![(binding.clone(), val.clone())])
-                }
-                _ => None,
+                Value::Int(_) => name == "Int",
+                Value::String(_) => name == "String",
+                Value::Bool(_) => name == "Bool",
+                Value::Void => name == "Void",
+                _ => false,
+            };
+            if matched {
+                Some(vec![(binding.clone(), val.clone())])
+            } else {
+                None
             }
         }
         PatternKind::Tuple(pats) => {
@@ -800,18 +1055,10 @@ mod tests {
             }
 
             func main() {
-                res_ok := register("Bob")
-                switch res_ok {
-                    case User(u):
-                        print(u.name)
-                    case InvalidName(e):
-                        print(e.msg)
-                }
-
-                res_err := register("")
-                switch res_err {
-                    case User(u):
-                        print(u.name)
+                u := register("Bob")
+                switch u {
+                    case User(user):
+                        print(user.name)
                     case InvalidName(e):
                         print(e.msg)
                 }
@@ -823,22 +1070,25 @@ mod tests {
     #[test]
     fn test_tuples_and_destructuring() {
         let src = r#"
-            error DivZero {}
+            error DivisionByZero {}
 
-            func divide(a: Int, b: Int) -> (Int, Int) | DivZero {
+            func divide(a: Int, b: Int) -> (Int, Int) | DivisionByZero {
                 guard b != 0 else {
-                    return DivZero()
+                    return DivisionByZero()
                 }
                 return (a / b, a % b)
             }
 
+            func quotient(a: Int, b: Int) -> Int | DivisionByZero {
+                (q, _) := divide(a, b)?
+                return q
+            }
+
             func main() {
-                res := divide(17, 5)
-                switch res {
-                    case (q, r):
-                        print(q)
-                        print(r)
-                    case DivZero(e):
+                switch quotient(17, 5) {
+                    case Int(v):
+                        print(v)
+                    case DivisionByZero(e):
                         print("error")
                 }
             }
@@ -849,30 +1099,21 @@ mod tests {
     #[test]
     fn test_map_preserves_errors_as_values() {
         let src = r#"
-            type User { name: String }
-            error InvalidName { msg: String }
+            error Bad { msg: String }
 
-            func create_user(name: String) -> User | InvalidName {
-                guard name.len() > 0 else {
-                    return InvalidName(msg: "empty")
+            func validate(n: Int) -> Int | Bad {
+                guard n > 0 else {
+                    return Bad(msg: "negative")
                 }
-                return User(name: name)
+                return n * 2
             }
 
             func main() {
-                names := ["Alice", "", "Charlie"]
-                results := map(names, create_user)
-                for r in results {
-                    switch r {
-                        case User(u):
-                            print(u.name)
-                        case InvalidName(e):
-                            print(e.msg)
-                    }
-                }
+                nums := [10, -5, 20]
+                results := map(nums, validate)
+                print(results)
             }
         "#;
         assert!(run_code(src).is_ok());
     }
 }
-

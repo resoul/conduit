@@ -1,12 +1,15 @@
 use std::env;
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::process;
 
-use conduit::ast::Program;
 use conduit::check::TypeChecker;
 use conduit::interp::Interpreter;
 use conduit::lexer::Lexer;
+use conduit::loader::ModuleLoader;
+use conduit::native::NativeRegistry;
 use conduit::parser::Parser;
+use conduit::reachability::ReachabilityAnalyzer;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -81,9 +84,7 @@ fn main() {
                 process::exit(1);
             }
             let file_path = &args[2];
-            let content = read_file(file_path);
-
-            let _ = parse_and_check(file_path, &content);
+            let _ = load_and_check(file_path);
             println!("Check passed: '{}' is valid.", file_path);
         }
         "run" => {
@@ -93,14 +94,34 @@ fn main() {
                 process::exit(1);
             }
             let file_path = &args[2];
-            let content = read_file(file_path);
-
-            let program = parse_and_check(file_path, &content);
+            let (root, loader) = load_and_check(file_path);
 
             let mut interpreter = Interpreter::new();
-            if let Err(err) = interpreter.run_program(&program) {
+            if let Err(err) = interpreter.run_project(&root, &loader) {
                 eprintln!("{}", err);
                 process::exit(1);
+            }
+        }
+        "reachability" => {
+            if args.len() < 3 {
+                eprintln!("Error: missing file path for 'reachability' command");
+                eprintln!("Usage: conduit reachability <file.cdt>");
+                process::exit(1);
+            }
+            let file_path = &args[2];
+            let (root, loader) = load_and_check(file_path);
+            let native_reg = NativeRegistry::new();
+            let mut analyzer = ReachabilityAnalyzer::new(&loader.modules, &native_reg);
+            let report = analyzer.analyze(&root, &[]);
+            println!("=== Reachability Analysis Report ===");
+            println!("Root module: {}", report.root_module.display());
+            println!(
+                "Reachable functions: {} / {} total ({} unused)",
+                report.reachable_functions_count, report.total_functions, report.unused_functions_count
+            );
+            println!("Reachable native functions ({}):", report.reachable_native_functions.len());
+            for (m, f) in &report.reachable_native_functions {
+                println!("  - {}.{}()", m, f);
             }
         }
         "lsp" => {
@@ -117,19 +138,11 @@ fn main() {
     }
 }
 
-fn parse_and_check(_path: &str, content: &str) -> Program {
-    let mut lexer = Lexer::new(content);
-    let tokens = match lexer.tokenize_all() {
-        Ok(t) => t,
-        Err(err) => {
-            eprintln!("{}", err);
-            process::exit(1);
-        }
-    };
-
-    let mut parser = Parser::new(tokens);
-    let program = match parser.parse_program() {
-        Ok(p) => p,
+fn load_and_check(file_path: &str) -> (PathBuf, ModuleLoader) {
+    let path = Path::new(file_path);
+    let mut loader = ModuleLoader::new();
+    let root = match loader.load_project(path) {
+        Ok(r) => r,
         Err(err) => {
             eprintln!("{}", err);
             process::exit(1);
@@ -137,12 +150,12 @@ fn parse_and_check(_path: &str, content: &str) -> Program {
     };
 
     let mut checker = TypeChecker::new();
-    if let Err(err) = checker.check_program(&program) {
+    if let Err(err) = checker.check_project(&root, &loader) {
         eprintln!("{}", err);
         process::exit(1);
     }
 
-    program
+    (root, loader)
 }
 
 fn read_file(path: &str) -> String {
@@ -159,11 +172,12 @@ fn print_usage() {
     println!("Conduit Programming Language v{}", conduit::VERSION);
     println!();
     println!("Usage:");
-    println!("  conduit run <file.cdt>       Type-check and execute a source file");
-    println!("  conduit check <file.cdt>     Type-check a source file");
-    println!("  conduit ast <file.cdt>       Parse and display the AST of a source file");
-    println!("  conduit tokens <file.cdt>    Print tokens of a source file");
-    println!("  conduit lsp                  Start the Language Server Protocol (LSP) server");
-    println!("  conduit --version            Show version");
-    println!("  conduit --help               Show this help message");
+    println!("  conduit run <file.cdt>          Type-check and execute a source file");
+    println!("  conduit check <file.cdt>        Type-check a source file and its imports");
+    println!("  conduit reachability <file.cdt> Analyze reachable functions and native dependencies");
+    println!("  conduit ast <file.cdt>          Parse and display the AST of a source file");
+    println!("  conduit tokens <file.cdt>       Print tokens of a source file");
+    println!("  conduit lsp                     Start the Language Server Protocol (LSP) server");
+    println!("  conduit --version               Show version");
+    println!("  conduit --help                  Show this help message");
 }

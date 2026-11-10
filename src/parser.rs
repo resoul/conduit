@@ -98,19 +98,112 @@ impl Parser {
     }
 
     fn parse_item(&mut self) -> Result<Item, ParserError> {
+        let mut is_exported = false;
+        let mut export_span = None;
+
+        if self.match_token(&TokenKind::KwExport) {
+            export_span = Some(self.tokens[self.cursor - 1].span);
+            is_exported = true;
+
+            if self.check(&TokenKind::KwExport) {
+                return Err(ParserError {
+                    message: "Repeated 'export' modifier".to_string(),
+                    span: self.peek().span,
+                });
+            }
+
+            if self.check(&TokenKind::KwImport) {
+                return Err(ParserError {
+                    message: "'export' cannot be applied to 'import'".to_string(),
+                    span: self.peek().span,
+                });
+            }
+        }
+
         let tok = self.peek();
         match tok.kind {
-            TokenKind::KwFunc => self.parse_func_item(),
-            TokenKind::KwType => self.parse_type_item(),
-            TokenKind::KwError => self.parse_error_item(),
-            _ => Err(ParserError {
-                message: format!("Expected 'func', 'type', or 'error', got '{:?}'", tok.kind),
-                span: tok.span,
-            }),
+            TokenKind::KwFunc => self.parse_func_item(is_exported),
+            TokenKind::KwType => self.parse_type_item(is_exported),
+            TokenKind::KwError => self.parse_error_item(is_exported),
+            TokenKind::KwImport => {
+                if is_exported {
+                    return Err(ParserError {
+                        message: "'export' cannot be applied to 'import'".to_string(),
+                        span: export_span.unwrap_or(tok.span),
+                    });
+                }
+                self.parse_import_item()
+            }
+            _ => {
+                if is_exported {
+                    return Err(ParserError {
+                        message: format!("'export' can only be applied to 'func', 'type', or 'error', got '{:?}'", tok.kind),
+                        span: tok.span,
+                    });
+                }
+                Err(ParserError {
+                    message: format!("Expected 'func', 'type', 'error', or 'import', got '{:?}'", tok.kind),
+                    span: tok.span,
+                })
+            }
         }
     }
 
-    fn parse_func_item(&mut self) -> Result<Item, ParserError> {
+    fn parse_import_item(&mut self) -> Result<Item, ParserError> {
+        let start_span = self.expect(&TokenKind::KwImport)?.span;
+        let (path, is_local) = match &self.peek().kind {
+            TokenKind::String(s) => {
+                let s = s.clone();
+                self.bump();
+                (s, true)
+            }
+            TokenKind::Ident(first) => {
+                let mut path = first.clone();
+                self.bump();
+                while self.match_token(&TokenKind::Dot) {
+                    let (seg, _) = self.expect_ident()?;
+                    path.push('.');
+                    path.push_str(&seg);
+                }
+                (path, false)
+            }
+            other => {
+                return Err(ParserError {
+                    message: format!("Expected module path or string literal in import, got '{:?}'", other),
+                    span: self.peek().span,
+                });
+            }
+        };
+
+        if is_local {
+            if path.ends_with(".cdt") {
+                return Err(ParserError {
+                    message: format!("Local import path '{}' must not include '.cdt' extension", path),
+                    span: start_span,
+                });
+            }
+
+            if !self.match_token(&TokenKind::KwAs) {
+                return Err(ParserError {
+                    message: format!("Local import '{}' requires an explicit alias using 'as'", path),
+                    span: start_span,
+                });
+            }
+            let (alias, _) = self.expect_ident()?;
+            Ok(Item::new_exported(ItemKind::Import { path, alias }, start_span, false))
+        } else {
+            let default_alias = path.split('.').last().unwrap_or(&path).to_string();
+            let alias = if self.match_token(&TokenKind::KwAs) {
+                let (custom_alias, _) = self.expect_ident()?;
+                custom_alias
+            } else {
+                default_alias
+            };
+            Ok(Item::new_exported(ItemKind::Import { path, alias }, start_span, false))
+        }
+    }
+
+    fn parse_func_item(&mut self, is_exported: bool) -> Result<Item, ParserError> {
         let start_span = self.expect(&TokenKind::KwFunc)?.span;
         let (name, _) = self.expect_ident()?;
 
@@ -140,7 +233,7 @@ impl Parser {
 
         let body = self.parse_block()?;
 
-        Ok(Item::new(
+        Ok(Item::new_exported(
             ItemKind::Func {
                 name,
                 params,
@@ -148,10 +241,11 @@ impl Parser {
                 body,
             },
             start_span,
+            is_exported,
         ))
     }
 
-    fn parse_type_item(&mut self) -> Result<Item, ParserError> {
+    fn parse_type_item(&mut self, is_exported: bool) -> Result<Item, ParserError> {
         let start_span = self.expect(&TokenKind::KwType)?.span;
         let (name, _) = self.expect_ident()?;
 
@@ -171,10 +265,10 @@ impl Parser {
         }
         self.expect(&TokenKind::RBrace)?;
 
-        Ok(Item::new(ItemKind::Type { name, fields }, start_span))
+        Ok(Item::new_exported(ItemKind::Type { name, fields }, start_span, is_exported))
     }
 
-    fn parse_error_item(&mut self) -> Result<Item, ParserError> {
+    fn parse_error_item(&mut self, is_exported: bool) -> Result<Item, ParserError> {
         let start_span = self.expect(&TokenKind::KwError)?.span;
         let (name, _) = self.expect_ident()?;
 
@@ -194,7 +288,7 @@ impl Parser {
         }
         self.expect(&TokenKind::RBrace)?;
 
-        Ok(Item::new(ItemKind::Error { name, fields }, start_span))
+        Ok(Item::new_exported(ItemKind::Error { name, fields }, start_span, is_exported))
     }
 
     fn parse_type_expr(&mut self) -> Result<TypeExpr, ParserError> {
@@ -223,14 +317,26 @@ impl Parser {
                 }
             }
             self.expect(&TokenKind::RParen)?;
-            if types.len() == 1 {
+            if self.match_token(&TokenKind::Arrow) {
+                let ret = self.parse_type_expr()?;
+                TypeExpr::Func {
+                    params: types,
+                    return_type: Box::new(ret),
+                }
+            } else if types.len() == 1 {
                 types.pop().unwrap()
             } else {
                 TypeExpr::Tuple(types)
             }
         } else {
             let (name, _) = self.expect_ident()?;
-            TypeExpr::Named(name)
+            let full_name = if self.match_token(&TokenKind::Dot) {
+                let (sub, _) = self.expect_ident()?;
+                format!("{}.{}", name, sub)
+            } else {
+                name
+            };
+            TypeExpr::Named(full_name)
         };
 
         while self.match_token(&TokenKind::Question) {
@@ -433,12 +539,18 @@ impl Parser {
             }
             TokenKind::Ident(name) => {
                 self.bump();
+                let full_name = if self.match_token(&TokenKind::Dot) {
+                    let (sub, _) = self.expect_ident()?;
+                    format!("{}.{}", name, sub)
+                } else {
+                    name
+                };
                 if self.match_token(&TokenKind::LParen) {
                     let (binding, _) = self.expect_ident()?;
                     self.expect(&TokenKind::RParen)?;
-                    Ok(Pattern::new(PatternKind::Type { name, binding }, tok.span))
+                    Ok(Pattern::new(PatternKind::Type { name: full_name, binding }, tok.span))
                 } else {
-                    Ok(Pattern::new(PatternKind::Ident(name), tok.span))
+                    Ok(Pattern::new(PatternKind::Ident(full_name), tok.span))
                 }
             }
             _ => Err(ParserError {

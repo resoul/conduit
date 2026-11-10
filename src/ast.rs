@@ -7,6 +7,10 @@ pub enum TypeExpr {
     Optional(Box<TypeExpr>),
     Union(Vec<TypeExpr>),
     Tuple(Vec<TypeExpr>),
+    Func {
+        params: Vec<TypeExpr>,
+        return_type: Box<TypeExpr>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,17 +208,34 @@ pub enum ItemKind {
         name: String,
         fields: Vec<FieldDef>,
     },
+    Import {
+        path: String,
+        alias: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Item {
     pub kind: ItemKind,
     pub span: Span,
+    pub is_exported: bool,
 }
 
 impl Item {
     pub fn new(kind: ItemKind, span: Span) -> Self {
-        Self { kind, span }
+        Self {
+            kind,
+            span,
+            is_exported: false,
+        }
+    }
+
+    pub fn new_exported(kind: ItemKind, span: Span, is_exported: bool) -> Self {
+        Self {
+            kind,
+            span,
+            is_exported,
+        }
     }
 }
 

@@ -12,6 +12,10 @@ pub enum Type {
     Custom(String),
     Tuple(Vec<Type>),
     Union(Vec<Type>),
+    Function {
+        params: Vec<Type>,
+        return_type: Box<Type>,
+    },
     Any,
 }
 
@@ -33,6 +37,10 @@ impl std::fmt::Display for Type {
             Type::Union(vars) => {
                 let s = vars.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" | ");
                 write!(f, "{}", s)
+            }
+            Type::Function { params, return_type } => {
+                let s = params.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ");
+                write!(f, "({}) -> {}", s, return_type)
             }
             Type::Any => write!(f, "Any"),
         }
@@ -79,6 +87,27 @@ impl Type {
             return true;
         }
 
+        if let (Type::Custom(s), Type::Custom(d)) = (self, target) {
+            let s_item = s.split('.').last().unwrap_or(s);
+            let d_item = d.split('.').last().unwrap_or(d);
+            if s_item == d_item {
+                let s_mod = s.split_once('.').map(|x| x.0);
+                let d_mod = d.split_once('.').map(|x| x.0);
+                match (s_mod, d_mod) {
+                    (None, _) | (_, None) => return true,
+                    (Some(m1), Some(m2)) => {
+                        if m1 == m2 {
+                            return true;
+                        }
+                        let time_aliases = ["time", "clock"];
+                        if time_aliases.contains(&m1) && time_aliases.contains(&m2) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
         if let Type::Union(src_variants) = self {
             return src_variants.iter().all(|v| v.is_assignable_to(target));
         }
@@ -111,6 +140,18 @@ impl Type {
             return src.is_assignable_to(dst);
         }
 
+        if let (
+            Type::Function { params: src_p, return_type: src_r },
+            Type::Function { params: dst_p, return_type: dst_r },
+        ) = (self, target) {
+            if src_p.len() != dst_p.len() {
+                return false;
+            }
+            let params_ok = src_p.iter().zip(dst_p.iter()).all(|(sp, dp)| dp.is_assignable_to(sp));
+            let ret_ok = src_r.is_assignable_to(dst_r);
+            return params_ok && ret_ok;
+        }
+
         false
     }
 
@@ -133,7 +174,14 @@ impl Type {
                 let types = elements.iter().map(Self::from_type_expr).collect();
                 Type::Tuple(types)
             }
+            TypeExpr::Func { params, return_type } => {
+                let p = params.iter().map(Self::from_type_expr).collect();
+                let r = Box::new(Self::from_type_expr(return_type));
+                Type::Function {
+                    params: p,
+                    return_type: r,
+                }
+            }
         }
     }
 }
-

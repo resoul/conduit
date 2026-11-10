@@ -5,6 +5,50 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
+## [0.1.4] - 2026-11-10
+
+### Added
+
+* **Explicit Exports (`export func`, `export type`, `export error`)**:
+  * Top-level declarations are private to the defining module by default.
+  * Explicit `export` keyword exposes functions, types, and errors to importing modules. Case does not determine visibility.
+  * Strict private type leakage check: exported functions, structs, or errors cannot expose private types in parameters, return types, fields, or nested in collections, tuples, unions, or function signatures.
+
+* **Module Imports & Canonical Path Resolution**:
+  * Standard library imports: `import cdt.time` (default alias `time`) and `import cdt.time as clock`.
+  * Local file imports: `import "./users" as users` and `import "../shared/validation" as validation`.
+  * Canonical path normalization ensures a file loaded via different relative paths creates a single module identity.
+  * Cyclic import detection with clear error chains (e.g., `a.cdt -> b.cdt -> a.cdt`).
+
+* **First-Class Functions and Callbacks Across Modules**:
+  * Imported and native functions can be passed as first-class values (`op := users.find; op(42)`).
+  * Seamless integration with `map(list, callback)` and `filter(list, callback)`.
+
+* **Unified Native Registry & `cdt.time` Standard Library**:
+  * Shared registry architecture (`NativeRegistry`) for native modules, functions, opaque types, and methods.
+  * First standard library `cdt.time`:
+    * Opaque types: `time.Timestamp`, `time.Instant`, `time.Duration`.
+    * Typed error: `time.TimeError { message: String }`.
+    * Functions: `time.now()`, `time.monotonic()`, `time.elapsed(start)`, `time.seconds(val)`, `time.milliseconds(val)`.
+    * Methods: `Timestamp.unix_seconds()`, `Timestamp.unix_milliseconds()`, `Duration.seconds()`, `Duration.milliseconds()`, `Duration.nanoseconds()`.
+    * Negative Unix timestamp flooring towards negative infinity (half a second before epoch produces `-1` Unix second).
+    * `elapsed()` validates monotonic clock progression, safely handling non-negative durations and reporting invalid/reversed order as `TimeError`.
+
+* **Reachability Analysis Tool (`conduit reachability`)**:
+  * Static dead-code and dependency analyzer tracing functions and native dependencies reachable from `main`.
+  * Generates summary reports showing reachable vs unused functions count and active native dependencies.
+
+* **LSP & TextMate Grammar Support**:
+  * Added `export`, `import`, and `as` keywords to syntax grammar and LSP completion.
+  * Context-aware autocompletion on module dot triggers (`time.`, `<alias>.`), exposing only exported items.
+  * LSP hover integrated with `NativeRegistry` documentation and function/method signatures.
+
+* **Examples (`examples/modules/`)**:
+  * Added runnable multi-module demo `users.cdt` and `main.cdt`.
+  * Added `time_demo.cdt` demonstrating `cdt.time` operations with propagation and switch pattern matching.
+
+---
+
 ## [0.1.3] - 2026-11-10
 
 ### Added

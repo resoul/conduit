@@ -1,0 +1,26 @@
+// time_demo.cdt - Standard library cdt.time demonstration
+
+import cdt.time
+
+func demo() -> Void | time.TimeError {
+    started := time.monotonic()
+    timestamp := time.now()?
+    print("Unix seconds:")
+    print(timestamp.unix_seconds()?)
+
+    duration := time.elapsed(started)?
+    print("Elapsed nanoseconds:")
+    print(duration.nanoseconds()?)
+}
+
+func main() {
+    print("=== Conduit cdt.time Standard Library Demo ===")
+    switch demo() {
+        case Void(v):
+            print("Time operations completed successfully.")
+        case time.TimeError(e):
+            print("Time operation failed:")
+            print(e.message)
+    }
+}
+

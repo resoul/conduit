@@ -21,7 +21,7 @@
     },
     {
       "name": "keyword.control.conduit",
-      "match": "\\b(func|return|if|else|guard|for|in|break|continue|switch|case|var|type|error)\\b"
+      "match": "\\b(func|return|if|else|guard|for|in|break|continue|switch|case|var|type|error|export|import|as)\\b"
     },
     {
       "name": "constant.language.boolean.conduit",

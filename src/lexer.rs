@@ -33,6 +33,9 @@ pub enum TokenKind {
     KwError,
     KwSwitch,
     KwCase,
+    KwExport,
+    KwImport,
+    KwAs,
 
     ColonAssign,
     Arrow,
@@ -259,6 +262,9 @@ impl<'a> Lexer<'a> {
             "error" => TokenKind::KwError,
             "switch" => TokenKind::KwSwitch,
             "case" => TokenKind::KwCase,
+            "export" => TokenKind::KwExport,
+            "import" => TokenKind::KwImport,
+            "as" => TokenKind::KwAs,
             "_" => TokenKind::Underscore,
             _ => TokenKind::Ident(word.to_string()),
         };
@@ -451,6 +457,16 @@ mod tests {
         assert!(tokens.iter().any(|t| t.kind == TokenKind::KwCase));
         assert!(tokens.iter().any(|t| t.kind == TokenKind::Underscore));
         assert!(tokens.iter().any(|t| t.kind == TokenKind::Bar));
+    }
+
+    #[test]
+    fn test_lex_export_import_as() {
+        let mut lexer = Lexer::new("export func foo() {}\nimport cdt.time as clock\nimport \"./users\" as users");
+        let tokens = lexer.tokenize_all().unwrap();
+        assert_eq!(tokens[0].kind, TokenKind::KwExport);
+        assert_eq!(tokens[1].kind, TokenKind::KwFunc);
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::KwImport));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::KwAs));
     }
 }
 
