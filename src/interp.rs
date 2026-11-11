@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -6,7 +7,8 @@ use crate::ast::*;
 use crate::lexer::{ESCAPED_CLOSE_BRACE, ESCAPED_OPEN_BRACE, Span};
 use crate::loader::{ModuleLoader, ModuleTarget};
 use crate::native::json::{
-    decode_node_to_conduit, encode_conduit_value, make_decode_error, make_encode_error, parse_json,
+    JsonDecodePlan, JsonEncodeSchema, decode_json_with_plan, encode_with_plan,
+    make_decode_error, make_encode_error,
 };
 use crate::native::NativeRegistry;
 use crate::types::{ModuleId, Type, TypeId};
@@ -68,6 +70,8 @@ pub struct Interpreter {
     module_structs: HashMap<Option<PathBuf>, HashSet<String>>,
     module_struct_type_params: HashMap<(Option<PathBuf>, String), Vec<String>>,
     module_struct_fields: HashMap<(Option<PathBuf>, String), Vec<crate::ast::FieldDef>>,
+    json_encode_schemas: RefCell<HashMap<TypeId, Arc<JsonEncodeSchema>>>,
+    json_decode_plans: RefCell<HashMap<Option<PathBuf>, HashMap<TypeExpr, Arc<JsonDecodePlan>>>>,
     module_errors: HashMap<Option<PathBuf>, HashSet<String>>,
     current_module: Option<PathBuf>,
     env: Vec<HashMap<String, Value>>,
@@ -84,6 +88,8 @@ impl Interpreter {
             module_structs: HashMap::new(),
             module_struct_type_params: HashMap::new(),
             module_struct_fields: HashMap::new(),
+            json_encode_schemas: RefCell::new(HashMap::new()),
+            json_decode_plans: RefCell::new(HashMap::new()),
             module_errors: HashMap::new(),
             current_module: None,
             env: vec![HashMap::new()],
@@ -120,12 +126,11 @@ impl Interpreter {
     }
 
     fn lookup_variable(&self, name: &str) -> Option<Value> {
-        for scope in self.env.iter().rev() {
-            if let Some(val) = scope.get(name) {
-                return Some(val.clone());
-            }
-        }
-        None
+        self.lookup_variable_ref(name).cloned()
+    }
+
+    fn lookup_variable_ref(&self, name: &str) -> Option<&Value> {
+        self.env.iter().rev().find_map(|scope| scope.get(name))
     }
 
     fn lookup_variable_mut(&mut self, name: &str) -> Option<&mut Value> {
@@ -300,6 +305,8 @@ impl Interpreter {
     }
 
     pub fn run_project(&mut self, root_path: &Path, loader: &ModuleLoader) -> Result<(), RuntimeError> {
+        self.json_encode_schemas.get_mut().clear();
+        self.json_decode_plans.get_mut().clear();
         for (path, loaded_mod) in &loader.modules {
             let mut imports_map = HashMap::new();
             for (alias, (target, _)) in &loaded_mod.imports {
@@ -349,6 +356,8 @@ impl Interpreter {
     }
 
     pub fn run_program(&mut self, program: &Program) -> Result<(), RuntimeError> {
+        self.json_encode_schemas.get_mut().clear();
+        self.json_decode_plans.get_mut().clear();
         let mut structs_set = HashSet::new();
         let mut errors_set = HashSet::new();
         let mut imports_map = HashMap::new();
@@ -738,10 +747,19 @@ impl Interpreter {
         }
     }
 
-    fn struct_field_order(&self, type_id: &TypeId) -> Option<Vec<String>> {
+    fn resolve_json_encode_schema(&self, type_id: &TypeId) -> Option<Arc<JsonEncodeSchema>> {
+        if let Some(schema) = self.json_encode_schemas.borrow().get(type_id) {
+            return Some(Arc::clone(schema));
+        }
         let key = Self::type_id_to_mod_key(type_id)?;
         let defs = self.module_struct_fields.get(&key)?;
-        Some(defs.iter().map(|f| f.name.clone()).collect())
+        let fields = defs.iter().map(|f| {
+            let json_name = f.json_name.clone().unwrap_or_else(|| f.name.clone());
+            (f.name.clone(), json_name)
+        }).collect();
+        let schema = Arc::new(JsonEncodeSchema::new(fields));
+        self.json_encode_schemas.borrow_mut().insert(type_id.clone(), Arc::clone(&schema));
+        Some(schema)
     }
 
     fn substitute_runtime_type(ty: &Type, bindings: &HashMap<String, Type>) -> Type {
@@ -880,7 +898,7 @@ impl Interpreter {
         type_id: &TypeId,
         type_args: &[Type],
         span: Span,
-    ) -> Option<Vec<(String, Type)>> {
+    ) -> Option<Vec<(String, String, Type)>> {
         let key = Self::type_id_to_mod_key(type_id)?;
         let defs = self.module_struct_fields.get(&key)?;
         let tparams = self
@@ -899,32 +917,119 @@ impl Interpreter {
                 .resolve_ast_type_in_mod(&f.ty, mod_opt, &tparams, span)
                 .ok()?;
             let concrete = Self::substitute_runtime_type(&fty, &bindings);
-            out.push((f.name.clone(), concrete));
+            let json_name = f.json_name.clone().unwrap_or_else(|| f.name.clone());
+            out.push((f.name.clone(), json_name, concrete));
         }
         Some(out)
     }
 
     fn execute_json_encode(&self, val: &Value) -> Value {
-        let mut out = String::new();
-        match encode_conduit_value(val, "", &mut out, &|tid| self.struct_field_order(tid)) {
+        let capacity = match val {
+            Value::List(items) | Value::Tuple(items) => items.len().saturating_mul(64).max(64),
+            Value::Struct { .. } | Value::Map(_) => 128,
+            Value::String(value) => value.len().saturating_add(2),
+            _ => 64,
+        };
+        let mut out = String::with_capacity(capacity);
+        match encode_with_plan(val, "", &mut out, &|tid| {
+            self.resolve_json_encode_schema(tid)
+        }) {
             Ok(()) => Value::String(out),
             Err((path, msg)) => make_encode_error(path, msg),
         }
     }
 
     fn execute_json_decode(&self, raw: &str, type_expr: &TypeExpr, span: Span) -> Result<Value, RuntimeError> {
-        let target_ty =
-            self.resolve_ast_type_in_mod(type_expr, &self.current_module, &[], span)?;
-        let node = match parse_json(raw) {
-            Ok(n) => n,
-            Err((path, msg)) => return Ok(make_decode_error(path, msg)),
+        let cached = self.json_decode_plans.borrow().get(&self.current_module)
+            .and_then(|plans| plans.get(type_expr)).cloned();
+        let plan = match cached {
+            Some(plan) => plan,
+            None => {
+                let target_ty = self.resolve_ast_type_in_mod(type_expr, &self.current_module, &[], span)?;
+                let plan = Arc::new(JsonDecodePlan::compile(&target_ty, &|tid, targs| {
+                    self.resolve_struct_fields_for_json(tid, targs, span)
+                }));
+                self.json_decode_plans.borrow_mut().entry(self.current_module.clone())
+                    .or_default().insert(type_expr.clone(), Arc::clone(&plan));
+                plan
+            }
         };
-        match decode_node_to_conduit(&node, &target_ty, "", &|tid, targs| {
+        match decode_json_with_plan(raw, &plan, &|tid, targs| {
             self.resolve_struct_fields_for_json(tid, targs, span)
         }) {
             Ok(v) => Ok(v),
             Err((path, msg)) => Ok(make_decode_error(path, msg)),
         }
+    }
+
+    // JSON only reads its input. Borrow simple places for the duration of the
+    // call; effectful expressions still use the usual evaluation path once.
+    fn json_argument_ref(&self, expr: &Expr) -> Option<&Value> {
+        match &expr.kind {
+            ExprKind::Ident(name) => self.lookup_variable_ref(name),
+            ExprKind::Member { target, field } => {
+                // Member evaluation gives module aliases precedence over locals.
+                if let ExprKind::Ident(alias) = &target.kind {
+                    if self.module_imports.get(&self.current_module)
+                        .is_some_and(|imports| imports.contains_key(alias))
+                    {
+                        return None;
+                    }
+                }
+                match self.json_argument_ref(target)? {
+                    Value::Struct { fields, .. } | Value::Error { fields, .. } => fields.get(field),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn eval_json_encode_argument(&mut self, expr: &Expr) -> Result<Value, InterpFlow> {
+        if let Some(value) = self.json_argument_ref(expr) {
+            return Ok(self.execute_json_encode(value));
+        }
+        let value = self.eval_expr(expr)?;
+        Ok(self.execute_json_encode(&value))
+    }
+
+    fn decode_json_argument(
+        &self,
+        value: &Value,
+        type_expr: Option<&TypeExpr>,
+        span: Span,
+        argument_span: Span,
+    ) -> Result<Value, RuntimeError> {
+        let raw = match value {
+            Value::String(raw) => raw,
+            other => return Err(RuntimeError {
+                message: format!("json.decode expects String, got {}", other.type_name()),
+                span: argument_span,
+            }),
+        };
+        let type_expr = type_expr.ok_or_else(|| RuntimeError {
+            message: "json.decode requires a target type argument <T>".to_string(),
+            span,
+        })?;
+        self.execute_json_decode(raw, type_expr, span)
+    }
+
+    fn eval_json_decode_argument(
+        &mut self,
+        expr: &Expr,
+        type_expr: Option<&TypeExpr>,
+        span: Span,
+    ) -> Result<Value, InterpFlow> {
+        if let Some(value) = self.json_argument_ref(expr) {
+            return self.decode_json_argument(value, type_expr, span, expr.span).map_err(Into::into);
+        }
+        let value = self.eval_expr(expr)?;
+        self.decode_json_argument(&value, type_expr, span, expr.span).map_err(Into::into)
+    }
+
+    fn is_json_encode_function(value: &Value) -> bool {
+        matches!(value, Value::NativeFunction { module, name }
+            if module == "cdt.json" && name == "encode")
     }
 
     fn is_mutable_place(expr: &Expr) -> bool {
@@ -1530,6 +1635,9 @@ impl Interpreter {
                         && named_args.is_empty()
                     {
                         if let Some(callee_val) = self.lookup_variable(name) {
+                            if Self::is_json_encode_function(&callee_val) && args.len() == 1 {
+                                return self.eval_json_encode_argument(&args[0]);
+                            }
                             let mut evaluated_args = Vec::with_capacity(args.len());
                             for arg in args {
                                 evaluated_args.push(self.eval_expr(arg)?);
@@ -1697,28 +1805,12 @@ impl Interpreter {
                                     }
 
                                     if nat_name == "cdt.json" && field == "decode" {
-                                        let raw_val = self.eval_expr(&args[0])?;
-                                        let raw = match raw_val {
-                                            Value::String(s) => s,
-                                            other => {
-                                                return Err(RuntimeError {
-                                                    message: format!("json.decode expects String, got {}", other.type_name()),
-                                                    span: args[0].span,
-                                                }.into());
-                                            }
-                                        };
-                                        let target_texpr = type_args.first().ok_or_else(|| RuntimeError {
-                                            message: "json.decode requires a target type argument <T>".to_string(),
-                                            span: callee.span,
-                                        })?;
                                         return self
-                                            .execute_json_decode(&raw, target_texpr, callee.span)
-                                            .map_err(InterpFlow::Error);
+                                            .eval_json_decode_argument(&args[0], type_args.first(), callee.span);
                                     }
 
                                     if nat_name == "cdt.json" && field == "encode" {
-                                        let target_val = self.eval_expr(&args[0])?;
-                                        return Ok(self.execute_json_encode(&target_val));
+                                        return self.eval_json_encode_argument(&args[0]);
                                     }
 
                                     let (is_constructible, is_error) = {
@@ -1839,6 +1931,9 @@ impl Interpreter {
                 }
 
                 let callee_val = self.eval_expr(callee)?;
+                if Self::is_json_encode_function(&callee_val) && args.len() == 1 {
+                    return self.eval_json_encode_argument(&args[0]);
+                }
                 let mut evaluated_args = Vec::new();
                 for a in args {
                     evaluated_args.push(self.eval_expr(a)?);

@@ -2,7 +2,7 @@ import cdt.json as json
 import cdt.validation as validation
 
 type User {
-    name: String @validation.min(2)
+    name: String `json:"display_name"` @validation.min(2)
     email: String @validation.email
     score: Float @validation.min(0.0)
 }
@@ -14,7 +14,7 @@ func ingest(raw: String) -> String | json.DecodeError | validation.ValidationErr
 }
 
 func main() {
-    ok_raw := "{\"name\":\"Alice\",\"email\":\"alice@example.com\",\"score\":98.5}"
+    ok_raw := "{\"display_name\":\"Alice\",\"email\":\"alice@example.com\",\"score\":98.5}"
     switch ingest(ok_raw) {
         case String(encoded): print(encoded)
         case json.DecodeError(e): print("Decode error at {e.path}: {e.message}")

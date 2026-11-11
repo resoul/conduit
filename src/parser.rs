@@ -1,5 +1,6 @@
 use crate::ast::*;
 use crate::lexer::{Span, Token, TokenKind};
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParserError {
@@ -376,41 +377,76 @@ impl Parser {
 
         self.expect(&TokenKind::LBrace)?;
         let mut fields = Vec::new();
+        let mut field_names = HashSet::new();
+        let mut json_names = HashSet::new();
         while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
             let (field_name, field_span) = self.expect_ident()?;
+            if !field_names.insert(field_name.clone()) {
+                return Err(ParserError {
+                    message: format!("Duplicate field name '{}'", field_name),
+                    span: field_span,
+                });
+            }
             self.expect(&TokenKind::Colon)?;
             let field_ty = self.parse_type_expr()?;
 
+            let mut json_name = None;
+            let mut json_tag_span = None;
             let mut annotations = Vec::new();
-            while self.match_token(&TokenKind::At) {
-                let ann_span = self.tokens[self.cursor - 1].span;
-                let (target_first, _) = self.expect_ident()?;
-                let target = if self.match_token(&TokenKind::Dot) {
-                    let (sub, _) = self.expect_ident()?;
-                    format!("{}.{}", target_first, sub)
-                } else {
-                    target_first
-                };
-                let mut args = Vec::new();
-                if self.match_token(&TokenKind::LParen) {
-                    while !self.check(&TokenKind::RParen) && !self.check(&TokenKind::Eof) {
-                        args.push(self.parse_annotation_arg()?);
-                        if !self.match_token(&TokenKind::Comma) {
-                            break;
+            loop {
+                if self.match_token(&TokenKind::At) {
+                    let ann_span = self.tokens[self.cursor - 1].span;
+                    let (target_first, _) = self.expect_ident()?;
+                    let target = if self.match_token(&TokenKind::Dot) {
+                        let (sub, _) = self.expect_ident()?;
+                        format!("{}.{}", target_first, sub)
+                    } else {
+                        target_first
+                    };
+                    let mut args = Vec::new();
+                    if self.match_token(&TokenKind::LParen) {
+                        while !self.check(&TokenKind::RParen) && !self.check(&TokenKind::Eof) {
+                            args.push(self.parse_annotation_arg()?);
+                            if !self.match_token(&TokenKind::Comma) {
+                                break;
+                            }
                         }
+                        self.expect(&TokenKind::RParen)?;
                     }
-                    self.expect(&TokenKind::RParen)?;
+                    annotations.push(FieldAnnotation {
+                        target,
+                        args,
+                        span: ann_span,
+                    });
+                } else if matches!(&self.peek().kind, TokenKind::FieldTag(_)) {
+                    if json_tag_span.is_some() {
+                        return Err(ParserError {
+                            message: "A field can have only one JSON tag".to_string(),
+                            span: self.peek().span,
+                        });
+                    }
+                    let (parsed_name, tag_span) = self.parse_json_field_tag()?;
+                    json_tag_span = Some(tag_span);
+                    if !parsed_name.is_empty() {
+                        json_name = Some(parsed_name);
+                    }
+                } else {
+                    break;
                 }
-                annotations.push(FieldAnnotation {
-                    target,
-                    args,
-                    span: ann_span,
+            }
+
+            let effective_json_name = json_name.as_deref().unwrap_or(&field_name);
+            if !json_names.insert(effective_json_name.to_string()) {
+                return Err(ParserError {
+                    message: format!("Duplicate JSON field name '{}'", effective_json_name),
+                    span: json_tag_span.unwrap_or(field_span),
                 });
             }
 
             fields.push(FieldDef {
                 name: field_name,
                 ty: field_ty,
+                json_name,
                 annotations,
                 span: field_span,
             });
@@ -428,6 +464,76 @@ impl Parser {
             start_span,
             is_exported,
         ))
+    }
+
+    fn parse_json_field_tag(&mut self) -> Result<(String, Span), ParserError> {
+        let token = self.bump();
+        let span = token.span;
+        let raw = match token.kind {
+            TokenKind::FieldTag(raw) => raw,
+            _ => unreachable!(),
+        };
+
+        let Some(mut chars) = raw.strip_prefix("json:\"").map(str::chars) else {
+            return Err(ParserError {
+                message: "Field tags must use the form `json:\"name\"`".to_string(),
+                span,
+            });
+        };
+
+        let mut name = String::new();
+        loop {
+            match chars.next() {
+                None => {
+                    return Err(ParserError {
+                        message: "Unterminated JSON field name in tag".to_string(),
+                        span,
+                    });
+                }
+                Some('"') => {
+                    if chars.next().is_some() {
+                        return Err(ParserError {
+                            message: "Only a JSON field name is supported in field tags".to_string(),
+                            span,
+                        });
+                    }
+                    if name.contains(',') {
+                        return Err(ParserError {
+                            message: "JSON tag options are not supported; specify only the field name".to_string(),
+                            span,
+                        });
+                    }
+                    return Ok((name, span));
+                }
+                Some('\\') => {
+                    let escaped = match chars.next() {
+                        Some('\\') => '\\',
+                        Some('"') => '"',
+                        Some('a') => '\u{0007}',
+                        Some('b') => '\u{0008}',
+                        Some('f') => '\u{000C}',
+                        Some('n') => '\n',
+                        Some('r') => '\r',
+                        Some('t') => '\t',
+                        Some('v') => '\u{000B}',
+                        Some(other) => {
+                            return Err(ParserError {
+                                message: format!("Unsupported escape sequence '\\{}' in JSON field tag", other),
+                                span,
+                            });
+                        }
+                        None => {
+                            return Err(ParserError {
+                                message: "Unterminated escape sequence in JSON field tag".to_string(),
+                                span,
+                            });
+                        }
+                    };
+                    name.push(escaped);
+                }
+                Some(ch) => name.push(ch),
+            }
+        }
     }
 
     fn parse_annotation_arg(&mut self) -> Result<Expr, ParserError> {
@@ -509,6 +615,7 @@ impl Parser {
             fields.push(FieldDef {
                 name: field_name,
                 ty: field_ty,
+                json_name: None,
                 annotations: Vec::new(),
                 span: field_span,
             });

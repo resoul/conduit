@@ -20,6 +20,7 @@ pub enum TokenKind {
     IntMinMagnitude,
     Float(f64),
     String(String),
+    FieldTag(String),
 
     KwFunc,
     KwReturn,
@@ -270,6 +271,32 @@ impl<'a> Lexer<'a> {
         Ok(Token::new(TokenKind::String(content), start_span))
     }
 
+    fn read_field_tag(&mut self, start_span: Span) -> Result<Token, LexerError> {
+        self.bump_char();
+        let mut content = String::new();
+
+        loop {
+            match self.peek_char() {
+                None => {
+                    return Err(LexerError {
+                        message: "Unterminated field tag".to_string(),
+                        span: start_span,
+                    });
+                }
+                Some('`') => {
+                    self.bump_char();
+                    break;
+                }
+                Some(ch) => {
+                    content.push(ch);
+                    self.bump_char();
+                }
+            }
+        }
+
+        Ok(Token::new(TokenKind::FieldTag(content), start_span))
+    }
+
     fn read_identifier_or_keyword(&mut self, start_span: Span) -> Token {
         let start_offset = self.byte_offset;
         while let Some(ch) = self.peek_char() {
@@ -329,6 +356,10 @@ impl<'a> Lexer<'a> {
 
         if ch == '"' {
             return self.read_string(start_span);
+        }
+
+        if ch == '`' {
+            return self.read_field_tag(start_span);
         }
 
         self.bump_char();

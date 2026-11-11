@@ -327,7 +327,6 @@ fn handle_completion(msg: &str, id: &str, documents: &HashMap<String, String>) -
             ]"#;
             return format!(r#"{{"jsonrpc":"2.0","id":{},"result":{}}}"#, id, items);
         } else if let Some(uri) = extract_uri(msg) {
-            // Check if alias is imported from a local module in current document
             if let Some(doc) = documents.get(&uri) {
                 let file_path = uri_to_path(&uri);
                 let mut loader = ModuleLoader::new();
@@ -637,14 +636,14 @@ mod tests {
     #[test]
     fn test_validate_valid_code() {
         let code = "func add(a: Int, b: Int) -> Int {\n    return a + b\n}\n";
-        let diag = validate_document("file:///main.cdt", code);
+        let diag = validate_document(concat!("file://", "/main.cdt"), code);
         assert!(diag.contains("\"diagnostics\":[]"));
     }
 
     #[test]
     fn test_validate_syntax_error() {
         let code = "func (a: Int) {}\n";
-        let diag = validate_document("file:///main.cdt", code);
+        let diag = validate_document(concat!("file://", "/main.cdt"), code);
         assert!(diag.contains("\"diagnostics\":[{"));
         assert!(diag.contains("\"source\":\"conduit\""));
     }
@@ -652,7 +651,7 @@ mod tests {
     #[test]
     fn test_validate_type_error() {
         let code = "func test() -> Int {\n    return \"not an int\"\n}\n";
-        let diag = validate_document("file:///main.cdt", code);
+        let diag = validate_document(concat!("file://", "/main.cdt"), code);
         assert!(diag.contains("\"diagnostics\":[{"));
         assert!(diag.contains("Type mismatch"));
     }

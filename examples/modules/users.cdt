@@ -1,5 +1,3 @@
-// users.cdt - User management module demonstrating exports
-
 export type User {
     id: Int
     name: String

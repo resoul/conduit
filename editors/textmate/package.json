@@ -1,0 +1,25 @@
+{
+  "name": "conduit-textmate",
+  "displayName": "Conduit TextMate Grammar",
+  "description": "TextMate grammar for Conduit .cdt files",
+  "version": "0.1.0",
+  "engines": {
+    "vscode": "*"
+  },
+  "contributes": {
+    "languages": [
+      {
+        "id": "conduit",
+        "aliases": ["Conduit", "conduit"],
+        "extensions": [".cdt"]
+      }
+    ],
+    "grammars": [
+      {
+        "language": "conduit",
+        "scopeName": "source.conduit",
+        "path": "./conduit.tmLanguage.json"
+      }
+    ]
+  }
+}
