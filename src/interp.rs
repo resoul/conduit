@@ -10,7 +10,9 @@ use crate::native::json::{
 };
 use crate::native::NativeRegistry;
 use crate::types::{ModuleId, Type, TypeId};
-use crate::value::{make_index_error, make_key_error, ClosureData, MapKey, OrderedMap, Value};
+use crate::value::{
+    make_index_error, make_key_error, make_parse_error, ClosureData, MapKey, OrderedMap, Value,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeError {
@@ -105,6 +107,84 @@ impl Interpreter {
             }
         }
         None
+    }
+
+    fn lookup_variable_mut(&mut self, name: &str) -> Option<&mut Value> {
+        for scope in self.env.iter_mut().rev() {
+            if let Some(val) = scope.get_mut(name) {
+                return Some(val);
+            }
+        }
+        None
+    }
+
+    fn mutate_place<F>(
+        &mut self,
+        place: &Expr,
+        mutate_fn: F,
+    ) -> Result<Value, RuntimeError>
+    where
+        F: FnOnce(&mut Value) -> Result<Value, RuntimeError>,
+    {
+        let mut fields = Vec::new();
+        let mut cur = place;
+        let root_name = loop {
+            match &cur.kind {
+                ExprKind::Member { target, field } => {
+                    fields.push((field.clone(), cur.span));
+                    cur = target;
+                }
+                ExprKind::Ident(name) => break name.clone(),
+                _ => {
+                    return Err(RuntimeError {
+                        message: "Invalid assignment target".to_string(),
+                        span: place.span,
+                    });
+                }
+            }
+        };
+        fields.reverse();
+
+        let mut slot = self.lookup_variable_mut(&root_name).ok_or_else(|| RuntimeError {
+            message: format!("Cannot assign to undefined variable '{}'", root_name),
+            span: cur.span,
+        })?;
+
+        for (field_name, fspan) in fields {
+            match slot {
+                Value::Struct { fields: map, .. } => {
+                    slot = map.get_mut(&field_name).ok_or_else(|| RuntimeError {
+                        message: format!("Field '{}' not found", field_name),
+                        span: fspan,
+                    })?;
+                }
+                other => {
+                    return Err(RuntimeError {
+                        message: format!("Field access not supported on type {}", other.type_name()),
+                        span: fspan,
+                    });
+                }
+            }
+        }
+
+        mutate_fn(slot)
+    }
+
+    fn bind_for_pattern(&mut self, pattern: &Pattern, val: Value) {
+        match &pattern.kind {
+            PatternKind::Ident(var_name) => {
+                self.define_variable(var_name.clone(), val);
+            }
+            PatternKind::Wildcard => {}
+            PatternKind::Tuple(sub_pats) => {
+                if let Value::Tuple(items) = val {
+                    for (sub_pat, item) in sub_pats.iter().zip(items.into_iter()) {
+                        self.bind_for_pattern(sub_pat, item);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     fn snapshot_env(&self) -> HashMap<String, Value> {
@@ -825,6 +905,42 @@ impl Interpreter {
                 Ok(ControlFlow::Next)
             }
             StmtKind::Assign { target, value } => {
+                if let ExprKind::Index { target: container, index } = &target.kind {
+                    let key_val = match self.eval_expr(index) {
+                        Ok(v) => v,
+                        Err(InterpFlow::Return(ret)) => return Ok(ControlFlow::Return(ret)),
+                        Err(InterpFlow::Error(err)) => return Err(err),
+                    };
+                    let key = MapKey::from_value(&key_val).ok_or_else(|| RuntimeError {
+                        message: format!(
+                            "Map key must be String, Int, or Bool, got {}",
+                            key_val.type_name()
+                        ),
+                        span: index.span,
+                    })?;
+                    let rhs = match self.eval_expr(value) {
+                        Ok(v) => v,
+                        Err(InterpFlow::Return(ret)) => return Ok(ControlFlow::Return(ret)),
+                        Err(InterpFlow::Error(err)) => return Err(err),
+                    };
+                    let target_span = target.span;
+                    self.mutate_place(container, move |slot| {
+                        if let Value::Map(map) = slot {
+                            map.set(key, rhs);
+                            Ok(Value::Void)
+                        } else {
+                            Err(RuntimeError {
+                                message: format!(
+                                    "Index assignment is only supported on Map, got {}",
+                                    slot.type_name()
+                                ),
+                                span: target_span,
+                            })
+                        }
+                    })?;
+                    return Ok(ControlFlow::Next);
+                }
+
                 let val = match self.eval_expr(value) {
                     Ok(v) => v,
                     Err(InterpFlow::Return(ret)) => return Ok(ControlFlow::Return(ret)),
@@ -832,6 +948,11 @@ impl Interpreter {
                 };
                 if let ExprKind::Ident(ref name) = target.kind {
                     self.assign_variable(name, val, target.span)?;
+                } else {
+                    self.mutate_place(target, move |slot| {
+                        *slot = val;
+                        Ok(Value::Void)
+                    })?;
                 }
                 Ok(ControlFlow::Next)
             }
@@ -873,32 +994,66 @@ impl Interpreter {
                     Ok(ControlFlow::Next)
                 }
             }
-            StmtKind::ForIn { variable, iterable, body } => {
+            StmtKind::ForIn { pattern, iterable, body } => {
                 let iter_val = match self.eval_expr(iterable) {
                     Ok(v) => v,
                     Err(InterpFlow::Return(ret)) => return Ok(ControlFlow::Return(ret)),
                     Err(InterpFlow::Error(err)) => return Err(err),
                 };
-                if let Value::List(items) = iter_val {
-                    for item in items {
-                        self.enter_scope();
-                        self.define_variable(variable.clone(), item);
-                        let mut flow = ControlFlow::Next;
-                        for s in &body.stmts {
-                            match self.eval_stmt(s)? {
-                                ControlFlow::Next => {}
-                                other => {
-                                    flow = other;
-                                    break;
-                                }
+                let items = match iter_val {
+                    Value::List(items) => items,
+                    Value::Map(map) => map.entry_tuples(),
+                    _ => Vec::new(),
+                };
+                for item in items {
+                    self.enter_scope();
+                    self.bind_for_pattern(pattern, item);
+                    let mut flow = ControlFlow::Next;
+                    for s in &body.stmts {
+                        match self.eval_stmt(s)? {
+                            ControlFlow::Next => {}
+                            other => {
+                                flow = other;
+                                break;
                             }
                         }
-                        self.exit_scope();
-                        match flow {
-                            ControlFlow::Break => break,
-                            ControlFlow::Return(v) => return Ok(ControlFlow::Return(v)),
-                            _ => {}
+                    }
+                    self.exit_scope();
+                    match flow {
+                        ControlFlow::Break => break,
+                        ControlFlow::Return(v) => return Ok(ControlFlow::Return(v)),
+                        _ => {}
+                    }
+                }
+                Ok(ControlFlow::Next)
+            }
+            StmtKind::While { condition, body } => {
+                loop {
+                    let cond_val = match self.eval_expr(condition) {
+                        Ok(v) => v,
+                        Err(InterpFlow::Return(ret)) => return Ok(ControlFlow::Return(ret)),
+                        Err(InterpFlow::Error(err)) => return Err(err),
+                    };
+                    if !cond_val.is_truthy() {
+                        break;
+                    }
+                    self.enter_scope();
+                    let mut flow = ControlFlow::Next;
+                    for s in &body.stmts {
+                        match self.eval_stmt(s)? {
+                            ControlFlow::Next => {}
+                            other => {
+                                flow = other;
+                                break;
+                            }
                         }
+                    }
+                    self.exit_scope();
+                    match flow {
+                        ControlFlow::Break => break,
+                        ControlFlow::Continue => continue,
+                        ControlFlow::Return(v) => return Ok(ControlFlow::Return(v)),
+                        ControlFlow::Next => {}
                     }
                 }
                 Ok(ControlFlow::Next)
@@ -1046,6 +1201,24 @@ impl Interpreter {
                         self.eval_expr(right)
                     };
                 }
+                if *op == BinaryOp::And {
+                    let l = self.eval_expr(left)?;
+                    return if !l.is_truthy() {
+                        Ok(Value::Bool(false))
+                    } else {
+                        let r = self.eval_expr(right)?;
+                        Ok(Value::Bool(r.is_truthy()))
+                    };
+                }
+                if *op == BinaryOp::Or {
+                    let l = self.eval_expr(left)?;
+                    return if l.is_truthy() {
+                        Ok(Value::Bool(true))
+                    } else {
+                        let r = self.eval_expr(right)?;
+                        Ok(Value::Bool(r.is_truthy()))
+                    };
+                }
 
                 let l = self.eval_expr(left)?;
                 let r = self.eval_expr(right)?;
@@ -1143,8 +1316,7 @@ impl Interpreter {
                     },
                     BinaryOp::Eq => Ok(Value::Bool(l == r)),
                     BinaryOp::NotEq => Ok(Value::Bool(l != r)),
-                    BinaryOp::And => Ok(Value::Bool(l.is_truthy() && r.is_truthy())),
-                    BinaryOp::Or => Ok(Value::Bool(l.is_truthy() || r.is_truthy())),
+                    BinaryOp::And | BinaryOp::Or | BinaryOp::Coalesce => unreachable!(),
                     BinaryOp::Range => match (l, r) {
                         (Value::Int(start), Value::Int(end)) => {
                             let items = (start..end).map(Value::Int).collect();
@@ -1155,7 +1327,6 @@ impl Interpreter {
                             span: expr.span,
                         }.into()),
                     },
-                    BinaryOp::Coalesce => unreachable!(),
                 }
             }
             ExprKind::Call { callee, type_args, args, named_args } => {
@@ -1165,7 +1336,7 @@ impl Interpreter {
                     let cur_errors = self.module_errors.get(&self.current_module);
                     let is_error = cur_errors.map(|e| e.contains(name)).unwrap_or(false);
 
-                    if is_struct || is_error || name == "IndexError" || name == "KeyError" {
+                    if is_struct || is_error || matches!(name.as_str(), "IndexError" | "KeyError" | "ParseError") {
                         let mut fields = HashMap::new();
                         for arg in named_args {
                             fields.insert(arg.name.clone(), self.eval_expr(&arg.value)?);
@@ -1397,201 +1568,18 @@ impl Interpreter {
                     }
 
                     let target_val = self.eval_expr(target)?;
-                    if let Value::Native(ref nat) = target_val {
-                        let type_id = nat.type_id();
-                        let method_impl = if let ModuleId::Native(ref nat_name) = type_id.module {
-                            self.native_registry
-                                .get_module(nat_name)
-                                .and_then(|m| m.methods.get(&(type_id.name.as_str(), field.as_str())))
-                                .map(|md| md.implementation)
-                        } else {
-                            None
-                        };
+                    return self.eval_method_on_value(target_val, Some(target), field, args, expr.span);
+                }
 
-                        if let Some(impl_fn) = method_impl {
-                            let mut evaluated = Vec::new();
-                            for a in args {
-                                evaluated.push(self.eval_expr(a)?);
-                            }
-                            let res = (impl_fn)(nat, evaluated);
-                            return match res {
-                                Ok(v) => Ok(v),
-                                Err(err_v) => Ok(err_v),
-                            };
-                        }
+                if let ExprKind::OptionalMember { target, field } = &callee.kind {
+                    let target_val = self.eval_expr(target)?;
+                    if target_val == Value::Nil {
+                        return Ok(Value::Nil);
                     }
-
-                    if field == "append" && args.len() == 1 {
-                        if let ExprKind::Ident(ref target_var) = target.kind {
-                            let val_to_append = self.eval_expr(&args[0])?;
-                            if let Some(mut current_val) = self.lookup_variable(target_var) {
-                                if let Value::List(ref mut items) = current_val {
-                                    items.push(val_to_append);
-                                    self.assign_variable(target_var, current_val, target.span)?;
-                                    return Ok(Value::Void);
-                                }
-                            }
-                        }
+                    if target_val.is_error() {
+                        return Err(InterpFlow::Return(target_val));
                     }
-
-                    if (field == "set" && args.len() == 2) || (field == "remove" && args.len() == 1) {
-                        if let ExprKind::Ident(ref target_var) = target.kind {
-                            if let Some(mut current_val) = self.lookup_variable(target_var) {
-                                if let Value::Map(ref mut map) = current_val {
-                                    let key_val = self.eval_expr(&args[0])?;
-                                    let key = MapKey::from_value(&key_val).ok_or_else(|| RuntimeError {
-                                        message: format!(
-                                            "Map key must be String, Int, or Bool, got {}",
-                                            key_val.type_name()
-                                        ),
-                                        span: args[0].span,
-                                    })?;
-                                    if field == "set" {
-                                        let val = self.eval_expr(&args[1])?;
-                                        map.set(key, val);
-                                        self.assign_variable(target_var, current_val, target.span)?;
-                                        return Ok(Value::Void);
-                                    } else {
-                                        let removed = map.remove(&key);
-                                        self.assign_variable(target_var, current_val, target.span)?;
-                                        return Ok(removed.unwrap_or(Value::Nil));
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    match target_val {
-                        Value::Int(n) => match field.as_str() {
-                            "to_string" => return Ok(Value::String(n.to_string())),
-                            "to_float" => return Ok(Value::Float(n as f64)),
-                            _ => {}
-                        },
-                        Value::Float(f) => match field.as_str() {
-                            "floor" => return Ok(Value::Int(f.floor() as i64)),
-                            "ceil" => return Ok(Value::Int(f.ceil() as i64)),
-                            "round" => return Ok(Value::Int(f.round() as i64)),
-                            "trunc" => return Ok(Value::Int(f.trunc() as i64)),
-                            "to_string" => return Ok(Value::String(f.to_string())),
-                            "is_nan" => return Ok(Value::Bool(f.is_nan())),
-                            "is_infinite" => return Ok(Value::Bool(f.is_infinite())),
-                            "is_finite" => return Ok(Value::Bool(f.is_finite())),
-                            _ => {}
-                        },
-                        Value::Bool(b) => {
-                            if field == "to_string" {
-                                return Ok(Value::String(b.to_string()));
-                            }
-                        }
-                        Value::String(s) => match field.as_str() {
-                            "trim" => return Ok(Value::String(s.trim().to_string())),
-                            "lower" => return Ok(Value::String(s.to_lowercase())),
-                            "upper" => return Ok(Value::String(s.to_uppercase())),
-                            "to_string" => return Ok(Value::String(s)),
-                            "len" => return Ok(Value::Int(s.len() as i64)),
-                            "char_count" => return Ok(Value::Int(s.chars().count() as i64)),
-                            "contains" => {
-                                let search = self.eval_expr(&args[0])?;
-                                if let Value::String(sub) = search {
-                                    return Ok(Value::Bool(s.contains(&sub)));
-                                }
-                            }
-                            "starts_with" => {
-                                let arg = self.eval_expr(&args[0])?;
-                                if let Value::String(prefix) = arg {
-                                    return Ok(Value::Bool(s.starts_with(&prefix)));
-                                }
-                            }
-                            "ends_with" => {
-                                let arg = self.eval_expr(&args[0])?;
-                                if let Value::String(suffix) = arg {
-                                    return Ok(Value::Bool(s.ends_with(&suffix)));
-                                }
-                            }
-                            "split" => {
-                                let arg = self.eval_expr(&args[0])?;
-                                if let Value::String(sep) = arg {
-                                    let parts = if sep.is_empty() {
-                                        s.chars().map(|c| Value::String(c.to_string())).collect()
-                                    } else {
-                                        s.split(&sep).map(|p| Value::String(p.to_string())).collect()
-                                    };
-                                    return Ok(Value::List(parts));
-                                }
-                            }
-                            "replace" => {
-                                let from_val = self.eval_expr(&args[0])?;
-                                let to_val = self.eval_expr(&args[1])?;
-                                if let (Value::String(from), Value::String(to)) = (from_val, to_val) {
-                                    let replaced = if from.is_empty() {
-                                        s
-                                    } else {
-                                        s.replace(&from, &to)
-                                    };
-                                    return Ok(Value::String(replaced));
-                                }
-                            }
-                            _ => {}
-                        },
-                        Value::List(items) => match field.as_str() {
-                            "len" => return Ok(Value::Int(items.len() as i64)),
-                            "get" => {
-                                let idx_val = self.eval_expr(&args[0])?;
-                                if let Value::Int(idx) = idx_val {
-                                    if idx < 0 || (idx as usize) >= items.len() {
-                                        return Ok(Value::Nil);
-                                    }
-                                    return Ok(items[idx as usize].clone());
-                                }
-                                return Err(RuntimeError {
-                                    message: format!("List method 'get' expects Int index, got {}", idx_val.type_name()),
-                                    span: args[0].span,
-                                }.into());
-                            }
-                            "contains" => {
-                                let search = self.eval_expr(&args[0])?;
-                                return Ok(Value::Bool(items.contains(&search)));
-                            }
-                            _ => {}
-                        },
-                        Value::Map(map) => match field.as_str() {
-                            "len" => return Ok(Value::Int(map.len() as i64)),
-                            "get" => {
-                                let key_val = self.eval_expr(&args[0])?;
-                                let key = MapKey::from_value(&key_val).ok_or_else(|| RuntimeError {
-                                    message: format!(
-                                        "Map key must be String, Int, or Bool, got {}",
-                                        key_val.type_name()
-                                    ),
-                                    span: args[0].span,
-                                })?;
-                                return Ok(map.get(&key).cloned().unwrap_or(Value::Nil));
-                            }
-                            "contains_key" => {
-                                let key_val = self.eval_expr(&args[0])?;
-                                let key = MapKey::from_value(&key_val).ok_or_else(|| RuntimeError {
-                                    message: format!(
-                                        "Map key must be String, Int, or Bool, got {}",
-                                        key_val.type_name()
-                                    ),
-                                    span: args[0].span,
-                                })?;
-                                return Ok(Value::Bool(map.contains_key(&key)));
-                            }
-                            "keys" => return Ok(Value::List(map.keys())),
-                            "values" => return Ok(Value::List(map.values())),
-                            "entries" => {
-                                let list = map
-                                    .entries()
-                                    .into_iter()
-                                    .map(|(k, v)| Value::Tuple(vec![k.to_value(), v.clone()]))
-                                    .collect();
-                                return Ok(Value::List(list));
-                            }
-                            _ => {}
-                        },
-                        _ => {}
-                    }
+                    return self.eval_method_on_value(target_val, None, field, args, expr.span);
                 }
 
                 let callee_val = self.eval_expr(callee)?;
@@ -1620,24 +1608,363 @@ impl Interpreter {
                 }
 
                 let target_val = self.eval_expr(target)?;
-                match target_val {
-                    Value::Struct { ref fields, .. } | Value::Error { ref fields, .. } => {
-                        if let Some(val) = fields.get(field) {
-                            Ok(val.clone())
+                self.eval_member_on_value(target_val, field, expr.span)
+            }
+            ExprKind::OptionalMember { target, field } => {
+                let target_val = self.eval_expr(target)?;
+                if target_val == Value::Nil {
+                    return Ok(Value::Nil);
+                }
+                if target_val.is_error() {
+                    return Err(InterpFlow::Return(target_val));
+                }
+                self.eval_member_on_value(target_val, field, expr.span)
+            }
+        }
+    }
+
+    fn eval_member_on_value(
+        &self,
+        target_val: Value,
+        field: &str,
+        span: Span,
+    ) -> Result<Value, InterpFlow> {
+        match target_val {
+            Value::Struct { ref fields, .. } | Value::Error { ref fields, .. } => {
+                if let Some(val) = fields.get(field) {
+                    Ok(val.clone())
+                } else {
+                    Err(RuntimeError {
+                        message: format!("Field '{}' not found", field),
+                        span,
+                    }
+                    .into())
+                }
+            }
+            _ => Err(RuntimeError {
+                message: format!("Field access not supported on type {}", target_val.type_name()),
+                span,
+            }
+            .into()),
+        }
+    }
+
+    fn eval_method_on_value(
+        &mut self,
+        target_val: Value,
+        place_expr: Option<&Expr>,
+        field: &str,
+        args: &[Expr],
+        call_span: Span,
+    ) -> Result<Value, InterpFlow> {
+        if let Value::Native(ref nat) = target_val {
+            let type_id = nat.type_id();
+            let method_impl = if let ModuleId::Native(ref nat_name) = type_id.module {
+                self.native_registry
+                    .get_module(nat_name)
+                    .and_then(|m| m.methods.get(&(type_id.name.as_str(), field)))
+                    .map(|md| md.implementation)
+            } else {
+                None
+            };
+
+            if let Some(impl_fn) = method_impl {
+                let mut evaluated = Vec::new();
+                for a in args {
+                    evaluated.push(self.eval_expr(a)?);
+                }
+                let res = (impl_fn)(nat, evaluated);
+                return match res {
+                    Ok(v) => Ok(v),
+                    Err(err_v) => Ok(err_v),
+                };
+            }
+        }
+
+        if let (Some(place), Value::List(_)) = (place_expr, &target_val) {
+            if field == "append" && args.len() == 1 {
+                let val_to_append = self.eval_expr(&args[0])?;
+                let pspan = place.span;
+                return self
+                    .mutate_place(place, move |slot| {
+                        if let Value::List(items) = slot {
+                            items.push(val_to_append);
+                            Ok(Value::Void)
                         } else {
                             Err(RuntimeError {
-                                message: format!("Field '{}' not found", field),
-                                span: expr.span,
-                            }.into())
+                                message: format!("Expected List, got {}", slot.type_name()),
+                                span: pspan,
+                            })
                         }
-                    }
-                    _ => Err(RuntimeError {
-                        message: format!("Field access not supported on type {}", target_val.type_name()),
-                        span: expr.span,
-                    }.into()),
+                    })
+                    .map_err(Into::into);
+            }
+        }
+
+        if let (Some(place), Value::Map(_)) = (place_expr, &target_val) {
+            if (field == "set" && args.len() == 2) || (field == "remove" && args.len() == 1) {
+                let key_val = self.eval_expr(&args[0])?;
+                let key = MapKey::from_value(&key_val).ok_or_else(|| RuntimeError {
+                    message: format!(
+                        "Map key must be String, Int, or Bool, got {}",
+                        key_val.type_name()
+                    ),
+                    span: args[0].span,
+                })?;
+                if field == "set" {
+                    let val = self.eval_expr(&args[1])?;
+                    let pspan = place.span;
+                    return self
+                        .mutate_place(place, move |slot| {
+                            if let Value::Map(map) = slot {
+                                map.set(key, val);
+                                Ok(Value::Void)
+                            } else {
+                                Err(RuntimeError {
+                                    message: format!("Expected Map, got {}", slot.type_name()),
+                                    span: pspan,
+                                })
+                            }
+                        })
+                        .map_err(Into::into);
+                } else {
+                    let pspan = place.span;
+                    return self
+                        .mutate_place(place, move |slot| {
+                            if let Value::Map(map) = slot {
+                                Ok(map.remove(&key).unwrap_or(Value::Nil))
+                            } else {
+                                Err(RuntimeError {
+                                    message: format!("Expected Map, got {}", slot.type_name()),
+                                    span: pspan,
+                                })
+                            }
+                        })
+                        .map_err(Into::into);
                 }
             }
         }
+
+        match target_val {
+            Value::Int(n) => match field {
+                "to_string" => return Ok(Value::String(n.to_string())),
+                "to_float" => return Ok(Value::Float(n as f64)),
+                _ => {}
+            },
+            Value::Float(f) => match field {
+                "floor" => return Ok(Value::Int(f.floor() as i64)),
+                "ceil" => return Ok(Value::Int(f.ceil() as i64)),
+                "round" => return Ok(Value::Int(f.round() as i64)),
+                "trunc" => return Ok(Value::Int(f.trunc() as i64)),
+                "to_string" => return Ok(Value::String(f.to_string())),
+                "is_nan" => return Ok(Value::Bool(f.is_nan())),
+                "is_infinite" => return Ok(Value::Bool(f.is_infinite())),
+                "is_finite" => return Ok(Value::Bool(f.is_finite())),
+                _ => {}
+            },
+            Value::Bool(b) => {
+                if field == "to_string" {
+                    return Ok(Value::String(b.to_string()));
+                }
+            }
+            Value::String(s) => match field {
+                "trim" => return Ok(Value::String(s.trim().to_string())),
+                "lower" => return Ok(Value::String(s.to_lowercase())),
+                "upper" => return Ok(Value::String(s.to_uppercase())),
+                "to_string" => return Ok(Value::String(s)),
+                "len" => return Ok(Value::Int(s.len() as i64)),
+                "char_count" => return Ok(Value::Int(s.chars().count() as i64)),
+                "to_int" => {
+                    return match s.parse::<i64>() {
+                        Ok(n) => Ok(Value::Int(n)),
+                        Err(e) => Ok(make_parse_error(&s, format!("Invalid Int '{}': {}", s, e))),
+                    };
+                }
+                "to_float" => {
+                    return match s.parse::<f64>() {
+                        Ok(f) if f.is_finite() => Ok(Value::Float(f)),
+                        Ok(_) => Ok(make_parse_error(
+                            &s,
+                            format!("Invalid Float '{}': non-finite value is not allowed", s),
+                        )),
+                        Err(e) => Ok(make_parse_error(&s, format!("Invalid Float '{}': {}", s, e))),
+                    };
+                }
+                "contains" => {
+                    let search = self.eval_expr(&args[0])?;
+                    if let Value::String(sub) = search {
+                        return Ok(Value::Bool(s.contains(&sub)));
+                    }
+                }
+                "index_of" => {
+                    let search = self.eval_expr(&args[0])?;
+                    if let Value::String(sub) = search {
+                        return match s.find(&sub) {
+                            Some(byte_idx) => {
+                                let char_idx = s[..byte_idx].chars().count() as i64;
+                                Ok(Value::Int(char_idx))
+                            }
+                            None => Ok(Value::Nil),
+                        };
+                    }
+                }
+                "starts_with" => {
+                    let arg = self.eval_expr(&args[0])?;
+                    if let Value::String(prefix) = arg {
+                        return Ok(Value::Bool(s.starts_with(&prefix)));
+                    }
+                }
+                "ends_with" => {
+                    let arg = self.eval_expr(&args[0])?;
+                    if let Value::String(suffix) = arg {
+                        return Ok(Value::Bool(s.ends_with(&suffix)));
+                    }
+                }
+                "split" => {
+                    let arg = self.eval_expr(&args[0])?;
+                    if let Value::String(sep) = arg {
+                        let parts = if sep.is_empty() {
+                            s.chars().map(|c| Value::String(c.to_string())).collect()
+                        } else {
+                            s.split(&sep).map(|p| Value::String(p.to_string())).collect()
+                        };
+                        return Ok(Value::List(parts));
+                    }
+                }
+                "slice" => {
+                    let start_val = self.eval_expr(&args[0])?;
+                    let end_val = self.eval_expr(&args[1])?;
+                    if let (Value::Int(start_i), Value::Int(end_i)) = (start_val, end_val) {
+                        let start = if start_i <= 0 { 0 } else { start_i as usize };
+                        let end = if end_i <= 0 { 0 } else { end_i as usize };
+                        if start >= end {
+                            return Ok(Value::String(String::new()));
+                        }
+                        let sliced: String = s.chars().skip(start).take(end - start).collect();
+                        return Ok(Value::String(sliced));
+                    }
+                }
+                "replace" => {
+                    let from_val = self.eval_expr(&args[0])?;
+                    let to_val = self.eval_expr(&args[1])?;
+                    if let (Value::String(from), Value::String(to)) = (from_val, to_val) {
+                        let replaced = if from.is_empty() {
+                            s
+                        } else {
+                            s.replace(&from, &to)
+                        };
+                        return Ok(Value::String(replaced));
+                    }
+                }
+                _ => {}
+            },
+            Value::List(items) => match field {
+                "len" => return Ok(Value::Int(items.len() as i64)),
+                "reverse" => {
+                    let mut rev = items;
+                    rev.reverse();
+                    return Ok(Value::List(rev));
+                }
+                "enumerate" => {
+                    let enumerated = items
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, item)| Value::Tuple(vec![Value::Int(i as i64), item]))
+                        .collect();
+                    return Ok(Value::List(enumerated));
+                }
+                "slice" => {
+                    let start_val = self.eval_expr(&args[0])?;
+                    let end_val = self.eval_expr(&args[1])?;
+                    if let (Value::Int(start_i), Value::Int(end_i)) = (start_val, end_val) {
+                        let len = items.len();
+                        let s = if start_i <= 0 { 0 } else { (start_i as usize).min(len) };
+                        let e = if end_i <= 0 { 0 } else { (end_i as usize).min(len) };
+                        if s >= e {
+                            return Ok(Value::List(Vec::new()));
+                        }
+                        return Ok(Value::List(items[s..e].to_vec()));
+                    }
+                }
+                "join" => {
+                    let sep_val = self.eval_expr(&args[0])?;
+                    if let Value::String(sep) = sep_val {
+                        let mut parts = Vec::with_capacity(items.len());
+                        for item in items {
+                            if let Value::String(s) = item {
+                                parts.push(s);
+                            }
+                        }
+                        return Ok(Value::String(parts.join(&sep)));
+                    }
+                }
+                "get" => {
+                    let idx_val = self.eval_expr(&args[0])?;
+                    if let Value::Int(idx) = idx_val {
+                        if idx < 0 || (idx as usize) >= items.len() {
+                            return Ok(Value::Nil);
+                        }
+                        return Ok(items[idx as usize].clone());
+                    }
+                    return Err(RuntimeError {
+                        message: format!(
+                            "List method 'get' expects Int index, got {}",
+                            idx_val.type_name()
+                        ),
+                        span: args[0].span,
+                    }
+                    .into());
+                }
+                "contains" => {
+                    let search = self.eval_expr(&args[0])?;
+                    return Ok(Value::Bool(items.contains(&search)));
+                }
+                _ => {}
+            },
+            Value::Map(map) => match field {
+                "len" => return Ok(Value::Int(map.len() as i64)),
+                "get" => {
+                    let key_val = self.eval_expr(&args[0])?;
+                    let key = MapKey::from_value(&key_val).ok_or_else(|| RuntimeError {
+                        message: format!(
+                            "Map key must be String, Int, or Bool, got {}",
+                            key_val.type_name()
+                        ),
+                        span: args[0].span,
+                    })?;
+                    return Ok(map.get(&key).cloned().unwrap_or(Value::Nil));
+                }
+                "contains_key" => {
+                    let key_val = self.eval_expr(&args[0])?;
+                    let key = MapKey::from_value(&key_val).ok_or_else(|| RuntimeError {
+                        message: format!(
+                            "Map key must be String, Int, or Bool, got {}",
+                            key_val.type_name()
+                        ),
+                        span: args[0].span,
+                    })?;
+                    return Ok(Value::Bool(map.contains_key(&key)));
+                }
+                "keys" => return Ok(Value::List(map.keys())),
+                "values" => return Ok(Value::List(map.values())),
+                "entries" => {
+                    let list = map
+                        .entries()
+                        .into_iter()
+                        .map(|(k, v)| Value::Tuple(vec![k.to_value(), v.clone()]))
+                        .collect();
+                    return Ok(Value::List(list));
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+
+        Err(RuntimeError {
+            message: format!("Unknown method '{}()'", field),
+            span: call_span,
+        }
+        .into())
     }
     fn resolve_pattern_type(&self, name: &str) -> ResolvedPatternType {
         match name {
@@ -1669,7 +1996,20 @@ impl Interpreter {
                         }
                     }
                     ResolvedPatternType::Unknown
-                } else if name == "IndexError" || name == "KeyError" {
+                } else if self
+                    .module_structs
+                    .get(&self.current_module)
+                    .map_or(false, |s| s.contains(name))
+                    || self
+                        .module_errors
+                        .get(&self.current_module)
+                        .map_or(false, |e| e.contains(name))
+                {
+                    ResolvedPatternType::Custom(TypeId::from_module_opt(
+                        self.current_module.as_ref(),
+                        name,
+                    ))
+                } else if matches!(name, "IndexError" | "KeyError" | "ParseError") {
                     ResolvedPatternType::Custom(TypeId::builtin(name))
                 } else {
                     ResolvedPatternType::Custom(TypeId::from_module_opt(

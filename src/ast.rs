@@ -78,6 +78,10 @@ pub enum ExprKind {
         target: Box<Expr>,
         field: String,
     },
+    OptionalMember {
+        target: Box<Expr>,
+        field: String,
+    },
     Index {
         target: Box<Expr>,
         index: Box<Expr>,
@@ -162,8 +166,12 @@ pub enum StmtKind {
         else_block: Block,
     },
     ForIn {
-        variable: String,
+        pattern: Pattern,
         iterable: Expr,
+        body: Block,
+    },
+    While {
+        condition: Expr,
         body: Block,
     },
     Switch {

@@ -595,6 +595,7 @@ impl Parser {
             TokenKind::KwIf => self.parse_if_stmt(),
             TokenKind::KwGuard => self.parse_guard_stmt(),
             TokenKind::KwFor => self.parse_for_stmt(),
+            TokenKind::KwWhile => self.parse_while_stmt(),
             TokenKind::KwSwitch => self.parse_switch_stmt(),
             TokenKind::KwBreak => {
                 let span = self.bump().span;
@@ -705,19 +706,48 @@ impl Parser {
         ))
     }
 
+    fn validate_for_pattern(pat: &Pattern) -> Result<(), ParserError> {
+        match &pat.kind {
+            PatternKind::Ident(name) if !name.contains('.') => Ok(()),
+            PatternKind::Wildcard => Ok(()),
+            PatternKind::Tuple(elems) => {
+                for p in elems {
+                    Self::validate_for_pattern(p)?;
+                }
+                Ok(())
+            }
+            _ => Err(ParserError {
+                message: "Expected variable name, '_', or tuple pattern in 'for in' loop".to_string(),
+                span: pat.span,
+            }),
+        }
+    }
+
     fn parse_for_stmt(&mut self) -> Result<Stmt, ParserError> {
         let span = self.expect(&TokenKind::KwFor)?.span;
-        let (variable, _) = self.expect_ident()?;
+        let pattern = self.parse_pattern()?;
+        Self::validate_for_pattern(&pattern)?;
         self.expect(&TokenKind::KwIn)?;
         let iterable = self.parse_expr()?;
         let body = self.parse_block()?;
 
         Ok(Stmt::new(
             StmtKind::ForIn {
-                variable,
+                pattern,
                 iterable,
                 body,
             },
+            span,
+        ))
+    }
+
+    fn parse_while_stmt(&mut self) -> Result<Stmt, ParserError> {
+        let span = self.expect(&TokenKind::KwWhile)?.span;
+        let condition = self.parse_expr()?;
+        let body = self.parse_block()?;
+
+        Ok(Stmt::new(
+            StmtKind::While { condition, body },
             span,
         ))
     }
@@ -1062,6 +1092,16 @@ impl Parser {
                 let (field, _) = self.expect_ident()?;
                 expr = Expr::new(
                     ExprKind::Member {
+                        target: Box::new(expr),
+                        field,
+                    },
+                    span,
+                );
+            } else if self.match_token(&TokenKind::QuestionDot) {
+                let span = expr.span;
+                let (field, _) = self.expect_ident()?;
+                expr = Expr::new(
+                    ExprKind::OptionalMember {
                         target: Box::new(expr),
                         field,
                     },

@@ -343,3 +343,13 @@ pub fn make_key_error(key: &MapKey) -> Value {
         fields,
     }
 }
+
+pub fn make_parse_error(value: &str, message: impl Into<String>) -> Value {
+    let mut fields = HashMap::new();
+    fields.insert("value".to_string(), Value::String(value.to_string()));
+    fields.insert("message".to_string(), Value::String(message.into()));
+    Value::Error {
+        type_id: TypeId::builtin("ParseError"),
+        fields,
+    }
+}

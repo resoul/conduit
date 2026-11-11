@@ -58,6 +58,8 @@ missing := nums.get(99) ?? 0  // 0
 
 If the element type `T` is already optional (`U?`), `.get(index)` keeps the result type as `U?` without double-wrapping. Both negative indices and `index >= list.len()` return `nil`.
 
+Lists also support `.slice(start: Int, end: Int) -> [T]` (with clamped bounds), `.reverse() -> [T]`, `.enumerate() -> [(Int, T)]`, and `[String].join(sep: String) -> String`.
+
 ---
 
 ## Maps (`Map<K, V>`)
@@ -91,6 +93,8 @@ func find_upper(m: Map<String, String>, key: String) -> String | KeyError {
 Use `.get(key) -> V?` when missing keys are expected rather than errors, alongside `.set(key, val)`, `.remove(key) -> V?`, `.contains_key(key) -> Bool`, `.len() -> Int`, `.keys() -> [K]`, `.values() -> [V]`, and `.entries() -> [(K, V)]`.
 
 Updating an existing key via `.set(key, new_val)` replaces the value **in place**, preserving the key's original position in `.keys()`, `.values()`, and `.entries()`. Calling `.remove(key)` followed by `.set(key, val)` appends the re-inserted key at the end.
+
+Mutable `var` maps also support index assignment `m[key] = value`, and mutable `var` structs allow nested field writes (`order.meta.updated = true`) and collection mutations (`order.items.append(x)`). Immutable `:=` bindings forbid mutation of the variable, its fields, and nested collections.
 
 ---
 

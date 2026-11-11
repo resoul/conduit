@@ -77,6 +77,27 @@ score = 42
 updated_score := score ?? 0 // Evaluates to 42
 ```
 
+### Optional Chaining (`?.`) and Flow-Sensitive Narrowing
+
+Use `?.` to safely traverse optional fields and call non-`Void`, non-error-returning methods without nested `switch` blocks. Chained accesses flatten cleanly to `U?` and short-circuit immediately on `nil`:
+
+```conduit
+city_upper := user?.profile?.city?.upper() ?? "UNKNOWN"
+```
+
+Comparing an optional binding against `nil` automatically narrows `T?` to `T` inside `guard x != nil else { ... }`, `if x != nil { ... }`, `while x != nil { ... }`, and short-circuit boolean conditions (`x != nil && x.active`, `x == nil || x.active`). Assigning `nil` back to a `var x: T?` resets the narrowed type back to `T?`.
+
+### Strict String Number Parsing (`ParseError`)
+
+Parse strings explicitly into numbers using `.to_int() -> Int | ParseError` and `.to_float() -> Float | ParseError`, where `ParseError { value: String, message: String }` is built into the prelude:
+
+```conduit
+n := "42".to_int()?
+f := "3.14".to_float()?
+```
+
+Both methods reject surrounding whitespace unless `.trim()` is called first, and `.to_float()` rejects non-finite values such as `"NaN"` or `"Infinity"`. Strings also provide Unicode-scalar-indexed `.index_of(sub: String) -> Int?` and `.slice(start: Int, end: Int) -> String`.
+
 > [!IMPORTANT]
 > **Difference between `T?` and `T | Error`:**
 > - `T?` (an optional) indicates mere presence or absence of a value. It does not carry diagnostic error details and cannot be unwrapped with the `?` try operator.

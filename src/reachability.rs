@@ -206,7 +206,7 @@ impl<'a> ReachabilityAnalyzer<'a> {
                 self.scan_expr(condition, current_mod_path, loaded_mod, worklist);
                 self.scan_block(else_block, current_mod_path, loaded_mod, worklist);
             }
-            StmtKind::ForIn { iterable, body, .. } => {
+            StmtKind::ForIn { iterable, body, .. } | StmtKind::While { condition: iterable, body } => {
                 self.scan_expr(iterable, current_mod_path, loaded_mod, worklist);
                 self.scan_block(body, current_mod_path, loaded_mod, worklist);
             }
@@ -244,7 +244,7 @@ impl<'a> ReachabilityAnalyzer<'a> {
                         worklist.push((current_mod_path.to_path_buf(), name.clone()));
                     }
                     self.mark_struct_reachable(current_mod_path, name, worklist);
-                } else if let ExprKind::Member { target, field } = &callee.kind {
+                } else if let ExprKind::Member { target, field } | ExprKind::OptionalMember { target, field } = &callee.kind {
                     if let ExprKind::Ident(ref alias) = target.kind {
                         if let Some((mod_target, _)) = loaded_mod.imports.get(alias) {
                             match mod_target {
@@ -273,6 +273,10 @@ impl<'a> ReachabilityAnalyzer<'a> {
                 for na in named_args {
                     self.scan_expr(&na.value, current_mod_path, loaded_mod, worklist);
                 }
+            }
+            ExprKind::OptionalMember { target, field } => {
+                self.reachable_native_methods.insert((String::new(), field.clone()));
+                self.scan_expr(target, current_mod_path, loaded_mod, worklist);
             }
             ExprKind::Member { target, field } => {
                 if let ExprKind::Ident(ref alias) = target.kind {

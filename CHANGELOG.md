@@ -5,6 +5,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
+## [0.1.9] - 2026-11-11
+
+### Added & Changed
+
+* **Optional Chaining (`?.`) & Flow-Sensitive Type Narrowing**:
+  * Added `?.` optional chaining for field access (`user?.profile?.city`) and non-`Void`, non-error-union method calls (`s?.trim()?.upper()`), flattening nested optionals to `U?` without double-wrapping (`U??`) and short-circuiting argument and tail evaluation on `nil`.
+  * Added flow-sensitive narrowing of `T?` to `T` via `guard x != nil else { ... }`, `if x != nil { ... } else { ... }`, `if x == nil { ... } else { ... }`, `while x != nil { ... }`, and short-circuit boolean expressions (`x != nil && ...`, `x == nil || ...`), with automatic reset back to `T?` upon assigning `nil` / `T?` / `Any` to mutable `var` bindings.
+  * Updated the interpreter to short-circuit `&&` and `||` right-hand operands so guards like `x == nil || x.field == 0` never dereference `nil`.
+
+* **Extended Loops, Destructuring, and Safe Mutation**:
+  * Added `while cond { ... }` precondition loops requiring strict `Bool` conditions, supporting `break` and `continue` isolated across closure boundaries.
+  * Extended `for` loops with tuple pattern destructuring (`for (idx, item) in items.enumerate()`, wildcard `_` with error-discard checks) and direct insertion-order iteration over `Map<K, V>` (`for (k, v) in map`, `for entry in map`).
+  * Enabled `m[key] = value` index assignment on mutable `var` maps, nested struct field assignment (`order.meta.updated = true`), and mutating method calls on fields of `var` structs (`order.items.append(x)`), while enforcing immutability on `:=` bindings (`Cannot mutate immutable variable '...'`).
+  * Added list methods `.slice(start, end)`, `.reverse()`, `.enumerate()`, and `[String].join(sep)`, plus Unicode-scalar-indexed string methods `.index_of(sub) -> Int?` and `.slice(start, end) -> String`.
+
+* **Strict String Number Parsing & Prelude `ParseError`**:
+  * Added prelude error `ParseError { value: String, message: String }` (shadowable by local user definitions) and methods `String.to_int() -> Int | ParseError` and `String.to_float() -> Float | ParseError` (rejecting whitespace without `.trim()`, `i64` overflow, and non-finite floats such as `"NaN"` / `"Infinity"`).
+  * Updated LSP hover/completion entries, TextMate syntax highlighting, and language documentation.
+
 ## [0.1.8] - 2026-11-11
 
 ### Added & Changed
