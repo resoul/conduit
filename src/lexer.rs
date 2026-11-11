@@ -14,6 +14,7 @@ impl Span {
 pub enum TokenKind {
     Ident(String),
     Int(i64),
+    Float(f64),
     String(String),
 
     KwFunc,
@@ -177,6 +178,29 @@ impl<'a> Lexer<'a> {
             } else {
                 break;
             }
+        }
+
+        if self.peek_char() == Some('.')
+            && self.peek_next_char().map_or(false, |c| c.is_ascii_digit())
+        {
+            self.bump_char();
+            while let Some(ch) = self.peek_char() {
+                if ch.is_ascii_digit() {
+                    self.bump_char();
+                } else {
+                    break;
+                }
+            }
+            let num_str = &self.input[start_offset..self.byte_offset];
+            return match num_str.parse::<f64>() {
+                Ok(value) if value.is_finite() => {
+                    Ok(Token::new(TokenKind::Float(value), start_span))
+                }
+                _ => Err(LexerError {
+                    message: format!("Invalid float literal: '{}'", num_str),
+                    span: start_span,
+                }),
+            };
         }
 
         let num_str = &self.input[start_offset..self.byte_offset];

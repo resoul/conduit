@@ -59,6 +59,71 @@ pub fn validate_email_str(s: &str) -> bool {
     true
 }
 
+fn check_bound(args: Vec<Value>, is_min: bool) -> Result<Value, Value> {
+    let (code, bound_word, cmp_phrase) = if is_min {
+        ("min", "Minimum", "is less than minimum")
+    } else {
+        ("max", "Maximum", "exceeds maximum")
+    };
+    if args.len() != 2 {
+        return Ok(make_issue(
+            format!("{}.args", code),
+            format!("Expected 2 arguments for {} validator", code),
+        ));
+    }
+    let len_check = |label: &str, count: usize, bound: i64| -> Value {
+        if bound < 0 {
+            return make_issue(
+                format!("{}.invalid_bound", code),
+                format!("{} length bound cannot be negative", bound_word),
+            );
+        }
+        let n = count as i64;
+        if (is_min && n < bound) || (!is_min && n > bound) {
+            make_issue(code, format!("{} length {} {} {}", label, n, cmp_phrase, bound))
+        } else {
+            Value::Void
+        }
+    };
+    match (&args[0], &args[1]) {
+        (Value::Int(n), Value::Int(bound)) => {
+            if (is_min && n < bound) || (!is_min && n > bound) {
+                Ok(make_issue(code, format!("Value {} {} {}", n, cmp_phrase, bound)))
+            } else {
+                Ok(Value::Void)
+            }
+        }
+        (Value::Float(val), Value::Float(bound)) => {
+            if !val.is_finite() || !bound.is_finite() {
+                return Ok(make_issue(
+                    format!("{}.non_finite", code),
+                    format!("{} validator requires finite Float value and bound", bound_word),
+                ));
+            }
+            if (is_min && val < bound) || (!is_min && val > bound) {
+                Ok(make_issue(code, format!("Value {} {} {}", val, cmp_phrase, bound)))
+            } else {
+                Ok(Value::Void)
+            }
+        }
+        (Value::String(s), Value::Int(bound)) => Ok(len_check("String", s.chars().count(), *bound)),
+        (Value::List(l), Value::Int(bound)) => Ok(len_check("List", l.len(), *bound)),
+        (Value::Map(m), Value::Int(bound)) => Ok(len_check("Map", m.len(), *bound)),
+        (Value::Float(_), _) => Ok(make_issue(
+            format!("{}.args", code),
+            format!("{} bound for Float must be a Float", bound_word),
+        )),
+        (Value::Int(_) | Value::String(_) | Value::List(_) | Value::Map(_), _) => Ok(make_issue(
+            format!("{}.args", code),
+            format!("{} bound must be an Int", bound_word),
+        )),
+        _ => Ok(make_issue(
+            format!("{}.type", code),
+            format!("Unsupported type for {} validator", code),
+        )),
+    }
+}
+
 pub fn create_validation_module() -> NativeModule {
     let mut module = NativeModule::new(
         "cdt.validation",
@@ -98,152 +163,31 @@ pub fn create_validation_module() -> NativeModule {
         fields: vec![("issues", Type::List(Box::new(violation_ty)))],
     });
 
+    let bound_value_ty = Type::union(vec![
+        Type::Int,
+        Type::Float,
+        Type::String,
+        Type::List(Box::new(Type::Any)),
+        Type::Map(Box::new(Type::Any), Box::new(Type::Any)),
+    ]);
+    let bound_arg_ty = Type::union(vec![Type::Int, Type::Float]);
+
     module.add_function(NativeFuncDef {
         name: "min",
-        doc: "Validates that a numeric value, string character count, or list element count meets a minimum bound (inclusive)",
-        params: vec![
-            (
-                "value",
-                Type::union(vec![
-                    Type::Int,
-                    Type::String,
-                    Type::List(Box::new(Type::Any)),
-                ]),
-            ),
-            ("min_val", Type::Int),
-        ],
+        doc: "Validates that a numeric value, string character count, list length, or map size meets a minimum bound (inclusive)",
+        params: vec![("value", bound_value_ty.clone()), ("min_val", bound_arg_ty.clone())],
         return_type: Type::union(vec![Type::Void, issue_ty.clone()]),
         is_validator: true,
-        implementation: |args| {
-            if args.len() != 2 {
-                return Ok(make_issue("min.args", "Expected 2 arguments for min validator"));
-            }
-            let min_val = match &args[1] {
-                Value::Int(n) => *n,
-                _ => return Ok(make_issue("min.args", "Minimum bound must be an Int")),
-            };
-            match &args[0] {
-                Value::Int(n) => {
-                    if *n < min_val {
-                        Ok(make_issue(
-                            "min",
-                            format!("Value {} is less than minimum {}", n, min_val),
-                        ))
-                    } else {
-                        Ok(Value::Void)
-                    }
-                }
-                Value::String(s) => {
-                    if min_val < 0 {
-                        return Ok(make_issue(
-                            "min.invalid_bound",
-                            "Minimum length bound cannot be negative",
-                        ));
-                    }
-                    let count = s.chars().count() as i64;
-                    if count < min_val {
-                        Ok(make_issue(
-                            "min",
-                            format!("String length {} is less than minimum {}", count, min_val),
-                        ))
-                    } else {
-                        Ok(Value::Void)
-                    }
-                }
-                Value::List(l) => {
-                    if min_val < 0 {
-                        return Ok(make_issue(
-                            "min.invalid_bound",
-                            "Minimum length bound cannot be negative",
-                        ));
-                    }
-                    let count = l.len() as i64;
-                    if count < min_val {
-                        Ok(make_issue(
-                            "min",
-                            format!("List length {} is less than minimum {}", count, min_val),
-                        ))
-                    } else {
-                        Ok(Value::Void)
-                    }
-                }
-                _ => Ok(make_issue("min.type", "Unsupported type for min validator")),
-            }
-        },
+        implementation: |args| check_bound(args, true),
     });
 
     module.add_function(NativeFuncDef {
         name: "max",
-        doc: "Validates that a numeric value, string character count, or list element count does not exceed a maximum bound (inclusive)",
-        params: vec![
-            (
-                "value",
-                Type::union(vec![
-                    Type::Int,
-                    Type::String,
-                    Type::List(Box::new(Type::Any)),
-                ]),
-            ),
-            ("max_val", Type::Int),
-        ],
+        doc: "Validates that a numeric value, string character count, list length, or map size does not exceed a maximum bound (inclusive)",
+        params: vec![("value", bound_value_ty), ("max_val", bound_arg_ty)],
         return_type: Type::union(vec![Type::Void, issue_ty.clone()]),
         is_validator: true,
-        implementation: |args| {
-            if args.len() != 2 {
-                return Ok(make_issue("max.args", "Expected 2 arguments for max validator"));
-            }
-            let max_val = match &args[1] {
-                Value::Int(n) => *n,
-                _ => return Ok(make_issue("max.args", "Maximum bound must be an Int")),
-            };
-            match &args[0] {
-                Value::Int(n) => {
-                    if *n > max_val {
-                        Ok(make_issue(
-                            "max",
-                            format!("Value {} exceeds maximum {}", n, max_val),
-                        ))
-                    } else {
-                        Ok(Value::Void)
-                    }
-                }
-                Value::String(s) => {
-                    if max_val < 0 {
-                        return Ok(make_issue(
-                            "max.invalid_bound",
-                            "Maximum length bound cannot be negative",
-                        ));
-                    }
-                    let count = s.chars().count() as i64;
-                    if count > max_val {
-                        Ok(make_issue(
-                            "max",
-                            format!("String length {} exceeds maximum {}", count, max_val),
-                        ))
-                    } else {
-                        Ok(Value::Void)
-                    }
-                }
-                Value::List(l) => {
-                    if max_val < 0 {
-                        return Ok(make_issue(
-                            "max.invalid_bound",
-                            "Maximum length bound cannot be negative",
-                        ));
-                    }
-                    let count = l.len() as i64;
-                    if count > max_val {
-                        Ok(make_issue(
-                            "max",
-                            format!("List length {} exceeds maximum {}", count, max_val),
-                        ))
-                    } else {
-                        Ok(Value::Void)
-                    }
-                }
-                _ => Ok(make_issue("max.type", "Unsupported type for max validator")),
-            }
-        },
+        implementation: |args| check_bound(args, false),
     });
 
     module.add_function(NativeFuncDef {

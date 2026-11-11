@@ -20,6 +20,7 @@
 
 # Standard Library
 - [Overview](library/index.md)
+- [cdt.json](library/json.md)
 - [cdt.time](library/time.md)
 - [cdt.validation](library/validation.md)
 

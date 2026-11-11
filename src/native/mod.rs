@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crate::types::{Type, TypeId};
 use crate::value::Value;
 
+pub mod json;
 pub mod time;
 pub mod validation;
 
@@ -166,6 +167,7 @@ impl NativeRegistry {
         };
         reg.register_module(time::create_time_module());
         reg.register_module(validation::create_validation_module());
+        reg.register_module(json::create_json_module());
         reg
     }
 

@@ -16,6 +16,7 @@ fn test_all_positive_documentation_examples_pass() {
         "examples/docs/language/errors.cdt",
         "examples/docs/language/tuples.cdt",
         "examples/docs/language/modules_main.cdt",
+        "examples/docs/library/json.cdt",
         "examples/docs/library/time.cdt",
         "examples/docs/library/validation.cdt",
         "examples/docs/guides/error_recipe.cdt",

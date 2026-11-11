@@ -287,9 +287,70 @@ impl Parser {
         Ok((params, return_type))
     }
 
+    fn parse_type_params(&mut self) -> Result<Vec<String>, ParserError> {
+        if !self.match_token(&TokenKind::Lt) {
+            return Ok(Vec::new());
+        }
+        if self.check(&TokenKind::Gt) {
+            return Err(ParserError {
+                message: "Type parameter list cannot be empty".to_string(),
+                span: self.peek().span,
+            });
+        }
+        let mut params = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        while !self.check(&TokenKind::Gt) && !self.check(&TokenKind::Eof) {
+            let (param_name, param_span) = self.expect_ident()?;
+            if !seen.insert(param_name.clone()) {
+                return Err(ParserError {
+                    message: format!("Duplicate type parameter '{}'", param_name),
+                    span: param_span,
+                });
+            }
+            params.push(param_name);
+            if !self.match_token(&TokenKind::Comma) {
+                break;
+            }
+        }
+        if params.is_empty() {
+            return Err(ParserError {
+                message: "Type parameter list cannot be empty".to_string(),
+                span: self.peek().span,
+            });
+        }
+        self.expect(&TokenKind::Gt)?;
+        Ok(params)
+    }
+
+    fn parse_type_arg_list(&mut self) -> Result<Vec<TypeExpr>, ParserError> {
+        let start_span = self.expect(&TokenKind::Lt)?.span;
+        if self.check(&TokenKind::Gt) {
+            return Err(ParserError {
+                message: "Type argument list cannot be empty".to_string(),
+                span: start_span,
+            });
+        }
+        let mut args = Vec::new();
+        while !self.check(&TokenKind::Gt) && !self.check(&TokenKind::Eof) {
+            args.push(self.parse_type_expr()?);
+            if !self.match_token(&TokenKind::Comma) {
+                break;
+            }
+        }
+        if args.is_empty() {
+            return Err(ParserError {
+                message: "Type argument list cannot be empty".to_string(),
+                span: start_span,
+            });
+        }
+        self.expect(&TokenKind::Gt)?;
+        Ok(args)
+    }
+
     fn parse_func_item(&mut self, is_exported: bool, is_validator: bool) -> Result<Item, ParserError> {
         let start_span = self.expect(&TokenKind::KwFunc)?.span;
         let (name, _) = self.expect_ident()?;
+        let type_params = self.parse_type_params()?;
 
         let (params, return_type) = self.parse_params_and_return_type()?;
         let body = self.parse_block()?;
@@ -297,6 +358,7 @@ impl Parser {
         Ok(Item::new_exported(
             ItemKind::Func {
                 name,
+                type_params,
                 params,
                 return_type,
                 body,
@@ -310,6 +372,7 @@ impl Parser {
     fn parse_type_item(&mut self, is_exported: bool) -> Result<Item, ParserError> {
         let start_span = self.expect(&TokenKind::KwType)?.span;
         let (name, _) = self.expect_ident()?;
+        let type_params = self.parse_type_params()?;
 
         self.expect(&TokenKind::LBrace)?;
         let mut fields = Vec::new();
@@ -356,7 +419,15 @@ impl Parser {
         }
         self.expect(&TokenKind::RBrace)?;
 
-        Ok(Item::new_exported(ItemKind::Type { name, fields }, start_span, is_exported))
+        Ok(Item::new_exported(
+            ItemKind::Type {
+                name,
+                type_params,
+                fields,
+            },
+            start_span,
+            is_exported,
+        ))
     }
 
     fn parse_annotation_arg(&mut self) -> Result<Expr, ParserError> {
@@ -366,17 +437,26 @@ impl Parser {
                 self.bump();
                 Ok(Expr::new(ExprKind::Int(n), tok.span))
             }
+            TokenKind::Float(f) => {
+                self.bump();
+                Ok(Expr::new(ExprKind::Float(f), tok.span))
+            }
             TokenKind::Minus => {
                 self.bump();
                 let next = self.peek().clone();
-                if let TokenKind::Int(n) = next.kind {
-                    self.bump();
-                    Ok(Expr::new(ExprKind::Int(-n), tok.span))
-                } else {
-                    Err(ParserError {
-                        message: "Expected integer literal after '-' in annotation argument".to_string(),
+                match next.kind {
+                    TokenKind::Int(n) => {
+                        self.bump();
+                        Ok(Expr::new(ExprKind::Int(-n), tok.span))
+                    }
+                    TokenKind::Float(f) => {
+                        self.bump();
+                        Ok(Expr::new(ExprKind::Float(-f), tok.span))
+                    }
+                    _ => Err(ParserError {
+                        message: "Expected numeric literal after '-' in annotation argument".to_string(),
                         span: next.span,
-                    })
+                    }),
                 }
             }
             TokenKind::String(ref s) => {
@@ -477,7 +557,15 @@ impl Parser {
             } else {
                 name
             };
-            TypeExpr::Named(full_name)
+            if self.check(&TokenKind::Lt) {
+                let type_args = self.parse_type_arg_list()?;
+                TypeExpr::Generic {
+                    name: full_name,
+                    type_args,
+                }
+            } else {
+                TypeExpr::Named(full_name)
+            }
         };
 
         while self.match_token(&TokenKind::Question) {
@@ -759,10 +847,10 @@ impl Parser {
 
     fn desugar_pipe(&self, left: Expr, right: Expr, span: Span) -> Result<Expr, ParserError> {
         match right.kind {
-            ExprKind::Call { callee, mut args, named_args } => {
+            ExprKind::Call { callee, type_args, mut args, named_args } => {
                 args.insert(0, left);
                 Ok(Expr::new(
-                    ExprKind::Call { callee, args, named_args },
+                    ExprKind::Call { callee, type_args, args, named_args },
                     span,
                 ))
             }
@@ -770,6 +858,7 @@ impl Parser {
                 Ok(Expr::new(
                     ExprKind::Call {
                         callee: Box::new(right),
+                        type_args: Vec::new(),
                         args: vec![left],
                         named_args: Vec::new(),
                     },
@@ -919,35 +1008,39 @@ impl Parser {
             if self.check(&TokenKind::LParen) && self.is_tuple_destructure() {
                 break;
             }
-            if self.match_token(&TokenKind::LParen) {
-                let span = expr.span;
-                let mut args = Vec::new();
-                let mut named_args = Vec::new();
-
-                while !self.check(&TokenKind::RParen) && !self.check(&TokenKind::Eof) {
-                    if let TokenKind::Ident(ref arg_name) = self.peek().kind {
-                        if self.peek_ahead(1).kind == TokenKind::Colon {
-                            let name = arg_name.clone();
-                            self.bump();
-                            self.bump();
-                            let val = self.parse_expr()?;
-                            named_args.push(NamedArg { name, value: val });
-                            if !self.match_token(&TokenKind::Comma) {
-                                break;
-                            }
-                            continue;
-                        }
-                    }
-
-                    args.push(self.parse_expr()?);
-                    if !self.match_token(&TokenKind::Comma) {
-                        break;
+            if matches!(expr.kind, ExprKind::Ident(_) | ExprKind::Member { .. }) && self.check(&TokenKind::Lt) {
+                if self.peek_ahead(1).kind == TokenKind::Gt && self.peek_ahead(2).kind == TokenKind::LParen {
+                    return Err(ParserError {
+                        message: "Type argument list cannot be empty".to_string(),
+                        span: self.peek().span,
+                    });
+                }
+                let saved_cursor = self.cursor;
+                if let Ok(parsed_type_args) = self.parse_type_arg_list() {
+                    if self.match_token(&TokenKind::LParen) {
+                        let span = expr.span;
+                        let (args, named_args) = self.parse_call_args()?;
+                        expr = Expr::new(
+                            ExprKind::Call {
+                                callee: Box::new(expr),
+                                type_args: parsed_type_args,
+                                args,
+                                named_args,
+                            },
+                            span,
+                        );
+                        continue;
                     }
                 }
-                self.expect(&TokenKind::RParen)?;
+                self.cursor = saved_cursor;
+            }
+            if self.match_token(&TokenKind::LParen) {
+                let span = expr.span;
+                let (args, named_args) = self.parse_call_args()?;
                 expr = Expr::new(
                     ExprKind::Call {
                         callee: Box::new(expr),
+                        type_args: Vec::new(),
                         args,
                         named_args,
                     },
@@ -985,12 +1078,44 @@ impl Parser {
         Ok(expr)
     }
 
+    fn parse_call_args(&mut self) -> Result<(Vec<Expr>, Vec<NamedArg>), ParserError> {
+        let mut args = Vec::new();
+        let mut named_args = Vec::new();
+
+        while !self.check(&TokenKind::RParen) && !self.check(&TokenKind::Eof) {
+            if let TokenKind::Ident(ref arg_name) = self.peek().kind {
+                if self.peek_ahead(1).kind == TokenKind::Colon {
+                    let name = arg_name.clone();
+                    self.bump();
+                    self.bump();
+                    let val = self.parse_expr()?;
+                    named_args.push(NamedArg { name, value: val });
+                    if !self.match_token(&TokenKind::Comma) {
+                        break;
+                    }
+                    continue;
+                }
+            }
+
+            args.push(self.parse_expr()?);
+            if !self.match_token(&TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(&TokenKind::RParen)?;
+        Ok((args, named_args))
+    }
+
     fn parse_primary(&mut self) -> Result<Expr, ParserError> {
         let tok = self.peek().clone();
         match tok.kind {
             TokenKind::Int(val) => {
                 self.bump();
                 Ok(Expr::new(ExprKind::Int(val), tok.span))
+            }
+            TokenKind::Float(val) => {
+                self.bump();
+                Ok(Expr::new(ExprKind::Float(val), tok.span))
             }
             TokenKind::String(val) => {
                 self.bump();

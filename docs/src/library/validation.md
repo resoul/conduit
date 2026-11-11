@@ -46,7 +46,7 @@ validation.check(value: T) -> T | validation.ValidationError
 ```
 
 - Normal struct constructors do not run validators automatically.
-- Calling `validation.check(val)` traverses the struct, nested structs, lists, and tuples recursively.
+- Calling `validation.check(val)` traverses the struct, generic struct fields (such as `Page<User>`), nested structs, lists, maps (`Map<K, V>`), and tuples recursively, producing paths such as `users["alice"].email` and `items[42].title`.
 - On success, it returns the original value unmodified (`T`).
 - On failure, all violations across all fields are collected into an aggregated `validation.ValidationError`.
 
@@ -106,10 +106,10 @@ Validation caught violations:
 ### Functions
 
 #### `min(value, min_val) -> Void | validation.Issue`
-- Validates that a numeric value, string character count (**Unicode scalar values**, matching `.char_count()` rather than `.len()` UTF-8 bytes), or list element count meets a minimum bound (inclusive).
+- Validates that a numeric value (`Int` or `Float`), string character count (**Unicode scalar values**, matching `.char_count()` rather than `.len()` UTF-8 bytes), list element count, or map entry count meets a minimum bound (inclusive). `Float` values must use a `Float` bound and reject non-finite values (`NaN`/`Infinity`).
 
 #### `max(value, max_val) -> Void | validation.Issue`
-- Validates that a numeric value, string character count (**Unicode scalar values**, matching `.char_count()` rather than `.len()` UTF-8 bytes), or list element count does not exceed a maximum bound (inclusive).
+- Validates that a numeric value (`Int` or `Float`), string character count (**Unicode scalar values**, matching `.char_count()` rather than `.len()` UTF-8 bytes), list element count, or map entry count does not exceed a maximum bound (inclusive). `Float` values must use a `Float` bound and reject non-finite values (`NaN`/`Infinity`).
 
 #### `email(value: String) -> Void | validation.Issue`
 - Validates that a string conforms to basic email format (non-empty local part, single `@`, and valid domain with dot).

@@ -19,6 +19,7 @@ All standard libraries reside in the reserved `cdt.*` namespace.
 
 | Module | Namespace | Description |
 | :--- | :--- | :--- |
+| [cdt.json](json.md) | `cdt.json` | Typed JSON decoding (`decode<T>`), deterministic `encode`, and dynamic `json.Value` trees. |
 | [cdt.time](time.md) | `cdt.time` | System clock, monotonic timestamps, high-resolution duration calculation, and epoch conversion. |
 | [cdt.validation](validation.md) | `cdt.validation` | Schema validation, field rule annotations, issue aggregation, and standard rules (`min`, `max`, `email`). |
 

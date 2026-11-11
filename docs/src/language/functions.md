@@ -72,6 +72,26 @@ Control-flow rules inside closures are scoped to the closure itself:
 
 ---
 
+## Generic Functions (`func name<T>(...)`)
+
+Functions can declare type parameters before their parameter list. Call sites may either let Conduit infer type arguments from call arguments or supply them explicitly with `<T, ...>`:
+
+```conduit
+func first_or_default<T>(items: [T], fallback: T) -> T {
+    return items.get(0) ?? fallback
+}
+
+// Type arguments inferred from arguments:
+n := first_or_default([10, 20], 0)
+
+// Explicit type arguments when calling with empty collections:
+empty_val := first_or_default<Int>([], 42)
+```
+
+Generic functions compose naturally with closures to build reusable collection combinators such as `find<T>`, `any<T>`, `all<T>`, and `fold<T, Acc>`, and can be `export`ed across module boundaries. Conflicting inferred types for the same type parameter (such as `same(1, "two")` for `func same<T>(a: T, b: T)`) are rejected at compile time.
+
+---
+
 ## Runnable Example
 
 The following program demonstrates function declarations, void procedures, higher-order callback execution, anonymous lambdas, and lexical closures:

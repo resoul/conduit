@@ -39,13 +39,21 @@ Conduit features built-in primitive types:
 
 ### Explicit `.to_string()` Conversion
 
-Conduit never performs implicit string coercion with `+`. Convert `Int` or `Bool` explicitly via `.to_string()`:
+Conduit never performs implicit string coercion with `+`. Convert `Int`, `Float`, or `Bool` explicitly via `.to_string()`:
 
 ```conduit
 count := 42
+ratio := 3.5
 ok := true
-msg := "count=" + count.to_string() + ", ok=" + ok.to_string()
+msg := "count=" + count.to_string() + ", ratio=" + ratio.to_string() + ", ok=" + ok.to_string()
 ```
+
+### `Float` & Strict Numeric Typing
+
+Conduit enforces strict separation between `Int` and `Float` (`f64`): arithmetic (`+`, `-`, `*`, `/`), unary `-`, and comparisons (`<`, `<=`, `>`, `>=`, `==`, `!=`) require matching operand types. Dividing a `Float` by `0.0` raises a `Runtime error: Division by zero` rather than propagating `NaN` or `Infinity`.
+
+- Convert integers explicitly via `n.to_float() -> Float`.
+- Convert or inspect floats via `.floor() -> Int`, `.ceil() -> Int`, `.round() -> Int`, `.trunc() -> Int`, `.to_string() -> String`, `.is_nan() -> Bool`, `.is_infinite() -> Bool`, and `.is_finite() -> Bool`.
 
 ## Optional Types (`T?`) and `nil`
 
@@ -103,6 +111,26 @@ Fields are accessed using dot notation:
 print(pt.x) // 10
 print(pt.y) // 20
 ```
+
+### Generic Record Types (`type Name<T, ...>`)
+
+Records can declare non-empty, unique type parameters to parameterize their fields across arbitrary concrete types (including nested generic containers):
+
+```conduit
+type Page<T> {
+    items: [T]
+    total: Int
+}
+
+type Pair<A, B> {
+    first: A
+    second: B
+}
+
+var page: Page<String> = Page(items: ["a", "b"], total: 2)
+```
+
+Different type arguments produce distinct, incompatible types (`Page<Int>` cannot be assigned to `Page<String>`). When pattern-matching generic records in a `switch`, match the base type name (`case Page(p):`) and `p` receives its concrete instantiated field types. Public `export` types and functions cannot leak private types inside generic type arguments.
 
 ---
 
