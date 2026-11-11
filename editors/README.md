@@ -34,6 +34,6 @@ You can connect RustRover to `conduit lsp` using either JetBrains' native LSP su
 ## Features Provided by `conduit lsp`
 
 * **Diagnostics on the fly**: Real-time syntax and type error squiggles as you type (`publishDiagnostics`).
-* **Hover Documentation**: Hover over keywords (`func`, `type`, `var`) or methods (`len`, `trim`, `lower`, `upper`, `append`, `contains`) to see signatures and usage.
+* **Hover Documentation**: Hover over keywords (`func`, `type`, `var`) or built-in types and methods (`IndexError`, `len`, `trim`, `lower`, `upper`, `append`, `contains`, `get`) to see signatures and usage.
 * **Auto-completion**: Triggered automatically or via `Ctrl + Space` and `.` for keywords and built-in methods.
 

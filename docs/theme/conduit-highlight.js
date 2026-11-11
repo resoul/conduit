@@ -9,7 +9,7 @@
                 aliases: ['cdt'],
                 keywords: {
                     keyword: 'func return if else guard while for in break continue switch case default var type error export import as',
-                    type: 'Int Float Bool String Void Duration Instant Timestamp TimeError Issue Violation ValidationError',
+                    type: 'Int Float Bool String Void IndexError Duration Instant Timestamp TimeError Issue Violation ValidationError',
                     literal: 'true false nil',
                     built_in: 'print map filter'
                 },

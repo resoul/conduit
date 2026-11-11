@@ -18,9 +18,23 @@ func validate_positive(n: Int) -> Int | InvalidItem {
     return n
 }
 
+func first_positive(items: [Int]) -> Int | IndexError {
+    first := items[0]?
+    return first
+}
+
 func main() {
     nums := [1, 2, 3, 4, 5]
     print(nums)
+
+    // Safe indexing returns T | IndexError; .get(i) returns T?
+    switch first_positive(nums) {
+        case Int(val):
+            print("First: {val}")
+        case IndexError(err):
+            print(err.message)
+    }
+    print(nums.get(99) ?? -1)
 
     // map applies a function to every item
     squared := map(nums, square)

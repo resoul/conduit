@@ -235,6 +235,7 @@ fn handle_hover(msg: &str, id: &str, documents: &HashMap<String, String>) -> Str
             "Int" => "**Int** — 64-bit signed integer type".to_string(),
             "String" => "**String** — UTF-8 encoded text string type".to_string(),
             "Bool" => "**Bool** — Boolean type (`true` or `false`)".to_string(),
+            "IndexError" => "**IndexError** — Built-in prelude error returned on out-of-bounds list indexing (`{ index: Int, length: Int, message: String }`)".to_string(),
             "nil" => "**nil** — Represents the absence of a value in optional types (`T?`)".to_string(),
             "trim" => "`.trim() -> String` — Returns a string slice with leading and trailing whitespace removed".to_string(),
             "lower" => "`.lower() -> String` — Returns a lowercase copy of the string".to_string(),
@@ -242,6 +243,7 @@ fn handle_hover(msg: &str, id: &str, documents: &HashMap<String, String>) -> Str
             "len" => "`.len() -> Int` — Returns the length of the string or collection".to_string(),
             "append" => "`.append(item)` — Appends an element to the end of the list".to_string(),
             "contains" => "`.contains(item) -> Bool` — Checks whether the element or substring exists".to_string(),
+            "get" => "`.get(index: Int) -> T?` — Safely gets an element by index, returning `nil` if out of bounds".to_string(),
             _ => String::new(),
         };
     }
@@ -348,12 +350,14 @@ fn handle_completion(msg: &str, id: &str, documents: &HashMap<String, String>) -
         {"label":"Int","kind":7,"detail":"Integer type"},
         {"label":"String","kind":7,"detail":"String type"},
         {"label":"Bool","kind":7,"detail":"Boolean type"},
+        {"label":"IndexError","kind":7,"detail":"Built-in list index out-of-bounds error"},
         {"label":"trim","kind":2,"detail":"String.trim() -> String"},
         {"label":"lower","kind":2,"detail":"String.lower() -> String"},
         {"label":"upper","kind":2,"detail":"String.upper() -> String"},
         {"label":"len","kind":2,"detail":"List/String.len() -> Int"},
         {"label":"append","kind":2,"detail":"List.append(item)"},
-        {"label":"contains","kind":2,"detail":"List/String.contains(item) -> Bool"}
+        {"label":"contains","kind":2,"detail":"List/String.contains(item) -> Bool"},
+        {"label":"get","kind":2,"detail":"List.get(index: Int) -> T?","insertText":"get(${1:index})","insertTextFormat":2}
     ]"#;
 
     format!(r#"{{"jsonrpc":"2.0","id":{},"result":{}}}"#, id, items)
@@ -406,7 +410,6 @@ fn get_words_at_position(text: &str, line_idx: usize, char_idx: usize) -> (Strin
 
     let simple_word: String = chars[start..end].iter().collect();
 
-    // Check for qualified word (e.g. prefix before '.')
     let mut qstart = start;
     if qstart > 1 && chars[qstart - 1] == '.' {
         let mut prev = qstart - 1;

@@ -90,7 +90,6 @@ impl<'a> ReachabilityAnalyzer<'a> {
     pub fn analyze(&mut self, root_path: &Path, extra_entry_points: &[(&Path, &str)]) -> ReachabilityReport {
         let mut worklist: Vec<(PathBuf, String)> = Vec::new();
 
-        // 1. Root main() entry point
         let canonical_root = lookup_module(self.modules, root_path)
             .map(|m| m.canonical_path.clone())
             .unwrap_or_else(|| root_path.to_path_buf());
@@ -99,7 +98,6 @@ impl<'a> ReachabilityAnalyzer<'a> {
             worklist.push((root_path.to_path_buf(), "main".to_string()));
         }
 
-        // Extra entry points (e.g. for future HTTP / RPC handlers)
         for &(mod_path, fn_name) in extra_entry_points {
             let canon = lookup_module(self.modules, mod_path)
                 .map(|m| m.canonical_path.clone())
@@ -124,7 +122,6 @@ impl<'a> ReachabilityAnalyzer<'a> {
             }
 
             if let Some(loaded_mod) = lookup_module(self.modules, &mod_path) {
-                // Ensure the canonical path is also marked reachable
                 self.reachable_functions.insert((loaded_mod.canonical_path.clone(), func_name.clone()));
 
                 for item in &loaded_mod.program.items {
@@ -236,22 +233,18 @@ impl<'a> ReachabilityAnalyzer<'a> {
     ) {
         match &expr.kind {
             ExprKind::Ident(name) => {
-                // Function used as a value / callback
                 if self.is_func_in_module(current_mod_path, name) {
                     worklist.push((current_mod_path.to_path_buf(), name.clone()));
                 }
                 self.mark_struct_reachable(current_mod_path, name, worklist);
             }
             ExprKind::Call { callee, args, named_args } => {
-                // Check if direct local call `foo()`
                 if let ExprKind::Ident(ref name) = callee.kind {
                     if self.is_func_in_module(current_mod_path, name) {
                         worklist.push((current_mod_path.to_path_buf(), name.clone()));
                     }
                     self.mark_struct_reachable(current_mod_path, name, worklist);
-                }
-                // Check if qualified call `alias.func()`
-                else if let ExprKind::Member { target, field } = &callee.kind {
+                } else if let ExprKind::Member { target, field } = &callee.kind {
                     if let ExprKind::Ident(ref alias) = target.kind {
                         if let Some((mod_target, _)) = loaded_mod.imports.get(alias) {
                             match mod_target {
@@ -263,7 +256,12 @@ impl<'a> ReachabilityAnalyzer<'a> {
                                     self.reachable_native_functions.insert((native_name.clone(), field.clone()));
                                 }
                             }
+                        } else {
+                            self.scan_expr(target, current_mod_path, loaded_mod, worklist);
                         }
+                    } else {
+                        self.reachable_native_methods.insert((String::new(), field.clone()));
+                        self.scan_expr(target, current_mod_path, loaded_mod, worklist);
                     }
                 } else {
                     self.scan_expr(callee, current_mod_path, loaded_mod, worklist);
@@ -290,12 +288,11 @@ impl<'a> ReachabilityAnalyzer<'a> {
                         }
                     }
                 } else {
-                    // Method call on value
                     self.reachable_native_methods.insert((String::new(), field.clone()));
                     self.scan_expr(target, current_mod_path, loaded_mod, worklist);
                 }
             }
-            ExprKind::Binary { left, right, .. } => {
+            ExprKind::Binary { left, right, .. } | ExprKind::Index { target: left, index: right } => {
                 self.scan_expr(left, current_mod_path, loaded_mod, worklist);
                 self.scan_expr(right, current_mod_path, loaded_mod, worklist);
             }

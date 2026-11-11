@@ -5,7 +5,7 @@ use crate::ast::*;
 use crate::lexer::Span;
 use crate::loader::{ModuleLoader, ModuleTarget};
 use crate::native::NativeRegistry;
-use crate::types::Type;
+use crate::types::{ModuleId, Type, TypeId};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypeError {
@@ -120,36 +120,134 @@ impl TypeChecker {
         None
     }
 
-    pub fn is_error_type(&self, ty: &Type) -> bool {
-        match ty {
-            Type::Custom(name) => {
-                if self.errors.contains(name) {
-                    return true;
-                }
-                if let Some((alias, field)) = name.split_once('.') {
-                    if let Some(target) = self.imports.get(alias) {
-                        match target {
-                            ModuleTarget::Native(nat_name) => {
-                                if let Some(m) = self.native_registry.get_module(nat_name) {
-                                    if let Some(t) = m.types.get(field) {
-                                        return t.is_error;
-                                    }
-                                }
-                            }
-                            ModuleTarget::Local(path) => {
-                                if let Some(info) = self.module_info.get(path) {
-                                    return info.errors.contains(field);
-                                }
-                            }
+    fn current_module_id(&self) -> ModuleId {
+        match &self.current_module_path {
+            Some(path) => ModuleId::Local(path.clone()),
+            None => ModuleId::Program,
+        }
+    }
+
+    fn current_type_id(&self, name: &str) -> TypeId {
+        TypeId {
+            module: self.current_module_id(),
+            name: name.to_string(),
+        }
+    }
+
+    fn resolve_type_name_in_ctx(
+        &self,
+        name: &str,
+        current_module: &ModuleId,
+        imports: &HashMap<String, ModuleTarget>,
+        span: Span,
+    ) -> Result<Type, TypeError> {
+        match name {
+            "Int" => Ok(Type::Int),
+            "String" => Ok(Type::String),
+            "Bool" => Ok(Type::Bool),
+            "Void" => Ok(Type::Void),
+            _ => {
+                if let Some((alias, item_name)) = name.split_once('.') {
+                    let target = imports.get(alias).ok_or_else(|| TypeError {
+                        message: format!("Unknown module alias '{}' in type '{}'", alias, name),
+                        span,
+                    })?;
+                    match target {
+                        ModuleTarget::Native(nat_name) => {
+                            Ok(Type::Custom(TypeId::native(nat_name.clone(), item_name)))
                         }
-                    } else if let Some(m) = self.native_registry.get_module(alias) {
-                        if let Some(t) = m.types.get(field) {
-                            return t.is_error;
+                        ModuleTarget::Local(path) => {
+                            Ok(Type::Custom(TypeId::local(path.clone(), item_name)))
                         }
                     }
+                } else if name == "IndexError" {
+                    Ok(Type::Custom(TypeId::builtin("IndexError")))
+                } else {
+                    Ok(Type::Custom(TypeId {
+                        module: current_module.clone(),
+                        name: name.to_string(),
+                    }))
                 }
-                false
             }
+        }
+    }
+
+    fn resolve_type_expr_in_ctx(
+        &self,
+        expr: &TypeExpr,
+        current_module: &ModuleId,
+        imports: &HashMap<String, ModuleTarget>,
+        span: Span,
+    ) -> Result<Type, TypeError> {
+        match expr {
+            TypeExpr::Named(name) => self.resolve_type_name_in_ctx(name, current_module, imports, span),
+            TypeExpr::List(inner) => Ok(Type::List(Box::new(self.resolve_type_expr_in_ctx(
+                inner,
+                current_module,
+                imports,
+                span,
+            )?))),
+            TypeExpr::Optional(inner) => Ok(Type::Optional(Box::new(self.resolve_type_expr_in_ctx(
+                inner,
+                current_module,
+                imports,
+                span,
+            )?))),
+            TypeExpr::Union(variants) => {
+                let mut types = Vec::with_capacity(variants.len());
+                for v in variants {
+                    types.push(self.resolve_type_expr_in_ctx(v, current_module, imports, span)?);
+                }
+                Ok(Type::union(types))
+            }
+            TypeExpr::Tuple(elements) => {
+                let mut types = Vec::with_capacity(elements.len());
+                for e in elements {
+                    types.push(self.resolve_type_expr_in_ctx(e, current_module, imports, span)?);
+                }
+                Ok(Type::Tuple(types))
+            }
+            TypeExpr::Func { params, return_type } => {
+                let mut p = Vec::with_capacity(params.len());
+                for param in params {
+                    p.push(self.resolve_type_expr_in_ctx(param, current_module, imports, span)?);
+                }
+                let r = Box::new(self.resolve_type_expr_in_ctx(return_type, current_module, imports, span)?);
+                Ok(Type::Function {
+                    params: p,
+                    return_type: r,
+                })
+            }
+        }
+    }
+
+    fn resolve_type_expr(&self, expr: &TypeExpr, span: Span) -> Result<Type, TypeError> {
+        let mod_id = self.current_module_id();
+        self.resolve_type_expr_in_ctx(expr, &mod_id, &self.imports, span)
+    }
+
+    pub fn is_error_type(&self, ty: &Type) -> bool {
+        match ty {
+            Type::Custom(type_id) => match &type_id.module {
+                ModuleId::Builtin => type_id.name == "IndexError",
+                ModuleId::Program => self.errors.contains(&type_id.name),
+                ModuleId::Local(path) => {
+                    if Some(path) == self.current_module_path.as_ref() {
+                        self.errors.contains(&type_id.name)
+                    } else {
+                        self.module_info
+                            .get(path)
+                            .map(|info| info.errors.contains(&type_id.name))
+                            .unwrap_or(false)
+                    }
+                }
+                ModuleId::Native(nat_name) => self
+                    .native_registry
+                    .get_module(nat_name)
+                    .and_then(|m| m.types.get(type_id.name.as_str()))
+                    .map(|t| t.is_error)
+                    .unwrap_or(false),
+            },
             _ => false,
         }
     }
@@ -184,30 +282,36 @@ impl TypeChecker {
 
     fn contains_private_type(&self, ty: &Type, current_mod: Option<&Path>) -> Option<String> {
         match ty {
-            Type::Custom(name) => {
-                // If it's a simple name without a dot, it refers to a type in the current module
-                if !name.contains('.') {
-                    let (exists, is_exported) = if let Some(path) = current_mod {
+            Type::Custom(type_id) => match &type_id.module {
+                ModuleId::Local(path) => {
+                    if current_mod.map(|c| c == path.as_path()).unwrap_or(false) {
                         if let Some(info) = self.module_info.get(path) {
-                            (
-                                info.structs.contains_key(name) || info.errors.contains(name),
-                                info.exports.contains(name),
-                            )
-                        } else {
-                            (false, false)
+                            let exists = info.structs.contains_key(&type_id.name)
+                                || info.errors.contains(&type_id.name);
+                            let is_exported = info.exports.contains(&type_id.name);
+                            if exists && !is_exported {
+                                return Some(type_id.name.clone());
+                            }
                         }
-                    } else {
-                        (
-                            self.structs.contains_key(name) || self.errors.contains(name),
-                            self.structs.get(name).map(|s| s.is_exported).unwrap_or(false),
-                        )
-                    };
+                    }
+                    None
+                }
+                ModuleId::Program => {
+                    let exists = self.structs.contains_key(&type_id.name)
+                        || self.errors.contains(&type_id.name);
+                    let is_exported = self
+                        .structs
+                        .get(&type_id.name)
+                        .map(|s| s.is_exported)
+                        .unwrap_or(false);
                     if exists && !is_exported {
-                        return Some(name.clone());
+                        Some(type_id.name.clone())
+                    } else {
+                        None
                     }
                 }
-                None
-            }
+                ModuleId::Builtin | ModuleId::Native(_) => None,
+            },
             Type::List(inner) | Type::Optional(inner) => self.contains_private_type(inner, current_mod),
             Type::Tuple(elems) => {
                 for e in elems {
@@ -238,8 +342,8 @@ impl TypeChecker {
     }
 
     pub fn check_project(&mut self, root_path: &Path, loader: &ModuleLoader) -> Result<(), TypeError> {
-        // Step 1: Register top-level items for all modules (Pass 1)
         for (path, loaded_mod) in &loader.modules {
+            let mod_id = ModuleId::Local(path.clone());
             let mut info = ModuleInfo::default();
             for (alias, (target, _)) in &loaded_mod.imports {
                 info.imports.insert(alias.clone(), target.clone());
@@ -251,7 +355,9 @@ impl TypeChecker {
                         let mut field_map = HashMap::new();
                         let mut ann_map = HashMap::new();
                         for f in fields {
-                            field_map.insert(f.name.clone(), Type::from_type_expr(&f.ty));
+                            let resolved_ty =
+                                self.resolve_type_expr_in_ctx(&f.ty, &mod_id, &info.imports, item.span)?;
+                            field_map.insert(f.name.clone(), resolved_ty);
                             ann_map.insert(f.name.clone(), f.annotations.clone());
                         }
                         if info.structs.contains_key(name) || info.errors.contains(name) {
@@ -276,7 +382,9 @@ impl TypeChecker {
                         let mut field_map = HashMap::new();
                         let mut ann_map = HashMap::new();
                         for f in fields {
-                            field_map.insert(f.name.clone(), Type::from_type_expr(&f.ty));
+                            let resolved_ty =
+                                self.resolve_type_expr_in_ctx(&f.ty, &mod_id, &info.imports, item.span)?;
+                            field_map.insert(f.name.clone(), resolved_ty);
                             ann_map.insert(f.name.clone(), f.annotations.clone());
                         }
                         if info.structs.contains_key(name) || info.errors.contains(name) {
@@ -299,14 +407,16 @@ impl TypeChecker {
                         info.errors.insert(name.clone());
                     }
                     ItemKind::Func { name, params, return_type, is_validator, .. } => {
-                        let param_types = params
-                            .iter()
-                            .map(|p| (p.name.clone(), Type::from_type_expr(&p.ty)))
-                            .collect();
-                        let ret_type = return_type
-                            .as_ref()
-                            .map(Type::from_type_expr)
-                            .unwrap_or(Type::Void);
+                        let mut param_types = Vec::with_capacity(params.len());
+                        for p in params {
+                            let resolved_ty =
+                                self.resolve_type_expr_in_ctx(&p.ty, &mod_id, &info.imports, item.span)?;
+                            param_types.push((p.name.clone(), resolved_ty));
+                        }
+                        let ret_type = match return_type.as_ref() {
+                            Some(rt) => self.resolve_type_expr_in_ctx(rt, &mod_id, &info.imports, item.span)?,
+                            None => Type::Void,
+                        };
 
                         if info.functions.contains_key(name) {
                             return Err(TypeError {
@@ -334,7 +444,6 @@ impl TypeChecker {
             self.module_info.insert(path.clone(), info);
         }
 
-        // Step 2: Validate private type leaks for all exported declarations
         for (path, info) in &self.module_info {
             for (fn_name, sig) in &info.functions {
                 if sig.is_exported {
@@ -378,7 +487,6 @@ impl TypeChecker {
             }
         }
 
-        // Step 3: Type check bodies of all modules
         for (path, loaded_mod) in &loader.modules {
             self.current_module_path = Some(path.clone());
             if let Some(info) = self.module_info.get(path) {
@@ -388,7 +496,6 @@ impl TypeChecker {
                 self.imports = info.imports.clone();
             }
 
-            // Always add built-in print
             self.functions.insert(
                 "print".to_string(),
                 FuncSignature {
@@ -400,12 +507,9 @@ impl TypeChecker {
             );
 
             for item in &loaded_mod.program.items {
-                if let ItemKind::Func { name, body, return_type, is_validator, params } = &item.kind {
+                if let ItemKind::Func { name, body, is_validator, params, .. } = &item.kind {
                     let sig = self.functions.get(name).unwrap().clone();
-                    let ret_ty = return_type
-                        .as_ref()
-                        .map(Type::from_type_expr)
-                        .unwrap_or(Type::Void);
+                    let ret_ty = sig.return_type.clone();
 
                     if *is_validator {
                         if params.is_empty() {
@@ -420,12 +524,10 @@ impl TypeChecker {
                             Type::Union(vars) => vars.contains(&Type::Void),
                             _ => false,
                         };
+                        let issue_id = TypeId::native("cdt.validation", "Issue");
                         let has_issue = match &ret {
-                            Type::Custom(s) => s == "Issue" || s.ends_with(".Issue"),
-                            Type::Union(vars) => vars.iter().any(|v| match v {
-                                Type::Custom(s) => s == "Issue" || s.ends_with(".Issue"),
-                                _ => false,
-                            }),
+                            Type::Custom(id) => id == &issue_id,
+                            Type::Union(vars) => vars.iter().any(|v| matches!(v, Type::Custom(id) if id == &issue_id)),
                             _ => false,
                         };
                         let is_valid_ret = match &ret {
@@ -471,7 +573,7 @@ impl TypeChecker {
                 if let ItemKind::Type { fields, .. } = &item.kind {
                     for f in fields {
                         for ann in &f.annotations {
-                            self.check_field_annotation(&f.name, f, ann, Some(loader))?;
+                            self.check_field_annotation(&f.name, f, ann)?;
                         }
                     }
                 }
@@ -484,12 +586,22 @@ impl TypeChecker {
 
     pub fn check_program(&mut self, program: &Program) -> Result<(), TypeError> {
         for item in &program.items {
+            if let ItemKind::Import { path, alias } = &item.kind {
+                if path.starts_with("cdt.") {
+                    self.imports.insert(alias.clone(), ModuleTarget::Native(path.clone()));
+                } else {
+                    self.imports.insert(alias.clone(), ModuleTarget::Local(PathBuf::from(path)));
+                }
+            }
+        }
+
+        for item in &program.items {
             match &item.kind {
                 ItemKind::Type { name, fields } => {
                     let mut field_map = HashMap::new();
                     let mut ann_map = HashMap::new();
                     for f in fields {
-                        field_map.insert(f.name.clone(), Type::from_type_expr(&f.ty));
+                        field_map.insert(f.name.clone(), self.resolve_type_expr(&f.ty, item.span)?);
                         ann_map.insert(f.name.clone(), f.annotations.clone());
                     }
                     if self.structs.contains_key(name) || self.errors.contains(name) {
@@ -511,7 +623,7 @@ impl TypeChecker {
                     let mut field_map = HashMap::new();
                     let mut ann_map = HashMap::new();
                     for f in fields {
-                        field_map.insert(f.name.clone(), Type::from_type_expr(&f.ty));
+                        field_map.insert(f.name.clone(), self.resolve_type_expr(&f.ty, item.span)?);
                         ann_map.insert(f.name.clone(), f.annotations.clone());
                     }
                     if self.structs.contains_key(name) || self.errors.contains(name) {
@@ -531,14 +643,14 @@ impl TypeChecker {
                     self.errors.insert(name.clone());
                 }
                 ItemKind::Func { name, params, return_type, is_validator, .. } => {
-                    let param_types = params
-                        .iter()
-                        .map(|p| (p.name.clone(), Type::from_type_expr(&p.ty)))
-                        .collect();
-                    let ret_type = return_type
-                        .as_ref()
-                        .map(Type::from_type_expr)
-                        .unwrap_or(Type::Void);
+                    let mut param_types = Vec::with_capacity(params.len());
+                    for p in params {
+                        param_types.push((p.name.clone(), self.resolve_type_expr(&p.ty, item.span)?));
+                    }
+                    let ret_type = match return_type.as_ref() {
+                        Some(rt) => self.resolve_type_expr(rt, item.span)?,
+                        None => Type::Void,
+                    };
 
                     if self.functions.contains_key(name) {
                         return Err(TypeError {
@@ -556,23 +668,14 @@ impl TypeChecker {
                         },
                     );
                 }
-                ItemKind::Import { path, alias } => {
-                    if path.starts_with("cdt.") {
-                        self.imports.insert(alias.clone(), ModuleTarget::Native(path.clone()));
-                    } else {
-                        self.imports.insert(alias.clone(), ModuleTarget::Local(PathBuf::from(path)));
-                    }
-                }
+                ItemKind::Import { .. } => {}
             }
         }
 
         for item in &program.items {
-            if let ItemKind::Func { name, body, return_type, is_validator, params } = &item.kind {
+            if let ItemKind::Func { name, body, is_validator, params, .. } = &item.kind {
                 let sig = self.functions.get(name).unwrap().clone();
-                let ret_ty = return_type
-                    .as_ref()
-                    .map(Type::from_type_expr)
-                    .unwrap_or(Type::Void);
+                let ret_ty = sig.return_type.clone();
 
                 if *is_validator {
                     if params.is_empty() {
@@ -587,12 +690,10 @@ impl TypeChecker {
                         Type::Union(vars) => vars.contains(&Type::Void),
                         _ => false,
                     };
+                    let issue_id = TypeId::native("cdt.validation", "Issue");
                     let has_issue = match &ret {
-                        Type::Custom(s) => s == "Issue" || s.ends_with(".Issue"),
-                        Type::Union(vars) => vars.iter().any(|v| match v {
-                            Type::Custom(s) => s == "Issue" || s.ends_with(".Issue"),
-                            _ => false,
-                        }),
+                        Type::Custom(id) => id == &issue_id,
+                        Type::Union(vars) => vars.iter().any(|v| matches!(v, Type::Custom(id) if id == &issue_id)),
                         _ => false,
                     };
                     if !has_void || !has_issue {
@@ -631,7 +732,7 @@ impl TypeChecker {
             if let ItemKind::Type { fields, .. } = &item.kind {
                 for f in fields {
                     for ann in &f.annotations {
-                        self.check_field_annotation(&f.name, f, ann, None)?;
+                        self.check_field_annotation(&f.name, f, ann)?;
                     }
                 }
             }
@@ -645,7 +746,6 @@ impl TypeChecker {
         field_name: &str,
         field: &crate::ast::FieldDef,
         ann: &crate::ast::FieldAnnotation,
-        loader: Option<&ModuleLoader>,
     ) -> Result<(), TypeError> {
         let (target_alias, func_name) = if let Some((alias, name)) = ann.target.split_once('.') {
             (Some(alias), name)
@@ -673,36 +773,20 @@ impl TypeChecker {
                         )
                     }
                     ModuleTarget::Local(path) => {
-                        if let Some(loader) = loader {
-                            let loaded = loader.modules.get(path).ok_or_else(|| TypeError {
-                                message: format!("Module '{}' not found", path.display()),
-                                span: ann.span,
-                            })?;
-                            let item = loaded.program.items.iter().find(|it| {
-                                if let ItemKind::Func { name, .. } = &it.kind {
-                                    name == func_name
-                                } else {
-                                    false
-                                }
-                            }).ok_or_else(|| TypeError {
-                                message: format!("Module '{}' has no function '{}'", alias, func_name),
-                                span: ann.span,
-                            })?;
-
-                            if let ItemKind::Func { params, return_type, is_validator, .. } = &item.kind {
-                                let param_types = params.iter().map(|p| (p.name.clone(), Type::from_type_expr(&p.ty))).collect();
-                                let ret = return_type.as_ref().map(Type::from_type_expr).unwrap_or(Type::Void);
-                                let is_val: bool = *is_validator;
-                                (param_types, ret, is_val, item.is_exported)
-                            } else {
-                                unreachable!()
-                            }
-                        } else {
-                            return Err(TypeError {
-                                message: format!("Cannot resolve imported module '{}'", alias),
-                                span: ann.span,
-                            });
-                        }
+                        let info = self.module_info.get(path).ok_or_else(|| TypeError {
+                            message: format!("Cannot resolve imported module '{}'", alias),
+                            span: ann.span,
+                        })?;
+                        let sig = info.functions.get(func_name).ok_or_else(|| TypeError {
+                            message: format!("Module '{}' has no function '{}'", alias, func_name),
+                            span: ann.span,
+                        })?;
+                        (
+                            sig.params.clone(),
+                            sig.return_type.clone(),
+                            sig.is_validator,
+                            sig.is_exported,
+                        )
                     }
                 }
             } else {
@@ -750,7 +834,7 @@ impl TypeChecker {
             });
         }
 
-        let raw_field_ty = Type::from_type_expr(&field.ty);
+        let raw_field_ty = self.resolve_type_expr(&field.ty, ann.span)?;
         let effective_field_ty = match raw_field_ty {
             Type::Optional(inner) => *inner,
             other => other,
@@ -846,7 +930,10 @@ impl TypeChecker {
                 }
             }
             StmtKind::VarDecl { name, ty, init } => {
-                let declared_ty = ty.as_ref().map(Type::from_type_expr);
+                let declared_ty = match ty.as_ref() {
+                    Some(t) => Some(self.resolve_type_expr(t, stmt.span)?),
+                    None => None,
+                };
                 if let Some(init_expr) = init {
                     let init_ty = self.check_expr(init_expr)?;
                     if let Some(ref target) = declared_ty {
@@ -867,6 +954,12 @@ impl TypeChecker {
                 }
             }
             StmtKind::Assign { target, value } => {
+                if matches!(target.kind, ExprKind::Index { .. }) {
+                    return Err(TypeError {
+                        message: "Index assignment 'list[i] = value' is not supported".to_string(),
+                        span: target.span,
+                    });
+                }
                 let target_ty = self.check_expr(target)?;
                 let value_ty = self.check_expr(value)?;
                 if !value_ty.is_assignable_to(&target_ty) {
@@ -952,9 +1045,9 @@ impl TypeChecker {
             }
             StmtKind::Switch { expr, cases } => {
                 let expr_ty = self.check_expr(expr)?;
-                let mut remaining = match &expr_ty {
-                    Type::Union(variants) => variants.clone(),
-                    other => vec![other.clone()],
+                let mut remaining = match Type::union(vec![expr_ty.clone()]) {
+                    Type::Union(variants) => variants,
+                    other => vec![other],
                 };
 
                 for case in cases {
@@ -968,33 +1061,13 @@ impl TypeChecker {
                             remaining.remove(idx);
                         }
                         PatternKind::Type { name, binding } => {
-                            let custom_ty = match name.as_str() {
-                                "Int" => Type::Int,
-                                "String" => Type::String,
-                                "Bool" => Type::Bool,
-                                "Void" => Type::Void,
-                                other => {
-                                    let item_suffix = other.split('.').last().unwrap_or(other);
-                                    let matched = remaining.iter().find(|t| match t {
-                                        Type::Custom(c) => {
-                                            let c_suffix = c.split('.').last().unwrap_or(c);
-                                            c == other
-                                                || c.ends_with(&format!(".{}", other))
-                                                || other.ends_with(&format!(".{}", c))
-                                                || (item_suffix == c_suffix && (!c.contains('.') || !other.contains('.') || {
-                                                    let (a1, _) = c.split_once('.').unwrap();
-                                                    let (a2, _) = other.split_once('.').unwrap();
-                                                    a1 == a2 || self.imports.get(a2).map(|t| match t {
-                                                        ModuleTarget::Native(n) => n.ends_with(a1) || a1 == n.split('.').last().unwrap_or(n),
-                                                        _ => false,
-                                                    }).unwrap_or(false)
-                                                }))
-                                        }
-                                        _ => false,
-                                    }).cloned();
-                                    matched.unwrap_or_else(|| Type::Custom(other.to_string()))
-                                }
-                            };
+                            let mod_id = self.current_module_id();
+                            let custom_ty = self.resolve_type_name_in_ctx(
+                                name,
+                                &mod_id,
+                                &self.imports,
+                                case.pattern.span,
+                            )?;
                             let idx = remaining.iter().position(|t| t == &custom_ty).ok_or_else(|| TypeError {
                                 message: format!("Redundant or impossible case '{}(...)' for type '{}'", name, expr_ty),
                                 span: case.pattern.span,
@@ -1129,6 +1202,20 @@ impl TypeChecker {
         if let Type::List(inner) = target_ty {
             match field {
                 "len" if args.is_empty() => return Ok(Type::Int),
+                "get" if args.len() == 1 => {
+                    let arg_ty = self.check_expr(&args[0])?;
+                    if arg_ty == Type::Int {
+                        let res_ty = match inner.as_ref() {
+                            Type::Optional(_) => inner.as_ref().clone(),
+                            _ => Type::Optional(inner.clone()),
+                        };
+                        return Ok(res_ty);
+                    }
+                    return Err(TypeError {
+                        message: format!("List method 'get()' expects Int argument, got {}", arg_ty),
+                        span: args[0].span,
+                    });
+                }
                 "append" | "contains" if args.len() == 1 => {
                     let arg_ty = self.check_expr(&args[0])?;
                     if arg_ty.is_assignable_to(inner) {
@@ -1139,17 +1226,14 @@ impl TypeChecker {
             }
         }
 
-        if let Type::Custom(type_name) = target_ty {
-            let short_name = type_name.split('.').last().unwrap_or(type_name);
-            let method_def = {
-                let mut found = None;
-                for m in self.native_registry.modules() {
-                    if let Some(md) = m.methods.get(&(short_name, field)) {
-                        found = Some(md.clone());
-                        break;
-                    }
-                }
-                found
+        if let Type::Custom(type_id) = target_ty {
+            let method_def = if let ModuleId::Native(ref nat_name) = type_id.module {
+                self.native_registry
+                    .get_module(nat_name)
+                    .and_then(|m| m.methods.get(&(type_id.name.as_str(), field)))
+                    .cloned()
+            } else {
+                None
             };
 
             if let Some(method_def) = method_def {
@@ -1157,7 +1241,7 @@ impl TypeChecker {
                     return Err(TypeError {
                         message: format!(
                             "Method '{}.{}()' expects {} arguments, got {}",
-                            type_name, field, method_def.params.len(), args.len()
+                            type_id, field, method_def.params.len(), args.len()
                         ),
                         span,
                     });
@@ -1168,7 +1252,7 @@ impl TypeChecker {
                         return Err(TypeError {
                             message: format!(
                                 "Argument {} of method '{}.{}()' expects {}, got {}",
-                                i + 1, type_name, field, expected_ty, actual_ty
+                                i + 1, type_id, field, expected_ty, actual_ty
                             ),
                             span: arg_expr.span,
                         });
@@ -1207,7 +1291,7 @@ impl TypeChecker {
                 }
 
                 if let Some(t) = m.types.get(field) {
-                    return Ok(Type::Custom(t.qualified_name.to_string()));
+                    return Ok(Type::Custom(TypeId::native(m.name, t.name)));
                 }
 
                 Err(TypeError {
@@ -1242,7 +1326,7 @@ impl TypeChecker {
                             span,
                         });
                     }
-                    return Ok(Type::Custom(format!("{}.{}", alias, field)));
+                    return Ok(Type::Custom(TypeId::local(path.clone(), field)));
                 }
 
                 Err(TypeError {
@@ -1269,7 +1353,9 @@ impl TypeChecker {
                         return_type: Box::new(sig.return_type),
                     })
                 } else if self.structs.contains_key(name) {
-                    Ok(Type::Custom(name.clone()))
+                    Ok(Type::Custom(self.current_type_id(name)))
+                } else if name == "IndexError" {
+                    Ok(Type::Custom(TypeId::builtin("IndexError")))
                 } else {
                     Err(TypeError {
                         message: format!("Unknown variable '{}'", name),
@@ -1293,6 +1379,26 @@ impl TypeChecker {
                     }
                 }
                 Ok(Type::List(Box::new(first_ty)))
+            }
+            ExprKind::Index { target, index } => {
+                let target_ty = self.check_expr(target)?;
+                let elem_ty = match target_ty {
+                    Type::List(inner) => *inner,
+                    other => {
+                        return Err(TypeError {
+                            message: format!("Cannot index into non-list type '{}'", other),
+                            span: target.span,
+                        });
+                    }
+                };
+                let index_ty = self.check_expr(index)?;
+                if index_ty != Type::Int {
+                    return Err(TypeError {
+                        message: format!("List index must be Int, got '{}'", index_ty),
+                        span: index.span,
+                    });
+                }
+                Ok(Type::union(vec![elem_ty, Type::Custom(TypeId::builtin("IndexError"))]))
             }
             ExprKind::Unary { op, expr: inner } => {
                 let inner_ty = self.check_expr(inner)?;
@@ -1459,9 +1565,28 @@ impl TypeChecker {
                 Ok(Type::union(successes))
             }
             ExprKind::Call { callee, args, named_args } => {
-                // 1. Direct local struct constructor
                 if let ExprKind::Ident(ref type_name) = callee.kind {
-                    if let Some(struct_sig) = self.structs.get(type_name).cloned() {
+                    let builtin_index_error = if type_name == "IndexError" && !self.structs.contains_key("IndexError") {
+                        let mut fields = HashMap::new();
+                        fields.insert("index".to_string(), Type::Int);
+                        fields.insert("length".to_string(), Type::Int);
+                        fields.insert("message".to_string(), Type::String);
+                        Some(StructSignature {
+                            fields,
+                            field_annotations: HashMap::new(),
+                            is_exported: true,
+                        })
+                    } else {
+                        None
+                    };
+                    let direct_struct = self
+                        .structs
+                        .get(type_name)
+                        .cloned()
+                        .map(|sig| (self.current_type_id(type_name), sig))
+                        .or_else(|| builtin_index_error.map(|sig| (TypeId::builtin("IndexError"), sig)));
+
+                    if let Some((type_id, struct_sig)) = direct_struct {
                         if !args.is_empty() {
                             return Err(TypeError {
                                 message: format!("Type '{}' must be constructed using named arguments", type_name),
@@ -1496,10 +1621,9 @@ impl TypeChecker {
                                 });
                             }
                         }
-                        return Ok(Type::Custom(type_name.clone()));
+                        return Ok(Type::Custom(type_id));
                     }
-
-                    // map(list, callback)
+                    
                     if type_name == "map" {
                         if args.len() != 2 {
                             return Err(TypeError {
@@ -1540,7 +1664,6 @@ impl TypeChecker {
                         }
                     }
 
-                    // filter(list, callback)
                     if type_name == "filter" {
                         if args.len() != 2 {
                             return Err(TypeError {
@@ -1587,8 +1710,7 @@ impl TypeChecker {
                         }
                     }
                 }
-
-                // 2. Check if callee is an imported module member call or constructor: `alias.foo(...)`
+                
                 if let ExprKind::Member { target, field } = &callee.kind {
                     if let ExprKind::Ident(ref alias) = target.kind {
                         if let Some(mod_target) = self.imports.get(alias).cloned() {
@@ -1641,7 +1763,7 @@ impl TypeChecker {
                                                 });
                                             }
                                         }
-                                        return Ok(Type::Custom(format!("{}.{}", alias, field)));
+                                        return Ok(Type::Custom(TypeId::native(nat_name.clone(), field)));
                                     }
 
                                     if let Some(f) = func_def {
@@ -1659,7 +1781,7 @@ impl TypeChecker {
                                                 });
                                             }
                                             let val_ty = self.check_expr(&args[0])?;
-                                            let err_ty = Type::Custom(format!("{}.ValidationError", alias));
+                                            let err_ty = Type::Custom(TypeId::native("cdt.validation", "ValidationError"));
                                             return Ok(Type::union(vec![val_ty, err_ty]));
                                         }
 
@@ -1692,8 +1814,7 @@ impl TypeChecker {
                                         message: format!("Module '{}' not loaded", path.display()),
                                         span: callee.span,
                                     })?;
-
-                                    // Check constructor of imported struct / error
+                                    
                                     if let Some(struct_sig) = info.structs.get(field) {
                                         if !struct_sig.is_exported {
                                             return Err(TypeError {
@@ -1735,10 +1856,9 @@ impl TypeChecker {
                                                 });
                                             }
                                         }
-                                        return Ok(Type::Custom(format!("{}.{}", alias, field)));
+                                        return Ok(Type::Custom(TypeId::local(path.clone(), field)));
                                     }
 
-                                    // Check imported function call
                                     if let Some(fn_sig) = info.functions.get(field) {
                                         if !fn_sig.is_exported {
                                             return Err(TypeError {
@@ -1768,12 +1888,10 @@ impl TypeChecker {
                         }
                     }
 
-                    // 3. Method call on value
                     let target_ty = self.check_expr(target)?;
                     return self.check_method_call(&target_ty, field, args, callee.span);
                 }
-
-                // 4. Function call (by name or through function-typed expression)
+                
                 let callee_ty = self.check_expr(callee)?;
                 if let Type::Function { params, return_type } = callee_ty {
                     if !named_args.is_empty() {
@@ -1821,75 +1939,45 @@ impl TypeChecker {
                     });
                 }
 
-                if let Type::Custom(ref struct_name) = target_ty {
-                    if let Some(struct_sig) = self.structs.get(struct_name) {
-                        if let Some(field_ty) = struct_sig.fields.get(field) {
-                            return Ok(field_ty.clone());
-                        } else {
-                            return Err(TypeError {
-                                message: format!("Type '{}' has no field '{}'", struct_name, field),
-                                span: expr.span,
-                            });
-                        }
-                    }
-
-                    // Check if imported struct: `alias.Type`
-                    if let Some((alias, item_name)) = struct_name.split_once('.') {
-                        if let Some(mod_target) = self.imports.get(alias) {
-                            match mod_target {
-                                ModuleTarget::Local(path) => {
-                                    if let Some(info) = self.module_info.get(path) {
-                                        if let Some(struct_sig) = info.structs.get(item_name) {
-                                            if let Some(field_ty) = struct_sig.fields.get(field) {
-                                                return Ok(field_ty.clone());
-                                            }
-                                        }
-                                    }
-                                }
-                                ModuleTarget::Native(nat_name) => {
-                                    if let Some(m) = self.native_registry.get_module(nat_name) {
-                                        if let Some(t) = m.types.get(item_name) {
-                                            for (f_name, f_ty) in &t.fields {
-                                                if *f_name == field {
-                                                    return Ok(f_ty.clone());
-                                                }
-                                            }
-                                        }
-                                    }
+                if let Type::Custom(ref type_id) = target_ty {
+                    match &type_id.module {
+                        ModuleId::Builtin => {
+                            if type_id.name == "IndexError" {
+                                match field.as_str() {
+                                    "index" | "length" => return Ok(Type::Int),
+                                    "message" => return Ok(Type::String),
+                                    _ => {}
                                 }
                             }
-                        } else if let Some(m) = self.native_registry.get_module(alias) {
-                            if let Some(t) = m.types.get(item_name) {
-                                for (f_name, f_ty) in &t.fields {
-                                    if *f_name == field {
-                                        return Ok(f_ty.clone());
+                        }
+                        ModuleId::Program => {
+                            if let Some(struct_sig) = self.structs.get(&type_id.name) {
+                                if let Some(field_ty) = struct_sig.fields.get(field) {
+                                    return Ok(field_ty.clone());
+                                }
+                            }
+                        }
+                        ModuleId::Local(path) => {
+                            if Some(path) == self.current_module_path.as_ref() {
+                                if let Some(struct_sig) = self.structs.get(&type_id.name) {
+                                    if let Some(field_ty) = struct_sig.fields.get(field) {
+                                        return Ok(field_ty.clone());
+                                    }
+                                }
+                            } else if let Some(info) = self.module_info.get(path) {
+                                if let Some(struct_sig) = info.structs.get(&type_id.name) {
+                                    if let Some(field_ty) = struct_sig.fields.get(field) {
+                                        return Ok(field_ty.clone());
                                     }
                                 }
                             }
                         }
-                    } else {
-                        // Check if struct_name is an exported type from any imported module
-                        for (_, mod_target) in &self.imports {
-                            match mod_target {
-                                ModuleTarget::Local(path) => {
-                                    if let Some(info) = self.module_info.get(path) {
-                                        if let Some(struct_sig) = info.structs.get(struct_name) {
-                                            if struct_sig.is_exported {
-                                                if let Some(field_ty) = struct_sig.fields.get(field) {
-                                                    return Ok(field_ty.clone());
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                ModuleTarget::Native(nat_name) => {
-                                    if let Some(m) = self.native_registry.get_module(nat_name) {
-                                        if let Some(t) = m.types.get(struct_name.as_str()) {
-                                            for (f_name, f_ty) in &t.fields {
-                                                if *f_name == field {
-                                                    return Ok(f_ty.clone());
-                                                }
-                                            }
+                        ModuleId::Native(nat_name) => {
+                            if let Some(m) = self.native_registry.get_module(nat_name) {
+                                if let Some(t) = m.types.get(type_id.name.as_str()) {
+                                    for (f_name, f_ty) in &t.fields {
+                                        if *f_name == field {
+                                            return Ok(f_ty.clone());
                                         }
                                     }
                                 }

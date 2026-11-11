@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::native::NativeValue;
+use crate::types::TypeId;
 
 #[derive(Clone)]
 pub enum Value {
@@ -13,11 +14,11 @@ pub enum Value {
     List(Vec<Value>),
     Tuple(Vec<Value>),
     Struct {
-        name: String,
+        type_id: TypeId,
         fields: HashMap<String, Value>,
     },
     Error {
-        name: String,
+        type_id: TypeId,
         fields: HashMap<String, Value>,
     },
     Native(Arc<dyn NativeValue>),
@@ -38,8 +39,8 @@ impl std::fmt::Debug for Value {
             Value::Void => write!(f, "Void"),
             Value::List(items) => write!(f, "List({:?})", items),
             Value::Tuple(items) => write!(f, "Tuple({:?})", items),
-            Value::Struct { name, fields } => write!(f, "Struct({}, {:?})", name, fields),
-            Value::Error { name, fields } => write!(f, "Error({}, {:?})", name, fields),
+            Value::Struct { type_id, fields } => write!(f, "Struct({}, {:?})", type_id, fields),
+            Value::Error { type_id, fields } => write!(f, "Error({}, {:?})", type_id, fields),
             Value::Native(nat) => write!(f, "Native({:?})", nat),
             Value::Function(name) => write!(f, "Function({})", name),
             Value::NativeFunction { module, name } => write!(f, "NativeFunction({}.{})", module, name),
@@ -58,13 +59,13 @@ impl PartialEq for Value {
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Tuple(a), Value::Tuple(b)) => a == b,
             (
-                Value::Struct { name: n1, fields: f1 },
-                Value::Struct { name: n2, fields: f2 },
-            ) => n1 == n2 && f1 == f2,
+                Value::Struct { type_id: t1, fields: f1 },
+                Value::Struct { type_id: t2, fields: f2 },
+            ) => t1 == t2 && f1 == f2,
             (
-                Value::Error { name: n1, fields: f1 },
-                Value::Error { name: n2, fields: f2 },
-            ) => n1 == n2 && f1 == f2,
+                Value::Error { type_id: t1, fields: f1 },
+                Value::Error { type_id: t2, fields: f2 },
+            ) => t1 == t2 && f1 == f2,
             (Value::Native(a), Value::Native(b)) => a.dyn_eq(&**b),
             (Value::Function(a), Value::Function(b)) => a == b,
             (
@@ -104,8 +105,8 @@ impl std::fmt::Display for Value {
                 }
                 write!(f, ")")
             }
-            Value::Struct { name, fields } | Value::Error { name, fields } => {
-                write!(f, "{}(", name)?;
+            Value::Struct { type_id, fields } | Value::Error { type_id, fields } => {
+                write!(f, "{}(", type_id)?;
                 let mut first = true;
                 for (k, v) in fields {
                     if !first {
@@ -156,5 +157,19 @@ impl Value {
 
     pub fn is_error(&self) -> bool {
         matches!(self, Value::Error { .. })
+    }
+}
+
+pub fn make_index_error(index: i64, length: usize) -> Value {
+    let mut fields = HashMap::new();
+    fields.insert("index".to_string(), Value::Int(index));
+    fields.insert("length".to_string(), Value::Int(length as i64));
+    fields.insert(
+        "message".to_string(),
+        Value::String(format!("Index {} out of bounds for list of length {}", index, length)),
+    );
+    Value::Error {
+        type_id: TypeId::builtin("IndexError"),
+        fields,
     }
 }

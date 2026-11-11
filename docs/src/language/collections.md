@@ -14,6 +14,50 @@ nums := [1, 2, 3, 4, 5]
 
 The type of `nums` is inferred as `[Int]`. Attempting to construct a list with mismatched element types results in a compile-time type mismatch error.
 
+### Safe Indexing (`list[index]`)
+
+Indexing into `[T]` never panics at runtime and always returns `T | IndexError`:
+
+```conduit
+error IndexError {
+    index: Int
+    length: Int
+    message: String
+}
+```
+
+`IndexError` is part of the prelude and requires no import. Both `index >= list.len()` and negative indices (`index < 0`) produce an `IndexError`—Conduit does not treat negative indices as offsets from the end of the list.
+
+You can propagate out-of-bounds errors with `?` or match explicitly with `switch`:
+
+```conduit
+func first_item(items: [String]) -> String | IndexError {
+    first := items[0]?
+    return first
+}
+
+func inspect(nums: [Int]) {
+    switch nums[-1] {
+        case Int(val):
+            print(val)
+        case IndexError(err):
+            print(err.message)
+    }
+}
+```
+
+### Optional Lookup (`list.get(index)`)
+
+For lookups where an absent element is expected and a default value makes sense, use `list.get(index: Int) -> T?`:
+
+```conduit
+nums := [10, 20, 30]
+first := nums.get(0) ?? 0     // 10
+missing := nums.get(99) ?? 0  // 0
+```
+
+If the element type `T` is already optional (`U?`), `.get(index)` keeps the result type as `U?` without double-wrapping. Both negative indices and `index >= list.len()` return `nil`.
+
 ---
 
 ## Transforming Collections
@@ -73,7 +117,7 @@ positives := filter([-2, 5, -1, 8], is_positive) // [5, 8]
 
 ## Runnable Example
 
-The following program demonstrates list construction, mapping, boolean filtering, and error preservation:
+The following program demonstrates list construction, safe indexing, `.get()`, mapping, boolean filtering, and error preservation:
 
 ```conduit
 {{#include ../../../examples/docs/language/collections.cdt}}
@@ -89,6 +133,8 @@ Output:
 
 ```text
 [1, 2, 3, 4, 5]
+First: 1
+-1
 [1, 4, 9, 16, 25]
 [5, 8]
 [InvalidItem(id: -1), 10, InvalidItem(id: -2)]

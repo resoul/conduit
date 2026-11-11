@@ -41,7 +41,7 @@
     },
     {
       "name": "support.type.conduit",
-      "match": "\\b(Int|String|Bool|Void)\\b"
+      "match": "\\b(Int|String|Bool|Void|IndexError)\\b"
     },
     {
       "name": "support.function.builtin.conduit",
