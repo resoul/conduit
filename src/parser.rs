@@ -259,10 +259,7 @@ impl Parser {
         }
     }
 
-    fn parse_func_item(&mut self, is_exported: bool, is_validator: bool) -> Result<Item, ParserError> {
-        let start_span = self.expect(&TokenKind::KwFunc)?.span;
-        let (name, _) = self.expect_ident()?;
-
+    fn parse_params_and_return_type(&mut self) -> Result<(Vec<Param>, Option<TypeExpr>), ParserError> {
         self.expect(&TokenKind::LParen)?;
         let mut params = Vec::new();
         while !self.check(&TokenKind::RParen) && !self.check(&TokenKind::Eof) {
@@ -287,6 +284,14 @@ impl Parser {
             None
         };
 
+        Ok((params, return_type))
+    }
+
+    fn parse_func_item(&mut self, is_exported: bool, is_validator: bool) -> Result<Item, ParserError> {
+        let start_span = self.expect(&TokenKind::KwFunc)?.span;
+        let (name, _) = self.expect_ident()?;
+
+        let (params, return_type) = self.parse_params_and_return_type()?;
         let body = self.parse_block()?;
 
         Ok(Item::new_exported(
@@ -761,7 +766,7 @@ impl Parser {
                     span,
                 ))
             }
-            ExprKind::Ident(_) => {
+            ExprKind::Ident(_) | ExprKind::Closure { .. } => {
                 Ok(Expr::new(
                     ExprKind::Call {
                         callee: Box::new(right),
@@ -1002,6 +1007,19 @@ impl Parser {
             TokenKind::KwNil => {
                 self.bump();
                 Ok(Expr::new(ExprKind::Nil, tok.span))
+            }
+            TokenKind::KwFunc => {
+                self.bump();
+                let (params, return_type) = self.parse_params_and_return_type()?;
+                let body = self.parse_block()?;
+                Ok(Expr::new(
+                    ExprKind::Closure {
+                        params,
+                        return_type,
+                        body,
+                    },
+                    tok.span,
+                ))
             }
             TokenKind::Ident(name) => {
                 self.bump();

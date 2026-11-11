@@ -5,6 +5,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
+## [0.1.7] - 2026-11-11
+
+### Added & Changed
+
+* **Anonymous Functions & Lexical Closures**:
+  * Added `func(param: Type, ...) -> ReturnType { ... }` expression syntax (omitted return type defaults to `Void`) usable in assignments, direct calls, `map`/`filter`, pipes (`|>`), and higher-order returns.
+  * Closures capture enclosing lexical bindings by value snapshot at creation time and preserve their defining module context so cross-module closures continue resolving private helpers and module types accurately.
+  * Type checker isolates closure `current_return_type` (`return` and `?` apply to the closure itself) and resets `loop_depth` (`break`/`continue` cannot cross closure boundaries), enforces `block_always_returns` for non-`Void` closures, and rejects unhandled error variables inside closures.
+  * Updated `ReachabilityAnalyzer` to scan parameter types, return types, and bodies of closure expressions.
+
+* **String Methods & Explicit `.to_string()`**:
+  * Added `String` methods: `.split(sep: String) -> [String]`, `.starts_with(prefix: String) -> Bool`, `.ends_with(suffix: String) -> Bool`, `.replace(from: String, to: String) -> String` (returning the original string unchanged when `from == ""`), and `.char_count() -> Int` (Unicode scalar count).
+  * Documented `String.len()` as UTF-8 byte length (`O(1)`) in contrast with `.char_count()` and `cdt.validation` `min`/`max` character-count bounds (Unicode scalar values).
+  * Added explicit `.to_string() -> String` on `Int`, `Bool`, and `String` while preserving strict non-coercion for `+`.
+  * Updated LSP hover/completion and documentation examples for closures, strings, and `.to_string()`.
+
 ## [0.1.6] - 2026-11-11
 
 ### Added & Changed

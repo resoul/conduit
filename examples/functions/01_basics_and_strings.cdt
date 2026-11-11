@@ -1,0 +1,44 @@
+func factorial(n: Int) -> Int {
+    if n <= 1 {
+        return 1
+    }
+    return n * factorial(n - 1)
+}
+
+func clamp(val: Int, low: Int, high: Int) -> Int {
+    if val < low {
+        return low
+    }
+    if val > high {
+        return high
+    }
+    return val
+}
+
+func format_greeting(name: String, formal: Bool) -> String {
+    clean := name.trim()
+    if formal {
+        return "Dear " + clean.upper()
+    }
+    return "Hi, " + clean
+}
+
+func main() {
+    print("factorial(5) = " + factorial(5).to_string())
+    print("clamp(150, 0, 100) = " + clamp(150, 0, 100).to_string())
+
+    print(format_greeting("   Alex   ", false))
+    print(format_greeting("doctor smith", true))
+
+    file := "main.cdt"
+    print("is .cdt file: " + file.ends_with(".cdt").to_string())
+    print("updated url: " + "http://example.com".replace("http://", "https://"))
+    print("has https: " + "https://example.com".starts_with("https://").to_string())
+
+    tags := "api,web,cli".split(",")
+    print("tag count: " + tags.len().to_string())
+
+    word := "café"
+    print("café bytes=" + word.len().to_string() + ", chars=" + word.char_count().to_string())
+}
+

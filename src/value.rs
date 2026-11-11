@@ -1,8 +1,18 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::ast::{Block, Param};
 use crate::native::NativeValue;
 use crate::types::TypeId;
+
+#[derive(Debug, Clone)]
+pub struct ClosureData {
+    pub params: Vec<Param>,
+    pub body: Block,
+    pub env: HashMap<String, Value>,
+    pub module: Option<PathBuf>,
+}
 
 #[derive(Clone)]
 pub enum Value {
@@ -23,6 +33,7 @@ pub enum Value {
     },
     Native(Arc<dyn NativeValue>),
     Function(String),
+    Closure(Arc<ClosureData>),
     NativeFunction {
         module: String,
         name: String,
@@ -43,6 +54,7 @@ impl std::fmt::Debug for Value {
             Value::Error { type_id, fields } => write!(f, "Error({}, {:?})", type_id, fields),
             Value::Native(nat) => write!(f, "Native({:?})", nat),
             Value::Function(name) => write!(f, "Function({})", name),
+            Value::Closure(c) => write!(f, "Closure({} params)", c.params.len()),
             Value::NativeFunction { module, name } => write!(f, "NativeFunction({}.{})", module, name),
         }
     }
@@ -77,6 +89,22 @@ impl PartialEq for Value {
     }
 }
 
+fn write_delimited(
+    f: &mut std::fmt::Formatter<'_>,
+    items: &[Value],
+    open: &str,
+    close: &str,
+) -> std::fmt::Result {
+    write!(f, "{}", open)?;
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            write!(f, ", ")?;
+        }
+        write!(f, "{}", item)?;
+    }
+    write!(f, "{}", close)
+}
+
 impl std::fmt::Display for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -85,26 +113,8 @@ impl std::fmt::Display for Value {
             Value::Bool(b) => write!(f, "{}", b),
             Value::Nil => write!(f, "nil"),
             Value::Void => write!(f, "()"),
-            Value::List(items) => {
-                write!(f, "[")?;
-                for (i, item) in items.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{}", item)?;
-                }
-                write!(f, "]")
-            }
-            Value::Tuple(items) => {
-                write!(f, "(")?;
-                for (i, item) in items.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{}", item)?;
-                }
-                write!(f, ")")
-            }
+            Value::List(items) => write_delimited(f, items, "[", "]"),
+            Value::Tuple(items) => write_delimited(f, items, "(", ")"),
             Value::Struct { type_id, fields } | Value::Error { type_id, fields } => {
                 write!(f, "{}(", type_id)?;
                 let mut first = true;
@@ -119,6 +129,7 @@ impl std::fmt::Display for Value {
             }
             Value::Native(nat) => nat.display(f),
             Value::Function(name) => write!(f, "<func {}>", name),
+            Value::Closure(_) => write!(f, "<closure>"),
             Value::NativeFunction { module, name } => write!(f, "<native func {}.{}>", module, name),
         }
     }
@@ -135,7 +146,7 @@ impl Value {
             Value::Tuple(_) => true,
             Value::Struct { .. } | Value::Error { .. } => true,
             Value::Native(_) => true,
-            Value::Function(_) | Value::NativeFunction { .. } => true,
+            Value::Function(_) | Value::Closure(_) | Value::NativeFunction { .. } => true,
         }
     }
 
@@ -151,7 +162,7 @@ impl Value {
             Value::Struct { .. } => "Struct",
             Value::Error { .. } => "Error",
             Value::Native(nat) => nat.type_name(),
-            Value::Function(_) | Value::NativeFunction { .. } => "Function",
+            Value::Function(_) | Value::Closure(_) | Value::NativeFunction { .. } => "Function",
         }
     }
 

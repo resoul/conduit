@@ -1,0 +1,44 @@
+func filter_positive(numbers: [Int]) -> [Int] {
+    var result: [Int] = []
+    for n in numbers {
+        if n > 0 {
+            result.append(n)
+        }
+    }
+    return result
+}
+
+func main() {
+    nums := [-10, 5, -2, 8, 0, 15, -1]
+    positives := filter_positive(nums)
+    print("Positives: {positives}")
+
+    print("Odd items <= 5:")
+    for n in 1..10 {
+        if n % 2 == 0 {
+            continue
+        }
+        if n > 5 {
+            break
+        }
+        print("  {n}")
+    }
+
+    var squares: [Int] = []
+    for i in 1..6 {
+        squares.append(i * i)
+    }
+    print("Squares (1..6): {squares}")
+
+    first := squares.get(0) ?? -1
+    missing := squares.get(99) ?? -1
+    print("get(0)={first}, get(99)={missing}")
+
+    switch squares[10] {
+        case Int(v):
+            print("squares[10] = {v}")
+        case IndexError(err):
+            print("Safe index error: {err.message}")
+    }
+}
+

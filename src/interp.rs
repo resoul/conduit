@@ -1,12 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::ast::*;
 use crate::lexer::Span;
 use crate::loader::{ModuleLoader, ModuleTarget};
 use crate::native::NativeRegistry;
 use crate::types::{ModuleId, TypeId};
-use crate::value::{make_index_error, Value};
+use crate::value::{make_index_error, ClosureData, Value};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeError {
@@ -99,6 +100,16 @@ impl Interpreter {
             }
         }
         None
+    }
+
+    fn snapshot_env(&self) -> HashMap<String, Value> {
+        let mut captured = HashMap::new();
+        for scope in &self.env {
+            for (k, v) in scope {
+                captured.insert(k.clone(), v.clone());
+            }
+        }
+        captured
     }
 
     fn interpolate(&self, template: &str) -> String {
@@ -432,6 +443,7 @@ impl Interpreter {
         };
 
         let prev_mod = self.current_module.clone();
+        let prev_env = std::mem::replace(&mut self.env, vec![HashMap::new()]);
         self.current_module = mod_path;
 
         self.enter_scope();
@@ -441,19 +453,28 @@ impl Interpreter {
         }
 
         let mut return_val = Value::Void;
+        let mut eval_err = None;
         for stmt in &body.stmts {
-            match self.eval_stmt(stmt)? {
-                ControlFlow::Next | ControlFlow::Break | ControlFlow::Continue => {}
-                ControlFlow::Return(val) => {
+            match self.eval_stmt(stmt) {
+                Ok(ControlFlow::Next | ControlFlow::Break | ControlFlow::Continue) => {}
+                Ok(ControlFlow::Return(val)) => {
                     return_val = val;
+                    break;
+                }
+                Err(e) => {
+                    eval_err = Some(e);
                     break;
                 }
             }
         }
 
         self.exit_scope();
+        self.env = prev_env;
         self.current_module = prev_mod;
-        Ok(return_val)
+        match eval_err {
+            Some(e) => Err(e),
+            None => Ok(return_val),
+        }
     }
 
     fn call_callable(&mut self, callee_val: &Value, args: Vec<Value>, span: Span) -> Result<Value, RuntimeError> {
@@ -465,6 +486,41 @@ impl Interpreter {
                 } else {
                     let cur = self.current_module.clone();
                     self.call_module_function(cur, fn_id, args, span)
+                }
+            }
+            Value::Closure(closure) => {
+                let prev_mod = self.current_module.clone();
+                let prev_env = std::mem::replace(&mut self.env, vec![closure.env.clone()]);
+                self.current_module = closure.module.clone();
+
+                self.enter_scope();
+                for (i, param) in closure.params.iter().enumerate() {
+                    let arg_val = args.get(i).cloned().unwrap_or(Value::Nil);
+                    self.define_variable(param.name.clone(), arg_val);
+                }
+
+                let mut return_val = Value::Void;
+                let mut eval_err = None;
+                for stmt in &closure.body.stmts {
+                    match self.eval_stmt(stmt) {
+                        Ok(ControlFlow::Next | ControlFlow::Break | ControlFlow::Continue) => {}
+                        Ok(ControlFlow::Return(val)) => {
+                            return_val = val;
+                            break;
+                        }
+                        Err(e) => {
+                            eval_err = Some(e);
+                            break;
+                        }
+                    }
+                }
+
+                self.exit_scope();
+                self.env = prev_env;
+                self.current_module = prev_mod;
+                match eval_err {
+                    Some(e) => Err(e),
+                    None => Ok(return_val),
                 }
             }
             Value::NativeFunction { module, name } => {
@@ -688,9 +744,13 @@ impl Interpreter {
             ExprKind::Ident(name) => {
                 if let Some(val) = self.lookup_variable(name) {
                     Ok(val)
-                } else if self.module_functions.contains_key(&(self.current_module.clone(), name.clone()))
-                    || self.module_functions.contains_key(&(None, name.clone()))
-                {
+                } else if self.module_functions.contains_key(&(self.current_module.clone(), name.clone())) {
+                    if let Some(ref cur_path) = self.current_module {
+                        Ok(Value::Function(format!("{}::{}", cur_path.display(), name)))
+                    } else {
+                        Ok(Value::Function(name.clone()))
+                    }
+                } else if self.module_functions.contains_key(&(None, name.clone())) {
                     Ok(Value::Function(name.clone()))
                 } else {
                     Err(RuntimeError {
@@ -706,6 +766,12 @@ impl Interpreter {
                 }
                 Ok(Value::List(vals))
             }
+            ExprKind::Closure { params, body, .. } => Ok(Value::Closure(Arc::new(ClosureData {
+                params: params.clone(),
+                body: body.clone(),
+                env: self.snapshot_env(),
+                module: self.current_module.clone(),
+            }))),
             ExprKind::Index { target, index } => {
                 let target_val = self.eval_expr(target)?;
                 let index_val = self.eval_expr(index)?;
@@ -844,7 +910,6 @@ impl Interpreter {
                 }
             }
             ExprKind::Call { callee, args, named_args } => {
-                // 1. Direct local struct or error constructor
                 if let ExprKind::Ident(ref name) = callee.kind {
                     let cur_structs = self.module_structs.get(&self.current_module);
                     let is_struct = cur_structs.map(|s| s.contains(name)).unwrap_or(false);
@@ -1079,15 +1144,62 @@ impl Interpreter {
                     }
 
                     match target_val {
+                        Value::Int(n) => {
+                            if field == "to_string" {
+                                return Ok(Value::String(n.to_string()));
+                            }
+                        }
+                        Value::Bool(b) => {
+                            if field == "to_string" {
+                                return Ok(Value::String(b.to_string()));
+                            }
+                        }
                         Value::String(s) => match field.as_str() {
                             "trim" => return Ok(Value::String(s.trim().to_string())),
                             "lower" => return Ok(Value::String(s.to_lowercase())),
                             "upper" => return Ok(Value::String(s.to_uppercase())),
+                            "to_string" => return Ok(Value::String(s)),
                             "len" => return Ok(Value::Int(s.len() as i64)),
+                            "char_count" => return Ok(Value::Int(s.chars().count() as i64)),
                             "contains" => {
                                 let search = self.eval_expr(&args[0])?;
                                 if let Value::String(sub) = search {
                                     return Ok(Value::Bool(s.contains(&sub)));
+                                }
+                            }
+                            "starts_with" => {
+                                let arg = self.eval_expr(&args[0])?;
+                                if let Value::String(prefix) = arg {
+                                    return Ok(Value::Bool(s.starts_with(&prefix)));
+                                }
+                            }
+                            "ends_with" => {
+                                let arg = self.eval_expr(&args[0])?;
+                                if let Value::String(suffix) = arg {
+                                    return Ok(Value::Bool(s.ends_with(&suffix)));
+                                }
+                            }
+                            "split" => {
+                                let arg = self.eval_expr(&args[0])?;
+                                if let Value::String(sep) = arg {
+                                    let parts = if sep.is_empty() {
+                                        s.chars().map(|c| Value::String(c.to_string())).collect()
+                                    } else {
+                                        s.split(&sep).map(|p| Value::String(p.to_string())).collect()
+                                    };
+                                    return Ok(Value::List(parts));
+                                }
+                            }
+                            "replace" => {
+                                let from_val = self.eval_expr(&args[0])?;
+                                let to_val = self.eval_expr(&args[1])?;
+                                if let (Value::String(from), Value::String(to)) = (from_val, to_val) {
+                                    let replaced = if from.is_empty() {
+                                        s
+                                    } else {
+                                        s.replace(&from, &to)
+                                    };
+                                    return Ok(Value::String(replaced));
                                 }
                             }
                             _ => {}

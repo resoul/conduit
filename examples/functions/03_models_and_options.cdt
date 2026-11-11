@@ -1,0 +1,70 @@
+type User {
+    id: Int
+    username: String
+    is_admin: Bool
+}
+
+type OrderItem {
+    product: String
+    price: Int
+    qty: Int
+}
+
+type OrderSummary {
+    user_name: String
+    total_amount: Int
+    item_count: Int
+}
+
+func calculate_order(user: User, items: [OrderItem]) -> OrderSummary? {
+    guard user.id > 0 else {
+        return nil
+    }
+    guard items.len() > 0 else {
+        return nil
+    }
+
+    var total = 0
+    var count = 0
+    for item in items {
+        total = total + (item.price * item.qty)
+        count = count + item.qty
+    }
+
+    if user.is_admin {
+        total = total - (total * 10 / 100)
+    }
+
+    return OrderSummary(
+        user_name: user.username,
+        total_amount: total,
+        item_count: count
+    )
+}
+
+func effective_port(custom: Int?) -> Int {
+    return custom ?? 8080
+}
+
+func main() {
+    admin := User(id: 1, username: "Alice", is_admin: true)
+    guest := User(id: 0, username: "Guest", is_admin: false)
+
+    items := [
+        OrderItem(product: "Monitor", price: 20000, qty: 1),
+        OrderItem(product: "Cable", price: 500, qty: 3)
+    ]
+
+    admin_summary := calculate_order(admin, items)
+    if admin_summary != nil {
+        print("Order summary computed for Alice")
+    }
+
+    guest_summary := calculate_order(guest, items)
+    if guest_summary == nil {
+        print("Invalid guest order rejected via guard -> nil")
+    }
+
+    print("Default port: " + effective_port(nil).to_string())
+    print("Custom port: " + effective_port(3000).to_string())
+}
