@@ -437,6 +437,10 @@ impl Parser {
                 self.bump();
                 Ok(Expr::new(ExprKind::Int(n), tok.span))
             }
+            TokenKind::IntMinMagnitude => Err(ParserError {
+                message: "Integer literal is too large unless preceded by '-'".to_string(),
+                span: tok.span,
+            }),
             TokenKind::Float(f) => {
                 self.bump();
                 Ok(Expr::new(ExprKind::Float(f), tok.span))
@@ -445,6 +449,10 @@ impl Parser {
                 self.bump();
                 let next = self.peek().clone();
                 match next.kind {
+                    TokenKind::IntMinMagnitude => {
+                        self.bump();
+                        Ok(Expr::new(ExprKind::Int(i64::MIN), tok.span))
+                    }
                     TokenKind::Int(n) => {
                         self.bump();
                         Ok(Expr::new(ExprKind::Int(-n), tok.span))
@@ -653,7 +661,10 @@ impl Parser {
 
     fn parse_return_stmt(&mut self) -> Result<Stmt, ParserError> {
         let span = self.expect(&TokenKind::KwReturn)?.span;
-        if self.check(&TokenKind::RBrace) || self.check(&TokenKind::Eof) {
+        if self.check(&TokenKind::RBrace)
+            || self.check(&TokenKind::KwCase)
+            || self.check(&TokenKind::Eof)
+        {
             Ok(Stmt::new(StmtKind::Return(None), span))
         } else {
             let expr = self.parse_expr()?;
@@ -934,14 +945,7 @@ impl Parser {
     }
 
     fn parse_and(&mut self) -> Result<Expr, ParserError> {
-        self.parse_binary_op(Self::parse_coalesce, &[(TokenKind::And, BinaryOp::And)])
-    }
-
-    fn parse_coalesce(&mut self) -> Result<Expr, ParserError> {
-        self.parse_binary_op(
-            Self::parse_equality,
-            &[(TokenKind::QuestionQuestion, BinaryOp::Coalesce)],
-        )
+        self.parse_binary_op(Self::parse_equality, &[(TokenKind::And, BinaryOp::And)])
     }
 
     fn parse_equality(&mut self) -> Result<Expr, ParserError> {
@@ -956,13 +960,20 @@ impl Parser {
 
     fn parse_comparison(&mut self) -> Result<Expr, ParserError> {
         self.parse_binary_op(
-            Self::parse_range,
+            Self::parse_coalesce,
             &[
                 (TokenKind::Lt, BinaryOp::Lt),
                 (TokenKind::LtEq, BinaryOp::LtEq),
                 (TokenKind::Gt, BinaryOp::Gt),
                 (TokenKind::GtEq, BinaryOp::GtEq),
             ],
+        )
+    }
+
+    fn parse_coalesce(&mut self) -> Result<Expr, ParserError> {
+        self.parse_binary_op(
+            Self::parse_range,
+            &[(TokenKind::QuestionQuestion, BinaryOp::Coalesce)],
         )
     }
 
@@ -1008,6 +1019,10 @@ impl Parser {
     fn parse_unary(&mut self) -> Result<Expr, ParserError> {
         if self.match_token(&TokenKind::Minus) {
             let span = self.peek().span;
+            if self.check(&TokenKind::IntMinMagnitude) {
+                self.bump();
+                return Ok(Expr::new(ExprKind::Int(i64::MIN), span));
+            }
             let expr = self.parse_unary()?;
             Ok(Expr::new(
                 ExprKind::Unary {
@@ -1153,6 +1168,10 @@ impl Parser {
                 self.bump();
                 Ok(Expr::new(ExprKind::Int(val), tok.span))
             }
+            TokenKind::IntMinMagnitude => Err(ParserError {
+                message: "Integer literal is too large unless preceded by '-'".to_string(),
+                span: tok.span,
+            }),
             TokenKind::Float(val) => {
                 self.bump();
                 Ok(Expr::new(ExprKind::Float(val), tok.span))

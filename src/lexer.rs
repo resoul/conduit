@@ -1,3 +1,6 @@
+pub(crate) const ESCAPED_OPEN_BRACE: char = '\u{e000}';
+pub(crate) const ESCAPED_CLOSE_BRACE: char = '\u{e001}';
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
     pub line: usize,
@@ -14,6 +17,7 @@ impl Span {
 pub enum TokenKind {
     Ident(String),
     Int(i64),
+    IntMinMagnitude,
     Float(f64),
     String(String),
 
@@ -208,6 +212,9 @@ impl<'a> Lexer<'a> {
         let num_str = &self.input[start_offset..self.byte_offset];
         match num_str.parse::<i64>() {
             Ok(value) => Ok(Token::new(TokenKind::Int(value), start_span)),
+            Err(_) if num_str == "9223372036854775808" => {
+                Ok(Token::new(TokenKind::IntMinMagnitude, start_span))
+            }
             Err(_) => Err(LexerError {
                 message: format!("Number too large: '{}'", num_str),
                 span: start_span,
@@ -239,6 +246,8 @@ impl<'a> Lexer<'a> {
                         Some('r') => content.push('\r'),
                         Some('"') => content.push('"'),
                         Some('\\') => content.push('\\'),
+                        Some('{') => content.push(ESCAPED_OPEN_BRACE),
+                        Some('}') => content.push(ESCAPED_CLOSE_BRACE),
                         Some(other) => {
                             content.push('\\');
                             content.push(other);

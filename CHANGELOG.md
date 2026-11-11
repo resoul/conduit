@@ -5,6 +5,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
+## [0.1.10] - 2026-11-11
+
+### Added & Changed
+
+* **Type System Soundness**:
+  * Disallowed mutating captured outer `var` bindings inside closures (`Cannot mutate captured variable '...' inside a closure`), preventing silent updates lost to environment snapshotting.
+  * Aligned function call resolution between `TypeChecker` and `Interpreter` so local bindings shadow top-level functions of the same name.
+  * Disallowed multiple instantiations of the same generic record in a single union (`Box<Int> | Box<String>`), both in direct union annotations and after generic type parameter substitution (`Cannot combine different generic instantiations of '...' in the same union`), preventing runtime type-erasure collisions in `switch`.
+  * Added contextual typing for empty list literals `[]` (`[T]` inferred from annotations, assignments, return types, function/method arguments, struct fields, `??`, and sibling list elements) while rejecting ambiguous standalone `[]` (`Cannot infer element type for empty list literal '[]'; add an explicit type annotation`).
+
+* **String Interpolation & Syntax Fixes**:
+  * Added compile-time verification of `{...}` string interpolation expressions (including dotted field paths like `{u.name}` and `{err.message}`) and support for escaped braces `\{` and `\}`.
+  * Raised the precedence of `??` above comparison operators (`==`, `!=`, `<`, `<=`, `>`, `>=`) so `a ?? 0 > 5` parses as `(a ?? 0) > 5`.
+  * Allowed bare `return` statements immediately before `case` inside `switch` blocks.
+  * Added exact lexer/parser support for the minimum 64-bit signed integer literal `-9223372036854775808` (`i64::MIN`).
+
+* **Runtime Safety, Performance & Hardening**:
+  * Replaced unchecked `i64` arithmetic (`+`, `-`, `*`, `/`, `%`, unary `-`) and `Float` rounding conversions (`.floor()`, `.ceil()`, `.round()`, `.trunc()`) with checked operations that raise descriptive `RuntimeError`s on overflow or `NaN`/`Infinity`.
+  * Enforced `MAX_CALL_DEPTH = 256` in the interpreter to prevent native stack overflow on unbounded recursion.
+  * Updated mutating collection methods (`List.append`, `Map.set`, `Map.remove`) to mutate target bindings and struct fields in place without cloning the collection on each call.
+  * Hardened `cdt.json`: fixed UTF-8 slicing in `\uXXXX` escape parsing, added `MAX_JSON_DEPTH = 128`, preserved `.0` on whole-number `Float` encoding (`3.0` -> `"3.0"`), and respected integer vs float syntax when decoding `Int | Float` unions.
+  * Removed the `file_name()` fallback in `ReachabilityAnalyzer::paths_match` and made `Display` formatting for structs/errors and multi-module type-checking order deterministic.
+
 ## [0.1.9] - 2026-11-11
 
 ### Added & Changed

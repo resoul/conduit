@@ -258,12 +258,14 @@ impl std::fmt::Display for Value {
             Value::Tuple(items) => write_delimited(f, items, "(", ")"),
             Value::Struct { type_id, fields } | Value::Error { type_id, fields } => {
                 write!(f, "{}(", type_id)?;
+                let mut ordered_fields: Vec<(&String, &Value)> = fields.iter().collect();
+                ordered_fields.sort_by(|(a, _), (b, _)| a.cmp(b));
                 let mut first = true;
-                for (k, v) in fields {
+                for (name, value) in ordered_fields {
                     if !first {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{}: {}", k, v)?;
+                    write!(f, "{}: {}", name, value)?;
                     first = false;
                 }
                 write!(f, ")")
