@@ -1,6 +1,6 @@
 use crate::lexer::Span;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TypeExpr {
     Named(String),
     Generic {
@@ -219,6 +219,7 @@ pub struct FieldAnnotation {
 pub struct FieldDef {
     pub name: String,
     pub ty: TypeExpr,
+    pub json_name: Option<String>,
     pub annotations: Vec<FieldAnnotation>,
     pub span: Span,
 }

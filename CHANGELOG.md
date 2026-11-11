@@ -5,6 +5,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
+## [0.1.11] - 2026-11-11
+
+### Added & Changed
+
+* **JSON Field Tags (`` `json:"..."` ``)**:
+  * Added Go-style `` `json:"..."` `` raw-string field tags on `type` record declarations to customize serialized and deserialized JSON key names independently of Conduit field identifiers and `@validation` rules.
+  * Added compile-time validation of field tag syntax and duplicate JSON key names within a struct, plus LSP hover rendering of field tags.
+  * Formatted non-identifier JSON field names in `DecodeError.path` and `EncodeError.path` using quoted bracket segments (e.g., `["a.b"]`, `items[0]["display name"]`).
+
+* **`cdt.json` Performance & Prepared Execution Plans**:
+  * Added a borrowed JSON parser (`BorrowedJsonNode<'a>`) using `Cow<'a, str>` for unescaped strings and object keys, `&'a str` number slices, slice-based string scanning, and lazy error-path construction on failure only.
+  * Added arena-compiled `JsonDecodePlan` and `JsonEncodeSchema` caches (keyed by canonical `TypeId` and generic type arguments, with automatic invalidation on interpreter reuse), stack-allocated field slots for structs up to 16 fields, pre-encoded `"\"key\":"` field prefixes, and direct `Float` buffer formatting without temporary `String` allocations.
+  * Updated the interpreter to borrow local variable and struct-field arguments in `json.decode` and `json.encode` without deep-cloning the input value, and added a cross-language JSON benchmark suite under `benchmarks/json/`.
+
+* **JetBrains & TextMate Editor Setup**:
+  * Added a VS Code-compatible TextMate manifest (`editors/textmate/package.json`) for `.cdt` files so RustRover and other JetBrains IDEs can load the Conduit grammar bundle.
+  * Updated JetBrains editor setup documentation (`docs/src/getting-started/editors.md`, `editors/README.md`) to use LSP4IJ for configuring `conduit lsp`.
+
 ## [0.1.10] - 2026-11-11
 
 ### Added & Changed
@@ -311,11 +329,4 @@ Initial release of the Conduit programming language core.
   * Built-in functions: `print(...)`.
   * Built-in methods for strings (`trim`, `lower`, `upper`, `len`, `contains`) and lists (`len`, `append`, `contains`).
   * CLI command: `conduit run <file.cdt>` (runs static type-checking prior to execution).
-
-* **Examples (`examples/functions/`)**:
-  * [01_math_and_logic.cdt](examples/functions/01_math_and_logic.cdt): Recursion (factorial, fibonacci), math helpers, boolean logic.
-  * [02_strings_and_text.cdt](examples/functions/02_strings_and_text.cdt): String concatenation, methods (`.trim()`, `.upper()`, `.contains()`).
-  * [03_lists_and_loops.cdt](examples/functions/03_lists_and_loops.cdt): List filtering, loops, ranges (`1..6`), list mutation via `.append()`.
-  * [04_structs_and_models.cdt](examples/functions/04_structs_and_models.cdt): Multiple structs, field access, interpolation of nested fields (`{order.user_name}`).
-  * [05_options_and_nil.cdt](examples/functions/05_options_and_nil.cdt): Optional types (`Int?`), `nil` handling, safe division.
 

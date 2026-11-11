@@ -20,6 +20,28 @@ user := json.decode<User>(raw)?
 checked := validation.check(user)?
 ```
 
+## JSON Field Names
+
+By default, a Conduit field maps to a JSON key with the same name. Add a Go-style `json` field tag after the field type to rename that key for both decoding and encoding:
+
+```conduit
+type Point {
+    x: Int `json:"x_coord"`
+    y: Int `json:"y_coord"`
+}
+
+point := json.decode<Point>("{\"x_coord\":10,\"y_coord\":20}")?
+encoded := json.encode(point)?
+```
+
+The tag is separate from field validators, so both can be used on one field:
+
+```conduit
+name: String `json:"display_name"` @validation.min(2)
+```
+
+Only a JSON field-name override is supported; comma-separated tag options such as `omitempty` are not supported.
+
 ---
 
 ## Runnable Example
@@ -37,7 +59,7 @@ conduit run examples/docs/library/json.cdt
 Output:
 
 ```text
-{"name":"Alice","email":"alice@example.com","score":98.5}
+{"display_name":"Alice","email":"alice@example.com","score":98.5}
 {"items":[10,20]}
 ```
 
@@ -48,6 +70,7 @@ Output:
 ### Error & Dynamic Tree Types
 
 - `json.DecodeError { path: String, message: String }` — Returned when JSON syntax or typed decoding fails. Path syntax follows `validation.Violation.path` (`""`, `"price"`, `"items[1].name"`, `"metadata[\"env\"]"`).
+- JSON keys that are not identifiers use a quoted bracket segment in error paths, for example `["a.b"]` or `items[0]["display name"]`.
 - `json.EncodeError { path: String, message: String }` — Returned when serializing a non-JSON-compatible value (non-finite `Float`, function/closure, or non-`String`-keyed `Map`).
 - `json.Value` — Opaque node representing dynamic JSON (`null`, `bool`, `number`, `string`, `array`, `object`).
 

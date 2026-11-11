@@ -1,5 +1,3 @@
-// main.cdt - Module imports, qualified calls, and callbacks
-
 import "./users" as users
 import cdt.time as clock
 

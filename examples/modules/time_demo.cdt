@@ -1,5 +1,3 @@
-// time_demo.cdt - Standard library cdt.time demonstration
-
 import cdt.time
 
 func demo() -> Void | time.TimeError {
