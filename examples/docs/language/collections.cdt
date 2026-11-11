@@ -47,5 +47,11 @@ func main() {
     // map preserves errors as first-class elements in the returned list
     validated := map([-1, 10, -2], validate_positive)
     print(validated)
+
+    // Ordered Map<K, V> preserves deterministic insertion order
+    var scores = Map.from([("alice", 10), ("bob", 20)])
+    scores.set("alice", 15)
+    print(scores.keys())
+    print(scores.get("bob") ?? 0)
 }
 

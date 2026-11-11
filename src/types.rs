@@ -68,13 +68,20 @@ impl std::fmt::Display for TypeId {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Type {
     Int,
+    Float,
     String,
     Bool,
     Nil,
     Void,
+    TypeParam(String),
     List(Box<Type>),
+    Map(Box<Type>, Box<Type>),
     Optional(Box<Type>),
     Custom(TypeId),
+    Generic {
+        type_id: TypeId,
+        type_args: Vec<Type>,
+    },
     Tuple(Vec<Type>),
     Union(Vec<Type>),
     Function {
@@ -88,13 +95,20 @@ impl std::fmt::Display for Type {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Type::Int => write!(f, "Int"),
+            Type::Float => write!(f, "Float"),
             Type::String => write!(f, "String"),
             Type::Bool => write!(f, "Bool"),
             Type::Nil => write!(f, "Nil"),
             Type::Void => write!(f, "Void"),
+            Type::TypeParam(name) => write!(f, "{}", name),
             Type::List(inner) => write!(f, "[{}]", inner),
+            Type::Map(key, val) => write!(f, "Map<{}, {}>", key, val),
             Type::Optional(inner) => write!(f, "{}?", inner),
             Type::Custom(name) => write!(f, "{}", name),
+            Type::Generic { type_id, type_args } => {
+                let s = type_args.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", ");
+                write!(f, "{}<{}>", type_id, s)
+            }
             Type::Tuple(elems) => {
                 let s = elems.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(", ");
                 write!(f, "({})", s)
@@ -188,6 +202,20 @@ impl Type {
                 return true;
             }
             return src.is_assignable_to(dst);
+        }
+
+        if let (Type::Map(sk, sv), Type::Map(dk, dv)) = (self, target) {
+            if **sk == Type::Any && **sv == Type::Any {
+                return true;
+            }
+            return sk.is_assignable_to(dk) && sv.is_assignable_to(dv);
+        }
+
+        if let (
+            Type::Generic { type_id: src_id, type_args: src_args },
+            Type::Generic { type_id: dst_id, type_args: dst_args },
+        ) = (self, target) {
+            return src_id == dst_id && src_args == dst_args;
         }
 
         if let (

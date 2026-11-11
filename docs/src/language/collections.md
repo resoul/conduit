@@ -60,6 +60,40 @@ If the element type `T` is already optional (`U?`), `.get(index)` keeps the resu
 
 ---
 
+## Maps (`Map<K, V>`)
+
+A `Map<K, V>` stores key-value entries with **deterministic insertion order**. Key types `K` are restricted to `String`, `Int`, and `Bool`; invalid key types (such as lists, optionals, or structs) are rejected at compile time.
+
+### Constructing Maps
+
+Create an empty map with `Map<K, V>()` or build one from `(key, value)` pairs with `Map.from`:
+
+```conduit
+var scores = Map<String, Int>()
+scores.set("alice", 10)
+scores.set("bob", 20)
+
+by_id := Map.from([(1, "one"), (2, "two")])
+empty := Map.from<String, Int>([])
+```
+
+### Indexing (`map[key]`) & `KeyError`
+
+Indexing with `map[key]` returns `V | KeyError` (where `KeyError { key: String, message: String }` is part of the prelude):
+
+```conduit
+func find_upper(m: Map<String, String>, key: String) -> String | KeyError {
+    val := m[key]?
+    return val.upper()
+}
+```
+
+Use `.get(key) -> V?` when missing keys are expected rather than errors, alongside `.set(key, val)`, `.remove(key) -> V?`, `.contains_key(key) -> Bool`, `.len() -> Int`, `.keys() -> [K]`, `.values() -> [V]`, and `.entries() -> [(K, V)]`.
+
+Updating an existing key via `.set(key, new_val)` replaces the value **in place**, preserving the key's original position in `.keys()`, `.values()`, and `.entries()`. Calling `.remove(key)` followed by `.set(key, val)` appends the re-inserted key at the end.
+
+---
+
 ## Transforming Collections
 
 Conduit provides two core higher-order functions for lists: `map` and `filter`.
@@ -138,5 +172,7 @@ First: 1
 [1, 4, 9, 16, 25]
 [5, 8]
 [InvalidItem(id: -1), 10, InvalidItem(id: -2)]
+[alice, bob]
+20
 ```
 

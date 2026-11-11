@@ -5,9 +5,12 @@ use std::sync::Arc;
 use crate::ast::*;
 use crate::lexer::Span;
 use crate::loader::{ModuleLoader, ModuleTarget};
+use crate::native::json::{
+    decode_node_to_conduit, encode_conduit_value, make_decode_error, make_encode_error, parse_json,
+};
 use crate::native::NativeRegistry;
-use crate::types::{ModuleId, TypeId};
-use crate::value::{make_index_error, ClosureData, Value};
+use crate::types::{ModuleId, Type, TypeId};
+use crate::value::{make_index_error, make_key_error, ClosureData, MapKey, OrderedMap, Value};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeError {
@@ -46,6 +49,7 @@ pub struct Interpreter {
     module_functions: HashMap<(Option<PathBuf>, String), (Vec<Param>, Block)>,
     module_imports: HashMap<Option<PathBuf>, HashMap<String, ModuleTarget>>,
     module_structs: HashMap<Option<PathBuf>, HashSet<String>>,
+    module_struct_type_params: HashMap<(Option<PathBuf>, String), Vec<String>>,
     module_struct_fields: HashMap<(Option<PathBuf>, String), Vec<crate::ast::FieldDef>>,
     module_errors: HashMap<Option<PathBuf>, HashSet<String>>,
     current_module: Option<PathBuf>,
@@ -59,6 +63,7 @@ impl Interpreter {
             module_functions: HashMap::new(),
             module_imports: HashMap::new(),
             module_structs: HashMap::new(),
+            module_struct_type_params: HashMap::new(),
             module_struct_fields: HashMap::new(),
             module_errors: HashMap::new(),
             current_module: None,
@@ -187,8 +192,10 @@ impl Interpreter {
                             (params.clone(), body.clone()),
                         );
                     }
-                    ItemKind::Type { name, fields } => {
+                    ItemKind::Type { name, type_params, fields } => {
                         structs_set.insert(name.clone());
+                        self.module_struct_type_params
+                            .insert((Some(path.clone()), name.clone()), type_params.clone());
                         self.module_struct_fields
                             .insert((Some(path.clone()), name.clone()), fields.clone());
                     }
@@ -225,8 +232,10 @@ impl Interpreter {
                 ItemKind::Func { name, params, body, .. } => {
                     self.module_functions.insert((None, name.clone()), (params.clone(), body.clone()));
                 }
-                ItemKind::Type { name, fields } => {
+                ItemKind::Type { name, type_params, fields } => {
                     structs_set.insert(name.clone());
+                    self.module_struct_type_params
+                        .insert((None, name.clone()), type_params.clone());
                     self.module_struct_fields
                         .insert((None, name.clone()), fields.clone());
                 }
@@ -360,6 +369,12 @@ impl Interpreter {
             Value::List(items) => {
                 for (i, item) in items.iter().enumerate() {
                     let item_path = format!("{}[{}]", path, i);
+                    self.validate_value_recursive(item, &item_path, violations, depth + 1, span)?;
+                }
+            }
+            Value::Map(map) => {
+                for (key, item) in map.entries() {
+                    let item_path = format!("{}{}", path, key.format_path_segment());
                     self.validate_value_recursive(item, &item_path, violations, depth + 1, span)?;
                 }
             }
@@ -528,6 +543,10 @@ impl Interpreter {
                     let target_val = args.into_iter().next().unwrap_or(Value::Nil);
                     return self.execute_validation_check(target_val, span);
                 }
+                if module == "cdt.json" && name == "encode" {
+                    let target_val = args.into_iter().next().unwrap_or(Value::Nil);
+                    return Ok(self.execute_json_encode(&target_val));
+                }
                 let m = self.native_registry.get_module(module).ok_or_else(|| RuntimeError {
                     message: format!("Unknown native module '{}'", module),
                     span,
@@ -545,6 +564,203 @@ impl Interpreter {
                 message: format!("Value '{}' is not a callable function", callee_val),
                 span,
             }),
+        }
+    }
+
+    fn type_id_to_mod_key(type_id: &TypeId) -> Option<(Option<PathBuf>, String)> {
+        match &type_id.module {
+            ModuleId::Program => Some((None, type_id.name.clone())),
+            ModuleId::Local(path) => Some((Some(path.clone()), type_id.name.clone())),
+            ModuleId::Builtin | ModuleId::Native(_) => None,
+        }
+    }
+
+    fn struct_field_order(&self, type_id: &TypeId) -> Option<Vec<String>> {
+        let key = Self::type_id_to_mod_key(type_id)?;
+        let defs = self.module_struct_fields.get(&key)?;
+        Some(defs.iter().map(|f| f.name.clone()).collect())
+    }
+
+    fn substitute_runtime_type(ty: &Type, bindings: &HashMap<String, Type>) -> Type {
+        match ty {
+            Type::TypeParam(name) => bindings
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| Type::TypeParam(name.clone())),
+            Type::List(inner) => Type::List(Box::new(Self::substitute_runtime_type(inner, bindings))),
+            Type::Map(k, v) => Type::Map(
+                Box::new(Self::substitute_runtime_type(k, bindings)),
+                Box::new(Self::substitute_runtime_type(v, bindings)),
+            ),
+            Type::Optional(inner) => {
+                Type::Optional(Box::new(Self::substitute_runtime_type(inner, bindings)))
+            }
+            Type::Tuple(elems) => Type::Tuple(
+                elems
+                    .iter()
+                    .map(|e| Self::substitute_runtime_type(e, bindings))
+                    .collect(),
+            ),
+            Type::Union(vars) => Type::union(
+                vars.iter()
+                    .map(|v| Self::substitute_runtime_type(v, bindings))
+                    .collect(),
+            ),
+            Type::Generic { type_id, type_args } => Type::Generic {
+                type_id: type_id.clone(),
+                type_args: type_args
+                    .iter()
+                    .map(|a| Self::substitute_runtime_type(a, bindings))
+                    .collect(),
+            },
+            other => other.clone(),
+        }
+    }
+
+    fn resolve_ast_type_in_mod(
+        &self,
+        ty_expr: &TypeExpr,
+        mod_opt: &Option<PathBuf>,
+        type_params: &[String],
+        span: Span,
+    ) -> Result<Type, RuntimeError> {
+        let resolve_target_id = |name: &str| -> Result<TypeId, RuntimeError> {
+            if let Some((alias, item_name)) = name.split_once('.') {
+                let target = self
+                    .module_imports
+                    .get(mod_opt)
+                    .and_then(|m| m.get(alias))
+                    .ok_or_else(|| RuntimeError {
+                        message: format!("Unknown module alias '{}' in json.decode", alias),
+                        span,
+                    })?;
+                Ok(match target {
+                    ModuleTarget::Native(nat_name) => TypeId::native(nat_name.clone(), item_name),
+                    ModuleTarget::Local(path) => TypeId::local(path.clone(), item_name),
+                })
+            } else {
+                Ok(TypeId::from_module_opt(mod_opt.as_ref(), name))
+            }
+        };
+
+        match ty_expr {
+            TypeExpr::Named(name) => match name.as_str() {
+                "Int" => Ok(Type::Int),
+                "Float" => Ok(Type::Float),
+                "String" => Ok(Type::String),
+                "Bool" => Ok(Type::Bool),
+                "Void" => Ok(Type::Void),
+                _ => {
+                    if !name.contains('.') && type_params.iter().any(|p| p == name) {
+                        Ok(Type::TypeParam(name.clone()))
+                    } else {
+                        Ok(Type::Custom(resolve_target_id(name)?))
+                    }
+                }
+            },
+            TypeExpr::Generic { name, type_args } => {
+                if name == "Map" && type_args.len() == 2 {
+                    let k = self.resolve_ast_type_in_mod(&type_args[0], mod_opt, type_params, span)?;
+                    let v = self.resolve_ast_type_in_mod(&type_args[1], mod_opt, type_params, span)?;
+                    Ok(Type::Map(Box::new(k), Box::new(v)))
+                } else {
+                    let type_id = resolve_target_id(name)?;
+                    let mut args = Vec::with_capacity(type_args.len());
+                    for ta in type_args {
+                        args.push(self.resolve_ast_type_in_mod(ta, mod_opt, type_params, span)?);
+                    }
+                    Ok(Type::Generic {
+                        type_id,
+                        type_args: args,
+                    })
+                }
+            }
+            TypeExpr::List(inner) => Ok(Type::List(Box::new(self.resolve_ast_type_in_mod(
+                inner,
+                mod_opt,
+                type_params,
+                span,
+            )?))),
+            TypeExpr::Optional(inner) => Ok(Type::Optional(Box::new(
+                self.resolve_ast_type_in_mod(inner, mod_opt, type_params, span)?,
+            ))),
+            TypeExpr::Tuple(elems) => {
+                let mut resolved = Vec::with_capacity(elems.len());
+                for e in elems {
+                    resolved.push(self.resolve_ast_type_in_mod(e, mod_opt, type_params, span)?);
+                }
+                Ok(Type::Tuple(resolved))
+            }
+            TypeExpr::Union(vars) => {
+                let mut resolved = Vec::with_capacity(vars.len());
+                for v in vars {
+                    resolved.push(self.resolve_ast_type_in_mod(v, mod_opt, type_params, span)?);
+                }
+                Ok(Type::union(resolved))
+            }
+            TypeExpr::Func { params, return_type } => {
+                let mut ps = Vec::with_capacity(params.len());
+                for p in params {
+                    ps.push(self.resolve_ast_type_in_mod(p, mod_opt, type_params, span)?);
+                }
+                let rt = self.resolve_ast_type_in_mod(return_type, mod_opt, type_params, span)?;
+                Ok(Type::Function {
+                    params: ps,
+                    return_type: Box::new(rt),
+                })
+            }
+        }
+    }
+
+    fn resolve_struct_fields_for_json(
+        &self,
+        type_id: &TypeId,
+        type_args: &[Type],
+        span: Span,
+    ) -> Option<Vec<(String, Type)>> {
+        let key = Self::type_id_to_mod_key(type_id)?;
+        let defs = self.module_struct_fields.get(&key)?;
+        let tparams = self
+            .module_struct_type_params
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+        let mut bindings = HashMap::new();
+        for (tp, arg) in tparams.iter().zip(type_args.iter()) {
+            bindings.insert(tp.clone(), arg.clone());
+        }
+        let mod_opt = &key.0;
+        let mut out = Vec::with_capacity(defs.len());
+        for f in defs {
+            let fty = self
+                .resolve_ast_type_in_mod(&f.ty, mod_opt, &tparams, span)
+                .ok()?;
+            let concrete = Self::substitute_runtime_type(&fty, &bindings);
+            out.push((f.name.clone(), concrete));
+        }
+        Some(out)
+    }
+
+    fn execute_json_encode(&self, val: &Value) -> Value {
+        let mut out = String::new();
+        match encode_conduit_value(val, "", &mut out, &|tid| self.struct_field_order(tid)) {
+            Ok(()) => Value::String(out),
+            Err((path, msg)) => make_encode_error(path, msg),
+        }
+    }
+
+    fn execute_json_decode(&self, raw: &str, type_expr: &TypeExpr, span: Span) -> Result<Value, RuntimeError> {
+        let target_ty =
+            self.resolve_ast_type_in_mod(type_expr, &self.current_module, &[], span)?;
+        let node = match parse_json(raw) {
+            Ok(n) => n,
+            Err((path, msg)) => return Ok(make_decode_error(path, msg)),
+        };
+        match decode_node_to_conduit(&node, &target_ty, "", &|tid, targs| {
+            self.resolve_struct_fields_for_json(tid, targs, span)
+        }) {
+            Ok(v) => Ok(v),
+            Err((path, msg)) => Ok(make_decode_error(path, msg)),
         }
     }
 
@@ -724,6 +940,7 @@ impl Interpreter {
     fn eval_expr(&mut self, expr: &Expr) -> Result<Value, InterpFlow> {
         match &expr.kind {
             ExprKind::Int(n) => Ok(Value::Int(*n)),
+            ExprKind::Float(f) => Ok(Value::Float(*f)),
             ExprKind::String(s) => Ok(Value::String(self.interpolate(s))),
             ExprKind::Bool(b) => Ok(Value::Bool(*b)),
             ExprKind::Nil => Ok(Value::Nil),
@@ -787,8 +1004,21 @@ impl Interpreter {
                         message: format!("List index must be Int, got {}", other.type_name()),
                         span: index.span,
                     }.into()),
+                    (Value::Map(map), key_val) => {
+                        let key = MapKey::from_value(&key_val).ok_or_else(|| RuntimeError {
+                            message: format!(
+                                "Map key must be String, Int, or Bool, got {}",
+                                key_val.type_name()
+                            ),
+                            span: index.span,
+                        })?;
+                        Ok(map.get(&key).cloned().unwrap_or_else(|| make_key_error(&key)))
+                    }
                     (other, _) => Err(RuntimeError {
-                        message: format!("Cannot index into non-list value of type {}", other.type_name()),
+                        message: format!(
+                            "Cannot index into value of type {}",
+                            other.type_name()
+                        ),
                         span: target.span,
                     }.into()),
                 }
@@ -798,8 +1028,9 @@ impl Interpreter {
                 match op {
                     UnaryOp::Neg => match val {
                         Value::Int(n) => Ok(Value::Int(-n)),
+                        Value::Float(f) => Ok(Value::Float(-f)),
                         _ => Err(RuntimeError {
-                            message: "Unary '-' applies to Int only".to_string(),
+                            message: "Unary '-' applies to Int or Float only".to_string(),
                             span: expr.span,
                         }.into()),
                     },
@@ -822,23 +1053,26 @@ impl Interpreter {
                 match op {
                     BinaryOp::Add => match (l, r) {
                         (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a + b)),
+                        (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a + b)),
                         (Value::String(a), Value::String(b)) => Ok(Value::String(format!("{}{}", a, b))),
                         _ => Err(RuntimeError {
-                            message: "Operator '+' requires matching Int or String operands".to_string(),
+                            message: "Operator '+' requires matching Int, Float, or String operands".to_string(),
                             span: expr.span,
                         }.into()),
                     },
                     BinaryOp::Sub => match (l, r) {
                         (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a - b)),
+                        (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a - b)),
                         _ => Err(RuntimeError {
-                            message: "Operator '-' requires Int operands".to_string(),
+                            message: "Operator '-' requires matching Int or Float operands".to_string(),
                             span: expr.span,
                         }.into()),
                     },
                     BinaryOp::Mul => match (l, r) {
                         (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a * b)),
+                        (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a * b)),
                         _ => Err(RuntimeError {
-                            message: "Operator '*' requires Int operands".to_string(),
+                            message: "Operator '*' requires matching Int or Float operands".to_string(),
                             span: expr.span,
                         }.into()),
                     },
@@ -848,8 +1082,19 @@ impl Interpreter {
                             span: expr.span,
                         }.into()),
                         (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a / b)),
+                        (Value::Float(a), Value::Float(b)) => {
+                            let res = a / b;
+                            if b == 0.0 || !res.is_finite() {
+                                Err(RuntimeError {
+                                    message: "Division by zero".to_string(),
+                                    span: expr.span,
+                                }.into())
+                            } else {
+                                Ok(Value::Float(res))
+                            }
+                        }
                         _ => Err(RuntimeError {
-                            message: "Operator '/' requires Int operands".to_string(),
+                            message: "Operator '/' requires matching Int or Float operands".to_string(),
                             span: expr.span,
                         }.into()),
                     },
@@ -866,29 +1111,33 @@ impl Interpreter {
                     },
                     BinaryOp::Lt => match (l, r) {
                         (Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a < b)),
+                        (Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a < b)),
                         _ => Err(RuntimeError {
-                            message: "Operator '<' requires Int operands".to_string(),
+                            message: "Operator '<' requires matching Int or Float operands".to_string(),
                             span: expr.span,
                         }.into()),
                     },
                     BinaryOp::LtEq => match (l, r) {
                         (Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a <= b)),
+                        (Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a <= b)),
                         _ => Err(RuntimeError {
-                            message: "Operator '<=' requires Int operands".to_string(),
+                            message: "Operator '<=' requires matching Int or Float operands".to_string(),
                             span: expr.span,
                         }.into()),
                     },
                     BinaryOp::Gt => match (l, r) {
                         (Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a > b)),
+                        (Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a > b)),
                         _ => Err(RuntimeError {
-                            message: "Operator '>' requires Int operands".to_string(),
+                            message: "Operator '>' requires matching Int or Float operands".to_string(),
                             span: expr.span,
                         }.into()),
                     },
                     BinaryOp::GtEq => match (l, r) {
                         (Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a >= b)),
+                        (Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a >= b)),
                         _ => Err(RuntimeError {
-                            message: "Operator '>=' requires Int operands".to_string(),
+                            message: "Operator '>=' requires matching Int or Float operands".to_string(),
                             span: expr.span,
                         }.into()),
                     },
@@ -909,42 +1158,34 @@ impl Interpreter {
                     BinaryOp::Coalesce => unreachable!(),
                 }
             }
-            ExprKind::Call { callee, args, named_args } => {
+            ExprKind::Call { callee, type_args, args, named_args } => {
                 if let ExprKind::Ident(ref name) = callee.kind {
                     let cur_structs = self.module_structs.get(&self.current_module);
                     let is_struct = cur_structs.map(|s| s.contains(name)).unwrap_or(false);
                     let cur_errors = self.module_errors.get(&self.current_module);
                     let is_error = cur_errors.map(|e| e.contains(name)).unwrap_or(false);
 
-                    if is_struct {
+                    if is_struct || is_error || name == "IndexError" || name == "KeyError" {
                         let mut fields = HashMap::new();
                         for arg in named_args {
                             fields.insert(arg.name.clone(), self.eval_expr(&arg.value)?);
                         }
-                        return Ok(Value::Struct {
-                            type_id: TypeId::from_module_opt(self.current_module.as_ref(), name.clone()),
-                            fields,
+                        return Ok(if is_struct {
+                            Value::Struct {
+                                type_id: TypeId::from_module_opt(self.current_module.as_ref(), name.clone()),
+                                fields,
+                            }
+                        } else {
+                            let type_id = if is_error {
+                                TypeId::from_module_opt(self.current_module.as_ref(), name.clone())
+                            } else {
+                                TypeId::builtin(name)
+                            };
+                            Value::Error { type_id, fields }
                         });
                     }
-                    if is_error {
-                        let mut fields = HashMap::new();
-                        for arg in named_args {
-                            fields.insert(arg.name.clone(), self.eval_expr(&arg.value)?);
-                        }
-                        return Ok(Value::Error {
-                            type_id: TypeId::from_module_opt(self.current_module.as_ref(), name.clone()),
-                            fields,
-                        });
-                    }
-                    if name == "IndexError" {
-                        let mut fields = HashMap::new();
-                        for arg in named_args {
-                            fields.insert(arg.name.clone(), self.eval_expr(&arg.value)?);
-                        }
-                        return Ok(Value::Error {
-                            type_id: TypeId::builtin("IndexError"),
-                            fields,
-                        });
+                    if name == "Map" && args.is_empty() && named_args.is_empty() {
+                        return Ok(Value::Map(OrderedMap::new()));
                     }
                     
                     if name == "map" && args.len() == 2 {
@@ -998,6 +1239,31 @@ impl Interpreter {
                 
                 if let ExprKind::Member { target, field } = &callee.kind {
                     if let ExprKind::Ident(ref alias) = target.kind {
+                        if alias == "Map" && field == "from" && args.len() == 1 {
+                            let pairs_val = self.eval_expr(&args[0])?;
+                            if let Value::List(items) = pairs_val {
+                                let mut map = OrderedMap::new();
+                                for item in items {
+                                    if let Value::Tuple(elems) = item {
+                                        if elems.len() == 2 {
+                                            if let Some(key) = MapKey::from_value(&elems[0]) {
+                                                map.set(key, elems[1].clone());
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                    return Err(RuntimeError {
+                                        message: "Map.from expects a list of (key, value) pairs with String, Int, or Bool keys".to_string(),
+                                        span: args[0].span,
+                                    }.into());
+                                }
+                                return Ok(Value::Map(map));
+                            }
+                            return Err(RuntimeError {
+                                message: format!("Map.from expects a List, got {}", pairs_val.type_name()),
+                                span: args[0].span,
+                            }.into());
+                        }
                         let cur_imports = self.module_imports.get(&self.current_module).cloned();
                         if let Some(target_mod) = cur_imports.and_then(|m| m.get(alias).cloned()) {
                             match target_mod {
@@ -1009,6 +1275,31 @@ impl Interpreter {
                                             Value::Nil
                                         };
                                         return self.execute_validation_check(target_val, callee.span).map_err(InterpFlow::Error);
+                                    }
+
+                                    if nat_name == "cdt.json" && field == "decode" {
+                                        let raw_val = self.eval_expr(&args[0])?;
+                                        let raw = match raw_val {
+                                            Value::String(s) => s,
+                                            other => {
+                                                return Err(RuntimeError {
+                                                    message: format!("json.decode expects String, got {}", other.type_name()),
+                                                    span: args[0].span,
+                                                }.into());
+                                            }
+                                        };
+                                        let target_texpr = type_args.first().ok_or_else(|| RuntimeError {
+                                            message: "json.decode requires a target type argument <T>".to_string(),
+                                            span: callee.span,
+                                        })?;
+                                        return self
+                                            .execute_json_decode(&raw, target_texpr, callee.span)
+                                            .map_err(InterpFlow::Error);
+                                    }
+
+                                    if nat_name == "cdt.json" && field == "encode" {
+                                        let target_val = self.eval_expr(&args[0])?;
+                                        return Ok(self.execute_json_encode(&target_val));
                                     }
 
                                     let (is_constructible, is_error) = {
@@ -1143,12 +1434,50 @@ impl Interpreter {
                         }
                     }
 
-                    match target_val {
-                        Value::Int(n) => {
-                            if field == "to_string" {
-                                return Ok(Value::String(n.to_string()));
+                    if (field == "set" && args.len() == 2) || (field == "remove" && args.len() == 1) {
+                        if let ExprKind::Ident(ref target_var) = target.kind {
+                            if let Some(mut current_val) = self.lookup_variable(target_var) {
+                                if let Value::Map(ref mut map) = current_val {
+                                    let key_val = self.eval_expr(&args[0])?;
+                                    let key = MapKey::from_value(&key_val).ok_or_else(|| RuntimeError {
+                                        message: format!(
+                                            "Map key must be String, Int, or Bool, got {}",
+                                            key_val.type_name()
+                                        ),
+                                        span: args[0].span,
+                                    })?;
+                                    if field == "set" {
+                                        let val = self.eval_expr(&args[1])?;
+                                        map.set(key, val);
+                                        self.assign_variable(target_var, current_val, target.span)?;
+                                        return Ok(Value::Void);
+                                    } else {
+                                        let removed = map.remove(&key);
+                                        self.assign_variable(target_var, current_val, target.span)?;
+                                        return Ok(removed.unwrap_or(Value::Nil));
+                                    }
+                                }
                             }
                         }
+                    }
+
+                    match target_val {
+                        Value::Int(n) => match field.as_str() {
+                            "to_string" => return Ok(Value::String(n.to_string())),
+                            "to_float" => return Ok(Value::Float(n as f64)),
+                            _ => {}
+                        },
+                        Value::Float(f) => match field.as_str() {
+                            "floor" => return Ok(Value::Int(f.floor() as i64)),
+                            "ceil" => return Ok(Value::Int(f.ceil() as i64)),
+                            "round" => return Ok(Value::Int(f.round() as i64)),
+                            "trunc" => return Ok(Value::Int(f.trunc() as i64)),
+                            "to_string" => return Ok(Value::String(f.to_string())),
+                            "is_nan" => return Ok(Value::Bool(f.is_nan())),
+                            "is_infinite" => return Ok(Value::Bool(f.is_infinite())),
+                            "is_finite" => return Ok(Value::Bool(f.is_finite())),
+                            _ => {}
+                        },
                         Value::Bool(b) => {
                             if field == "to_string" {
                                 return Ok(Value::String(b.to_string()));
@@ -1225,6 +1554,42 @@ impl Interpreter {
                             }
                             _ => {}
                         },
+                        Value::Map(map) => match field.as_str() {
+                            "len" => return Ok(Value::Int(map.len() as i64)),
+                            "get" => {
+                                let key_val = self.eval_expr(&args[0])?;
+                                let key = MapKey::from_value(&key_val).ok_or_else(|| RuntimeError {
+                                    message: format!(
+                                        "Map key must be String, Int, or Bool, got {}",
+                                        key_val.type_name()
+                                    ),
+                                    span: args[0].span,
+                                })?;
+                                return Ok(map.get(&key).cloned().unwrap_or(Value::Nil));
+                            }
+                            "contains_key" => {
+                                let key_val = self.eval_expr(&args[0])?;
+                                let key = MapKey::from_value(&key_val).ok_or_else(|| RuntimeError {
+                                    message: format!(
+                                        "Map key must be String, Int, or Bool, got {}",
+                                        key_val.type_name()
+                                    ),
+                                    span: args[0].span,
+                                })?;
+                                return Ok(Value::Bool(map.contains_key(&key)));
+                            }
+                            "keys" => return Ok(Value::List(map.keys())),
+                            "values" => return Ok(Value::List(map.values())),
+                            "entries" => {
+                                let list = map
+                                    .entries()
+                                    .into_iter()
+                                    .map(|(k, v)| Value::Tuple(vec![k.to_value(), v.clone()]))
+                                    .collect();
+                                return Ok(Value::List(list));
+                            }
+                            _ => {}
+                        },
                         _ => {}
                     }
                 }
@@ -1277,6 +1642,7 @@ impl Interpreter {
     fn resolve_pattern_type(&self, name: &str) -> ResolvedPatternType {
         match name {
             "Int" => ResolvedPatternType::Int,
+            "Float" => ResolvedPatternType::Float,
             "String" => ResolvedPatternType::String,
             "Bool" => ResolvedPatternType::Bool,
             "Void" => ResolvedPatternType::Void,
@@ -1303,8 +1669,8 @@ impl Interpreter {
                         }
                     }
                     ResolvedPatternType::Unknown
-                } else if name == "IndexError" {
-                    ResolvedPatternType::Custom(TypeId::builtin("IndexError"))
+                } else if name == "IndexError" || name == "KeyError" {
+                    ResolvedPatternType::Custom(TypeId::builtin(name))
                 } else {
                     ResolvedPatternType::Custom(TypeId::from_module_opt(
                         self.current_module.as_ref(),
@@ -1335,6 +1701,7 @@ impl Interpreter {
                         &nat.type_id() == pat_id
                     }
                     (Value::Int(_), ResolvedPatternType::Int) => true,
+                    (Value::Float(_), ResolvedPatternType::Float) => true,
                     (Value::String(_), ResolvedPatternType::String) => true,
                     (Value::Bool(_), ResolvedPatternType::Bool) => true,
                     (Value::Void, ResolvedPatternType::Void) => true,
@@ -1376,6 +1743,7 @@ impl Interpreter {
 
 enum ResolvedPatternType {
     Int,
+    Float,
     String,
     Bool,
     Void,

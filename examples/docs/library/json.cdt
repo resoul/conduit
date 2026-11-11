@@ -1,0 +1,31 @@
+import cdt.json as json
+import cdt.validation as validation
+
+type User {
+    name: String @validation.min(2)
+    email: String @validation.email
+    score: Float @validation.min(0.0)
+}
+
+func ingest(raw: String) -> String | json.DecodeError | validation.ValidationError | json.EncodeError {
+    user := json.decode<User>(raw)?
+    checked := validation.check(user)?
+    return json.encode(checked)?
+}
+
+func main() {
+    ok_raw := "{\"name\":\"Alice\",\"email\":\"alice@example.com\",\"score\":98.5}"
+    switch ingest(ok_raw) {
+        case String(encoded): print(encoded)
+        case json.DecodeError(e): print("Decode error at {e.path}: {e.message}")
+        case validation.ValidationError(e): print("Validation failed")
+        case json.EncodeError(e): print("Encode error: {e.message}")
+    }
+
+    // Dynamic JSON tree access with json.parse / json.Value
+    switch json.parse("{\"items\":[10,20]}") {
+        case json.Value(tree): print(json.stringify(tree))
+        case json.DecodeError(e): print(e.message)
+    }
+}
+

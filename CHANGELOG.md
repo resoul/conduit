@@ -5,6 +5,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
+## [0.1.8] - 2026-11-11
+
+### Added & Changed
+
+* **User-Defined Generic Functions & Records**:
+  * Added generic record declarations `type Name<T, ...> { ... }` and generic function declarations `func name<T, ...>(...) -> ...` with validation rejecting empty (`<>`) and duplicate (`<T, T>`) type parameter lists.
+  * Added explicit generic type arguments on type annotations (`Page<User>`, `alias.Page<Int>`, nested `Box<[Pair<String, Int>]>`) and function calls (`first_or_default<Int>([], 0)`), alongside type argument inference from call arguments with conflict detection (`Conflicting types inferred for type parameter 'T'`).
+  * Added `Type::TypeParam` and canonical `Type::Generic { type_id, type_args }` identity so `Box<Int>` and `Box<String>` are strictly distinct, generic `switch` branches bind concrete field types, and `export` privacy recursively inspects generic type arguments.
+  * Updated `ReachabilityAnalyzer` and LSP hover/completions to traverse generic type arguments.
+
+* **Ordered Dictionary Type (`Map<K, V>`)**:
+  * Added built-in `Map<K, V>` constrained to `String`, `Int`, or `Bool` keys (`"Map key type must be 'String', 'Int', or 'Bool', got '...'"`), with deterministic insertion ordering (`set` overwrites preserve original key position; `remove` then re-`set` appends to end).
+  * Added `Map<K, V>()` and `Map.from([(k, v), ...])` constructors, safe `map[key] -> V | KeyError` indexing with prelude `KeyError { key: String, message: String }`, and `.set`, `.get`, `.remove`, `.contains_key`, `.len`, `.keys`, `.values`, and `.entries` methods.
+  * Integrated `Map<K, V>` and generic structs with `cdt.validation` (`min`/`max` on map entry counts and recursive `validation.check` producing formatted paths such as `users_by_id["alice"].email` and `items[42].title`).
+
+* **Floating-Point Type (`Float`) & Strict Conversions**:
+  * Added `Float` (`f64`, IEEE 754) literals (`0.0`, `3.14`, `-42.5`), arithmetic (`+`, `-`, `*`, `/`), unary `-`, comparisons (`<`, `<=`, `>`, `>=`, `==`, `!=`), and runtime `Division by zero` checks to prevent silent `NaN`/`Infinity` propagation.
+  * Preserved strict separation from `Int` (no implicit mixing), with explicit `Int.to_float()` and `Float` methods `.floor()`, `.ceil()`, `.round()`, `.trunc()`, `.to_string()`, `.is_nan()`, `.is_infinite()`, and `.is_finite()`.
+  * Extended `cdt.validation` `min` / `max` bounds and custom `[#validator]` literal arguments (including negative floats) to support `Float`, rejecting non-finite `NaN` and `Infinity` values.
+
+* **Standard Library `cdt.json`**:
+  * Implemented zero-dependency RFC 8259 JSON parser and serializer in pure Rust `std`, exporting `json.Value`, `json.DecodeError { path, message }`, and `json.EncodeError { path, message }`.
+  * Added typed `json.decode<T>(raw)` enforcing strict field presence, `null` rules, unknown field rejection, exact 64-bit integer bounds (rejecting fractions, exponents, and overflows), non-ambiguous union checking, and exact violation paths without implicitly triggering `@`-validators.
+  * Added deterministic `json.encode(value)` preserving struct declaration field order and `Map` insertion order, plus unstructured `json.parse`, `json.stringify`, and `.is_null()` / `.as_*()` navigation helpers on `json.Value`.
+
 ## [0.1.7] - 2026-11-11
 
 ### Added & Changed

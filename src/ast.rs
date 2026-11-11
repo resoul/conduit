@@ -3,6 +3,10 @@ use crate::lexer::Span;
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeExpr {
     Named(String),
+    Generic {
+        name: String,
+        type_args: Vec<TypeExpr>,
+    },
     List(Box<TypeExpr>),
     Optional(Box<TypeExpr>),
     Union(Vec<TypeExpr>),
@@ -47,6 +51,7 @@ pub struct NamedArg {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExprKind {
     Int(i64),
+    Float(f64),
     String(String),
     Bool(bool),
     Nil,
@@ -65,6 +70,7 @@ pub enum ExprKind {
     Try(Box<Expr>),
     Call {
         callee: Box<Expr>,
+        type_args: Vec<TypeExpr>,
         args: Vec<Expr>,
         named_args: Vec<NamedArg>,
     },
@@ -213,6 +219,7 @@ pub struct FieldDef {
 pub enum ItemKind {
     Func {
         name: String,
+        type_params: Vec<String>,
         params: Vec<Param>,
         return_type: Option<TypeExpr>,
         body: Block,
@@ -220,6 +227,7 @@ pub enum ItemKind {
     },
     Type {
         name: String,
+        type_params: Vec<String>,
         fields: Vec<FieldDef>,
     },
     Error {

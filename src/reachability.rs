@@ -235,7 +235,10 @@ impl<'a> ReachabilityAnalyzer<'a> {
                 }
                 self.mark_struct_reachable(current_mod_path, name, worklist);
             }
-            ExprKind::Call { callee, args, named_args } => {
+            ExprKind::Call { callee, type_args, args, named_args } => {
+                for ta in type_args {
+                    self.scan_type_expr(ta, current_mod_path, loaded_mod, worklist);
+                }
                 if let ExprKind::Ident(ref name) = callee.kind {
                     if self.is_func_in_module(current_mod_path, name) {
                         worklist.push((current_mod_path.to_path_buf(), name.clone()));
@@ -310,7 +313,11 @@ impl<'a> ReachabilityAnalyzer<'a> {
                 }
                 self.scan_block(body, current_mod_path, loaded_mod, worklist);
             }
-            ExprKind::Int(_) | ExprKind::String(_) | ExprKind::Bool(_) | ExprKind::Nil => {}
+            ExprKind::Int(_)
+            | ExprKind::Float(_)
+            | ExprKind::String(_)
+            | ExprKind::Bool(_)
+            | ExprKind::Nil => {}
         }
     }
 
@@ -348,7 +355,7 @@ impl<'a> ReachabilityAnalyzer<'a> {
         };
 
         for item in &loaded_mod.program.items {
-            if let ItemKind::Type { name, fields } = &item.kind {
+            if let ItemKind::Type { name, fields, .. } = &item.kind {
                 if name == type_name {
                     for f in fields {
                         self.scan_type_expr(&f.ty, &canon, loaded_mod, worklist);
@@ -375,6 +382,22 @@ impl<'a> ReachabilityAnalyzer<'a> {
         }
     }
 
+    fn mark_named_type_reachable(
+        &mut self,
+        name: &str,
+        current_mod_path: &Path,
+        loaded_mod: &LoadedModule,
+        worklist: &mut Vec<(PathBuf, String)>,
+    ) {
+        if let Some((alias, type_name)) = name.split_once('.') {
+            if let Some((ModuleTarget::Local(target_path), _)) = loaded_mod.imports.get(alias) {
+                self.mark_struct_reachable(target_path, type_name, worklist);
+            }
+        } else {
+            self.mark_struct_reachable(current_mod_path, name, worklist);
+        }
+    }
+
     fn scan_type_expr(
         &mut self,
         ty: &TypeExpr,
@@ -384,12 +407,12 @@ impl<'a> ReachabilityAnalyzer<'a> {
     ) {
         match ty {
             TypeExpr::Named(name) => {
-                if let Some((alias, type_name)) = name.split_once('.') {
-                    if let Some((ModuleTarget::Local(target_path), _)) = loaded_mod.imports.get(alias) {
-                        self.mark_struct_reachable(target_path, type_name, worklist);
-                    }
-                } else {
-                    self.mark_struct_reachable(current_mod_path, name, worklist);
+                self.mark_named_type_reachable(name, current_mod_path, loaded_mod, worklist);
+            }
+            TypeExpr::Generic { name, type_args } => {
+                self.mark_named_type_reachable(name, current_mod_path, loaded_mod, worklist);
+                for ta in type_args {
+                    self.scan_type_expr(ta, current_mod_path, loaded_mod, worklist);
                 }
             }
             TypeExpr::List(inner) | TypeExpr::Optional(inner) => {
@@ -418,13 +441,7 @@ impl<'a> ReachabilityAnalyzer<'a> {
     ) {
         match &pattern.kind {
             PatternKind::Type { name, .. } => {
-                if let Some((alias, type_name)) = name.split_once('.') {
-                    if let Some((ModuleTarget::Local(target_path), _)) = loaded_mod.imports.get(alias) {
-                        self.mark_struct_reachable(target_path, type_name, worklist);
-                    }
-                } else {
-                    self.mark_struct_reachable(current_mod_path, name, worklist);
-                }
+                self.mark_named_type_reachable(name, current_mod_path, loaded_mod, worklist);
             }
             PatternKind::Tuple(pats) => {
                 for p in pats {
