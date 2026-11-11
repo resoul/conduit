@@ -72,6 +72,7 @@ pub struct TypeChecker {
     scopes: Vec<HashMap<String, VarBinding>>,
     narrowed: HashMap<String, Type>,
     widened_outer_vars: Vec<(usize, HashSet<String>)>,
+    closure_boundary_scope_depth: Vec<usize>,
     current_return_type: Option<Type>,
     current_type_params: Vec<String>,
     loop_depth: usize,
@@ -90,6 +91,7 @@ impl TypeChecker {
             scopes: Vec::new(),
             narrowed: HashMap::new(),
             widened_outer_vars: Vec::new(),
+            closure_boundary_scope_depth: Vec::new(),
             current_return_type: None,
             current_type_params: Vec::new(),
             loop_depth: 0,
@@ -182,6 +184,51 @@ impl TypeChecker {
             }
         }
         None
+    }
+
+    fn validate_union_generic_instantiations(
+        types: &[Type],
+        span: Span,
+    ) -> Result<(), TypeError> {
+        fn collect_members<'a>(ty: &'a Type, members: &mut Vec<&'a Type>) {
+            match ty {
+                Type::Union(variants) => {
+                    for variant in variants {
+                        collect_members(variant, members);
+                    }
+                }
+                Type::Optional(inner) => collect_members(inner, members),
+                other => members.push(other),
+            }
+        }
+
+        let mut members = Vec::new();
+        for ty in types {
+            collect_members(ty, &mut members);
+        }
+        let mut seen: Vec<(&TypeId, &Vec<Type>)> = Vec::new();
+        for ty in members {
+            if let Type::Generic { type_id, type_args } = ty {
+                if let Some((_, previous_args)) = seen.iter().find(|(id, _)| *id == type_id) {
+                    if *previous_args != type_args {
+                        let previous = Type::Generic {
+                            type_id: type_id.clone(),
+                            type_args: (*previous_args).clone(),
+                        };
+                        return Err(TypeError {
+                            message: format!(
+                                "Cannot combine distinct generic instantiations of '{}' ('{}' and '{}') in the same union",
+                                type_id, previous, ty
+                            ),
+                            span,
+                        });
+                    }
+                } else {
+                    seen.push((type_id, type_args));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn lookup_effective_type_unmarked(&self, name: &str) -> Option<Type> {
@@ -537,6 +584,7 @@ impl TypeChecker {
                         span,
                     )?);
                 }
+                Self::validate_union_generic_instantiations(&types, span)?;
                 Ok(Type::union(types))
             }
             TypeExpr::Tuple(elements) => {
@@ -691,6 +739,13 @@ impl TypeChecker {
                                 ),
                                 span,
                             });
+                        }
+                        let mut subst = HashMap::new();
+                        for (param, arg) in sig.type_params.iter().zip(type_args.iter()) {
+                            subst.insert(param.clone(), arg.clone());
+                        }
+                        for field_ty in sig.fields.values() {
+                            Self::substitute_type(field_ty, &subst, span)?;
                         }
                     }
                     None => {
@@ -870,6 +925,7 @@ impl TypeChecker {
                 for v in vars {
                     res.push(Self::substitute_type(v, bindings, span)?);
                 }
+                Self::validate_union_generic_instantiations(&res, span)?;
                 Ok(Type::union(res))
             }
             Type::Generic { type_id, type_args } => {
@@ -1126,7 +1182,10 @@ impl TypeChecker {
     }
 
     pub fn check_project(&mut self, root_path: &Path, loader: &ModuleLoader) -> Result<(), TypeError> {
-        for (path, loaded_mod) in &loader.modules {
+        let mut module_paths: Vec<PathBuf> = loader.modules.keys().cloned().collect();
+        module_paths.sort();
+        for path in &module_paths {
+            let loaded_mod = &loader.modules[path];
             let mod_id = ModuleId::Local(path.clone());
             let mut info = ModuleInfo::default();
             for (alias, (target, _)) in &loaded_mod.imports {
@@ -1265,10 +1324,11 @@ impl TypeChecker {
             self.module_info.insert(path.clone(), info);
         }
 
-        let all_module_paths: Vec<PathBuf> = self.module_info.keys().cloned().collect();
-        for path in all_module_paths {
+        let mut all_module_paths: Vec<PathBuf> = self.module_info.keys().cloned().collect();
+        all_module_paths.sort();
+        for path in &all_module_paths {
             self.current_module_path = Some(path.clone());
-            let info = self.module_info.get(&path).cloned().unwrap();
+            let info = self.module_info.get(path).cloned().unwrap();
             for sig in info.functions.values() {
                 for (_, param_ty) in &sig.params {
                     self.check_generic_arity_in_type(param_ty, Span::new(1, 1))?;
@@ -1283,7 +1343,8 @@ impl TypeChecker {
         }
         self.current_module_path = None;
 
-        for (path, info) in &self.module_info {
+        for path in &all_module_paths {
+            let info = self.module_info.get(path).cloned().unwrap();
             for (fn_name, sig) in &info.functions {
                 if sig.is_exported {
                     for (param_name, param_ty) in &sig.params {
@@ -1326,7 +1387,8 @@ impl TypeChecker {
             }
         }
 
-        for (path, loaded_mod) in &loader.modules {
+        for path in &module_paths {
+            let loaded_mod = &loader.modules[path];
             self.current_module_path = Some(path.clone());
             if let Some(info) = self.module_info.get(path) {
                 self.functions = info.functions.clone();
@@ -1811,7 +1873,17 @@ impl TypeChecker {
                             span: expr.span,
                         });
                     }
+                    let closure_boundary = self.closure_boundary_scope_depth.last().copied();
                     if let Some((scope_idx, binding)) = self.lookup_variable_binding_mut(root_name) {
+                        if closure_boundary.is_some_and(|boundary| scope_idx < boundary) {
+                            return Err(TypeError {
+                                message: format!(
+                                    "Cannot mutate captured variable '{}' inside a closure",
+                                    root_name
+                                ),
+                                span: expr.span,
+                            });
+                        }
                         if !binding.is_mutable {
                             return Err(TypeError {
                                 message: format!("Cannot mutate immutable variable '{}'", root_name),
@@ -1958,7 +2030,11 @@ impl TypeChecker {
                     None => None,
                 };
                 if let Some(init_expr) = init {
-                    let init_ty = self.check_expr(init_expr)?;
+                    let init_ty = if let Some(ref target) = declared_ty {
+                        self.check_expr_with_expected(init_expr, target)?
+                    } else {
+                        self.check_expr(init_expr)?
+                    };
                     if let Some(ref target) = declared_ty {
                         if !init_ty.is_assignable_to(target) {
                             return Err(TypeError {
@@ -1995,7 +2071,7 @@ impl TypeChecker {
                                     span: index.span,
                                 });
                             }
-                            let rhs_ty = self.check_expr(value)?;
+                            let rhs_ty = self.check_expr_with_expected(value, &val_ty)?;
                             if !rhs_ty.is_assignable_to(&val_ty) {
                                 return Err(TypeError {
                                     message: format!("Cannot assign value of type {} to target of type {}", rhs_ty, val_ty),
@@ -2020,7 +2096,7 @@ impl TypeChecker {
                 } else {
                     self.check_expr(target)?
                 };
-                let value_ty = self.check_expr(value)?;
+                let value_ty = self.check_expr_with_expected(value, &target_ty)?;
                 if !value_ty.is_assignable_to(&target_ty) {
                     return Err(TypeError {
                         message: format!("Cannot assign value of type {} to target of type {}", value_ty, target_ty),
@@ -2037,7 +2113,11 @@ impl TypeChecker {
             }
             StmtKind::Return(opt_expr) => {
                 let actual_ty = if let Some(expr) = opt_expr {
-                    self.check_expr(expr)?
+                    if let Some(expected) = self.current_return_type.clone() {
+                        self.check_expr_with_expected(expr, &expected)?
+                    } else {
+                        self.check_expr(expr)?
+                    }
                 } else {
                     Type::Void
                 };
@@ -2533,7 +2613,7 @@ impl TypeChecker {
                     });
                 }
                 "append" | "contains" if args.len() == 1 => {
-                    let arg_ty = self.check_expr(&args[0])?;
+                    let arg_ty = self.check_expr_with_expected(&args[0], inner)?;
                     if arg_ty.is_assignable_to(inner) {
                         return Ok(if field == "append" { Type::Void } else { Type::Bool });
                     }
@@ -2581,7 +2661,7 @@ impl TypeChecker {
                             span: args[0].span,
                         });
                     }
-                    let v_arg_ty = self.check_expr(&args[1])?;
+                    let v_arg_ty = self.check_expr_with_expected(&args[1], val_ty)?;
                     if !v_arg_ty.is_assignable_to(val_ty) {
                         return Err(TypeError {
                             message: format!(
@@ -2776,7 +2856,18 @@ impl TypeChecker {
                 message: format!("Type '{}' has no field '{}'", display_name, arg.name),
                 span: callee_span,
             })?;
-            let actual_arg_ty = self.check_expr(&arg.value)?;
+            let expected_for_check = if struct_sig.type_params.is_empty() {
+                expected_field_ty.clone()
+            } else {
+                Self::substitute_type(expected_field_ty, &bindings, arg.value.span)?
+            };
+            let actual_arg_ty = if type_args.is_empty()
+                && Self::contains_type_param(&expected_for_check)
+            {
+                self.check_expr(&arg.value)?
+            } else {
+                self.check_expr_with_expected(&arg.value, &expected_for_check)?
+            };
             if !struct_sig.type_params.is_empty() && type_args.is_empty() {
                 Self::unify_type(expected_field_ty, &actual_arg_ty, &mut bindings, arg.value.span)?;
             }
@@ -2892,7 +2983,14 @@ impl TypeChecker {
 
         let mut actual_arg_tys = Vec::with_capacity(args.len());
         for (arg_expr, (_, param_ty)) in args.iter().zip(fn_sig.params.iter()) {
-            let actual_ty = self.check_expr(arg_expr)?;
+            let expected_for_check = Self::substitute_type(param_ty, &bindings, arg_expr.span)?;
+            let actual_ty = if type_args.is_empty()
+                && Self::contains_type_param(&expected_for_check)
+            {
+                self.check_expr(arg_expr)?
+            } else {
+                self.check_expr_with_expected(arg_expr, &expected_for_check)?
+            };
             if !fn_sig.type_params.is_empty() && type_args.is_empty() {
                 Self::unify_type(param_ty, &actual_ty, &mut bindings, arg_expr.span)?;
             }
@@ -2945,7 +3043,27 @@ impl TypeChecker {
         match &expr.kind {
             ExprKind::Int(_) => Ok(Type::Int),
             ExprKind::Float(_) => Ok(Type::Float),
-            ExprKind::String(_) => Ok(Type::String),
+            ExprKind::String(value) => {
+                let mut chars = value.chars().peekable();
+                while let Some(ch) = chars.next() {
+                    if ch != '{' {
+                        continue;
+                    }
+                    let mut segment = String::new();
+                    let mut closed = false;
+                    for inner in chars.by_ref() {
+                        if inner == '}' {
+                            closed = true;
+                            break;
+                        }
+                        segment.push(inner);
+                    }
+                    if closed {
+                        self.check_interpolation_path(&segment, expr.span)?;
+                    }
+                }
+                Ok(Type::String)
+            }
             ExprKind::Bool(_) => Ok(Type::Bool),
             ExprKind::Nil => Ok(Type::Nil),
             ExprKind::Ident(name) => {
@@ -2979,12 +3097,15 @@ impl TypeChecker {
             }
             ExprKind::List(elements) => {
                 if elements.is_empty() {
-                    return Ok(Type::List(Box::new(Type::Any)));
+                    return Err(TypeError {
+                        message: "Cannot infer element type for empty list '[]'; add an explicit type annotation".to_string(),
+                        span: expr.span,
+                    });
                 }
 
                 let first_ty = self.check_expr(&elements[0])?;
                 for elem in &elements[1..] {
-                    let elem_ty = self.check_expr(elem)?;
+                    let elem_ty = self.check_expr_with_expected(elem, &first_ty)?;
                     if !elem_ty.is_assignable_to(&first_ty) {
                         return Err(TypeError {
                             message: format!("List elements must have compatible types: expected {}, got {}", first_ty, elem_ty),
@@ -3060,6 +3181,7 @@ impl TypeChecker {
                 let saved_widened = std::mem::take(&mut self.widened_outer_vars);
                 self.loop_depth = 0;
 
+                self.closure_boundary_scope_depth.push(self.scopes.len());
                 self.enter_scope();
                 for (param_name, param_ty) in &param_types {
                     self.define_variable(param_name.clone(), param_ty.clone(), false, expr.span);
@@ -3067,6 +3189,7 @@ impl TypeChecker {
 
                 let body_res = self.check_block(body);
                 let exit_res = self.exit_scope();
+                self.closure_boundary_scope_depth.pop();
 
                 self.narrowed = saved_narrowed;
                 self.widened_outer_vars = saved_widened;
@@ -3124,6 +3247,25 @@ impl TypeChecker {
                         let res = self.check_expr(right);
                         self.narrowed = saved;
                         res?
+                    }
+                    BinaryOp::Coalesce => {
+                        let expected = match &left_ty {
+                            Type::Optional(inner) => Some(inner.as_ref().clone()),
+                            Type::Union(variants) if variants.contains(&Type::Nil) => {
+                                let remaining: Vec<Type> = variants
+                                    .iter()
+                                    .filter(|variant| **variant != Type::Nil)
+                                    .cloned()
+                                    .collect();
+                                Some(Type::union(remaining))
+                            }
+                            _ => None,
+                        };
+                        if let Some(expected) = expected {
+                            self.check_expr_with_expected(right, &expected)?
+                        } else {
+                            self.check_expr(right)?
+                        }
                     }
                     _ => self.check_expr(right)?,
                 };
@@ -3279,6 +3421,52 @@ impl TypeChecker {
                 Ok(Type::union(successes))
             }
             ExprKind::Call { callee, type_args, args, named_args } => {
+                if let ExprKind::Ident(name) = &callee.kind {
+                    let is_constructor = name == "Map"
+                        || self.structs.contains_key(name)
+                        || self.errors.contains(name)
+                        || Self::builtin_error_sig(name).is_some();
+                    let is_builtin = matches!(name.as_str(), "map" | "filter" | "print");
+                    if !is_constructor
+                        && !is_builtin
+                        && type_args.is_empty()
+                        && named_args.is_empty()
+                    {
+                        if let Some(callee_ty) = self.lookup_variable(name) {
+                            if let Type::Function { params, return_type } = callee_ty {
+                                if args.len() != params.len() {
+                                    return Err(TypeError {
+                                        message: format!(
+                                            "Function expects {} arguments, got {}",
+                                            params.len(), args.len()
+                                        ),
+                                        span: expr.span,
+                                    });
+                                }
+                                for (i, (arg, expected)) in
+                                    args.iter().zip(params.iter()).enumerate()
+                                {
+                                    let actual = self.check_expr_with_expected(arg, expected)?;
+                                    if !actual.is_assignable_to(expected) {
+                                        return Err(TypeError {
+                                            message: format!(
+                                                "Argument {} expects {}, got {}",
+                                                i + 1, expected, actual
+                                            ),
+                                            span: arg.span,
+                                        });
+                                    }
+                                }
+                                return Ok(*return_type);
+                            }
+                            return Err(TypeError {
+                                message: format!("Cannot call non-function expression of type '{}'", callee_ty),
+                                span: callee.span,
+                            });
+                        }
+                    }
+                }
+
                 if let ExprKind::Ident(ref type_name) = callee.kind {
                     if type_name == "Map" {
                         if type_args.len() != 2 {
@@ -3448,7 +3636,6 @@ impl TypeChecker {
                                     span: expr.span,
                                 });
                             }
-                            let arg_ty = self.check_expr(&args[0])?;
                             if !type_args.is_empty() {
                                 if type_args.len() != 2 {
                                     return Err(TypeError {
@@ -3467,6 +3654,7 @@ impl TypeChecker {
                                     key_ty.clone(),
                                     val_ty.clone(),
                                 ])));
+                                let arg_ty = self.check_expr_with_expected(&args[0], &expected_list)?;
                                 if !arg_ty.is_assignable_to(&expected_list) {
                                     return Err(TypeError {
                                         message: format!(
@@ -3478,6 +3666,7 @@ impl TypeChecker {
                                 }
                                 return Ok(Type::Map(Box::new(key_ty), Box::new(val_ty)));
                             }
+                            let arg_ty = self.check_expr(&args[0])?;
                             if let Type::List(elem_ty) = arg_ty {
                                 if let Type::Tuple(elems) = *elem_ty {
                                     if elems.len() == 2 {
@@ -3526,8 +3715,8 @@ impl TypeChecker {
                                         }
                                         let mut provided_fields = HashSet::new();
                                         for na in named_args {
-                                            let arg_ty = self.check_expr(&na.value)?;
                                             if let Some((_, expected_ty)) = ty_def.fields.iter().find(|(name, _)| *name == na.name.as_str()) {
+                                                let arg_ty = self.check_expr_with_expected(&na.value, expected_ty)?;
                                                 if !arg_ty.is_assignable_to(expected_ty) {
                                                     return Err(TypeError {
                                                         message: format!("Type mismatch for field '{}' in construction of '{}.{}': expected {}, got {}", na.name, alias, field, expected_ty, arg_ty),
@@ -3770,7 +3959,7 @@ impl TypeChecker {
                         });
                     }
                     for (i, (arg_expr, expected_ty)) in args.iter().zip(params.iter()).enumerate() {
-                        let actual_ty = self.check_expr(arg_expr)?;
+                        let actual_ty = self.check_expr_with_expected(arg_expr, expected_ty)?;
                         if !actual_ty.is_assignable_to(expected_ty) {
                             return Err(TypeError {
                                 message: format!("Argument {} expects {}, got {}", i + 1, expected_ty, actual_ty),
@@ -3817,6 +4006,102 @@ impl TypeChecker {
                     }),
                 }
             }
+        }
+    }
+
+    fn is_interpolation_identifier(value: &str) -> bool {
+        let mut bytes = value.bytes();
+        matches!(bytes.next(), Some(b'a'..=b'z' | b'A'..=b'Z' | b'_'))
+            && bytes.all(|b| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_'))
+    }
+
+    fn check_interpolation_path(&mut self, segment: &str, span: Span) -> Result<(), TypeError> {
+        let parts: Vec<&str> = segment.split('.').collect();
+        if parts.is_empty() || !parts.iter().all(|p| Self::is_interpolation_identifier(p)) {
+            return Ok(());
+        }
+        let mut cur_ty = self.lookup_variable(parts[0]).ok_or_else(|| TypeError {
+            message: format!("Unknown variable '{}' in string interpolation", parts[0]),
+            span,
+        })?;
+        for field in &parts[1..] {
+            cur_ty = self.check_member_on_type(&cur_ty, field, span)?;
+        }
+        Ok(())
+    }
+
+    fn check_expr_with_expected(
+        &mut self,
+        expr: &Expr,
+        expected: &Type,
+    ) -> Result<Type, TypeError> {
+        match (&expr.kind, expected) {
+            (ExprKind::List(elements), Type::List(expected_element)) => {
+                for element in elements {
+                    let actual = self.check_expr_with_expected(element, expected_element)?;
+                    if !actual.is_assignable_to(expected_element) {
+                        return Err(TypeError {
+                            message: format!(
+                                "List element type '{}' is not assignable to expected type '{}'",
+                                actual, expected_element
+                            ),
+                            span: element.span,
+                        });
+                    }
+                }
+                Ok(expected.clone())
+            }
+            (ExprKind::List(_), Type::Optional(inner)) if matches!(**inner, Type::List(_)) => {
+                self.check_expr_with_expected(expr, inner)
+            }
+            (ExprKind::List(_), Type::Union(variants)) => {
+                let list_targets: Vec<&Type> = variants
+                    .iter()
+                    .filter(|variant| matches!(variant, Type::List(_)))
+                    .collect();
+                if let [target] = list_targets.as_slice() {
+                    self.check_expr_with_expected(expr, target)
+                } else {
+                    self.check_expr(expr)
+                }
+            }
+            (ExprKind::Tuple(elements), Type::Tuple(expected_elements))
+                if elements.len() == expected_elements.len() =>
+            {
+                for (element, expected_element) in elements.iter().zip(expected_elements) {
+                    let actual = self.check_expr_with_expected(element, expected_element)?;
+                    if !actual.is_assignable_to(expected_element) {
+                        return Err(TypeError {
+                            message: format!(
+                                "Tuple element type '{}' is not assignable to expected type '{}'",
+                                actual, expected_element
+                            ),
+                            span: element.span,
+                        });
+                    }
+                }
+                Ok(expected.clone())
+            }
+            _ => self.check_expr(expr),
+        }
+    }
+
+    fn contains_type_param(ty: &Type) -> bool {
+        match ty {
+            Type::TypeParam(_) => true,
+            Type::List(inner) | Type::Optional(inner) => Self::contains_type_param(inner),
+            Type::Map(key, value) => {
+                Self::contains_type_param(key) || Self::contains_type_param(value)
+            }
+            Type::Tuple(elements) | Type::Union(elements) => {
+                elements.iter().any(Self::contains_type_param)
+            }
+            Type::Generic { type_args, .. } => type_args.iter().any(Self::contains_type_param),
+            Type::Function { params, return_type } => {
+                params.iter().any(Self::contains_type_param)
+                    || Self::contains_type_param(return_type)
+            }
+            _ => false,
         }
     }
 

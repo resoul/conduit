@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::ast::*;
-use crate::lexer::Span;
+use crate::lexer::{ESCAPED_CLOSE_BRACE, ESCAPED_OPEN_BRACE, Span};
 use crate::loader::{ModuleLoader, ModuleTarget};
 use crate::native::json::{
     decode_node_to_conduit, encode_conduit_value, make_decode_error, make_encode_error, parse_json,
@@ -13,6 +13,9 @@ use crate::types::{ModuleId, Type, TypeId};
 use crate::value::{
     make_index_error, make_key_error, make_parse_error, ClosureData, MapKey, OrderedMap, Value,
 };
+
+const MAX_CALL_DEPTH: usize = 256;
+const INTERPRETER_STACK_SIZE: usize = 24 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeError {
@@ -46,6 +49,18 @@ impl From<RuntimeError> for InterpFlow {
     }
 }
 
+fn checked_float_to_int(value: f64, span: Span) -> Result<Value, RuntimeError> {
+    let min = i64::MIN as f64;
+    let max_exclusive = i64::MAX as f64;
+    if !value.is_finite() || value < min || value >= max_exclusive {
+        return Err(RuntimeError {
+            message: "Cannot convert non-finite or out-of-range Float to Int".to_string(),
+            span,
+        });
+    }
+    Ok(Value::Int(value as i64))
+}
+
 pub struct Interpreter {
     pub native_registry: NativeRegistry,
     module_functions: HashMap<(Option<PathBuf>, String), (Vec<Param>, Block)>,
@@ -56,6 +71,8 @@ pub struct Interpreter {
     module_errors: HashMap<Option<PathBuf>, HashSet<String>>,
     current_module: Option<PathBuf>,
     env: Vec<HashMap<String, Value>>,
+    call_depth: usize,
+    large_stack_active: bool,
 }
 
 impl Interpreter {
@@ -70,6 +87,8 @@ impl Interpreter {
             module_errors: HashMap::new(),
             current_module: None,
             env: vec![HashMap::new()],
+            call_depth: 0,
+            large_stack_active: false,
         }
     }
 
@@ -197,22 +216,48 @@ impl Interpreter {
         captured
     }
 
+    fn push_unescaped_braces(dst: &mut String, text: &str) {
+        for ch in text.chars() {
+            if ch == ESCAPED_OPEN_BRACE {
+                dst.push('{');
+            } else if ch == ESCAPED_CLOSE_BRACE {
+                dst.push('}');
+            } else {
+                dst.push(ch);
+            }
+        }
+    }
+
     fn interpolate(&self, template: &str) -> String {
         let mut result = String::new();
         let mut chars = template.chars().peekable();
 
         while let Some(ch) = chars.next() {
-            if ch == '{' {
-                let mut var_name = String::new();
-                for inner in chars.by_ref() {
-                    if inner == '}' {
-                        break;
-                    }
-                    var_name.push(inner);
+            if ch == ESCAPED_OPEN_BRACE {
+                result.push('{');
+                continue;
+            }
+            if ch == ESCAPED_CLOSE_BRACE {
+                result.push('}');
+                continue;
+            }
+            if ch != '{' {
+                result.push(ch);
+                continue;
+            }
+
+            let mut segment = String::new();
+            let mut closed = false;
+            for inner in chars.by_ref() {
+                if inner == '}' {
+                    closed = true;
+                    break;
                 }
-                let clean_name = var_name.trim();
-                if clean_name.contains('.') {
-                    let parts: Vec<&str> = clean_name.split('.').collect();
+                segment.push(inner);
+            }
+            if closed {
+                let parts: Vec<&str> = segment.split('.').collect();
+                if !parts.is_empty() && parts.iter().all(|p| Self::is_simple_identifier(p)) {
                     if let Some(mut current) = self.lookup_variable(parts[0]) {
                         let mut resolved = true;
                         for part in &parts[1..] {
@@ -237,20 +282,21 @@ impl Interpreter {
                         }
                     }
                 }
-
-                if let Some(val) = self.lookup_variable(clean_name) {
-                    result.push_str(&val.to_string());
-                } else {
-                    result.push('{');
-                    result.push_str(&var_name);
-                    result.push('}');
-                }
-            } else {
-                result.push(ch);
+            }
+            result.push('{');
+            Self::push_unescaped_braces(&mut result, &segment);
+            if closed {
+                result.push('}');
             }
         }
 
         result
+    }
+
+    fn is_simple_identifier(value: &str) -> bool {
+        let mut bytes = value.bytes();
+        matches!(bytes.next(), Some(b'a'..=b'z' | b'A'..=b'Z' | b'_'))
+            && bytes.all(|b| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_'))
     }
 
     pub fn run_project(&mut self, root_path: &Path, loader: &ModuleLoader) -> Result<(), RuntimeError> {
@@ -525,6 +571,33 @@ impl Interpreter {
         args: Vec<Value>,
         span: Span,
     ) -> Result<Value, RuntimeError> {
+        if self.call_depth == 0 && !self.large_stack_active {
+            self.large_stack_active = true;
+            let result = std::thread::scope(|scope| {
+                let handle = std::thread::Builder::new()
+                    .stack_size(INTERPRETER_STACK_SIZE)
+                    .spawn_scoped(scope, || {
+                        self.call_module_function(mod_path, name, args, span)
+                    })
+                    .map_err(|error| RuntimeError {
+                        message: format!("Unable to start interpreter thread: {}", error),
+                        span,
+                    })?;
+                match handle.join() {
+                    Ok(result) => result,
+                    Err(panic) => std::panic::resume_unwind(panic),
+                }
+            });
+            self.large_stack_active = false;
+            return result;
+        }
+
+        if self.call_depth >= MAX_CALL_DEPTH {
+            return Err(RuntimeError {
+                message: "Maximum call stack depth (256) exceeded".to_string(),
+                span,
+            });
+        }
         let key = (mod_path.clone(), name.to_string());
         let (params, body) = if let Some(sig) = self.module_functions.get(&key).cloned() {
             sig
@@ -540,6 +613,7 @@ impl Interpreter {
         let prev_mod = self.current_module.clone();
         let prev_env = std::mem::replace(&mut self.env, vec![HashMap::new()]);
         self.current_module = mod_path;
+        self.call_depth += 1;
 
         self.enter_scope();
         for (i, param) in params.iter().enumerate() {
@@ -566,6 +640,7 @@ impl Interpreter {
         self.exit_scope();
         self.env = prev_env;
         self.current_module = prev_mod;
+        self.call_depth -= 1;
         match eval_err {
             Some(e) => Err(e),
             None => Ok(return_val),
@@ -584,6 +659,13 @@ impl Interpreter {
                 }
             }
             Value::Closure(closure) => {
+                if self.call_depth >= MAX_CALL_DEPTH {
+                    return Err(RuntimeError {
+                        message: "Maximum call stack depth (256) exceeded".to_string(),
+                        span,
+                    });
+                }
+                self.call_depth += 1;
                 let prev_mod = self.current_module.clone();
                 let prev_env = std::mem::replace(&mut self.env, vec![closure.env.clone()]);
                 self.current_module = closure.module.clone();
@@ -613,6 +695,7 @@ impl Interpreter {
                 self.exit_scope();
                 self.env = prev_env;
                 self.current_module = prev_mod;
+                self.call_depth -= 1;
                 match eval_err {
                     Some(e) => Err(e),
                     None => Ok(return_val),
@@ -842,6 +925,89 @@ impl Interpreter {
             Ok(v) => Ok(v),
             Err((path, msg)) => Ok(make_decode_error(path, msg)),
         }
+    }
+
+    fn is_mutable_place(expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::Ident(_) => true,
+            ExprKind::Member { target, .. } => Self::is_mutable_place(target),
+            _ => false,
+        }
+    }
+
+    fn eval_mutating_method_on_place(
+        &mut self,
+        place: &Expr,
+        field: &str,
+        args: &[Expr],
+    ) -> Result<Value, InterpFlow> {
+        if field == "append" && args.len() == 1 {
+            let value = self.eval_expr(&args[0])?;
+            return self
+                .mutate_place(place, move |slot| {
+                    if let Value::List(items) = slot {
+                        items.push(value);
+                        Ok(Value::Void)
+                    } else {
+                        Err(RuntimeError {
+                            message: format!("Expected List, got {}", slot.type_name()),
+                            span: place.span,
+                        })
+                    }
+                })
+                .map_err(Into::into);
+        }
+
+        if field == "set" && args.len() == 2 {
+            let key_val = self.eval_expr(&args[0])?;
+            let key = MapKey::from_value(&key_val).ok_or_else(|| RuntimeError {
+                message: format!(
+                    "Map key must be String, Int, or Bool, got {}",
+                    key_val.type_name()
+                ),
+                span: args[0].span,
+            })?;
+            let value = self.eval_expr(&args[1])?;
+            return self
+                .mutate_place(place, move |slot| {
+                    if let Value::Map(map) = slot {
+                        map.set(key, value);
+                        Ok(Value::Void)
+                    } else {
+                        Err(RuntimeError {
+                            message: format!("Expected Map, got {}", slot.type_name()),
+                            span: place.span,
+                        })
+                    }
+                })
+                .map_err(Into::into);
+        }
+
+        if field == "remove" && args.len() == 1 {
+            let key_val = self.eval_expr(&args[0])?;
+            let key = MapKey::from_value(&key_val).ok_or_else(|| RuntimeError {
+                message: format!(
+                    "Map key must be String, Int, or Bool, got {}",
+                    key_val.type_name()
+                ),
+                span: args[0].span,
+            })?;
+            return self
+                .mutate_place(place, move |slot| {
+                    if let Value::Map(map) = slot {
+                        Ok(map.remove(&key).unwrap_or(Value::Nil))
+                    } else {
+                        Err(RuntimeError {
+                            message: format!("Expected Map, got {}", slot.type_name()),
+                            span: place.span,
+                        })
+                    }
+                })
+                .map_err(Into::into);
+        }
+
+        let target_val = self.eval_expr(place)?;
+        self.eval_method_on_value(target_val, Some(place), field, args, place.span)
     }
 
     fn eval_block(&mut self, block: &Block) -> Result<ControlFlow, RuntimeError> {
@@ -1182,7 +1348,13 @@ impl Interpreter {
                 let val = self.eval_expr(inner)?;
                 match op {
                     UnaryOp::Neg => match val {
-                        Value::Int(n) => Ok(Value::Int(-n)),
+                        Value::Int(n) => n.checked_neg().map(Value::Int).ok_or_else(|| {
+                            RuntimeError {
+                                message: "Integer overflow".to_string(),
+                                span: expr.span,
+                            }
+                            .into()
+                        }),
                         Value::Float(f) => Ok(Value::Float(-f)),
                         _ => Err(RuntimeError {
                             message: "Unary '-' applies to Int or Float only".to_string(),
@@ -1225,7 +1397,9 @@ impl Interpreter {
 
                 match op {
                     BinaryOp::Add => match (l, r) {
-                        (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a + b)),
+                        (Value::Int(a), Value::Int(b)) => a.checked_add(b).map(Value::Int).ok_or_else(|| RuntimeError {
+                            message: "Integer overflow".to_string(), span: expr.span,
+                        }.into()),
                         (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a + b)),
                         (Value::String(a), Value::String(b)) => Ok(Value::String(format!("{}{}", a, b))),
                         _ => Err(RuntimeError {
@@ -1234,7 +1408,9 @@ impl Interpreter {
                         }.into()),
                     },
                     BinaryOp::Sub => match (l, r) {
-                        (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a - b)),
+                        (Value::Int(a), Value::Int(b)) => a.checked_sub(b).map(Value::Int).ok_or_else(|| RuntimeError {
+                            message: "Integer overflow".to_string(), span: expr.span,
+                        }.into()),
                         (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a - b)),
                         _ => Err(RuntimeError {
                             message: "Operator '-' requires matching Int or Float operands".to_string(),
@@ -1242,7 +1418,9 @@ impl Interpreter {
                         }.into()),
                     },
                     BinaryOp::Mul => match (l, r) {
-                        (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a * b)),
+                        (Value::Int(a), Value::Int(b)) => a.checked_mul(b).map(Value::Int).ok_or_else(|| RuntimeError {
+                            message: "Integer overflow".to_string(), span: expr.span,
+                        }.into()),
                         (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a * b)),
                         _ => Err(RuntimeError {
                             message: "Operator '*' requires matching Int or Float operands".to_string(),
@@ -1254,7 +1432,9 @@ impl Interpreter {
                             message: "Division by zero".to_string(),
                             span: expr.span,
                         }.into()),
-                        (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a / b)),
+                        (Value::Int(a), Value::Int(b)) => a.checked_div(b).map(Value::Int).ok_or_else(|| RuntimeError {
+                            message: "Integer overflow".to_string(), span: expr.span,
+                        }.into()),
                         (Value::Float(a), Value::Float(b)) => {
                             let res = a / b;
                             if b == 0.0 || !res.is_finite() {
@@ -1276,7 +1456,9 @@ impl Interpreter {
                             message: "Modulo by zero".to_string(),
                             span: expr.span,
                         }.into()),
-                        (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a % b)),
+                        (Value::Int(a), Value::Int(b)) => a.checked_rem(b).map(Value::Int).ok_or_else(|| RuntimeError {
+                            message: "Integer overflow".to_string(), span: expr.span,
+                        }.into()),
                         _ => Err(RuntimeError {
                             message: "Operator '%' requires Int operands".to_string(),
                             span: expr.span,
@@ -1330,6 +1512,67 @@ impl Interpreter {
                 }
             }
             ExprKind::Call { callee, type_args, args, named_args } => {
+                if let ExprKind::Ident(name) = &callee.kind {
+                    let is_constructor = name == "Map"
+                        || self
+                            .module_structs
+                            .get(&self.current_module)
+                            .is_some_and(|types| types.contains(name))
+                        || self
+                            .module_errors
+                            .get(&self.current_module)
+                            .is_some_and(|errors| errors.contains(name))
+                        || matches!(name.as_str(), "IndexError" | "KeyError" | "ParseError");
+                    let is_builtin = matches!(name.as_str(), "map" | "filter" | "print");
+                    if !is_constructor
+                        && !is_builtin
+                        && type_args.is_empty()
+                        && named_args.is_empty()
+                    {
+                        if let Some(callee_val) = self.lookup_variable(name) {
+                            let mut evaluated_args = Vec::with_capacity(args.len());
+                            for arg in args {
+                                evaluated_args.push(self.eval_expr(arg)?);
+                            }
+                            return self
+                                .call_callable(&callee_val, evaluated_args, callee.span)
+                                .map_err(Into::into);
+                        }
+                    }
+                }
+
+                if let ExprKind::Ident(name) = &callee.kind {
+                    let is_constructor = name == "Map"
+                        || self
+                            .module_structs
+                            .get(&self.current_module)
+                            .is_some_and(|types| types.contains(name))
+                        || self
+                            .module_errors
+                            .get(&self.current_module)
+                            .is_some_and(|errors| errors.contains(name))
+                        || matches!(name.as_str(), "IndexError" | "KeyError" | "ParseError");
+                    let is_builtin = matches!(name.as_str(), "map" | "filter" | "print");
+                    let module_function_exists = self
+                        .module_functions
+                        .contains_key(&(self.current_module.clone(), name.clone()))
+                        || self.module_functions.contains_key(&(None, name.clone()));
+                    if !is_constructor
+                        && !is_builtin
+                        && !type_args.is_empty()
+                        && named_args.is_empty()
+                        && module_function_exists
+                    {
+                        let mut evaluated_args = Vec::with_capacity(args.len());
+                        for arg in args {
+                            evaluated_args.push(self.eval_expr(arg)?);
+                        }
+                        return self
+                            .call_module_function(self.current_module.clone(), name, evaluated_args, callee.span)
+                            .map_err(Into::into);
+                    }
+                }
+
                 if let ExprKind::Ident(ref name) = callee.kind {
                     let cur_structs = self.module_structs.get(&self.current_module);
                     let is_struct = cur_structs.map(|s| s.contains(name)).unwrap_or(false);
@@ -1396,13 +1639,18 @@ impl Interpreter {
                     }
 
                     if name == "print" {
-                        for (i, a) in args.iter().enumerate() {
-                            let val = self.eval_expr(a)?;
-                            if i > 0 {
-                                print!(" ");
+                        if !type_args.is_empty() || !named_args.is_empty() || args.len() != 1 {
+                            return Err(RuntimeError {
+                                message: format!(
+                                    "Function 'print' expects exactly 1 argument, got {}",
+                                    args.len()
+                                ),
+                                span: expr.span,
                             }
-                            print!("{}", val);
+                            .into());
                         }
+                        let val = self.eval_expr(&args[0])?;
+                        print!("{}", val);
                         println!();
                         return Ok(Value::Void);
                     }
@@ -1565,6 +1813,14 @@ impl Interpreter {
                                 }
                             }
                         }
+                    }
+
+                    if Self::is_mutable_place(target)
+                        && ((field == "append" && args.len() == 1)
+                            || (field == "set" && args.len() == 2)
+                            || (field == "remove" && args.len() == 1))
+                    {
+                        return self.eval_mutating_method_on_place(target, field, args);
                     }
 
                     let target_val = self.eval_expr(target)?;
@@ -1752,10 +2008,10 @@ impl Interpreter {
                 _ => {}
             },
             Value::Float(f) => match field {
-                "floor" => return Ok(Value::Int(f.floor() as i64)),
-                "ceil" => return Ok(Value::Int(f.ceil() as i64)),
-                "round" => return Ok(Value::Int(f.round() as i64)),
-                "trunc" => return Ok(Value::Int(f.trunc() as i64)),
+                "floor" => return checked_float_to_int(f.floor(), call_span).map_err(Into::into),
+                "ceil" => return checked_float_to_int(f.ceil(), call_span).map_err(Into::into),
+                "round" => return checked_float_to_int(f.round(), call_span).map_err(Into::into),
+                "trunc" => return checked_float_to_int(f.trunc(), call_span).map_err(Into::into),
                 "to_string" => return Ok(Value::String(f.to_string())),
                 "is_nan" => return Ok(Value::Bool(f.is_nan())),
                 "is_infinite" => return Ok(Value::Bool(f.is_infinite())),

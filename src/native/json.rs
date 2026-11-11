@@ -6,6 +6,8 @@ use super::{NativeFuncDef, NativeMethodDef, NativeModule, NativeTypeDef, NativeV
 use crate::types::{Type, TypeId};
 use crate::value::{MapKey, OrderedMap, Value};
 
+const MAX_JSON_DEPTH: usize = 128;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct JsonNumber {
     pub raw: String,
@@ -122,7 +124,7 @@ impl<'a> JsonParser<'a> {
 
     fn parse_root(&mut self) -> Result<JsonNode, (String, String)> {
         self.skip_ws();
-        let node = self.parse_value("")?;
+        let node = self.parse_value("", 0)?;
         self.skip_ws();
         if self.pos < self.bytes.len() {
             return Err(self.err("", "Unexpected trailing characters after JSON value"));
@@ -130,19 +132,22 @@ impl<'a> JsonParser<'a> {
         Ok(node)
     }
 
-    fn parse_value(&mut self, path: &str) -> Result<JsonNode, (String, String)> {
+    fn parse_value(&mut self, path: &str, depth: usize) -> Result<JsonNode, (String, String)> {
         self.skip_ws();
         let b = match self.peek() {
             Some(c) => c,
             None => return Err(self.err(path, "Unexpected end of JSON input")),
         };
+        if matches!(b, b'[' | b'{') && depth >= MAX_JSON_DEPTH {
+            return Err(self.err(path, "Maximum JSON nesting depth (128) exceeded"));
+        }
         match b {
             b'n' => self.parse_literal(b"null", JsonNode::Null, path),
             b't' => self.parse_literal(b"true", JsonNode::Bool(true), path),
             b'f' => self.parse_literal(b"false", JsonNode::Bool(false), path),
             b'"' => self.parse_string(path).map(JsonNode::String),
-            b'[' => self.parse_array(path),
-            b'{' => self.parse_object(path),
+            b'[' => self.parse_array(path, depth),
+            b'{' => self.parse_object(path, depth),
             b'-' | b'0'..=b'9' => self.parse_number(path).map(JsonNode::Number),
             other => Err(self.err(
                 path,
@@ -248,10 +253,19 @@ impl<'a> JsonParser<'a> {
         if self.pos + 4 > self.bytes.len() {
             return Err(self.err(path, "Incomplete \\uXXXX escape in JSON string"));
         }
-        let hex = &self.src[self.pos..self.pos + 4];
+        let bytes = &self.bytes[self.pos..self.pos + 4];
+        let mut value = 0u16;
+        for byte in bytes {
+            let digit = match *byte {
+                b'0'..=b'9' => *byte - b'0',
+                b'a'..=b'f' => *byte - b'a' + 10,
+                b'A'..=b'F' => *byte - b'A' + 10,
+                _ => return Err(self.err(path, "Invalid \\uXXXX hex sequence")),
+            };
+            value = (value << 4) | u16::from(digit);
+        }
         self.pos += 4;
-        u16::from_str_radix(hex, 16)
-            .map_err(|_| self.err(path, format!("Invalid \\uXXXX hex sequence '{}'", hex)))
+        Ok(value)
     }
 
     fn parse_number(&mut self, path: &str) -> Result<JsonNumber, (String, String)> {
@@ -325,7 +339,7 @@ impl<'a> JsonParser<'a> {
         })
     }
 
-    fn parse_array(&mut self, path: &str) -> Result<JsonNode, (String, String)> {
+    fn parse_array(&mut self, path: &str, depth: usize) -> Result<JsonNode, (String, String)> {
         self.pos += 1;
         self.skip_ws();
         let mut items = Vec::new();
@@ -335,7 +349,7 @@ impl<'a> JsonParser<'a> {
         }
         loop {
             let item_path = join_index_path(path, items.len());
-            items.push(self.parse_value(&item_path)?);
+            items.push(self.parse_value(&item_path, depth + 1)?);
             self.skip_ws();
             match self.peek() {
                 Some(b',') => {
@@ -351,7 +365,7 @@ impl<'a> JsonParser<'a> {
         }
     }
 
-    fn parse_object(&mut self, path: &str) -> Result<JsonNode, (String, String)> {
+    fn parse_object(&mut self, path: &str, depth: usize) -> Result<JsonNode, (String, String)> {
         self.pos += 1;
         self.skip_ws();
         let mut entries = Vec::new();
@@ -371,7 +385,7 @@ impl<'a> JsonParser<'a> {
                 return Err(self.err(&field_path, "Expected ':' after JSON object key"));
             }
             self.pos += 1;
-            let val = self.parse_value(&field_path)?;
+            let val = self.parse_value(&field_path, depth + 1)?;
             entries.push((key, val));
             self.skip_ws();
             match self.peek() {
@@ -423,7 +437,16 @@ fn write_json_node(node: &JsonNode, out: &mut String) {
     match node {
         JsonNode::Null => out.push_str("null"),
         JsonNode::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        JsonNode::Number(n) => out.push_str(&n.raw),
+        JsonNode::Number(n) => {
+            out.push_str(&n.raw);
+            if !n.is_int_syntax
+                && !n.raw.contains('.')
+                && !n.raw.contains('e')
+                && !n.raw.contains('E')
+            {
+                out.push_str(".0");
+            }
+        }
         JsonNode::String(s) => write_json_escaped_string(s, out),
         JsonNode::Array(items) => {
             out.push('[');
@@ -678,9 +701,13 @@ fn decode_union_node(
             .iter()
             .filter(|v| matches!(v, Type::String) || matches!(v, Type::Optional(inner) if **inner == Type::String))
             .collect(),
-        JsonNode::Number(_) => variants
+        JsonNode::Number(number) => variants
             .iter()
-            .filter(|v| matches!(v, Type::Int | Type::Float) || matches!(v, Type::Optional(inner) if matches!(**inner, Type::Int | Type::Float)))
+            .filter(|v| {
+                (number.is_int_syntax && matches!(v, Type::Int))
+                    || (!number.is_int_syntax && matches!(v, Type::Float))
+                    || matches!(v, Type::Optional(inner) if (number.is_int_syntax && **inner == Type::Int) || (!number.is_int_syntax && **inner == Type::Float))
+            })
             .collect(),
         JsonNode::Array(_) => variants
             .iter()
@@ -759,7 +786,14 @@ pub fn encode_conduit_value(
                     "Cannot encode non-finite Float (NaN or Infinity) to JSON".to_string(),
                 ));
             }
-            let _ = write!(out, "{}", f);
+            let formatted = f.to_string();
+            out.push_str(&formatted);
+            if !formatted.contains('.')
+                && !formatted.contains('e')
+                && !formatted.contains('E')
+            {
+                out.push_str(".0");
+            }
             Ok(())
         }
         Value::String(s) => {

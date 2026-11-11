@@ -22,7 +22,6 @@ fn paths_match(candidate: &Path, target: &Path, norm_target: &Path) -> bool {
         || normalize_path(candidate) == norm_target
         || candidate.ends_with(target)
         || target.ends_with(candidate)
-        || (candidate.file_name().is_some() && candidate.file_name() == target.file_name())
 }
 
 impl ReachabilityReport {
