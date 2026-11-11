@@ -1,10 +1,9 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration as StdDuration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
 
 use super::{NativeFuncDef, NativeMethodDef, NativeModule, NativeTypeDef, NativeValue};
 use crate::types::{Type, TypeId};
-use crate::value::Value;
+use crate::value::{StructSchema, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timestamp(pub SystemTime);
@@ -94,11 +93,13 @@ impl NativeValue for Duration {
 }
 
 pub fn make_time_error(message: impl Into<String>) -> Value {
-    let mut fields = HashMap::new();
-    fields.insert("message".to_string(), Value::String(message.into()));
+    static SCHEMA: OnceLock<Arc<StructSchema>> = OnceLock::new();
+    let schema = Arc::clone(SCHEMA.get_or_init(|| {
+        StructSchema::new(TypeId::native("cdt.time", "TimeError"), ["message".into()])
+    }));
     Value::Error {
-        type_id: TypeId::native("cdt.time", "TimeError"),
-        fields,
+        schema,
+        values: vec![Value::String(message.into())],
     }
 }
 

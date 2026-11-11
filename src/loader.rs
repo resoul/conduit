@@ -31,7 +31,7 @@ pub enum ModuleTarget {
 pub struct LoadedModule {
     pub canonical_path: PathBuf,
     pub program: Program,
-    pub imports: HashMap<String, (ModuleTarget, Span)>, // alias -> (target, span)
+    pub imports: HashMap<String, (ModuleTarget, Span)>,
 }
 
 pub fn normalize_path(path: &Path) -> PathBuf {
@@ -188,8 +188,7 @@ impl ModuleLoader {
 
         let current_dir = canonical_path.parent().unwrap_or_else(|| Path::new("."));
         let mut imports_map: HashMap<String, (ModuleTarget, Span)> = HashMap::new();
-
-        // Check for local top-level declaration names to detect alias conflicts
+        
         let mut local_declared_names = HashMap::new();
         for item in &program.items {
             match &item.kind {
@@ -246,7 +245,6 @@ impl ModuleLoader {
                         span: item.span,
                     });
                 } else {
-                    // Local module import
                     let relative_file = format!("{}.cdt", import_path);
                     let target_raw = current_dir.join(relative_file);
                     let target_canon = self.canonicalize_path(&target_raw, item.span)?;

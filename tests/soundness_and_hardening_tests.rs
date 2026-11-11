@@ -5,7 +5,7 @@ use conduit::check::TypeChecker;
 use conduit::interp::Interpreter;
 use conduit::loader::ModuleLoader;
 use conduit::native::json::{
-    decode_node_to_conduit, encode_conduit_value, parse_json, stringify_json_node,
+    decode_json, encode_with_struct_schemas, parse_json, stringify_json_node,
 };
 use conduit::reachability::ReachabilityReport;
 use conduit::types::{Type, TypeId};
@@ -278,18 +278,12 @@ fn json_parser_is_utf8_safe_and_limited_to_128_nested_containers() {
 #[test]
 fn json_float_encoding_preserves_float_syntax_on_round_trip() {
     let mut encoded = String::new();
-    encode_conduit_value(&Value::Float(3.0), "", &mut encoded, &|_| None).unwrap();
+    encode_with_struct_schemas(&Value::Float(3.0), "", &mut encoded).unwrap();
     assert_eq!(encoded, "3.0");
 
     let node = parse_json(&encoded).unwrap();
     assert_eq!(stringify_json_node(&node), "3.0");
-    let decoded = decode_node_to_conduit(
-        &node,
-        &Type::union(vec![Type::Int, Type::Float]),
-        "",
-        &|_, _| None,
-    )
-    .unwrap();
+    let decoded = decode_json(&encoded, &Type::union(vec![Type::Int, Type::Float])).unwrap();
     assert_eq!(decoded, Value::Float(3.0));
 }
 
@@ -367,12 +361,13 @@ fn reachability_and_struct_display_distinguish_paths_and_sort_fields() {
     };
     assert!(!report.is_function_reachable(PathBuf::new().join("b/util.cdt").as_path(), "helper"));
 
-    let mut fields = std::collections::HashMap::new();
-    fields.insert("z".to_string(), Value::Int(2));
-    fields.insert("a".to_string(), Value::Int(1));
+    let schema = conduit::value::StructSchema::new(
+        TypeId::program("Pair"),
+        ["z".to_string(), "a".to_string()],
+    );
     let value = Value::Struct {
-        type_id: TypeId::program("Pair"),
-        fields,
+        schema,
+        values: vec![Value::Int(2), Value::Int(1)],
     };
     assert_eq!(value.to_string(), "Pair(a: 1, z: 2)");
 

@@ -14,10 +14,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   * Added compile-time validation of field tag syntax and duplicate JSON key names within a struct, plus LSP hover rendering of field tags.
   * Formatted non-identifier JSON field names in `DecodeError.path` and `EncodeError.path` using quoted bracket segments (e.g., `["a.b"]`, `items[0]["display name"]`).
 
-* **`cdt.json` Performance & Prepared Execution Plans**:
+* **`cdt.json` & Interpreter Performance**:
   * Added a borrowed JSON parser (`BorrowedJsonNode<'a>`) using `Cow<'a, str>` for unescaped strings and object keys, `&'a str` number slices, slice-based string scanning, and lazy error-path construction on failure only.
-  * Added arena-compiled `JsonDecodePlan` and `JsonEncodeSchema` caches (keyed by canonical `TypeId` and generic type arguments, with automatic invalidation on interpreter reuse), stack-allocated field slots for structs up to 16 fields, pre-encoded `"\"key\":"` field prefixes, and direct `Float` buffer formatting without temporary `String` allocations.
-  * Updated the interpreter to borrow local variable and struct-field arguments in `json.decode` and `json.encode` without deep-cloning the input value, and added a cross-language JSON benchmark suite under `benchmarks/json/`.
+  * Replaced per-instance `HashMap<String, Value>` storage in `Value::Struct` and `Value::Error` with shared `Arc<StructSchema>` metadata and indexed `Vec<Value>` slots, with `OnceLock` static schemas for builtin/native types, preserved lexicographical `Display` ordering, cursor-guided key matching in `JsonDecodePlan`, and inline cached `"\"key\":"` prefixes for zero-lookup encoding.
+  * Updated `Interpreter` to share function AST bodies (`Arc<(Vec<Param>, Block)>`) and closure captured environments (`Arc<HashMap<String, Value>>`), update variables in place via `get_mut`, and borrow place/member chains in `json.decode`, `json.encode`, and zero-arg methods without intermediate clones.
+  * Removed legacy DOM decoding (`decode_node_to_conduit*`) and resolver-based encoding wrappers (`encode_conduit_value*` / `JsonEncodeSchema`) in favor of `JsonDecodePlan` and `encode_with_struct_schemas`.
+  * Added a cross-language JSON benchmark suite under `benchmarks/json/` (supporting configurable `--records N`) and an allocation/microbenchmark profiler crate under `benchmarks/profile/`.
 
 * **JetBrains & TextMate Editor Setup**:
   * Added a VS Code-compatible TextMate manifest (`editors/textmate/package.json`) for `.cdt` files so RustRover and other JetBrains IDEs can load the Conduit grammar bundle.

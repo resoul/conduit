@@ -1,16 +1,15 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 mod decode;
 mod encode;
 mod parser;
 
 pub(crate) use decode::JsonDecodePlan;
-pub(crate) use encode::{JsonEncodeSchema, encode_with_plan};
+pub use encode::encode_with_struct_schemas;
 
 use super::{NativeFuncDef, NativeMethodDef, NativeModule, NativeTypeDef, NativeValue};
 use crate::types::{Type, TypeId};
-use crate::value::{MapKey, OrderedMap, Value};
+use crate::value::{MapKey, OrderedMap, StructSchema, Value};
 
 const MAX_JSON_DEPTH: usize = 128;
 
@@ -61,28 +60,34 @@ impl NativeValue for JsonValue {
 }
 
 pub fn make_decode_error(path: impl Into<String>, message: impl Into<String>) -> Value {
-    let mut fields = HashMap::new();
-    fields.insert("path".to_string(), Value::String(path.into()));
-    fields.insert("message".to_string(), Value::String(message.into()));
+    static SCHEMA: OnceLock<Arc<StructSchema>> = OnceLock::new();
+    let schema = Arc::clone(SCHEMA.get_or_init(|| {
+        StructSchema::new(
+            TypeId::native("cdt.json", "DecodeError"),
+            ["path".into(), "message".into()],
+        )
+    }));
     Value::Error {
-        type_id: TypeId::native("cdt.json", "DecodeError"),
-        fields,
+        schema,
+        values: vec![Value::String(path.into()), Value::String(message.into())],
     }
 }
 
 pub fn make_encode_error(path: impl Into<String>, message: impl Into<String>) -> Value {
-    let mut fields = HashMap::new();
-    fields.insert("path".to_string(), Value::String(path.into()));
-    fields.insert("message".to_string(), Value::String(message.into()));
+    static SCHEMA: OnceLock<Arc<StructSchema>> = OnceLock::new();
+    let schema = Arc::clone(SCHEMA.get_or_init(|| {
+        StructSchema::new(
+            TypeId::native("cdt.json", "EncodeError"),
+            ["path".into(), "message".into()],
+        )
+    }));
     Value::Error {
-        type_id: TypeId::native("cdt.json", "EncodeError"),
-        fields,
+        schema,
+        values: vec![Value::String(path.into()), Value::String(message.into())],
     }
 }
 
 pub fn join_field_path(base: &str, field: &str) -> String {
-    // Bare segments follow the language's identifier syntax. Everything else
-    // uses the same quoted bracket syntax as string map keys.
     let mut chars = field.chars();
     let is_identifier = chars
         .next()
@@ -133,6 +138,12 @@ pub(crate) fn decode_json_with_plan(
     decode::decode_borrowed_json(node, plan, "", resolve_struct)
 }
 
+pub fn decode_json(raw: &str, target_ty: &Type) -> Result<Value, (String, String)> {
+    let no_structs = |_: &TypeId, _: &[Type]| None;
+    let plan = JsonDecodePlan::compile(target_ty, &no_structs);
+    decode_json_with_plan(raw, &plan, &no_structs)
+}
+
 pub fn write_json_escaped_string(s: &str, out: &mut String) {
     encode::write_escaped_string(s, out);
 }
@@ -181,428 +192,6 @@ fn write_json_node(node: &JsonNode, out: &mut String) {
             out.push('}');
         }
     }
-}
-
-pub fn decode_node_to_conduit(
-    node: &JsonNode,
-    target_ty: &Type,
-    path: &str,
-    resolve_struct: &dyn Fn(&TypeId, &[Type]) -> Option<Vec<(String, Type)>>,
-) -> Result<Value, (String, String)> {
-    let resolve_struct_with_json_names =
-        |type_id: &TypeId, type_args: &[Type]| -> Option<Vec<(String, String, Type)>> {
-            resolve_struct(type_id, type_args).map(|fields| {
-                fields
-                    .into_iter()
-                    .map(|(field_name, field_ty)| {
-                        let json_name = field_name.clone();
-                        (field_name, json_name, field_ty)
-                    })
-                    .collect()
-            })
-        };
-    decode_node_to_conduit_with_json_names(node, target_ty, path, &resolve_struct_with_json_names)
-}
-
-#[derive(Debug)]
-pub(crate) struct JsonDecodeSchema {
-    fields: Vec<(String, String, Type)>,
-    field_indexes: HashMap<String, usize>,
-}
-
-impl JsonDecodeSchema {
-    pub(crate) fn new(fields: Vec<(String, String, Type)>) -> Self {
-        let field_indexes = fields
-            .iter()
-            .enumerate()
-            .map(|(index, (_, json_name, _))| (json_name.clone(), index))
-            .collect();
-        Self {
-            fields,
-            field_indexes,
-        }
-    }
-}
-
-pub(crate) fn decode_node_to_conduit_with_json_names(
-    node: &JsonNode,
-    target_ty: &Type,
-    path: &str,
-    resolve_struct: &dyn Fn(&TypeId, &[Type]) -> Option<Vec<(String, String, Type)>>,
-) -> Result<Value, (String, String)> {
-    let resolve_schema = |type_id: &TypeId, type_args: &[Type]| {
-        resolve_struct(type_id, type_args).map(|fields| Arc::new(JsonDecodeSchema::new(fields)))
-    };
-    decode_node_to_conduit_with_schema(node, target_ty, path, &resolve_schema)
-}
-
-pub(crate) fn decode_node_to_conduit_with_schema(
-    node: &JsonNode,
-    target_ty: &Type,
-    path: &str,
-    resolve_struct: &dyn Fn(&TypeId, &[Type]) -> Option<Arc<JsonDecodeSchema>>,
-) -> Result<Value, (String, String)> {
-    match target_ty {
-        Type::Optional(inner) => {
-            if matches!(node, JsonNode::Null) {
-                Ok(Value::Nil)
-            } else {
-                decode_node_to_conduit_with_schema(node, inner, path, resolve_struct)
-            }
-        }
-        Type::Custom(tid) if tid == &TypeId::native("cdt.json", "Value") => {
-            Ok(Value::Native(Arc::new(JsonValue(node.clone()))))
-        }
-        Type::Int => match node {
-            JsonNode::Number(num) => {
-                if !num.is_int_syntax {
-                    Err((
-                        path.to_string(),
-                        format!(
-                            "Expected Int, got fractional or exponential number '{}'",
-                            num.raw
-                        ),
-                    ))
-                } else if let Some(n) = num.int_val {
-                    Ok(Value::Int(n))
-                } else {
-                    Err((
-                        path.to_string(),
-                        format!("Integer value '{}' overflows 64-bit Int", num.raw),
-                    ))
-                }
-            }
-            other => Err((
-                path.to_string(),
-                format!("Expected Int, got {}", json_kind_name(other)),
-            )),
-        },
-        Type::Float => match node {
-            JsonNode::Number(num) => Ok(Value::Float(num.float_val)),
-            other => Err((
-                path.to_string(),
-                format!("Expected Float, got {}", json_kind_name(other)),
-            )),
-        },
-        Type::Bool => match node {
-            JsonNode::Bool(b) => Ok(Value::Bool(*b)),
-            other => Err((
-                path.to_string(),
-                format!("Expected Bool, got {}", json_kind_name(other)),
-            )),
-        },
-        Type::String => match node {
-            JsonNode::String(s) => Ok(Value::String(s.clone())),
-            other => Err((
-                path.to_string(),
-                format!("Expected String, got {}", json_kind_name(other)),
-            )),
-        },
-        Type::List(inner) => match node {
-            JsonNode::Array(items) => {
-                let mut vals = Vec::with_capacity(items.len());
-                for (i, item) in items.iter().enumerate() {
-                    vals.push(
-                        decode_node_to_conduit_with_schema(item, inner, "", resolve_struct)
-                            .map_err(|(child, message)| {
-                                (
-                                    prepend_error_path(join_index_path(path, i), &child),
-                                    message,
-                                )
-                            })?,
-                    );
-                }
-                Ok(Value::List(vals))
-            }
-            other => Err((
-                path.to_string(),
-                format!("Expected List, got {}", json_kind_name(other)),
-            )),
-        },
-        Type::Map(key_ty, val_ty) => {
-            if **key_ty != Type::String {
-                return Err((
-                    path.to_string(),
-                    format!(
-                        "JSON objects can only decode to Map<String, V>, got Map<{}, {}>",
-                        key_ty, val_ty
-                    ),
-                ));
-            }
-            match node {
-                JsonNode::Object(entries) => {
-                    let mut map = OrderedMap::new();
-                    for (k, v) in entries {
-                        let map_key = MapKey::String(k.clone());
-                        let decoded_v =
-                            decode_node_to_conduit_with_schema(v, val_ty, "", resolve_struct)
-                                .map_err(|(child, message)| {
-                                    (
-                                        prepend_error_path(join_key_path(path, &map_key), &child),
-                                        message,
-                                    )
-                                })?;
-                        map.set(map_key, decoded_v);
-                    }
-                    Ok(Value::Map(map))
-                }
-                other => Err((
-                    path.to_string(),
-                    format!(
-                        "Expected JSON object for Map<String, {}>, got {}",
-                        val_ty,
-                        json_kind_name(other)
-                    ),
-                )),
-            }
-        }
-        Type::Tuple(elem_types) => match node {
-            JsonNode::Array(items) => {
-                if items.len() != elem_types.len() {
-                    return Err((
-                        path.to_string(),
-                        format!(
-                            "Expected tuple JSON array of length {}, got length {}",
-                            elem_types.len(),
-                            items.len()
-                        ),
-                    ));
-                }
-                let mut vals = Vec::with_capacity(elem_types.len());
-                for (i, (item, elem_ty)) in items.iter().zip(elem_types.iter()).enumerate() {
-                    vals.push(
-                        decode_node_to_conduit_with_schema(item, elem_ty, "", resolve_struct)
-                            .map_err(|(child, message)| {
-                                (
-                                    prepend_error_path(join_index_path(path, i), &child),
-                                    message,
-                                )
-                            })?,
-                    );
-                }
-                Ok(Value::Tuple(vals))
-            }
-            other => Err((
-                path.to_string(),
-                format!("Expected tuple JSON array, got {}", json_kind_name(other)),
-            )),
-        },
-        Type::Custom(type_id) => decode_struct_node(node, type_id, &[], path, resolve_struct),
-        Type::Generic { type_id, type_args } => {
-            decode_struct_node(node, type_id, type_args, path, resolve_struct)
-        }
-        Type::Union(variants) => decode_union_node(node, variants, path, resolve_struct),
-        other => Err((
-            path.to_string(),
-            format!("Unsupported target type '{}' for json.decode", other),
-        )),
-    }
-}
-
-fn decode_struct_node(
-    node: &JsonNode,
-    type_id: &TypeId,
-    type_args: &[Type],
-    path: &str,
-    resolve_struct: &dyn Fn(&TypeId, &[Type]) -> Option<Arc<JsonDecodeSchema>>,
-) -> Result<Value, (String, String)> {
-    let declared_fields = resolve_struct(type_id, type_args).ok_or_else(|| {
-        (
-            path.to_string(),
-            format!("Type '{}' cannot be decoded from JSON", type_id),
-        )
-    })?;
-    let entries = match node {
-        JsonNode::Object(e) => e,
-        other => {
-            return Err((
-                path.to_string(),
-                format!(
-                    "Expected JSON object for '{}', got {}",
-                    type_id,
-                    json_kind_name(other)
-                ),
-            ));
-        }
-    };
-
-    // Validate all keys before decoding fields, preserving error precedence and
-    // the last occurrence of duplicate input keys without a per-object hash map.
-    let mut json_fields = vec![None; declared_fields.fields.len()];
-    for (k, v) in entries {
-        let Some(&field_index) = declared_fields.field_indexes.get(k.as_str()) else {
-            return Err((
-                join_field_path(path, k),
-                format!("Unknown field '{}' for type '{}'", k, type_id),
-            ));
-        };
-        json_fields[field_index] = Some(v);
-    }
-
-    let mut out_fields = HashMap::with_capacity(declared_fields.fields.len());
-    for (field_index, (field_name, json_name, field_ty)) in
-        declared_fields.fields.iter().enumerate()
-    {
-        // Parser-defined schemas have unique names. The fallback also keeps
-        // the legacy resolver API's behavior for repeated schema JSON names.
-        let jval = json_fields[field_index].or_else(|| {
-            declared_fields
-                .field_indexes
-                .get(json_name.as_str())
-                .and_then(|&index| json_fields[index])
-        });
-        if let Some(jval) = jval {
-            let decoded = decode_node_to_conduit_with_schema(jval, field_ty, "", resolve_struct)
-                .map_err(|(child, message)| {
-                    (
-                        prepend_error_path(join_field_path(path, json_name), &child),
-                        message,
-                    )
-                })?;
-            out_fields.insert(field_name.clone(), decoded);
-        } else if matches!(field_ty, Type::Optional(_)) || union_contains_nil(field_ty) {
-            out_fields.insert(field_name.clone(), Value::Nil);
-        } else {
-            return Err((
-                join_field_path(path, json_name),
-                format!("Missing required field '{}'", json_name),
-            ));
-        }
-    }
-
-    Ok(Value::Struct {
-        type_id: type_id.clone(),
-        fields: out_fields,
-    })
-}
-
-fn union_contains_nil(ty: &Type) -> bool {
-    match ty {
-        Type::Nil | Type::Optional(_) => true,
-        Type::Union(vs) => vs.iter().any(union_contains_nil),
-        _ => false,
-    }
-}
-
-fn decode_union_node(
-    node: &JsonNode,
-    variants: &[Type],
-    path: &str,
-    resolve_struct: &dyn Fn(&TypeId, &[Type]) -> Option<Arc<JsonDecodeSchema>>,
-) -> Result<Value, (String, String)> {
-    let candidates: Vec<&Type> = match node {
-        JsonNode::Null => variants
-            .iter()
-            .filter(|v| matches!(v, Type::Nil | Type::Optional(_)))
-            .collect(),
-        JsonNode::Bool(_) => variants
-            .iter()
-            .filter(|v| matches!(v, Type::Bool) || matches!(v, Type::Optional(inner) if **inner == Type::Bool))
-            .collect(),
-        JsonNode::String(_) => variants
-            .iter()
-            .filter(|v| matches!(v, Type::String) || matches!(v, Type::Optional(inner) if **inner == Type::String))
-            .collect(),
-        JsonNode::Number(number) => variants
-            .iter()
-            .filter(|v| {
-                (number.is_int_syntax && matches!(v, Type::Int))
-                    || (!number.is_int_syntax && matches!(v, Type::Float))
-                    || matches!(v, Type::Optional(inner) if (number.is_int_syntax && **inner == Type::Int) || (!number.is_int_syntax && **inner == Type::Float))
-            })
-            .collect(),
-        JsonNode::Array(_) => variants
-            .iter()
-            .filter(|v| matches!(v, Type::List(_) | Type::Tuple(_)))
-            .collect(),
-        JsonNode::Object(_) => variants
-            .iter()
-            .filter(|v| matches!(v, Type::Map(_, _) | Type::Custom(_) | Type::Generic { .. }))
-            .collect(),
-    };
-
-    if candidates.len() > 1 {
-        return Err((
-            path.to_string(),
-            format!("Ambiguous union target for JSON {}", json_kind_name(node)),
-        ));
-    }
-
-    if let Some(target) = candidates.into_iter().next() {
-        if matches!(node, JsonNode::Null) {
-            return Ok(Value::Nil);
-        }
-        return decode_node_to_conduit_with_schema(node, target, path, resolve_struct);
-    }
-
-    if let Some(jv) = variants
-        .iter()
-        .find(|v| matches!(v, Type::Custom(id) if id == &TypeId::native("cdt.json", "Value")))
-    {
-        return decode_node_to_conduit_with_schema(node, jv, path, resolve_struct);
-    }
-
-    Err((
-        path.to_string(),
-        format!(
-            "JSON {} does not match any variant of target union",
-            json_kind_name(node)
-        ),
-    ))
-}
-
-fn json_kind_name(node: &JsonNode) -> &'static str {
-    match node {
-        JsonNode::Null => "null",
-        JsonNode::Bool(_) => "bool",
-        JsonNode::Number(_) => "number",
-        JsonNode::String(_) => "string",
-        JsonNode::Array(_) => "array",
-        JsonNode::Object(_) => "object",
-    }
-}
-
-pub fn encode_conduit_value(
-    val: &Value,
-    path: &str,
-    out: &mut String,
-    struct_field_order: &dyn Fn(&TypeId) -> Option<Vec<String>>,
-) -> Result<(), (String, String)> {
-    let struct_fields_with_json_names = |type_id: &TypeId| -> Option<Vec<(String, String)>> {
-        struct_field_order(type_id).map(|field_names| {
-            field_names
-                .into_iter()
-                .map(|field_name| {
-                    let json_name = field_name.clone();
-                    (field_name, json_name)
-                })
-                .collect()
-        })
-    };
-    encode_conduit_value_with_json_names(val, path, out, &struct_fields_with_json_names)
-}
-
-pub(crate) fn encode_conduit_value_with_json_names(
-    val: &Value,
-    path: &str,
-    out: &mut String,
-    struct_fields: &dyn Fn(&TypeId) -> Option<Vec<(String, String)>>,
-) -> Result<(), (String, String)> {
-    let resolve_schema = |type_id: &TypeId| struct_fields(type_id).map(Arc::from);
-    encode_conduit_value_with_schema(val, path, out, &resolve_schema)
-}
-
-pub(crate) fn encode_conduit_value_with_schema(
-    val: &Value,
-    path: &str,
-    out: &mut String,
-    struct_fields: &dyn Fn(&TypeId) -> Option<Arc<[(String, String)]>>,
-) -> Result<(), (String, String)> {
-    let resolve_schema = |type_id: &TypeId| {
-        struct_fields(type_id)
-            .map(|fields| Arc::new(JsonEncodeSchema::new(fields.as_ref().to_vec())))
-    };
-    encode_with_plan(val, path, out, &resolve_schema)
 }
 
 fn wrap_json_value(node: JsonNode) -> Value {
@@ -717,7 +306,7 @@ pub fn create_json_module() -> NativeModule {
         implementation: |args| {
             let val = args.into_iter().next().unwrap_or(Value::Nil);
             let mut out = String::new();
-            match encode_conduit_value(&val, "", &mut out, &|_| None) {
+            match encode_with_struct_schemas(&val, "", &mut out) {
                 Ok(()) => Ok(Value::String(out)),
                 Err((path, msg)) => Ok(make_encode_error(path, msg)),
             }
@@ -857,7 +446,7 @@ mod path_tests {
     #[test]
     fn json_paths_quote_non_identifier_keys() {
         assert_eq!(join_field_path("", "name"), "name");
-        assert_eq!(join_field_path("items[0]", "имя_2"), "items[0].имя_2");
+        assert_eq!(join_field_path("items[0]", "name_2"), "items[0].name_2");
         assert_eq!(join_field_path("", "a.b"), "[\"a.b\"]");
         assert_eq!(join_field_path("items[0]", "x[0]"), "items[0][\"x[0]\"]");
         assert_eq!(join_field_path("", ""), "[\"\"]");
@@ -874,17 +463,19 @@ mod path_tests {
         let ty = Type::Custom(type_id.clone());
         let schema =
             |_: &TypeId, _: &[Type]| Some(vec![("x".to_owned(), "a.b".to_owned(), Type::Int)]);
-        let node = parse_json(r#"{"a.b":"wrong"}"#).unwrap();
-        let decode_err =
-            decode_node_to_conduit_with_json_names(&node, &ty, "", &schema).unwrap_err();
+        let plan = JsonDecodePlan::compile(&ty, &schema);
+        let decode_err = decode_json_with_plan(r#"{"a.b":"wrong"}"#, &plan, &schema).unwrap_err();
         assert_eq!(decode_err.0, "[\"a.b\"]");
 
-        let fields = HashMap::from([("x".to_owned(), Value::Function("f".to_owned()))]);
-        let value = Value::Struct { type_id, fields };
-        let names = |_: &TypeId| Some(vec![("x".to_owned(), "a.b".to_owned())]);
+        let value = Value::Struct {
+            schema: StructSchema::with_json_names(
+                type_id,
+                vec![("x".to_owned(), "a.b".to_owned())],
+            ),
+            values: vec![Value::Function("f".to_owned())],
+        };
         let mut output = String::new();
-        let encode_err =
-            encode_conduit_value_with_json_names(&value, "", &mut output, &names).unwrap_err();
+        let encode_err = encode_with_struct_schemas(&value, "", &mut output).unwrap_err();
         assert_eq!(encode_err.0, "[\"a.b\"]");
     }
 
@@ -892,30 +483,43 @@ mod path_tests {
     fn indexed_schema_preserves_duplicate_keys_and_error_precedence() {
         let type_id = TypeId::program("Tagged");
         let ty = Type::Custom(type_id.clone());
-        let schema = Arc::new(JsonDecodeSchema::new(vec![
-            ("x".to_owned(), "display_name".to_owned(), Type::Int),
-            (
-                "note".to_owned(),
-                "note".to_owned(),
-                Type::Optional(Box::new(Type::String)),
-            ),
-        ]));
-        let resolve = |_: &TypeId, _: &[Type]| Some(schema.clone());
-        let node = parse_json(r#"{"display_name":"ignored","display_name":7}"#).unwrap();
-        let value = decode_node_to_conduit_with_schema(&node, &ty, "", &resolve).unwrap();
+        let resolve = |_: &TypeId, _: &[Type]| {
+            Some(vec![
+                ("x".to_owned(), "display_name".to_owned(), Type::Int),
+                (
+                    "note".to_owned(),
+                    "note".to_owned(),
+                    Type::Optional(Box::new(Type::String)),
+                ),
+            ])
+        };
+        let plan = JsonDecodePlan::compile(&ty, &resolve);
+        let value = decode_json_with_plan(
+            r#"{"display_name":"ignored","display_name":7}"#,
+            &plan,
+            &resolve,
+        )
+        .unwrap();
         assert_eq!(
             value,
             Value::Struct {
-                type_id,
-                fields: HashMap::from([
-                    ("x".to_owned(), Value::Int(7)),
-                    ("note".to_owned(), Value::Nil),
-                ]),
+                schema: StructSchema::with_json_names(
+                    type_id,
+                    vec![
+                        ("x".to_owned(), "display_name".to_owned()),
+                        ("note".to_owned(), "note".to_owned()),
+                    ],
+                ),
+                values: vec![Value::Int(7), Value::Nil],
             }
         );
 
-        let node = parse_json(r#"{"display_name":7,"display_name":false}"#).unwrap();
-        let error = decode_node_to_conduit_with_schema(&node, &ty, "", &resolve).unwrap_err();
+        let error = decode_json_with_plan(
+            r#"{"display_name":7,"display_name":false}"#,
+            &plan,
+            &resolve,
+        )
+        .unwrap_err();
         assert_eq!(error.0, "display_name");
         assert!(error.1.contains("Expected Int"));
 
@@ -923,35 +527,10 @@ mod path_tests {
             r#"{"display_name":false,"unexpected":1}"#,
             r#"{"unexpected":1}"#,
         ] {
-            let node = parse_json(raw).unwrap();
-            let error = decode_node_to_conduit_with_schema(&node, &ty, "", &resolve).unwrap_err();
+            let error = decode_json_with_plan(raw, &plan, &resolve).unwrap_err();
             assert_eq!(error.0, "unexpected");
             assert!(error.1.contains("Unknown field"));
         }
-    }
-
-    #[test]
-    fn legacy_resolver_keeps_repeated_schema_names_compatible() {
-        let type_id = TypeId::program("Legacy");
-        let ty = Type::Custom(type_id.clone());
-        let node = parse_json(r#"{"key":7}"#).unwrap();
-        let resolve = |_: &TypeId, _: &[Type]| {
-            Some(vec![
-                ("x".to_owned(), "key".to_owned(), Type::Int),
-                ("y".to_owned(), "key".to_owned(), Type::Int),
-            ])
-        };
-        let value = decode_node_to_conduit_with_json_names(&node, &ty, "", &resolve).unwrap();
-        assert_eq!(
-            value,
-            Value::Struct {
-                type_id,
-                fields: HashMap::from([
-                    ("x".to_owned(), Value::Int(7)),
-                    ("y".to_owned(), Value::Int(7)),
-                ]),
-            }
-        );
     }
 
     #[test]
@@ -961,31 +540,27 @@ mod path_tests {
             Box::new(Type::String),
             Box::new(Type::Tuple(vec![Type::Custom(type_id.clone())])),
         )));
-        let schema = Arc::new(JsonDecodeSchema::new(vec![(
-            "x".to_owned(),
-            "a.b".to_owned(),
-            Type::Int,
-        )]));
-        let resolve = |_: &TypeId, _: &[Type]| Some(schema.clone());
-        let node = parse_json(r#"[{"metadata":[{"a.b":false}]}]"#).unwrap();
-        let error =
-            decode_node_to_conduit_with_schema(&node, &ty, "payload", &resolve).unwrap_err();
+        let resolve =
+            |_: &TypeId, _: &[Type]| Some(vec![("x".to_owned(), "a.b".to_owned(), Type::Int)]);
+        let plan = JsonDecodePlan::compile(&ty, &resolve);
+        let node = parser::parse_borrowed_json(r#"[{"metadata":[{"a.b":false}]}]"#).unwrap();
+        let error = decode::decode_borrowed_json(node, &plan, "payload", &resolve).unwrap_err();
         assert_eq!(error.0, "payload[0][\"metadata\"][0][\"a.b\"]");
 
         let mut map = OrderedMap::new();
         map.set(
             MapKey::String("metadata".to_owned()),
             Value::Tuple(vec![Value::Struct {
-                type_id,
-                fields: HashMap::from([("x".to_owned(), Value::Function("f".to_owned()))]),
+                schema: StructSchema::with_json_names(
+                    type_id,
+                    vec![("x".to_owned(), "a.b".to_owned())],
+                ),
+                values: vec![Value::Function("f".to_owned())],
             }]),
         );
         let value = Value::List(vec![Value::Map(map)]);
-        let fields: Arc<[(String, String)]> = vec![("x".to_owned(), "a.b".to_owned())].into();
-        let resolve = |_: &TypeId| Some(fields.clone());
         let mut out = String::new();
-        let error =
-            encode_conduit_value_with_schema(&value, "payload", &mut out, &resolve).unwrap_err();
+        let error = encode_with_struct_schemas(&value, "payload", &mut out).unwrap_err();
         assert_eq!(error.0, "payload[0][\"metadata\"][0][\"a.b\"]");
     }
 }

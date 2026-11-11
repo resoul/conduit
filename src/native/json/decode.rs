@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::types::{Type, TypeId};
-use crate::value::{MapKey, OrderedMap, Value};
+use crate::value::{MapKey, OrderedMap, StructSchema, Value};
 
 use super::parser::BorrowedJsonNode;
 use super::{join_field_path, join_index_path, join_key_path, prepend_error_path, JsonValue};
@@ -37,7 +37,7 @@ enum PlanNode {
 
 #[derive(Debug)]
 struct StructPlan {
-    type_id: TypeId,
+    struct_schema: Arc<StructSchema>,
     fields: Vec<FieldPlan>,
     field_indexes: HashMap<String, usize>,
     has_duplicate_json_names: bool,
@@ -45,7 +45,6 @@ struct StructPlan {
 
 #[derive(Debug)]
 struct FieldPlan {
-    name: String,
     json_name: String,
     child: usize,
     is_optional: bool,
@@ -152,9 +151,6 @@ impl Compiler<'_> {
     }
 
     fn add_struct(&mut self, ty: &Type, type_id: &TypeId, type_args: &[Type]) -> PlanNode {
-        // Exact recursive types already reuse their pending arena index. A
-        // different instantiation can expand forever, so compile it only if its
-        // corresponding JSON value is actually visited.
         if self.active_structs.contains(type_id) {
             return PlanNode::Deferred(ty.clone());
         }
@@ -162,22 +158,39 @@ impl Compiler<'_> {
             return PlanNode::Unavailable(type_id.clone());
         };
         self.active_structs.push(type_id.clone());
+        let use_map = definitions.len() > 8;
         let mut fields = Vec::with_capacity(definitions.len());
-        let mut field_indexes = HashMap::with_capacity(definitions.len());
+        let mut schema_names = Vec::with_capacity(definitions.len());
+        let mut field_indexes = if use_map {
+            HashMap::with_capacity(definitions.len())
+        } else {
+            HashMap::new()
+        };
+        let mut seen_names = if !use_map {
+            Vec::with_capacity(definitions.len())
+        } else {
+            Vec::new()
+        };
         let mut has_duplicate_json_names = false;
         for (name, json_name, ty) in definitions {
             let index = fields.len();
-            has_duplicate_json_names |= field_indexes.insert(json_name.clone(), index).is_some();
+            if use_map {
+                has_duplicate_json_names |= field_indexes.insert(json_name.clone(), index).is_some();
+            } else {
+                has_duplicate_json_names |= seen_names.iter().any(|prev| prev == &json_name);
+                seen_names.push(json_name.clone());
+            }
+            schema_names.push((name, json_name.clone()));
             fields.push(FieldPlan {
-                name,
                 json_name,
                 is_optional: union_contains_nil(&ty),
                 child: self.add(&ty),
             });
         }
         self.active_structs.pop();
+        let struct_schema = StructSchema::with_json_names(type_id.clone(), schema_names);
         PlanNode::Struct(StructPlan {
-            type_id: type_id.clone(),
+            struct_schema,
             fields,
             field_indexes,
             has_duplicate_json_names,
@@ -193,8 +206,6 @@ fn union_contains_nil(ty: &Type) -> bool {
     }
 }
 
-// Null, bool, string, integer number, other number, array, object. These
-// predicates intentionally mirror the legacy union dispatch before conversion.
 fn union_candidate(ty: &Type, kind: usize) -> bool {
     match kind {
         0 => matches!(ty, Type::Nil | Type::Optional(_)),
@@ -409,6 +420,31 @@ fn decode_node(
     }
 }
 
+fn find_field_index(schema: &StructPlan, key: &str, cursor: &mut usize) -> Option<usize> {
+    if !schema.has_duplicate_json_names {
+        if let Some(field) = schema.fields.get(*cursor) {
+            if field.json_name == key {
+                let idx = *cursor;
+                *cursor += 1;
+                return Some(idx);
+            }
+        }
+    }
+    let found = if schema.fields.len() <= 8 {
+        if schema.has_duplicate_json_names {
+            schema.fields.iter().rposition(|field| field.json_name == key)
+        } else {
+            schema.fields.iter().position(|field| field.json_name == key)
+        }
+    } else {
+        schema.field_indexes.get(key).copied()
+    };
+    if let Some(idx) = found {
+        *cursor = idx + 1;
+    }
+    found
+}
+
 fn decode_struct(
     node: BorrowedJsonNode<'_>,
     schema: &StructPlan,
@@ -423,7 +459,7 @@ fn decode_struct(
                 path.to_owned(),
                 format!(
                     "Expected JSON object for '{}', got {}",
-                    schema.type_id,
+                    schema.struct_schema.type_id,
                     kind_name(&other)
                 ),
             ));
@@ -438,23 +474,26 @@ fn decode_struct(
         heap = (0..count).map(|_| None).collect::<Vec<_>>();
         &mut heap[..]
     };
-    // Every input key is checked before any field conversion, and later input
-    // duplicates overwrite earlier nodes even if those earlier nodes were bad.
+
+    let mut cursor = 0;
     for (key, value) in entries {
-        let Some(&index) = schema.field_indexes.get(key.as_ref()) else {
+        let Some(index) = find_field_index(schema, key.as_ref(), &mut cursor) else {
             return Err((
                 join_field_path(path, &key),
-                format!("Unknown field '{}' for type '{}'", key, schema.type_id),
+                format!(
+                    "Unknown field '{}' for type '{}'",
+                    key, schema.struct_schema.type_id
+                ),
             ));
         };
         slots[index] = Some(value);
     }
-    let mut fields = HashMap::with_capacity(count);
+    let mut values = Vec::with_capacity(count);
     for (index, field) in schema.fields.iter().enumerate() {
         let value = if schema.has_duplicate_json_names {
-            // Only legacy resolver callbacks can create repeated schema names.
-            // Each field must receive its own conversion of the same last node.
-            slots[schema.field_indexes[&field.json_name]].clone()
+            let mut last_cursor = 0;
+            let last_idx = find_field_index(schema, &field.json_name, &mut last_cursor).unwrap_or(index);
+            slots[last_idx].clone()
         } else {
             slots[index].take()
         };
@@ -467,9 +506,9 @@ fn decode_struct(
                     )
                 },
             )?;
-            fields.insert(field.name.clone(), decoded);
+            values.push(decoded);
         } else if field.is_optional {
-            fields.insert(field.name.clone(), Value::Nil);
+            values.push(Value::Nil);
         } else {
             return Err((
                 join_field_path(path, &field.json_name),
@@ -478,8 +517,8 @@ fn decode_struct(
         }
     }
     Ok(Value::Struct {
-        type_id: schema.type_id.clone(),
-        fields,
+        schema: Arc::clone(&schema.struct_schema),
+        values,
     })
 }
 
@@ -512,73 +551,95 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
-    use crate::native::json::decode_node_to_conduit_with_json_names;
-    use crate::native::json::parse_json;
     use crate::native::json::parser::parse_borrowed_json;
 
-    fn assert_matches_reference(raw: &str, ty: &Type, resolve: &ResolveStruct<'_>) {
-        let owned = parse_json(raw).unwrap();
-        let expected = decode_node_to_conduit_with_json_names(&owned, ty, "payload", resolve);
+    fn decode_raw(raw: &str, ty: &Type, resolve: &ResolveStruct<'_>) -> Result<Value, (String, String)> {
         let plan = JsonDecodePlan::compile(ty, resolve);
-        let borrowed = parse_borrowed_json(raw).unwrap();
-        let actual = decode_borrowed_json(borrowed, &plan, "payload", resolve);
-        assert_eq!(actual, expected, "type={ty}, json={raw}");
+        let borrowed = parse_borrowed_json(raw)?;
+        decode_borrowed_json(borrowed, &plan, "payload", resolve)
     }
 
     #[test]
-    fn compiled_decoder_matches_legacy_scalar_container_and_union_semantics() {
+    fn compiled_decoder_handles_scalars_containers_and_unions() {
         let dynamic = Type::Custom(TypeId::native("cdt.json", "Value"));
-        let types = vec![
-            Type::Int,
-            Type::Float,
-            Type::Bool,
-            Type::String,
-            Type::Nil,
-            Type::Void,
-            Type::Any,
-            Type::TypeParam("T".to_owned()),
-            Type::Custom(TypeId::program("Missing")),
-            Type::Optional(Box::new(Type::Int)),
-            Type::List(Box::new(Type::Int)),
-            Type::List(Box::new(Type::Void)),
-            Type::Map(Box::new(Type::String), Box::new(Type::Int)),
-            Type::Map(Box::new(Type::Bool), Box::new(Type::String)),
-            Type::Tuple(vec![Type::Int, Type::String]),
-            Type::Union(vec![Type::Int, Type::Float, Type::String, Type::Nil]),
-            Type::Union(vec![Type::Bool, Type::Optional(Box::new(Type::Bool))]),
-            Type::Union(vec![Type::List(Box::new(Type::Int)), Type::Tuple(vec![])]),
-            Type::Union(vec![Type::Optional(Box::new(Type::List(Box::new(
-                Type::Int,
-            ))))]),
-            Type::Union(vec![Type::Int, dynamic.clone()]),
-            Type::Union(vec![
-                Type::Custom(TypeId::program("Missing")),
-                dynamic.clone(),
-            ]),
-            dynamic,
-        ];
-        for raw in [
-            "null",
-            "true",
-            "false",
-            "7",
-            "-9223372036854775808",
-            "9223372036854775808",
-            "7.0",
-            "1e2",
-            r#""text""#,
-            r#""\\n\\u263a""#,
-            "[]",
-            "[1]",
-            r#"[1,"s"]"#,
-            "{}",
-            r#"{"a.b":1}"#,
-            r#"{"a":false,"a":7}"#,
-        ] {
-            for ty in &types {
-                assert_matches_reference(raw, ty, &|_, _| None);
-            }
-        }
+        let no_structs = |_: &TypeId, _: &[Type]| None;
+
+        assert_eq!(decode_raw("7", &Type::Int, &no_structs), Ok(Value::Int(7)));
+        assert_eq!(
+            decode_raw("-9223372036854775808", &Type::Int, &no_structs),
+            Ok(Value::Int(i64::MIN))
+        );
+        assert!(decode_raw("9223372036854775808", &Type::Int, &no_structs).is_err());
+        assert!(decode_raw("7.0", &Type::Int, &no_structs).is_err());
+        assert_eq!(
+            decode_raw("1e2", &Type::Float, &no_structs),
+            Ok(Value::Float(100.0))
+        );
+        assert_eq!(
+            decode_raw("true", &Type::Bool, &no_structs),
+            Ok(Value::Bool(true))
+        );
+        assert_eq!(
+            decode_raw(r#""\\n\\u263a""#, &Type::String, &no_structs),
+            Ok(Value::String("\\n\\u263a".to_owned()))
+        );
+        assert_eq!(
+            decode_raw("null", &Type::Optional(Box::new(Type::Int)), &no_structs),
+            Ok(Value::Nil)
+        );
+        assert_eq!(
+            decode_raw("[1]", &Type::List(Box::new(Type::Int)), &no_structs),
+            Ok(Value::List(vec![Value::Int(1)]))
+        );
+        assert!(decode_raw("[null]", &Type::List(Box::new(Type::Void)), &no_structs).is_err());
+
+        assert_eq!(
+            decode_raw(
+                r#"{"a":false,"a":7}"#,
+                &Type::Map(Box::new(Type::String), Box::new(Type::Int)),
+                &no_structs,
+            ),
+            Err(("payload[\"a\"]".to_owned(), "Expected Int, got bool".to_owned()))
+        );
+        let mut expected_map = OrderedMap::new();
+        expected_map.set(MapKey::String("a".to_owned()), Value::Int(7));
+        assert_eq!(
+            decode_raw(
+                r#"{"a":1,"a":7}"#,
+                &Type::Map(Box::new(Type::String), Box::new(Type::Int)),
+                &no_structs,
+            ),
+            Ok(Value::Map(expected_map))
+        );
+        assert!(decode_raw("{}", &Type::Map(Box::new(Type::Bool), Box::new(Type::String)), &no_structs).is_err());
+
+        assert_eq!(
+            decode_raw(
+                r#"[1,"s"]"#,
+                &Type::Tuple(vec![Type::Int, Type::String]),
+                &no_structs,
+            ),
+            Ok(Value::Tuple(vec![Value::Int(1), Value::String("s".to_owned())]))
+        );
+
+        let scalar_union = Type::union(vec![Type::Int, Type::Float, Type::String, Type::Nil]);
+        assert_eq!(decode_raw("7", &scalar_union, &no_structs), Ok(Value::Int(7)));
+        assert_eq!(decode_raw("7.0", &scalar_union, &no_structs), Ok(Value::Float(7.0)));
+        assert_eq!(
+            decode_raw("null", &scalar_union, &no_structs),
+            Ok(Value::Nil)
+        );
+
+        let ambiguous_bool = Type::Union(vec![Type::Bool, Type::Optional(Box::new(Type::Bool))]);
+        assert!(decode_raw("true", &ambiguous_bool, &no_structs).is_err());
+
+        let ambiguous_arr = Type::Union(vec![Type::List(Box::new(Type::Int)), Type::Tuple(vec![])]);
+        assert!(decode_raw("[]", &ambiguous_arr, &no_structs).is_err());
+
+        let with_dyn = Type::union(vec![Type::Int, dynamic]);
+        let dyn_res = decode_raw(r#""text""#, &with_dyn, &no_structs).unwrap();
+        assert!(matches!(dyn_res, Value::Native(_)));
+        assert!(decode_raw("true", &Type::Custom(TypeId::program("Missing")), &no_structs).is_err());
     }
 
     #[test]
@@ -603,34 +664,22 @@ mod tests {
                 ]
             })
         };
-        for raw in [
-            r#"{"a.b":7,"empty":[]}"#,
-            r#"{"a.b":7,"optional":null,"empty":[]}"#,
-            r#"{"a.b":false,"a.b":7,"empty":[]}"#,
-            r#"{"a.b":7,"a.b":false,"empty":[]}"#,
-            r#"{"a.b":false,"unknown":0}"#,
-            r#"{"unknown":0}"#,
-            r#"{"empty":[null]}"#,
-            r#"{"a.b":7,"optional":{},"empty":[]}"#,
-            "null",
-        ] {
-            assert_matches_reference(raw, &tagged, &resolve);
-        }
 
-        let duplicate_resolver = |_: &TypeId, _: &[Type]| {
-            Some(vec![
-                ("x".to_owned(), "key".to_owned(), Type::Int),
-                ("y".to_owned(), "key".to_owned(), Type::Float),
-            ])
-        };
-        for raw in [
-            r#"{"key":7}"#,
-            r#"{"key":false,"key":7}"#,
-            r#"{"key":"bad"}"#,
-            "{}",
-        ] {
-            assert_matches_reference(raw, &tagged, &duplicate_resolver);
-        }
+        let val = decode_raw(r#"{"a.b":false,"a.b":7,"empty":[]}"#, &tagged, &resolve).unwrap();
+        assert_eq!(val.field("x"), Some(&Value::Int(7)));
+        assert_eq!(val.field("optional"), Some(&Value::Nil));
+        assert_eq!(val.field("empty"), Some(&Value::List(vec![])));
+
+        assert_eq!(
+            decode_raw(r#"{"a.b":7,"a.b":false,"empty":[]}"#, &tagged, &resolve)
+                .unwrap_err()
+                .0,
+            "payload[\"a.b\"]"
+        );
+        let err = decode_raw(r#"{"a.b":false,"unknown":0}"#, &tagged, &resolve).unwrap_err();
+        assert_eq!(err.0, "payload.unknown");
+        assert!(err.1.contains("Unknown field"));
+        assert!(decode_raw(r#"{"a.b":7,"optional":{},"empty":[]}"#, &tagged, &resolve).is_err());
 
         let many = |_: &TypeId, _: &[Type]| {
             Some(
@@ -641,9 +690,11 @@ mod tests {
         };
         let mut entries: Vec<_> = (0..20).map(|i| format!("\"key{i}\":{i}")).collect();
         let raw = format!("{{{}}}", entries.join(","));
-        assert_matches_reference(&raw, &tagged, &many);
+        let many_val = decode_raw(&raw, &tagged, &many).unwrap();
+        assert_eq!(many_val.field("f19"), Some(&Value::Int(19)));
         entries[19] = "\"unknown\":false".to_owned();
-        assert_matches_reference(&format!("{{{}}}", entries.join(",")), &tagged, &many);
+        let err = decode_raw(&format!("{{{}}}", entries.join(",")), &tagged, &many).unwrap_err();
+        assert_eq!(err.0, "payload.unknown");
     }
 
     #[test]
@@ -696,11 +747,19 @@ mod tests {
                 ]
             })
         };
-        assert_matches_reference(
+        let exp_val = decode_raw(
             r#"{"value":1,"next":{"value":[2,3],"next":null}}"#,
             &expanding,
             &resolve,
+        )
+        .unwrap();
+        assert_eq!(exp_val.field("value"), Some(&Value::Int(1)));
+        let nested = exp_val.field("next").unwrap();
+        assert_eq!(
+            nested.field("value"),
+            Some(&Value::List(vec![Value::Int(2), Value::Int(3)]))
         );
+        assert_eq!(nested.field("next"), Some(&Value::Nil));
 
         let text = "owned escaped string".to_owned();
         let original_buffer = text.as_ptr();

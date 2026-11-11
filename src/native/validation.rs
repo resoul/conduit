@@ -1,36 +1,52 @@
-use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 
 use super::{NativeFuncDef, NativeModule, NativeTypeDef};
 use crate::types::{Type, TypeId};
-use crate::value::Value;
+use crate::value::{StructSchema, Value};
 
 pub fn make_issue(code: impl Into<String>, message: impl Into<String>) -> Value {
-    let mut fields = HashMap::new();
-    fields.insert("code".to_string(), Value::String(code.into()));
-    fields.insert("message".to_string(), Value::String(message.into()));
+    static SCHEMA: OnceLock<Arc<StructSchema>> = OnceLock::new();
+    let schema = Arc::clone(SCHEMA.get_or_init(|| {
+        StructSchema::new(
+            TypeId::native("cdt.validation", "Issue"),
+            ["code".into(), "message".into()],
+        )
+    }));
     Value::Error {
-        type_id: TypeId::native("cdt.validation", "Issue"),
-        fields,
+        schema,
+        values: vec![Value::String(code.into()), Value::String(message.into())],
     }
 }
 
 pub fn make_violation(path: impl Into<String>, code: impl Into<String>, message: impl Into<String>) -> Value {
-    let mut fields = HashMap::new();
-    fields.insert("path".to_string(), Value::String(path.into()));
-    fields.insert("code".to_string(), Value::String(code.into()));
-    fields.insert("message".to_string(), Value::String(message.into()));
+    static SCHEMA: OnceLock<Arc<StructSchema>> = OnceLock::new();
+    let schema = Arc::clone(SCHEMA.get_or_init(|| {
+        StructSchema::new(
+            TypeId::native("cdt.validation", "Violation"),
+            ["path".into(), "code".into(), "message".into()],
+        )
+    }));
     Value::Struct {
-        type_id: TypeId::native("cdt.validation", "Violation"),
-        fields,
+        schema,
+        values: vec![
+            Value::String(path.into()),
+            Value::String(code.into()),
+            Value::String(message.into()),
+        ],
     }
 }
 
 pub fn make_validation_error(violations: Vec<Value>) -> Value {
-    let mut fields = HashMap::new();
-    fields.insert("issues".to_string(), Value::List(violations));
+    static SCHEMA: OnceLock<Arc<StructSchema>> = OnceLock::new();
+    let schema = Arc::clone(SCHEMA.get_or_init(|| {
+        StructSchema::new(
+            TypeId::native("cdt.validation", "ValidationError"),
+            ["issues".into()],
+        )
+    }));
     Value::Error {
-        type_id: TypeId::native("cdt.validation", "ValidationError"),
-        fields,
+        schema,
+        values: vec![Value::List(violations)],
     }
 }
 

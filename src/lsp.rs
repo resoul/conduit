@@ -128,8 +128,7 @@ pub fn validate_document(uri: &str, text: &str) -> String {
 pub fn validate_document_with_env(uri: &str, text: &str, documents: &HashMap<String, String>) -> String {
     let file_path = uri_to_path(uri);
     let mut loader = ModuleLoader::new();
-
-    // Register unsaved open documents
+    
     for (doc_uri, doc_text) in documents {
         loader.with_virtual_file(uri_to_path(doc_uri), doc_text.clone());
     }
@@ -184,8 +183,7 @@ fn handle_hover(msg: &str, id: &str, documents: &HashMap<String, String>) -> Str
 
     let registry = NativeRegistry::new();
     let mut hover_text = String::new();
-
-    // 1. Check native registry for time module
+    
     if let Some(time_mod) = registry.get_module("time") {
         for ty in time_mod.types.values() {
             if ty.name == word || ty.qualified_name == qualified_word || ty.qualified_name == word {

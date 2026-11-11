@@ -169,21 +169,17 @@ fn test_criterion_2_generic_functions_inference_and_combinators() {
             }
 
             func main() {
-                // Inferred generic function
                 n := col.first_or_default([10, 20, 30], 0)
                 assert_eq(n.to_string(), "10")
 
-                // Explicit type args on empty list
                 empty_fallback := col.first_or_default<Int>([], 99)
                 assert_eq(empty_fallback.to_string(), "99")
 
-                // Multiple type params
                 pair := make_pair("age", 30)
                 (k, v) := pair
                 assert_eq(k, "age")
                 assert_eq(v.to_string(), "30")
 
-                // Built-in map/filter + cross-module user generics: find, any, all, fold
                 users := [
                     User(name: "Alice", age: 30),
                     User(name: "Bob", age: 19),
@@ -297,14 +293,12 @@ fn test_criterion_3_generics_privacy_and_parser_rejections() {
     assert!(check_single(leak_in_nested_list)
         .unwrap_err()
         .contains("private"));
-
-    // Empty type parameter list rejected by parser
+    
     let mut lex = Lexer::new("func bad<>() {}");
     let tokens = lex.tokenize_all().unwrap();
     let mut parser = Parser::new(tokens);
     assert!(parser.parse_program().is_err());
-
-    // Duplicate type parameter rejected by parser
+    
     let mut lex = Lexer::new("type Dup<T, T> { x: T }");
     let tokens = lex.tokenize_all().unwrap();
     let mut parser = Parser::new(tokens);
@@ -332,7 +326,6 @@ fn test_criterion_4_map_keys_indexing_and_deterministic_order() {
             scores.set("bob", 20)
             scores.set("carol", 30)
 
-            // Updating an existing key preserves insertion order
             scores.set("bob", 99)
 
             keys := scores.keys()
@@ -343,7 +336,6 @@ fn test_criterion_4_map_keys_indexing_and_deterministic_order() {
             vals := scores.values()
             assert_eq((vals.get(1) ?? 0).to_string(), "99")
 
-            // Removing then re-inserting moves key to end
             removed := scores.remove("alice")
             assert_eq((removed ?? -1).to_string(), "10")
             assert_eq(scores.contains_key("alice").to_string(), "false")
@@ -359,7 +351,6 @@ fn test_criterion_4_map_keys_indexing_and_deterministic_order() {
             assert_eq(k2, "alice")
             assert_eq(v2.to_string(), "55")
 
-            // Int and Bool keys + Map.from
             by_id := Map.from([(1, "one"), (2, "two")])
             assert_eq(by_id.get(1) ?? "", "one")
             assert_eq(by_id.get(99) ?? "missing", "missing")
@@ -370,7 +361,6 @@ fn test_criterion_4_map_keys_indexing_and_deterministic_order() {
             empty_map := Map.from<String, Int>([])
             assert_eq(empty_map.len().to_string(), "0")
 
-            // m[k] returns V | KeyError and works with switch and '?'
             switch scores["bob"] {
                 case Int(v): assert_eq(v.to_string(), "99")
                 case KeyError(e): boom := 1 / 0
@@ -475,8 +465,7 @@ fn test_criterion_5_validation_generics_maps_and_reachability() {
     "#,
     )
     .expect("validation should recurse into generic structs and Map values with exact paths");
-
-    // Verify Map min/max rule enforcement
+    
     run_single(
         r#"
         import cdt.validation as validation
@@ -502,8 +491,7 @@ fn test_criterion_5_validation_generics_maps_and_reachability() {
     "#,
     )
     .expect("validation.min should validate Map length");
-
-    // Reachability traces validators through Map and generic type annotations
+    
     let reach_src = r#"
         import cdt.validation as validation
 

@@ -7,13 +7,14 @@ use crate::ast::*;
 use crate::lexer::{ESCAPED_CLOSE_BRACE, ESCAPED_OPEN_BRACE, Span};
 use crate::loader::{ModuleLoader, ModuleTarget};
 use crate::native::json::{
-    JsonDecodePlan, JsonEncodeSchema, decode_json_with_plan, encode_with_plan,
-    make_decode_error, make_encode_error,
+    decode_json_with_plan, encode_with_struct_schemas, make_decode_error, make_encode_error,
+    JsonDecodePlan,
 };
 use crate::native::NativeRegistry;
 use crate::types::{ModuleId, Type, TypeId};
 use crate::value::{
-    make_index_error, make_key_error, make_parse_error, ClosureData, MapKey, OrderedMap, Value,
+    builtin_error_schema, make_index_error, make_key_error, make_parse_error, ClosureData,
+    MapKey, OrderedMap, StructSchema, Value,
 };
 
 const MAX_CALL_DEPTH: usize = 256;
@@ -65,16 +66,18 @@ fn checked_float_to_int(value: f64, span: Span) -> Result<Value, RuntimeError> {
 
 pub struct Interpreter {
     pub native_registry: NativeRegistry,
-    module_functions: HashMap<(Option<PathBuf>, String), (Vec<Param>, Block)>,
+    module_functions: HashMap<(Option<PathBuf>, String), Arc<(Vec<Param>, Block)>>,
     module_imports: HashMap<Option<PathBuf>, HashMap<String, ModuleTarget>>,
     module_structs: HashMap<Option<PathBuf>, HashSet<String>>,
     module_struct_type_params: HashMap<(Option<PathBuf>, String), Vec<String>>,
     module_struct_fields: HashMap<(Option<PathBuf>, String), Vec<crate::ast::FieldDef>>,
-    json_encode_schemas: RefCell<HashMap<TypeId, Arc<JsonEncodeSchema>>>,
+    module_error_fields: HashMap<(Option<PathBuf>, String), Vec<crate::ast::FieldDef>>,
+    struct_schemas: RefCell<HashMap<TypeId, Arc<StructSchema>>>,
     json_decode_plans: RefCell<HashMap<Option<PathBuf>, HashMap<TypeExpr, Arc<JsonDecodePlan>>>>,
     module_errors: HashMap<Option<PathBuf>, HashSet<String>>,
     current_module: Option<PathBuf>,
     env: Vec<HashMap<String, Value>>,
+    captured_env: Option<Arc<HashMap<String, Value>>>,
     call_depth: usize,
     large_stack_active: bool,
 }
@@ -88,11 +91,13 @@ impl Interpreter {
             module_structs: HashMap::new(),
             module_struct_type_params: HashMap::new(),
             module_struct_fields: HashMap::new(),
-            json_encode_schemas: RefCell::new(HashMap::new()),
+            module_error_fields: HashMap::new(),
+            struct_schemas: RefCell::new(HashMap::new()),
             json_decode_plans: RefCell::new(HashMap::new()),
             module_errors: HashMap::new(),
             current_module: None,
             env: vec![HashMap::new()],
+            captured_env: None,
             call_depth: 0,
             large_stack_active: false,
         }
@@ -114,8 +119,8 @@ impl Interpreter {
 
     fn assign_variable(&mut self, name: &str, val: Value, span: Span) -> Result<(), RuntimeError> {
         for scope in self.env.iter_mut().rev() {
-            if scope.contains_key(name) {
-                scope.insert(name.to_string(), val);
+            if let Some(slot) = scope.get_mut(name) {
+                *slot = val;
                 return Ok(());
             }
         }
@@ -130,7 +135,11 @@ impl Interpreter {
     }
 
     fn lookup_variable_ref(&self, name: &str) -> Option<&Value> {
-        self.env.iter().rev().find_map(|scope| scope.get(name))
+        self.env
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name))
+            .or_else(|| self.captured_env.as_deref().and_then(|env| env.get(name)))
     }
 
     fn lookup_variable_mut(&mut self, name: &str) -> Option<&mut Value> {
@@ -175,19 +184,16 @@ impl Interpreter {
         })?;
 
         for (field_name, fspan) in fields {
-            match slot {
-                Value::Struct { fields: map, .. } => {
-                    slot = map.get_mut(&field_name).ok_or_else(|| RuntimeError {
-                        message: format!("Field '{}' not found", field_name),
-                        span: fspan,
-                    })?;
-                }
-                other => {
-                    return Err(RuntimeError {
-                        message: format!("Field access not supported on type {}", other.type_name()),
-                        span: fspan,
-                    });
-                }
+            if matches!(slot, Value::Struct { .. }) {
+                slot = slot.field_mut(&field_name).ok_or_else(|| RuntimeError {
+                    message: format!("Field '{}' not found", field_name),
+                    span: fspan,
+                })?;
+            } else {
+                return Err(RuntimeError {
+                    message: format!("Field access not supported on type {}", slot.type_name()),
+                    span: fspan,
+                });
             }
         }
 
@@ -211,14 +217,17 @@ impl Interpreter {
         }
     }
 
-    fn snapshot_env(&self) -> HashMap<String, Value> {
-        let mut captured = HashMap::new();
+    fn snapshot_env(&self) -> Arc<HashMap<String, Value>> {
+        let mut captured = match &self.captured_env {
+            Some(env) => (**env).clone(),
+            None => HashMap::new(),
+        };
         for scope in &self.env {
             for (k, v) in scope {
                 captured.insert(k.clone(), v.clone());
             }
         }
-        captured
+        Arc::new(captured)
     }
 
     fn push_unescaped_braces(dst: &mut String, text: &str) {
@@ -267,8 +276,8 @@ impl Interpreter {
                         let mut resolved = true;
                         for part in &parts[1..] {
                             match current {
-                                Value::Struct { ref fields, .. } | Value::Error { ref fields, .. } => {
-                                    if let Some(val) = fields.get(*part) {
+                                Value::Struct { .. } | Value::Error { .. } => {
+                                    if let Some(val) = current.field(part) {
                                         current = val.clone();
                                     } else {
                                         resolved = false;
@@ -305,8 +314,9 @@ impl Interpreter {
     }
 
     pub fn run_project(&mut self, root_path: &Path, loader: &ModuleLoader) -> Result<(), RuntimeError> {
-        self.json_encode_schemas.get_mut().clear();
+        self.struct_schemas.get_mut().clear();
         self.json_decode_plans.get_mut().clear();
+        self.module_error_fields.clear();
         for (path, loaded_mod) in &loader.modules {
             let mut imports_map = HashMap::new();
             for (alias, (target, _)) in &loaded_mod.imports {
@@ -322,7 +332,7 @@ impl Interpreter {
                     ItemKind::Func { name, params, body, .. } => {
                         self.module_functions.insert(
                             (Some(path.clone()), name.clone()),
-                            (params.clone(), body.clone()),
+                            Arc::new((params.clone(), body.clone())),
                         );
                     }
                     ItemKind::Type { name, type_params, fields } => {
@@ -332,8 +342,10 @@ impl Interpreter {
                         self.module_struct_fields
                             .insert((Some(path.clone()), name.clone()), fields.clone());
                     }
-                    ItemKind::Error { name, .. } => {
+                    ItemKind::Error { name, fields } => {
                         errors_set.insert(name.clone());
+                        self.module_error_fields
+                            .insert((Some(path.clone()), name.clone()), fields.clone());
                     }
                     ItemKind::Import { .. } => {}
                 }
@@ -356,8 +368,9 @@ impl Interpreter {
     }
 
     pub fn run_program(&mut self, program: &Program) -> Result<(), RuntimeError> {
-        self.json_encode_schemas.get_mut().clear();
+        self.struct_schemas.get_mut().clear();
         self.json_decode_plans.get_mut().clear();
+        self.module_error_fields.clear();
         let mut structs_set = HashSet::new();
         let mut errors_set = HashSet::new();
         let mut imports_map = HashMap::new();
@@ -365,7 +378,10 @@ impl Interpreter {
         for item in &program.items {
             match &item.kind {
                 ItemKind::Func { name, params, body, .. } => {
-                    self.module_functions.insert((None, name.clone()), (params.clone(), body.clone()));
+                    self.module_functions.insert(
+                        (None, name.clone()),
+                        Arc::new((params.clone(), body.clone())),
+                    );
                 }
                 ItemKind::Type { name, type_params, fields } => {
                     structs_set.insert(name.clone());
@@ -374,8 +390,10 @@ impl Interpreter {
                     self.module_struct_fields
                         .insert((None, name.clone()), fields.clone());
                 }
-                ItemKind::Error { name, .. } => {
+                ItemKind::Error { name, fields } => {
                     errors_set.insert(name.clone());
+                    self.module_error_fields
+                        .insert((None, name.clone()), fields.clone());
                 }
                 ItemKind::Import { path, alias } => {
                     if path.starts_with("cdt.") {
@@ -437,8 +455,8 @@ impl Interpreter {
         }
 
         match val {
-            Value::Struct { type_id, fields } => {
-                if let Some((decl_mod, field_defs)) = self.find_struct_fields(type_id) {
+            Value::Struct { schema, .. } => {
+                if let Some((decl_mod, field_defs)) = self.find_struct_fields(&schema.type_id) {
                     for f in &field_defs {
                         let field_path = if path.is_empty() {
                             f.name.clone()
@@ -446,7 +464,7 @@ impl Interpreter {
                             format!("{}.{}", path, f.name)
                         };
 
-                        if let Some(f_val) = fields.get(&f.name) {
+                        if let Some(f_val) = val.field(&f.name) {
                             self.validate_value_recursive(f_val, &field_path, violations, depth + 1, span)?;
 
                             if let Value::Nil = f_val {
@@ -469,9 +487,9 @@ impl Interpreter {
                                 let res = self.invoke_validator(&decl_mod, &ann.target, eval_args, span)?;
                                 match res {
                                     Value::Void | Value::Nil => {}
-                                    Value::Error { ref fields, .. } => {
+                                    Value::Error { .. } => {
                                         if let (Some(Value::String(code)), Some(Value::String(msg))) =
-                                            (fields.get("code"), fields.get("message"))
+                                            (res.field("code"), res.field("message"))
                                         {
                                             let violation = crate::native::validation::make_violation(
                                                 &field_path,
@@ -608,19 +626,21 @@ impl Interpreter {
             });
         }
         let key = (mod_path.clone(), name.to_string());
-        let (params, body) = if let Some(sig) = self.module_functions.get(&key).cloned() {
-            sig
-        } else if let Some(sig) = self.module_functions.get(&(None, name.to_string())).cloned() {
-            sig
+        let fn_def = if let Some(sig) = self.module_functions.get(&key) {
+            Arc::clone(sig)
+        } else if let Some(sig) = self.module_functions.get(&(None, name.to_string())) {
+            Arc::clone(sig)
         } else {
             return Err(RuntimeError {
                 message: format!("Function '{}' not found", name),
                 span,
             });
         };
+        let (params, body) = (&fn_def.0, &fn_def.1);
 
         let prev_mod = self.current_module.clone();
-        let prev_env = std::mem::replace(&mut self.env, vec![HashMap::new()]);
+        let prev_captured = self.captured_env.take();
+        let prev_env = std::mem::replace(&mut self.env, Vec::with_capacity(4));
         self.current_module = mod_path;
         self.call_depth += 1;
 
@@ -648,6 +668,7 @@ impl Interpreter {
 
         self.exit_scope();
         self.env = prev_env;
+        self.captured_env = prev_captured;
         self.current_module = prev_mod;
         self.call_depth -= 1;
         match eval_err {
@@ -676,7 +697,8 @@ impl Interpreter {
                 }
                 self.call_depth += 1;
                 let prev_mod = self.current_module.clone();
-                let prev_env = std::mem::replace(&mut self.env, vec![closure.env.clone()]);
+                let prev_captured = self.captured_env.replace(Arc::clone(&closure.env));
+                let prev_env = std::mem::replace(&mut self.env, Vec::with_capacity(4));
                 self.current_module = closure.module.clone();
 
                 self.enter_scope();
@@ -703,6 +725,7 @@ impl Interpreter {
 
                 self.exit_scope();
                 self.env = prev_env;
+                self.captured_env = prev_captured;
                 self.current_module = prev_mod;
                 self.call_depth -= 1;
                 match eval_err {
@@ -747,19 +770,73 @@ impl Interpreter {
         }
     }
 
-    fn resolve_json_encode_schema(&self, type_id: &TypeId) -> Option<Arc<JsonEncodeSchema>> {
-        if let Some(schema) = self.json_encode_schemas.borrow().get(type_id) {
+    fn resolve_struct_schema(&self, type_id: &TypeId) -> Option<Arc<StructSchema>> {
+        if let Some(schema) = self.struct_schemas.borrow().get(type_id) {
             return Some(Arc::clone(schema));
         }
-        let key = Self::type_id_to_mod_key(type_id)?;
-        let defs = self.module_struct_fields.get(&key)?;
-        let fields = defs.iter().map(|f| {
-            let json_name = f.json_name.clone().unwrap_or_else(|| f.name.clone());
-            (f.name.clone(), json_name)
-        }).collect();
-        let schema = Arc::new(JsonEncodeSchema::new(fields));
-        self.json_encode_schemas.borrow_mut().insert(type_id.clone(), Arc::clone(&schema));
+        let schema = match &type_id.module {
+            ModuleId::Builtin => return builtin_error_schema(&type_id.name),
+            ModuleId::Native(nat_name) => {
+                let module = self.native_registry.get_module(nat_name)?;
+                let td = module.types.get(type_id.name.as_str())?;
+                StructSchema::new(
+                    type_id.clone(),
+                    td.fields.iter().map(|(name, _)| (*name).to_string()),
+                )
+            }
+            ModuleId::Program | ModuleId::Local(_) => {
+                let key = Self::type_id_to_mod_key(type_id)?;
+                if let Some(defs) = self.module_struct_fields.get(&key) {
+                    let fields = defs
+                        .iter()
+                        .map(|f| {
+                            let json_name = f.json_name.clone().unwrap_or_else(|| f.name.clone());
+                            (f.name.clone(), json_name)
+                        })
+                        .collect();
+                    StructSchema::with_json_names(type_id.clone(), fields)
+                } else if let Some(defs) = self.module_error_fields.get(&key) {
+                    StructSchema::new(type_id.clone(), defs.iter().map(|f| f.name.clone()))
+                } else {
+                    return None;
+                }
+            }
+        };
+        self.struct_schemas
+            .borrow_mut()
+            .insert(type_id.clone(), Arc::clone(&schema));
         Some(schema)
+    }
+
+    fn construct_record(
+        &mut self,
+        type_id: TypeId,
+        is_error: bool,
+        named_args: &[NamedArg],
+    ) -> Result<Value, InterpFlow> {
+        let (schema, values) = if let Some(schema) = self.resolve_struct_schema(&type_id) {
+            let mut values = vec![Value::Nil; schema.field_count()];
+            for arg in named_args {
+                let val = self.eval_expr(&arg.value)?;
+                if let Some(idx) = schema.index_of(&arg.name) {
+                    values[idx] = val;
+                }
+            }
+            (schema, values)
+        } else {
+            let mut names = Vec::with_capacity(named_args.len());
+            let mut values = Vec::with_capacity(named_args.len());
+            for arg in named_args {
+                names.push(arg.name.clone());
+                values.push(self.eval_expr(&arg.value)?);
+            }
+            (StructSchema::new(type_id, names), values)
+        };
+        Ok(if is_error {
+            Value::Error { schema, values }
+        } else {
+            Value::Struct { schema, values }
+        })
     }
 
     fn substitute_runtime_type(ty: &Type, bindings: &HashMap<String, Type>) -> Type {
@@ -931,9 +1008,7 @@ impl Interpreter {
             _ => 64,
         };
         let mut out = String::with_capacity(capacity);
-        match encode_with_plan(val, "", &mut out, &|tid| {
-            self.resolve_json_encode_schema(tid)
-        }) {
+        match encode_with_struct_schemas(val, "", &mut out) {
             Ok(()) => Value::String(out),
             Err((path, msg)) => make_encode_error(path, msg),
         }
@@ -961,14 +1036,11 @@ impl Interpreter {
             Err((path, msg)) => Ok(make_decode_error(path, msg)),
         }
     }
-
-    // JSON only reads its input. Borrow simple places for the duration of the
-    // call; effectful expressions still use the usual evaluation path once.
+    
     fn json_argument_ref(&self, expr: &Expr) -> Option<&Value> {
         match &expr.kind {
             ExprKind::Ident(name) => self.lookup_variable_ref(name),
             ExprKind::Member { target, field } => {
-                // Member evaluation gives module aliases precedence over locals.
                 if let ExprKind::Ident(alias) = &target.kind {
                     if self.module_imports.get(&self.current_module)
                         .is_some_and(|imports| imports.contains_key(alias))
@@ -977,7 +1049,7 @@ impl Interpreter {
                     }
                 }
                 match self.json_argument_ref(target)? {
-                    Value::Struct { fields, .. } | Value::Error { fields, .. } => fields.get(field),
+                    v @ (Value::Struct { .. } | Value::Error { .. }) => v.field(field),
                     _ => None,
                 }
             }
@@ -1688,23 +1760,12 @@ impl Interpreter {
                     let is_error = cur_errors.map(|e| e.contains(name)).unwrap_or(false);
 
                     if is_struct || is_error || matches!(name.as_str(), "IndexError" | "KeyError" | "ParseError") {
-                        let mut fields = HashMap::new();
-                        for arg in named_args {
-                            fields.insert(arg.name.clone(), self.eval_expr(&arg.value)?);
-                        }
-                        return Ok(if is_struct {
-                            Value::Struct {
-                                type_id: TypeId::from_module_opt(self.current_module.as_ref(), name.clone()),
-                                fields,
-                            }
+                        let type_id = if is_struct || is_error {
+                            TypeId::from_module_opt(self.current_module.as_ref(), name.clone())
                         } else {
-                            let type_id = if is_error {
-                                TypeId::from_module_opt(self.current_module.as_ref(), name.clone())
-                            } else {
-                                TypeId::builtin(name)
-                            };
-                            Value::Error { type_id, fields }
-                        });
+                            TypeId::builtin(name)
+                        };
+                        return self.construct_record(type_id, !is_struct, named_args);
                     }
                     if name == "Map" && args.is_empty() && named_args.is_empty() {
                         return Ok(Value::Map(OrderedMap::new()));
@@ -1826,21 +1887,11 @@ impl Interpreter {
                                     };
 
                                     if is_constructible {
-                                        let mut fields = HashMap::new();
-                                        for arg in named_args {
-                                            fields.insert(arg.name.clone(), self.eval_expr(&arg.value)?);
-                                        }
-                                        if is_error {
-                                            return Ok(Value::Error {
-                                                type_id: TypeId::native(nat_name.clone(), field.clone()),
-                                                fields,
-                                            });
-                                        } else {
-                                            return Ok(Value::Struct {
-                                                type_id: TypeId::native(nat_name.clone(), field.clone()),
-                                                fields,
-                                            });
-                                        }
+                                        return self.construct_record(
+                                            TypeId::native(nat_name.clone(), field.clone()),
+                                            is_error,
+                                            named_args,
+                                        );
                                     }
 
                                     let func_impl = {
@@ -1874,25 +1925,12 @@ impl Interpreter {
                                         .map(|e| e.contains(field))
                                         .unwrap_or(false);
 
-                                    if is_struct {
-                                        let mut fields = HashMap::new();
-                                        for arg in named_args {
-                                            fields.insert(arg.name.clone(), self.eval_expr(&arg.value)?);
-                                        }
-                                        return Ok(Value::Struct {
-                                            type_id: TypeId::local(path.clone(), field.clone()),
-                                            fields,
-                                        });
-                                    }
-                                    if is_error {
-                                        let mut fields = HashMap::new();
-                                        for arg in named_args {
-                                            fields.insert(arg.name.clone(), self.eval_expr(&arg.value)?);
-                                        }
-                                        return Ok(Value::Error {
-                                            type_id: TypeId::local(path.clone(), field.clone()),
-                                            fields,
-                                        });
+                                    if is_struct || is_error {
+                                        return self.construct_record(
+                                            TypeId::local(path.clone(), field.clone()),
+                                            is_error,
+                                            named_args,
+                                        );
                                     }
 
                                     let mut evaluated = Vec::new();
@@ -1913,6 +1951,14 @@ impl Interpreter {
                             || (field == "remove" && args.len() == 1))
                     {
                         return self.eval_mutating_method_on_place(target, field, args);
+                    }
+
+                    if args.is_empty() {
+                        if let Some(target_ref) = self.json_argument_ref(target) {
+                            if let Some(res) = Self::eval_zero_arg_method_on_ref(target_ref, field, expr.span)? {
+                                return Ok(res);
+                            }
+                        }
                     }
 
                     let target_val = self.eval_expr(target)?;
@@ -1942,12 +1988,15 @@ impl Interpreter {
             }
             ExprKind::Member { target, field } => {
                 if let ExprKind::Ident(ref alias) = target.kind {
-                    let cur_imports = self.module_imports.get(&self.current_module).cloned();
-                    if let Some(target_mod) = cur_imports.and_then(|m| m.get(alias).cloned()) {
+                    if let Some(target_mod) = self
+                        .module_imports
+                        .get(&self.current_module)
+                        .and_then(|m| m.get(alias))
+                    {
                         match target_mod {
                             ModuleTarget::Native(nat_name) => {
                                 return Ok(Value::NativeFunction {
-                                    module: nat_name,
+                                    module: nat_name.clone(),
                                     name: field.clone(),
                                 });
                             }
@@ -1958,8 +2007,12 @@ impl Interpreter {
                     }
                 }
 
+                if let Some(target_ref) = self.json_argument_ref(target) {
+                    return Self::eval_member_on_value(target_ref, field, expr.span);
+                }
+
                 let target_val = self.eval_expr(target)?;
-                self.eval_member_on_value(target_val, field, expr.span)
+                Self::eval_member_on_value(&target_val, field, expr.span)
             }
             ExprKind::OptionalMember { target, field } => {
                 let target_val = self.eval_expr(target)?;
@@ -1969,20 +2022,102 @@ impl Interpreter {
                 if target_val.is_error() {
                     return Err(InterpFlow::Return(target_val));
                 }
-                self.eval_member_on_value(target_val, field, expr.span)
+                Self::eval_member_on_value(&target_val, field, expr.span)
             }
         }
     }
 
+    fn eval_zero_arg_method_on_ref(
+        target_val: &Value,
+        field: &str,
+        call_span: Span,
+    ) -> Result<Option<Value>, InterpFlow> {
+        let res = match target_val {
+            Value::Int(n) => match field {
+                "to_string" => Value::String(n.to_string()),
+                "to_float" => Value::Float(*n as f64),
+                _ => return Ok(None),
+            },
+            Value::Float(f) => match field {
+                "floor" => checked_float_to_int(f.floor(), call_span)?,
+                "ceil" => checked_float_to_int(f.ceil(), call_span)?,
+                "round" => checked_float_to_int(f.round(), call_span)?,
+                "trunc" => checked_float_to_int(f.trunc(), call_span)?,
+                "to_string" => Value::String(f.to_string()),
+                "is_nan" => Value::Bool(f.is_nan()),
+                "is_infinite" => Value::Bool(f.is_infinite()),
+                "is_finite" => Value::Bool(f.is_finite()),
+                _ => return Ok(None),
+            },
+            Value::Bool(b) => match field {
+                "to_string" => Value::String(b.to_string()),
+                _ => return Ok(None),
+            },
+            Value::String(s) => match field {
+                "trim" => Value::String(s.trim().to_string()),
+                "lower" => Value::String(s.to_lowercase()),
+                "upper" => Value::String(s.to_uppercase()),
+                "to_string" => Value::String(s.clone()),
+                "len" => Value::Int(s.len() as i64),
+                "char_count" => Value::Int(s.chars().count() as i64),
+                "to_int" => match s.parse::<i64>() {
+                    Ok(n) => Value::Int(n),
+                    Err(e) => make_parse_error(s, format!("Invalid Int '{}': {}", s, e)),
+                },
+                "to_float" => match s.parse::<f64>() {
+                    Ok(f) if f.is_finite() => Value::Float(f),
+                    Ok(_) => make_parse_error(
+                        s,
+                        format!("Invalid Float '{}': non-finite value is not allowed", s),
+                    ),
+                    Err(e) => make_parse_error(s, format!("Invalid Float '{}': {}", s, e)),
+                },
+                _ => return Ok(None),
+            },
+            Value::List(items) => match field {
+                "len" => Value::Int(items.len() as i64),
+                "reverse" => {
+                    let mut rev = items.clone();
+                    rev.reverse();
+                    Value::List(rev)
+                }
+                "enumerate" => {
+                    let enumerated = items
+                        .iter()
+                        .enumerate()
+                        .map(|(i, item)| Value::Tuple(vec![Value::Int(i as i64), item.clone()]))
+                        .collect();
+                    Value::List(enumerated)
+                }
+                _ => return Ok(None),
+            },
+            Value::Map(map) => match field {
+                "len" => Value::Int(map.len() as i64),
+                "keys" => Value::List(map.keys()),
+                "values" => Value::List(map.values()),
+                "entries" => {
+                    let list = map
+                        .entries()
+                        .iter()
+                        .map(|(k, v)| Value::Tuple(vec![k.to_value(), v.clone()]))
+                        .collect();
+                    Value::List(list)
+                }
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+        Ok(Some(res))
+    }
+
     fn eval_member_on_value(
-        &self,
-        target_val: Value,
+        target_val: &Value,
         field: &str,
         span: Span,
     ) -> Result<Value, InterpFlow> {
         match target_val {
-            Value::Struct { ref fields, .. } | Value::Error { ref fields, .. } => {
-                if let Some(val) = fields.get(field) {
+            Value::Struct { .. } | Value::Error { .. } => {
+                if let Some(val) = target_val.field(field) {
                     Ok(val.clone())
                 } else {
                     Err(RuntimeError {
@@ -2385,9 +2520,9 @@ impl Interpreter {
                 let target = self.resolve_pattern_type(name);
                 let matched = match (val, target) {
                     (
-                        Value::Struct { type_id, .. } | Value::Error { type_id, .. },
+                        Value::Struct { schema, .. } | Value::Error { schema, .. },
                         ResolvedPatternType::Custom(ref pat_id),
-                    ) => type_id == pat_id,
+                    ) => &schema.type_id == pat_id,
                     (Value::Native(nat), ResolvedPatternType::Custom(ref pat_id)) => {
                         &nat.type_id() == pat_id
                     }

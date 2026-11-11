@@ -1,42 +1,9 @@
 use std::fmt::Write as _;
-use std::sync::Arc;
 
 use super::{
     JsonValue, join_field_path, join_index_path, join_key_path, prepend_error_path, write_json_node,
 };
-use crate::types::TypeId;
 use crate::value::{MapKey, Value};
-
-#[derive(Debug)]
-struct JsonEncodeField {
-    source_name: String,
-    json_name: String,
-    key_prefix: String,
-}
-
-#[derive(Debug)]
-pub(crate) struct JsonEncodeSchema {
-    fields: Vec<JsonEncodeField>,
-}
-
-impl JsonEncodeSchema {
-    pub(crate) fn new(fields: Vec<(String, String)>) -> Self {
-        let fields = fields
-            .into_iter()
-            .map(|(source_name, json_name)| {
-                let mut key_prefix = String::with_capacity(json_name.len().saturating_add(3));
-                write_escaped_string(&json_name, &mut key_prefix);
-                key_prefix.push(':');
-                JsonEncodeField {
-                    source_name,
-                    json_name,
-                    key_prefix,
-                }
-            })
-            .collect();
-        Self { fields }
-    }
-}
 
 pub(super) fn write_escaped_string(s: &str, out: &mut String) {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
@@ -44,7 +11,6 @@ pub(super) fn write_escaped_string(s: &str, out: &mut String) {
     let mut chunk_start = 0;
     for (index, &byte) in s.as_bytes().iter().enumerate() {
         if byte == b'"' || byte == b'\\' || byte < 0x20 {
-            // Escapable bytes are ASCII, so these slices end on UTF-8 boundaries.
             out.push_str(&s[chunk_start..index]);
             match byte {
                 b'"' => out.push_str("\\\""),
@@ -67,11 +33,10 @@ pub(super) fn write_escaped_string(s: &str, out: &mut String) {
     out.push('"');
 }
 
-pub(crate) fn encode_with_plan(
+pub fn encode_with_struct_schemas(
     val: &Value,
     path: &str,
     out: &mut String,
-    resolve: &dyn Fn(&TypeId) -> Option<Arc<JsonEncodeSchema>>,
 ) -> Result<(), (String, String)> {
     match val {
         Value::Nil => out.push_str("null"),
@@ -102,7 +67,7 @@ pub(crate) fn encode_with_plan(
                 if index > 0 {
                     out.push(',');
                 }
-                encode_with_plan(item, "", out, resolve).map_err(|(child, message)| {
+                encode_with_struct_schemas(item, "", out).map_err(|(child, message)| {
                     (
                         prepend_error_path(join_index_path(path, index), &child),
                         message,
@@ -128,7 +93,7 @@ pub(crate) fn encode_with_plan(
                 }
                 write_escaped_string(key_str, out);
                 out.push(':');
-                encode_with_plan(value, "", out, resolve).map_err(|(child, message)| {
+                encode_with_struct_schemas(value, "", out).map_err(|(child, message)| {
                     (
                         prepend_error_path(join_key_path(path, key), &child),
                         message,
@@ -137,30 +102,23 @@ pub(crate) fn encode_with_plan(
             }
             out.push('}');
         }
-        Value::Struct { type_id, fields } => {
+        Value::Struct { schema, values } => {
             out.push('{');
-            let schema = resolve(type_id).unwrap_or_else(|| {
-                let mut names: Vec<String> = fields.keys().cloned().collect();
-                names.sort();
-                Arc::new(JsonEncodeSchema::new(
-                    names.into_iter().map(|name| (name.clone(), name)).collect(),
-                ))
-            });
-            let mut first = true;
-            for field in &schema.fields {
-                if let Some(value) = fields.get(&field.source_name) {
-                    if !first {
-                        out.push(',');
-                    }
-                    first = false;
-                    out.push_str(&field.key_prefix);
-                    encode_with_plan(value, "", out, resolve).map_err(|(child, message)| {
-                        (
-                            prepend_error_path(join_field_path(path, &field.json_name), &child),
-                            message,
-                        )
-                    })?;
+            let prefixes = schema.json_prefixes();
+            let json_names = schema.json_names();
+            for (index, ((prefix, json_name), value)) in
+                prefixes.iter().zip(json_names.iter()).zip(values.iter()).enumerate()
+            {
+                if index > 0 {
+                    out.push(',');
                 }
+                out.push_str(prefix);
+                encode_with_struct_schemas(value, "", out).map_err(|(child, message)| {
+                    (
+                        prepend_error_path(join_field_path(path, json_name), &child),
+                        message,
+                    )
+                })?;
             }
             out.push('}');
         }
@@ -193,15 +151,16 @@ pub(crate) fn encode_with_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use crate::types::TypeId;
+    use crate::value::StructSchema;
 
     #[test]
     fn sliced_escaping_preserves_unicode_and_appends_to_existing_output() {
         let mut out = "prefix:".to_string();
-        write_escaped_string("București😀/\"\\\u{8}\u{C}\n\r\t\0\u{B}\u{1F}終", &mut out);
+        write_escaped_string("Ok😀/\"\\\u{8}\u{C}\n\r\t\0\u{B}\u{1F}終", &mut out);
         assert_eq!(
             out,
-            "prefix:\"București😀/\\\"\\\\\\b\\f\\n\\r\\t\\u0000\\u000B\\u001F終\""
+            "prefix:\"Ok😀/\\\"\\\\\\b\\f\\n\\r\\t\\u0000\\u000B\\u001F終\""
         );
         write_escaped_string("", &mut out);
         assert!(out.ends_with("終\"\"\""));
@@ -233,7 +192,7 @@ mod tests {
     fn floats_inspect_only_appended_bytes_and_preserve_signed_zero() {
         for value in [0.0, -0.0, 1.0, -2.0, 1.5, 1e30, 1e-30, f64::MIN, f64::MAX] {
             let mut out = "previous.eE:".to_string();
-            encode_with_plan(&Value::Float(value), "", &mut out, &|_| None).unwrap();
+            encode_with_struct_schemas(&Value::Float(value), "", &mut out).unwrap();
             let mut formatted = value.to_string();
             if !formatted.contains(['.', 'e', 'E']) {
                 formatted.push_str(".0");
@@ -241,12 +200,12 @@ mod tests {
             assert_eq!(out, format!("previous.eE:{}", formatted));
         }
         let mut out = String::new();
-        encode_with_plan(&Value::Float(-0.0), "", &mut out, &|_| None).unwrap();
+        encode_with_struct_schemas(&Value::Float(-0.0), "", &mut out).unwrap();
         assert_eq!(out, "-0.0");
         for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let mut out = "prefix".to_string();
-            let error =
-                encode_with_plan(&Value::Float(value), "root", &mut out, &|_| None).unwrap_err();
+            let error = encode_with_struct_schemas(&Value::Float(value), "root", &mut out)
+                .unwrap_err();
             assert_eq!(
                 error,
                 (
@@ -261,46 +220,47 @@ mod tests {
     #[test]
     fn encoded_key_prefixes_preserve_names_quoting_order_and_error_paths() {
         let type_id = TypeId::program("Tagged");
-        let schema = Arc::new(JsonEncodeSchema::new(vec![
-            ("missing".into(), "skip".into()),
-            ("second".into(), "a\"b\\\n\u{1F}😀".into()),
-            ("first".into(), "".into()),
-        ]));
-        let resolve = |_: &TypeId| Some(Arc::clone(&schema));
+        let schema = StructSchema::with_json_names(
+            type_id.clone(),
+            vec![
+                ("second".into(), "a\"b\\\n\u{1F}😀".into()),
+                ("first".into(), "".into()),
+            ],
+        );
         let value = Value::Struct {
-            type_id: type_id.clone(),
-            fields: HashMap::from([
-                ("first".into(), Value::Int(1)),
-                ("second".into(), Value::Int(2)),
-            ]),
+            schema,
+            values: vec![Value::Int(2), Value::Int(1)],
         };
         let mut out = "prefix:".to_string();
-        encode_with_plan(&value, "", &mut out, &resolve).unwrap();
+        encode_with_struct_schemas(&value, "", &mut out).unwrap();
         assert_eq!(out, "prefix:{\"a\\\"b\\\\\\n\\u001F😀\":2,\"\":1}");
 
         let value = Value::Struct {
-            type_id,
-            fields: HashMap::from([("second".into(), Value::Function("f".into()))]),
+            schema: StructSchema::with_json_names(
+                type_id,
+                vec![("second".into(), "a\"b\\\n\u{1F}😀".into())],
+            ),
+            values: vec![Value::Function("f".into())],
         };
-        let error = encode_with_plan(&value, "items[0]", &mut String::new(), &resolve).unwrap_err();
+        let error = encode_with_struct_schemas(&value, "items[0]", &mut String::new()).unwrap_err();
         assert_eq!(error.0, join_field_path("items[0]", "a\"b\\\n\u{1F}😀"));
     }
 
     #[test]
-    fn fallback_struct_fields_are_sorted_and_maps_keep_insertion_order() {
+    fn struct_fields_preserve_schema_order_and_maps_keep_insertion_order() {
         let value = Value::Struct {
-            type_id: TypeId::program("Fallback"),
-            fields: HashMap::from([("z".into(), Value::Int(1)), ("a".into(), Value::Int(2))]),
+            schema: StructSchema::new(TypeId::program("Ordered"), ["z".into(), "a".into()]),
+            values: vec![Value::Int(1), Value::Int(2)],
         };
         let mut out = String::new();
-        encode_with_plan(&value, "", &mut out, &|_| None).unwrap();
-        assert_eq!(out, "{\"a\":2,\"z\":1}");
+        encode_with_struct_schemas(&value, "", &mut out).unwrap();
+        assert_eq!(out, "{\"z\":1,\"a\":2}");
 
         let mut map = crate::value::OrderedMap::new();
         map.set(MapKey::String("z".into()), Value::Int(1));
         map.set(MapKey::String("a".into()), Value::Int(2));
         out.clear();
-        encode_with_plan(&Value::Map(map), "", &mut out, &|_| None).unwrap();
+        encode_with_struct_schemas(&Value::Map(map), "", &mut out).unwrap();
         assert_eq!(out, "{\"z\":1,\"a\":2}");
     }
 }
