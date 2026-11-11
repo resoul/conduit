@@ -96,6 +96,15 @@ import cdt.time as time
 
 ---
 
+## Canonical Type Identity & Import Aliases
+
+Every `type` and `error` in Conduit is uniquely identified by its canonical declaring module path together with its declaration name. Import aliases only affect how a symbol is spelled locally:
+
+- Importing the same module under two aliases (`import "./users" as u1` and `import "./users" as u2`) yields the exact same canonical type, so `u1.User` and `u2.User` are interchangeable across assignments, function calls, and `switch` patterns.
+- Same-named declarations in distinct modules (such as `a.User` and `b.User`) remain strictly separate, incompatible types at both compile time and runtime. Struct schemas used by `cdt.validation.check` also follow canonical identity and never collide across modules.
+
+---
+
 ## Cycle Detection
 
 Conduit statically analyzes the module dependency graph before type checking. If cyclic dependencies exist (e.g., `A -> B -> C -> A`), the compiler halts immediately with a clear dependency trace:

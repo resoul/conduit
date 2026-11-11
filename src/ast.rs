@@ -72,6 +72,10 @@ pub enum ExprKind {
         target: Box<Expr>,
         field: String,
     },
+    Index {
+        target: Box<Expr>,
+        index: Box<Expr>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

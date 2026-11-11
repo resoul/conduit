@@ -1,4 +1,69 @@
-use crate::ast::TypeExpr;
+use std::path::PathBuf;
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ModuleId {
+    Builtin,
+    Program,
+    Local(PathBuf),
+    Native(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TypeId {
+    pub module: ModuleId,
+    pub name: String,
+}
+
+impl TypeId {
+    pub fn builtin(name: impl Into<String>) -> Self {
+        Self {
+            module: ModuleId::Builtin,
+            name: name.into(),
+        }
+    }
+
+    pub fn program(name: impl Into<String>) -> Self {
+        Self {
+            module: ModuleId::Program,
+            name: name.into(),
+        }
+    }
+
+    pub fn local(path: impl Into<PathBuf>, name: impl Into<String>) -> Self {
+        Self {
+            module: ModuleId::Local(path.into()),
+            name: name.into(),
+        }
+    }
+
+    pub fn native(module: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            module: ModuleId::Native(module.into()),
+            name: name.into(),
+        }
+    }
+
+    pub fn from_module_opt(module: Option<&PathBuf>, name: impl Into<String>) -> Self {
+        match module {
+            Some(path) => Self::local(path.clone(), name),
+            None => Self::program(name),
+        }
+    }
+}
+
+impl std::fmt::Display for TypeId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.module {
+            ModuleId::Builtin | ModuleId::Program | ModuleId::Local(_) => {
+                write!(f, "{}", self.name)
+            }
+            ModuleId::Native(mod_name) => {
+                let short = mod_name.strip_prefix("cdt.").unwrap_or(mod_name);
+                write!(f, "{}.{}", short, self.name)
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Type {
@@ -9,7 +74,7 @@ pub enum Type {
     Void,
     List(Box<Type>),
     Optional(Box<Type>),
-    Custom(String),
+    Custom(TypeId),
     Tuple(Vec<Type>),
     Union(Vec<Type>),
     Function {
@@ -87,27 +152,9 @@ impl Type {
             return true;
         }
 
-        if let (Type::Custom(s), Type::Custom(d)) = (self, target) {
-            let s_item = s.split('.').last().unwrap_or(s);
-            let d_item = d.split('.').last().unwrap_or(d);
-            if s_item == d_item {
-                let s_mod = s.split_once('.').map(|x| x.0);
-                let d_mod = d.split_once('.').map(|x| x.0);
-                match (s_mod, d_mod) {
-                    (None, _) | (_, None) => return true,
-                    (Some(m1), Some(m2)) => {
-                        if m1 == m2 {
-                            return true;
-                        }
-                        let native_types = [
-                            "Timestamp", "Instant", "Duration", "TimeError",
-                            "Issue", "Violation", "ValidationError",
-                        ];
-                        if native_types.contains(&s_item) {
-                            return true;
-                        }
-                    }
-                }
+        if let Type::Optional(inner) = self {
+            if let Type::Union(_) = target {
+                return inner.is_assignable_to(target) && Type::Nil.is_assignable_to(target);
             }
         }
 
@@ -156,35 +203,5 @@ impl Type {
         }
 
         false
-    }
-
-    pub fn from_type_expr(expr: &TypeExpr) -> Self {
-        match expr {
-            TypeExpr::Named(name) => match name.as_str() {
-                "Int" => Type::Int,
-                "String" => Type::String,
-                "Bool" => Type::Bool,
-                "Void" => Type::Void,
-                custom => Type::Custom(custom.to_string()),
-            },
-            TypeExpr::List(inner) => Type::List(Box::new(Self::from_type_expr(inner))),
-            TypeExpr::Optional(inner) => Type::Optional(Box::new(Self::from_type_expr(inner))),
-            TypeExpr::Union(variants) => {
-                let types = variants.iter().map(Self::from_type_expr).collect();
-                Self::union(types)
-            }
-            TypeExpr::Tuple(elements) => {
-                let types = elements.iter().map(Self::from_type_expr).collect();
-                Type::Tuple(types)
-            }
-            TypeExpr::Func { params, return_type } => {
-                let p = params.iter().map(Self::from_type_expr).collect();
-                let r = Box::new(Self::from_type_expr(return_type));
-                Type::Function {
-                    params: p,
-                    return_type: r,
-                }
-            }
-        }
     }
 }

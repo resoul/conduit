@@ -48,5 +48,14 @@ func main() {
 
     squares := generate_squares(6)
     print("Squares (1..6): {squares}")
+
+    first_pos := positives.get(0) ?? -1
+    print("First positive (.get): {first_pos}")
+    switch squares[10] {
+        case Int(v):
+            print("Square[10]: {v}")
+        case IndexError(err):
+            print("Out of bounds: {err.message}")
+    }
 }
 

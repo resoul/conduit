@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::types::Type;
+use crate::types::{Type, TypeId};
 use crate::value::Value;
 
 pub mod time;
 pub mod validation;
 
 pub trait NativeValue: std::fmt::Debug + Send + Sync {
+    fn type_id(&self) -> TypeId;
     fn type_name(&self) -> &'static str;
     fn display(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result;
     fn as_any(&self) -> &dyn std::any::Any;

@@ -948,6 +948,17 @@ impl Parser {
                     },
                     span,
                 );
+            } else if self.match_token(&TokenKind::LBracket) {
+                let span = expr.span;
+                let index = self.parse_expr()?;
+                self.expect(&TokenKind::RBracket)?;
+                expr = Expr::new(
+                    ExprKind::Index {
+                        target: Box::new(expr),
+                        index: Box::new(index),
+                    },
+                    span,
+                );
             } else if self.match_token(&TokenKind::Dot) {
                 let span = expr.span;
                 let (field, _) = self.expect_ident()?;

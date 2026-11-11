@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use super::{NativeFuncDef, NativeModule, NativeTypeDef};
-use crate::types::Type;
+use crate::types::{Type, TypeId};
 use crate::value::Value;
 
 pub fn make_issue(code: impl Into<String>, message: impl Into<String>) -> Value {
@@ -9,7 +9,7 @@ pub fn make_issue(code: impl Into<String>, message: impl Into<String>) -> Value 
     fields.insert("code".to_string(), Value::String(code.into()));
     fields.insert("message".to_string(), Value::String(message.into()));
     Value::Error {
-        name: "validation.Issue".to_string(),
+        type_id: TypeId::native("cdt.validation", "Issue"),
         fields,
     }
 }
@@ -20,7 +20,7 @@ pub fn make_violation(path: impl Into<String>, code: impl Into<String>, message:
     fields.insert("code".to_string(), Value::String(code.into()));
     fields.insert("message".to_string(), Value::String(message.into()));
     Value::Struct {
-        name: "validation.Violation".to_string(),
+        type_id: TypeId::native("cdt.validation", "Violation"),
         fields,
     }
 }
@@ -29,7 +29,7 @@ pub fn make_validation_error(violations: Vec<Value>) -> Value {
     let mut fields = HashMap::new();
     fields.insert("issues".to_string(), Value::List(violations));
     Value::Error {
-        name: "validation.ValidationError".to_string(),
+        type_id: TypeId::native("cdt.validation", "ValidationError"),
         fields,
     }
 }
@@ -66,9 +66,9 @@ pub fn create_validation_module() -> NativeModule {
         "Standard library for schema validation and field rules",
     );
 
-    let issue_ty = Type::Custom("validation.Issue".to_string());
-    let violation_ty = Type::Custom("validation.Violation".to_string());
-    let validation_error_ty = Type::Custom("validation.ValidationError".to_string());
+    let issue_ty = Type::Custom(TypeId::native("cdt.validation", "Issue"));
+    let violation_ty = Type::Custom(TypeId::native("cdt.validation", "Violation"));
+    let validation_error_ty = Type::Custom(TypeId::native("cdt.validation", "ValidationError"));
 
     module.add_type(NativeTypeDef {
         name: "Issue",
@@ -98,7 +98,6 @@ pub fn create_validation_module() -> NativeModule {
         fields: vec![("issues", Type::List(Box::new(violation_ty)))],
     });
 
-    // min(value, min_val)
     module.add_function(NativeFuncDef {
         name: "min",
         doc: "Validates that a numeric value, string character count, or list element count meets a minimum bound (inclusive)",
@@ -173,7 +172,6 @@ pub fn create_validation_module() -> NativeModule {
         },
     });
 
-    // max(value, max_val)
     module.add_function(NativeFuncDef {
         name: "max",
         doc: "Validates that a numeric value, string character count, or list element count does not exceed a maximum bound (inclusive)",
@@ -248,7 +246,6 @@ pub fn create_validation_module() -> NativeModule {
         },
     });
 
-    // email(value)
     module.add_function(NativeFuncDef {
         name: "email",
         doc: "Validates that a string conforms to basic email address format (local@domain.tld)",
@@ -268,7 +265,6 @@ pub fn create_validation_module() -> NativeModule {
         },
     });
 
-    // check(value: T) -> T | validation.ValidationError
     module.add_function(NativeFuncDef {
         name: "check",
         doc: "Validates a value and all its nested fields against declared annotations, returning the value or an aggregated ValidationError",
@@ -276,7 +272,6 @@ pub fn create_validation_module() -> NativeModule {
         return_type: Type::union(vec![Type::Any, validation_error_ty]),
         is_validator: false,
         implementation: |_args| {
-            // Handled specially by the interpreter runtime
             Ok(Value::Void)
         },
     });

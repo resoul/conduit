@@ -5,6 +5,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
+## [0.1.6] - 2026-11-11
+
+### Added & Changed
+
+* **Canonical Type Identity Across Compiler & Runtime**:
+  * Replaced suffix and short-name matching with canonical `TypeId` (`ModuleId` + type name) distinguishing `Builtin`, `Program`, canonical `Local(PathBuf)`, and `Native(String)` modules.
+  * Updated `TypeChecker`, `Value::Struct` / `Value::Error`, `NativeValue`, `switch` pattern matching, native method lookup, and validation schema resolution (`module_struct_fields`) to use canonical `TypeId`.
+  * Two types with identical names declared in different modules (e.g. `a.User` vs `b.User`) are now strictly distinct and incompatible across compile-time checks, runtime `switch`, and `cdt.validation.check`.
+  * Importing the same module under different aliases consistently resolves to the exact same canonical type.
+
+* **Safe List Indexing & Prelude `IndexError`**:
+  * Added list index operator `list[index]` returning `T | IndexError` for `[T]` with `Int` index.
+  * Added prelude error `IndexError { index: Int, length: Int, message: String }` (available without imports). Both `index < 0` and `index >= list.len()` produce `IndexError`.
+  * Added `list.get(index: Int) -> T?` returning `nil` for out-of-bounds or negative indices without double-wrapping `U?` elements.
+  * Updated `ReachabilityAnalyzer` and parser postfix chaining to support indexed expressions (such as `err.issues[0]?` and `matrix[r]?[c]?`).
+
 ## [0.1.5] - 2026-11-10
 
 ### Added

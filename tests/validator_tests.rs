@@ -838,6 +838,11 @@ fn test_criterion_12_try_operator_and_error_propagation() {
             return validation.check(candidate)?
         }
 
+        func first_issue_code(err: validation.ValidationError) -> String | IndexError {
+            first := err.issues[0]?
+            return first.code
+        }
+
         func main() {
             // Case 1: valid age returns Person
             p1 := create_person(21)
@@ -859,11 +864,7 @@ fn test_criterion_12_try_operator_and_error_propagation() {
                     if e.issues.len() != 1 {
                         div := 1 / 0
                     }
-                    c := ""
-                    for iss in e.issues {
-                        c = iss.code
-                    }
-                    if c != "min" {
+                    if first_issue_code(e) != "min" {
                         div := 1 / 0
                     }
             }

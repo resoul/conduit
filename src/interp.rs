@@ -5,7 +5,8 @@ use crate::ast::*;
 use crate::lexer::Span;
 use crate::loader::{ModuleLoader, ModuleTarget};
 use crate::native::NativeRegistry;
-use crate::value::Value;
+use crate::types::{ModuleId, TypeId};
+use crate::value::{make_index_error, Value};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeError {
@@ -256,14 +257,16 @@ impl Interpreter {
         }
     }
 
-    fn find_struct_fields(&self, name: &str) -> Option<(Option<PathBuf>, Vec<crate::ast::FieldDef>)> {
-        let short_name = name.split('.').last().unwrap_or(name);
-        for ((decl_mod, s_name), fields) in &self.module_struct_fields {
-            if s_name == short_name {
-                return Some((decl_mod.clone(), fields.clone()));
-            }
-        }
-        None
+    fn find_struct_fields(&self, type_id: &TypeId) -> Option<(Option<PathBuf>, Vec<crate::ast::FieldDef>)> {
+        let decl_mod = match &type_id.module {
+            ModuleId::Program => None,
+            ModuleId::Local(path) => Some(path.clone()),
+            ModuleId::Builtin | ModuleId::Native(_) => return None,
+        };
+        let key = (decl_mod.clone(), type_id.name.clone());
+        self.module_struct_fields
+            .get(&key)
+            .map(|fields| (decl_mod, fields.clone()))
     }
 
     fn validate_value_recursive(
@@ -279,8 +282,8 @@ impl Interpreter {
         }
 
         match val {
-            Value::Struct { name, fields } => {
-                if let Some((decl_mod, field_defs)) = self.find_struct_fields(name) {
+            Value::Struct { type_id, fields } => {
+                if let Some((decl_mod, field_defs)) = self.find_struct_fields(type_id) {
                     for f in &field_defs {
                         let field_path = if path.is_empty() {
                             f.name.clone()
@@ -635,7 +638,7 @@ impl Interpreter {
                     Err(InterpFlow::Error(err)) => return Err(err),
                 };
                 for case in cases {
-                    if let Some(bindings) = match_pattern(&case.pattern, &val) {
+                    if let Some(bindings) = self.match_pattern(&case.pattern, &val) {
                         self.enter_scope();
                         for (k, v) in bindings {
                             self.define_variable(k, v);
@@ -702,6 +705,27 @@ impl Interpreter {
                     vals.push(self.eval_expr(e)?);
                 }
                 Ok(Value::List(vals))
+            }
+            ExprKind::Index { target, index } => {
+                let target_val = self.eval_expr(target)?;
+                let index_val = self.eval_expr(index)?;
+                match (target_val, index_val) {
+                    (Value::List(items), Value::Int(idx)) => {
+                        if idx < 0 || (idx as usize) >= items.len() {
+                            Ok(make_index_error(idx, items.len()))
+                        } else {
+                            Ok(items[idx as usize].clone())
+                        }
+                    }
+                    (Value::List(_), other) => Err(RuntimeError {
+                        message: format!("List index must be Int, got {}", other.type_name()),
+                        span: index.span,
+                    }.into()),
+                    (other, _) => Err(RuntimeError {
+                        message: format!("Cannot index into non-list value of type {}", other.type_name()),
+                        span: target.span,
+                    }.into()),
+                }
             }
             ExprKind::Unary { op, expr: inner } => {
                 let val = self.eval_expr(inner)?;
@@ -833,7 +857,7 @@ impl Interpreter {
                             fields.insert(arg.name.clone(), self.eval_expr(&arg.value)?);
                         }
                         return Ok(Value::Struct {
-                            name: name.clone(),
+                            type_id: TypeId::from_module_opt(self.current_module.as_ref(), name.clone()),
                             fields,
                         });
                     }
@@ -843,12 +867,21 @@ impl Interpreter {
                             fields.insert(arg.name.clone(), self.eval_expr(&arg.value)?);
                         }
                         return Ok(Value::Error {
-                            name: name.clone(),
+                            type_id: TypeId::from_module_opt(self.current_module.as_ref(), name.clone()),
                             fields,
                         });
                     }
-
-                    // map(list, callback)
+                    if name == "IndexError" {
+                        let mut fields = HashMap::new();
+                        for arg in named_args {
+                            fields.insert(arg.name.clone(), self.eval_expr(&arg.value)?);
+                        }
+                        return Ok(Value::Error {
+                            type_id: TypeId::builtin("IndexError"),
+                            fields,
+                        });
+                    }
+                    
                     if name == "map" && args.len() == 2 {
                         let list_val = self.eval_expr(&args[0])?;
                         let cb_val = self.eval_expr(&args[1])?;
@@ -866,7 +899,6 @@ impl Interpreter {
                         }
                     }
 
-                    // filter(list, callback)
                     if name == "filter" && args.len() == 2 {
                         let list_val = self.eval_expr(&args[0])?;
                         let cb_val = self.eval_expr(&args[1])?;
@@ -898,8 +930,7 @@ impl Interpreter {
                         return Ok(Value::Void);
                     }
                 }
-
-                // 2. Member call on imported module: `alias.foo(...)`
+                
                 if let ExprKind::Member { target, field } = &callee.kind {
                     if let ExprKind::Ident(ref alias) = target.kind {
                         let cur_imports = self.module_imports.get(&self.current_module).cloned();
@@ -934,12 +965,12 @@ impl Interpreter {
                                         }
                                         if is_error {
                                             return Ok(Value::Error {
-                                                name: format!("{}.{}", alias, field),
+                                                type_id: TypeId::native(nat_name.clone(), field.clone()),
                                                 fields,
                                             });
                                         } else {
                                             return Ok(Value::Struct {
-                                                name: format!("{}.{}", alias, field),
+                                                type_id: TypeId::native(nat_name.clone(), field.clone()),
                                                 fields,
                                             });
                                         }
@@ -982,7 +1013,7 @@ impl Interpreter {
                                             fields.insert(arg.name.clone(), self.eval_expr(&arg.value)?);
                                         }
                                         return Ok(Value::Struct {
-                                            name: format!("{}.{}", alias, field),
+                                            type_id: TypeId::local(path.clone(), field.clone()),
                                             fields,
                                         });
                                     }
@@ -992,12 +1023,11 @@ impl Interpreter {
                                             fields.insert(arg.name.clone(), self.eval_expr(&arg.value)?);
                                         }
                                         return Ok(Value::Error {
-                                            name: format!("{}.{}", alias, field),
+                                            type_id: TypeId::local(path.clone(), field.clone()),
                                             fields,
                                         });
                                     }
 
-                                    // Function in imported module
                                     let mut evaluated = Vec::new();
                                     for a in args {
                                         evaluated.push(self.eval_expr(a)?);
@@ -1010,19 +1040,16 @@ impl Interpreter {
                         }
                     }
 
-                    // 3. Method call on value: `target.method(...)`
                     let target_val = self.eval_expr(target)?;
                     if let Value::Native(ref nat) = target_val {
-                        let short_type = nat.type_name().split('.').last().unwrap_or(nat.type_name());
-                        let method_impl = {
-                            let mut found = None;
-                            for m in self.native_registry.modules() {
-                                if let Some(method_def) = m.methods.get(&(short_type, field.as_str())) {
-                                    found = Some(method_def.implementation);
-                                    break;
-                                }
-                            }
-                            found
+                        let type_id = nat.type_id();
+                        let method_impl = if let ModuleId::Native(ref nat_name) = type_id.module {
+                            self.native_registry
+                                .get_module(nat_name)
+                                .and_then(|m| m.methods.get(&(type_id.name.as_str(), field.as_str())))
+                                .map(|md| md.implementation)
+                        } else {
+                            None
                         };
 
                         if let Some(impl_fn) = method_impl {
@@ -1067,6 +1094,19 @@ impl Interpreter {
                         },
                         Value::List(items) => match field.as_str() {
                             "len" => return Ok(Value::Int(items.len() as i64)),
+                            "get" => {
+                                let idx_val = self.eval_expr(&args[0])?;
+                                if let Value::Int(idx) = idx_val {
+                                    if idx < 0 || (idx as usize) >= items.len() {
+                                        return Ok(Value::Nil);
+                                    }
+                                    return Ok(items[idx as usize].clone());
+                                }
+                                return Err(RuntimeError {
+                                    message: format!("List method 'get' expects Int index, got {}", idx_val.type_name()),
+                                    span: args[0].span,
+                                }.into());
+                            }
                             "contains" => {
                                 let search = self.eval_expr(&args[0])?;
                                 return Ok(Value::Bool(items.contains(&search)));
@@ -1077,7 +1117,6 @@ impl Interpreter {
                     }
                 }
 
-                // 4. General function or callable expression call
                 let callee_val = self.eval_expr(callee)?;
                 let mut evaluated_args = Vec::new();
                 for a in args {
@@ -1123,71 +1162,113 @@ impl Interpreter {
             }
         }
     }
-}
-
-fn match_pattern(pattern: &Pattern, val: &Value) -> Option<Vec<(String, Value)>> {
-    match &pattern.kind {
-        PatternKind::Nil => {
-            if *val == Value::Nil {
-                Some(Vec::new())
-            } else {
-                None
-            }
-        }
-        PatternKind::Type { name, binding } => {
-            let name_item = name.split('.').last().unwrap_or(name);
-            let matched = match val {
-                Value::Struct { name: struct_name, .. } | Value::Error { name: struct_name, .. } => {
-                    let struct_item = struct_name.split('.').last().unwrap_or(struct_name);
-                    struct_name == name
-                        || struct_name.ends_with(&format!(".{}", name))
-                        || name.ends_with(&format!(".{}", struct_name))
-                        || struct_item == name_item
-                }
-                Value::Native(nat) => {
-                    let nat_item = nat.type_name().split('.').last().unwrap_or(nat.type_name());
-                    nat.type_name() == name
-                        || nat.type_name().ends_with(&format!(".{}", name))
-                        || name.ends_with(&format!(".{}", nat.type_name()))
-                        || nat_item == name_item
-                }
-                Value::Int(_) => name == "Int",
-                Value::String(_) => name == "String",
-                Value::Bool(_) => name == "Bool",
-                Value::Void => name == "Void",
-                _ => false,
-            };
-            if matched {
-                Some(vec![(binding.clone(), val.clone())])
-            } else {
-                None
-            }
-        }
-        PatternKind::Tuple(pats) => {
-            if let Value::Tuple(items) = val {
-                if pats.len() == items.len() {
-                    let mut bindings = Vec::new();
-                    for (pat, item) in pats.iter().zip(items) {
-                        match &pat.kind {
-                            PatternKind::Ident(var_name) => {
-                                bindings.push((var_name.clone(), item.clone()));
+    fn resolve_pattern_type(&self, name: &str) -> ResolvedPatternType {
+        match name {
+            "Int" => ResolvedPatternType::Int,
+            "String" => ResolvedPatternType::String,
+            "Bool" => ResolvedPatternType::Bool,
+            "Void" => ResolvedPatternType::Void,
+            _ => {
+                if let Some((alias, item_name)) = name.split_once('.') {
+                    if let Some(target) = self
+                        .module_imports
+                        .get(&self.current_module)
+                        .and_then(|m| m.get(alias))
+                    {
+                        match target {
+                            ModuleTarget::Native(nat_name) => {
+                                return ResolvedPatternType::Custom(TypeId::native(
+                                    nat_name.clone(),
+                                    item_name,
+                                ));
                             }
-                            PatternKind::Wildcard => {}
-                            _ => return None,
+                            ModuleTarget::Local(path) => {
+                                return ResolvedPatternType::Custom(TypeId::local(
+                                    path.clone(),
+                                    item_name,
+                                ));
+                            }
                         }
                     }
-                    return Some(bindings);
+                    ResolvedPatternType::Unknown
+                } else if name == "IndexError" {
+                    ResolvedPatternType::Custom(TypeId::builtin("IndexError"))
+                } else {
+                    ResolvedPatternType::Custom(TypeId::from_module_opt(
+                        self.current_module.as_ref(),
+                        name,
+                    ))
                 }
             }
-            None
-        }
-        PatternKind::Ident(var_name) => {
-            Some(vec![(var_name.clone(), val.clone())])
-        }
-        PatternKind::Wildcard => {
-            Some(Vec::new())
         }
     }
+
+    fn match_pattern(&self, pattern: &Pattern, val: &Value) -> Option<Vec<(String, Value)>> {
+        match &pattern.kind {
+            PatternKind::Nil => {
+                if *val == Value::Nil {
+                    Some(Vec::new())
+                } else {
+                    None
+                }
+            }
+            PatternKind::Type { name, binding } => {
+                let target = self.resolve_pattern_type(name);
+                let matched = match (val, target) {
+                    (
+                        Value::Struct { type_id, .. } | Value::Error { type_id, .. },
+                        ResolvedPatternType::Custom(ref pat_id),
+                    ) => type_id == pat_id,
+                    (Value::Native(nat), ResolvedPatternType::Custom(ref pat_id)) => {
+                        &nat.type_id() == pat_id
+                    }
+                    (Value::Int(_), ResolvedPatternType::Int) => true,
+                    (Value::String(_), ResolvedPatternType::String) => true,
+                    (Value::Bool(_), ResolvedPatternType::Bool) => true,
+                    (Value::Void, ResolvedPatternType::Void) => true,
+                    _ => false,
+                };
+                if matched {
+                    Some(vec![(binding.clone(), val.clone())])
+                } else {
+                    None
+                }
+            }
+            PatternKind::Tuple(pats) => {
+                if let Value::Tuple(items) = val {
+                    if pats.len() == items.len() {
+                        let mut bindings = Vec::new();
+                        for (pat, item) in pats.iter().zip(items) {
+                            match &pat.kind {
+                                PatternKind::Ident(var_name) => {
+                                    bindings.push((var_name.clone(), item.clone()));
+                                }
+                                PatternKind::Wildcard => {}
+                                _ => return None,
+                            }
+                        }
+                        return Some(bindings);
+                    }
+                }
+                None
+            }
+            PatternKind::Ident(var_name) => {
+                Some(vec![(var_name.clone(), val.clone())])
+            }
+            PatternKind::Wildcard => {
+                Some(Vec::new())
+            }
+        }
+    }
+}
+
+enum ResolvedPatternType {
+    Int,
+    String,
+    Bool,
+    Void,
+    Custom(TypeId),
+    Unknown,
 }
 
 #[cfg(test)]

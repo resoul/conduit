@@ -3,13 +3,17 @@ use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
 
 use super::{NativeFuncDef, NativeMethodDef, NativeModule, NativeTypeDef, NativeValue};
-use crate::types::Type;
+use crate::types::{Type, TypeId};
 use crate::value::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timestamp(pub SystemTime);
 
 impl NativeValue for Timestamp {
+    fn type_id(&self) -> TypeId {
+        TypeId::native("cdt.time", "Timestamp")
+    }
+
     fn type_name(&self) -> &'static str {
         "time.Timestamp"
     }
@@ -35,6 +39,10 @@ impl NativeValue for Timestamp {
 pub struct Instant(pub StdInstant);
 
 impl NativeValue for Instant {
+    fn type_id(&self) -> TypeId {
+        TypeId::native("cdt.time", "Instant")
+    }
+
     fn type_name(&self) -> &'static str {
         "time.Instant"
     }
@@ -60,6 +68,10 @@ impl NativeValue for Instant {
 pub struct Duration(pub StdDuration);
 
 impl NativeValue for Duration {
+    fn type_id(&self) -> TypeId {
+        TypeId::native("cdt.time", "Duration")
+    }
+
     fn type_name(&self) -> &'static str {
         "time.Duration"
     }
@@ -85,7 +97,7 @@ pub fn make_time_error(message: impl Into<String>) -> Value {
     let mut fields = HashMap::new();
     fields.insert("message".to_string(), Value::String(message.into()));
     Value::Error {
-        name: "time.TimeError".to_string(),
+        type_id: TypeId::native("cdt.time", "TimeError"),
         fields,
     }
 }
@@ -93,10 +105,10 @@ pub fn make_time_error(message: impl Into<String>) -> Value {
 pub fn create_time_module() -> NativeModule {
     let mut module = NativeModule::new("cdt.time", "time", "Standard library for system and monotonic time operations");
 
-    let timestamp_ty = Type::Custom("time.Timestamp".to_string());
-    let instant_ty = Type::Custom("time.Instant".to_string());
-    let duration_ty = Type::Custom("time.Duration".to_string());
-    let time_error_ty = Type::Custom("time.TimeError".to_string());
+    let timestamp_ty = Type::Custom(TypeId::native("cdt.time", "Timestamp"));
+    let instant_ty = Type::Custom(TypeId::native("cdt.time", "Instant"));
+    let duration_ty = Type::Custom(TypeId::native("cdt.time", "Duration"));
+    let time_error_ty = Type::Custom(TypeId::native("cdt.time", "TimeError"));
 
     module.add_type(NativeTypeDef {
         name: "Timestamp",
