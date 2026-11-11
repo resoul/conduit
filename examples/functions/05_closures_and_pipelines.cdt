@@ -1,0 +1,32 @@
+func add_one(x: Int) -> Int {
+    return x + 1
+}
+
+func double(x: Int) -> Int {
+    return x * 2
+}
+
+func make_multiplier(factor: Int) -> (Int) -> Int {
+    return func(x: Int) -> Int {
+        return x * factor
+    }
+}
+
+func main() {
+    // Pipelines with named functions and lambdas
+    piped := 10 |> double |> add_one |> func(x: Int) -> Int { return x + 100 }
+    print("pipeline result = " + piped.to_string())
+
+    // Higher-order list transformations with anonymous functions
+    nums := [1, 2, 3, 4, 5, 6]
+    evens := nums |> filter(func(x: Int) -> Bool { return x % 2 == 0 })
+    squared := map(evens, func(x: Int) -> Int { return x * x })
+    print("even squares = {squared}")
+
+    // Lexical closure capturing outer binding by value snapshot
+    var factor = 3
+    times3 := make_multiplier(factor)
+    factor = 100
+    print("times3(7) = " + times3(7).to_string())
+}
+

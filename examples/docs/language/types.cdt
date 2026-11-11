@@ -26,5 +26,11 @@ func main() {
     pt := Point(x: 10, y: 20)
     print(pt.x)
     print(pt.y)
+
+    // String length (bytes vs Unicode scalar values), splitting, and .to_string()
+    label := "café"
+    print(label.len().to_string() + ":" + label.char_count().to_string())
+    parts := "red,green".split(",")
+    print(parts.len())
 }
 

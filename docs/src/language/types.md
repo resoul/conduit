@@ -18,6 +18,35 @@ Conduit features built-in primitive types:
 
 ---
 
+### String Methods & Length Semantics
+
+`String` values expose methods for inspection, transformation, and splitting:
+
+| Method | Signature | Behavior |
+| :--- | :--- | :--- |
+| `.len()` | `() -> Int` | Returns **UTF-8 byte length** (`O(1)`). Use `.char_count()` when counting characters. |
+| `.char_count()` | `() -> Int` | Returns the count of **Unicode scalar values** (`"café".char_count() == 4`, whereas `"café".len() == 5`). |
+| `.trim()` | `() -> String` | Strips leading and trailing whitespace. |
+| `.lower()` / `.upper()` | `() -> String` | Converts ASCII/Unicode text to lowercase or uppercase. |
+| `.contains(sub)` | `(String) -> Bool` | Checks whether `sub` occurs in the string. |
+| `.starts_with(prefix)` | `(String) -> Bool` | Checks whether the string begins with `prefix`. |
+| `.ends_with(suffix)` | `(String) -> Bool` | Checks whether the string ends with `suffix`. |
+| `.split(sep)` | `(String) -> [String]` | Splits on `sep` (returns `[s]` if `sep` is not found; `[""]` when `s == ""` and `sep != ""`). |
+| `.replace(from, to)` | `(String, String) -> String` | Replaces all occurrences of `from` with `to` (returns the original string unchanged when `from == ""`). |
+| `.to_string()` | `() -> String` | Identity conversion on `String`. |
+
+> **Note:** `cdt.validation` constraints `min` and `max` measure string character count in Unicode scalar values (matching `.char_count()`), while `String.len()` returns raw UTF-8 bytes.
+
+### Explicit `.to_string()` Conversion
+
+Conduit never performs implicit string coercion with `+`. Convert `Int` or `Bool` explicitly via `.to_string()`:
+
+```conduit
+count := 42
+ok := true
+msg := "count=" + count.to_string() + ", ok=" + ok.to_string()
+```
+
 ## Optional Types (`T?`) and `nil`
 
 Any type can be marked as optional by appending a question mark `?`:
@@ -101,5 +130,7 @@ true
 25
 10
 20
+5:4
+2
 ```
 

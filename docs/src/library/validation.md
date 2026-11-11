@@ -106,10 +106,10 @@ Validation caught violations:
 ### Functions
 
 #### `min(value, min_val) -> Void | validation.Issue`
-- Validates that a numeric value, string character count (Unicode scalar values), or list element count meets a minimum bound (inclusive).
+- Validates that a numeric value, string character count (**Unicode scalar values**, matching `.char_count()` rather than `.len()` UTF-8 bytes), or list element count meets a minimum bound (inclusive).
 
 #### `max(value, max_val) -> Void | validation.Issue`
-- Validates that a numeric value, string character count, or list element count does not exceed a maximum bound (inclusive).
+- Validates that a numeric value, string character count (**Unicode scalar values**, matching `.char_count()` rather than `.len()` UTF-8 bytes), or list element count does not exceed a maximum bound (inclusive).
 
 #### `email(value: String) -> Void | validation.Issue`
 - Validates that a string conforms to basic email format (non-empty local part, single `@`, and valid domain with dot).

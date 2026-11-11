@@ -11,6 +11,12 @@ func greet(name: String) {
     print("Welcome, " + name)
 }
 
+func make_adder(base: Int) -> (Int) -> Int {
+    return func(x: Int) -> Int {
+        return base + x
+    }
+}
+
 func main() {
     sum := add(15, 27)
     print(sum)
@@ -20,5 +26,13 @@ func main() {
     print(res)
 
     greet("Explorer")
+
+    // Anonymous function (lambda) passed inline
+    product := apply_binary(func(x: Int, y: Int) -> Int { return x * y }, 6, 7)
+    print(product)
+
+    // Lexical closure capturing `base` by value snapshot
+    add10 := make_adder(10)
+    print(add10(5))
 }
 

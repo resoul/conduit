@@ -45,7 +45,7 @@
     },
     {
       "name": "support.function.builtin.conduit",
-      "match": "\\b(print)\\b"
+      "match": "\\b(print|map|filter)\\b"
     },
     {
       "name": "constant.numeric.integer.conduit",

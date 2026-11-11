@@ -16,21 +16,24 @@ pub struct ReachabilityReport {
     pub unused_functions_count: usize,
 }
 
+fn paths_match(candidate: &Path, target: &Path, norm_target: &Path) -> bool {
+    candidate == target
+        || candidate == norm_target
+        || normalize_path(candidate) == norm_target
+        || candidate.ends_with(target)
+        || target.ends_with(candidate)
+        || (candidate.file_name().is_some() && candidate.file_name() == target.file_name())
+}
+
 impl ReachabilityReport {
     pub fn is_function_reachable(&self, module: &Path, func_name: &str) -> bool {
         if self.reachable_functions.contains(&(module.to_path_buf(), func_name.to_string())) {
             return true;
         }
         let norm_module = normalize_path(module);
-        self.reachable_functions.iter().any(|(p, name)| {
-            name == func_name
-                && (p == module
-                    || p == &norm_module
-                    || normalize_path(p) == norm_module
-                    || p.ends_with(module)
-                    || module.ends_with(p)
-                    || (p.file_name().is_some() && p.file_name() == module.file_name()))
-        })
+        self.reachable_functions
+            .iter()
+            .any(|(p, name)| name == func_name && paths_match(p, module, &norm_module))
     }
 
     pub fn is_native_function_reachable(&self, module_name: &str, func_name: &str) -> bool {
@@ -59,13 +62,7 @@ fn lookup_module<'m>(modules: &'m HashMap<PathBuf, LoadedModule>, path: &Path) -
         return Some(m);
     }
     for (p, m) in modules {
-        if p == path
-            || p == &norm
-            || normalize_path(p) == norm
-            || p.ends_with(path)
-            || path.ends_with(p)
-            || (p.file_name().is_some() && p.file_name() == path.file_name())
-        {
+        if paths_match(p, path, &norm) {
             return Some(m);
         }
     }
@@ -303,6 +300,15 @@ impl<'a> ReachabilityAnalyzer<'a> {
                 for e in elems {
                     self.scan_expr(e, current_mod_path, loaded_mod, worklist);
                 }
+            }
+            ExprKind::Closure { params, return_type, body } => {
+                for p in params {
+                    self.scan_type_expr(&p.ty, current_mod_path, loaded_mod, worklist);
+                }
+                if let Some(rt) = return_type {
+                    self.scan_type_expr(rt, current_mod_path, loaded_mod, worklist);
+                }
+                self.scan_block(body, current_mod_path, loaded_mod, worklist);
             }
             ExprKind::Int(_) | ExprKind::String(_) | ExprKind::Bool(_) | ExprKind::Nil => {}
         }

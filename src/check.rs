@@ -1187,15 +1187,54 @@ impl TypeChecker {
     ) -> Result<Type, TypeError> {
         if target_ty == &Type::String {
             match field {
-                "len" if args.is_empty() => return Ok(Type::Int),
-                "trim" | "lower" | "upper" if args.is_empty() => return Ok(Type::String),
-                "contains" if args.len() == 1 => {
+                "len" | "char_count" if args.is_empty() => return Ok(Type::Int),
+                "trim" | "lower" | "upper" | "to_string" if args.is_empty() => {
+                    return Ok(Type::String);
+                }
+                "contains" | "starts_with" | "ends_with" if args.len() == 1 => {
                     let arg_ty = self.check_expr(&args[0])?;
                     if arg_ty == Type::String {
                         return Ok(Type::Bool);
                     }
+                    return Err(TypeError {
+                        message: format!("String method '{}()' expects String argument, got {}", field, arg_ty),
+                        span: args[0].span,
+                    });
+                }
+                "split" if args.len() == 1 => {
+                    let arg_ty = self.check_expr(&args[0])?;
+                    if arg_ty == Type::String {
+                        return Ok(Type::List(Box::new(Type::String)));
+                    }
+                    return Err(TypeError {
+                        message: format!("String method 'split()' expects String argument, got {}", arg_ty),
+                        span: args[0].span,
+                    });
+                }
+                "replace" if args.len() == 2 => {
+                    let from_ty = self.check_expr(&args[0])?;
+                    if from_ty != Type::String {
+                        return Err(TypeError {
+                            message: format!("String method 'replace()' expects String for first argument, got {}", from_ty),
+                            span: args[0].span,
+                        });
+                    }
+                    let to_ty = self.check_expr(&args[1])?;
+                    if to_ty != Type::String {
+                        return Err(TypeError {
+                            message: format!("String method 'replace()' expects String for second argument, got {}", to_ty),
+                            span: args[1].span,
+                        });
+                    }
+                    return Ok(Type::String);
                 }
                 _ => {}
+            }
+        }
+
+        if target_ty == &Type::Int || target_ty == &Type::Bool {
+            if field == "to_string" && args.is_empty() {
+                return Ok(Type::String);
             }
         }
 
@@ -1399,6 +1438,55 @@ impl TypeChecker {
                     });
                 }
                 Ok(Type::union(vec![elem_ty, Type::Custom(TypeId::builtin("IndexError"))]))
+            }
+            ExprKind::Closure { params, return_type, body } => {
+                let mut param_types = Vec::with_capacity(params.len());
+                for p in params {
+                    let ty = self.resolve_type_expr(&p.ty, p.span)?;
+                    param_types.push((p.name.clone(), ty));
+                }
+                let ret_ty = match return_type.as_ref() {
+                    Some(rt) => self.resolve_type_expr(rt, expr.span)?,
+                    None => Type::Void,
+                };
+
+                let can_fallthrough_void = match &ret_ty {
+                    Type::Void => true,
+                    Type::Union(vars) => vars.contains(&Type::Void),
+                    _ => false,
+                };
+                if !can_fallthrough_void && !block_always_returns(body) {
+                    return Err(TypeError {
+                        message: format!(
+                            "Closure must return a value of type '{}' on all reachable paths",
+                            ret_ty
+                        ),
+                        span: expr.span,
+                    });
+                }
+
+                let prev_return_type = self.current_return_type.replace(ret_ty.clone());
+                let prev_loop_depth = self.loop_depth;
+                self.loop_depth = 0;
+
+                self.enter_scope();
+                for (param_name, param_ty) in &param_types {
+                    self.define_variable(param_name.clone(), param_ty.clone(), expr.span);
+                }
+
+                let body_res = self.check_block(body);
+                let exit_res = self.exit_scope();
+
+                self.loop_depth = prev_loop_depth;
+                self.current_return_type = prev_return_type;
+
+                body_res?;
+                exit_res?;
+
+                Ok(Type::Function {
+                    params: param_types.into_iter().map(|(_, t)| t).collect(),
+                    return_type: Box::new(ret_ty),
+                })
             }
             ExprKind::Unary { op, expr: inner } => {
                 let inner_ty = self.check_expr(inner)?;

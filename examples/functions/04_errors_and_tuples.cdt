@@ -1,0 +1,76 @@
+type User {
+    name: String
+    email: String
+}
+
+error InvalidUserName {
+    message: String
+}
+
+error InvalidEmail {
+    email: String
+}
+
+error DivisionByZero {}
+
+func create_user(name: String, email: String) -> User | InvalidUserName | InvalidEmail {
+    guard name.trim().len() > 0 else {
+        return InvalidUserName(message: "Name is required")
+    }
+    guard email.contains("@") else {
+        return InvalidEmail(email: email)
+    }
+    return User(name: name, email: email)
+}
+
+func register(name: String, email: String) -> User | InvalidUserName | InvalidEmail {
+    user := create_user(name, email)?
+    return user
+}
+
+func divide(a: Int, b: Int) -> (Int, Int) | DivisionByZero {
+    guard b != 0 else {
+        return DivisionByZero()
+    }
+    return (a / b, a % b)
+}
+
+func quotient(a: Int, b: Int) -> Int | DivisionByZero {
+    (q, _) := divide(a, b)?
+    return q
+}
+
+func main() {
+    switch register("Alice", "alice@example.com") {
+        case User(u):
+            print("Registered: {u.name} <{u.email}>")
+        case InvalidUserName(err):
+            print("Name error: {err.message}")
+        case InvalidEmail(err):
+            print("Email error: {err.email}")
+    }
+
+    switch register("", "bad-email") {
+        case User(u):
+            print("Registered: {u.name}")
+        case InvalidUserName(err):
+            print("Caught expected error: {err.message}")
+        case InvalidEmail(err):
+            print("Email error: {err.email}")
+    }
+
+    switch divide(17, 5) {
+        case (q, r):
+            print("17 / 5 -> q={q}, r={r}")
+        case DivisionByZero(err):
+            print("Division by zero")
+    }
+
+    switch quotient(100, 0) {
+        case Int(v):
+            print("Quotient: {v}")
+        case DivisionByZero(err):
+            print("Propagated DivisionByZero cleanly")
+    }
+}
+

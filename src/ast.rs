@@ -76,6 +76,11 @@ pub enum ExprKind {
         target: Box<Expr>,
         index: Box<Expr>,
     },
+    Closure {
+        params: Vec<Param>,
+        return_type: Option<TypeExpr>,
+        body: Block,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
