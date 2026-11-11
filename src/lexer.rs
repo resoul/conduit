@@ -22,6 +22,7 @@ pub enum TokenKind {
     KwIf,
     KwElse,
     KwFor,
+    KwWhile,
     KwIn,
     KwVar,
     KwType,
@@ -59,6 +60,7 @@ pub enum TokenKind {
     Slash,
     Percent,
     QuestionQuestion,
+    QuestionDot,
     Question,
     DotDot,
     Dot,
@@ -276,6 +278,7 @@ impl<'a> Lexer<'a> {
             "if" => TokenKind::KwIf,
             "else" => TokenKind::KwElse,
             "for" => TokenKind::KwFor,
+            "while" => TokenKind::KwWhile,
             "in" => TokenKind::KwIn,
             "var" => TokenKind::KwVar,
             "type" => TokenKind::KwType,
@@ -334,6 +337,9 @@ impl<'a> Lexer<'a> {
                 if self.peek_char() == Some('?') {
                     self.bump_char();
                     TokenKind::QuestionQuestion
+                } else if self.peek_char() == Some('.') {
+                    self.bump_char();
+                    TokenKind::QuestionDot
                 } else {
                     TokenKind::Question
                 }

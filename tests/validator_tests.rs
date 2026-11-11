@@ -351,7 +351,7 @@ fn test_criterion_5_optional_field_validation() {
                     if e.issues.len() != 1 {
                         err := 1 / 0
                     }
-                    p := ""
+                    var p = ""
                     for iss in e.issues {
                         p = iss.path
                     }
@@ -418,13 +418,13 @@ fn test_criterion_6_validation_check_flow_and_order() {
                     if err.issues.len() != 3 {
                         div := 1 / 0
                     }
-                    idx := 0
-                    c0 := ""
-                    p0 := ""
-                    c1 := ""
-                    p1 := ""
-                    c2 := ""
-                    p2 := ""
+                    var idx = 0
+                    var c0 = ""
+                    var p0 = ""
+                    var c1 = ""
+                    var p1 = ""
+                    var c2 = ""
+                    var p2 = ""
                     for iss in err.issues {
                         if idx == 0 {
                             c0 = iss.code
@@ -511,10 +511,10 @@ fn test_criterion_7_nested_paths_and_lists() {
                     if err.issues.len() != 3 {
                         div := 1 / 0
                     }
-                    idx := 0
-                    p0 := ""
-                    p1 := ""
-                    p2 := ""
+                    var idx = 0
+                    var p0 = ""
+                    var p1 = ""
+                    var p2 = ""
                     for iss in err.issues {
                         if idx == 0 {
                             p0 = iss.path
@@ -643,15 +643,15 @@ fn test_criterion_9_min_max_and_email_rules() {
                     if err.issues.len() != 4 {
                         div := 1 / 0
                     }
-                    idx := 0
-                    c0 := ""
-                    p0 := ""
-                    c1 := ""
-                    p1 := ""
-                    c2 := ""
-                    p2 := ""
-                    c3 := ""
-                    p3 := ""
+                    var idx = 0
+                    var c0 = ""
+                    var p0 = ""
+                    var c1 = ""
+                    var p1 = ""
+                    var c2 = ""
+                    var p2 = ""
+                    var c3 = ""
+                    var p3 = ""
                     for iss in err.issues {
                         if idx == 0 {
                             c0 = iss.code

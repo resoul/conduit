@@ -47,6 +47,20 @@ pub struct ModuleInfo {
     pub imports: HashMap<String, ModuleTarget>,
 }
 
+#[derive(Debug, Clone)]
+struct VarBinding {
+    base_ty: Type,
+    is_mutable: bool,
+    span: Span,
+    used: bool,
+}
+
+enum OptionalChainTarget {
+    Optional(Type),
+    Fallible(Vec<Type>, Vec<Type>),
+    Invalid,
+}
+
 pub struct TypeChecker {
     pub native_registry: NativeRegistry,
     pub module_info: HashMap<PathBuf, ModuleInfo>,
@@ -55,7 +69,9 @@ pub struct TypeChecker {
     pub structs: HashMap<String, StructSignature>,
     pub errors: HashSet<String>,
     pub imports: HashMap<String, ModuleTarget>,
-    scopes: Vec<HashMap<String, (Type, Span, bool)>>,
+    scopes: Vec<HashMap<String, VarBinding>>,
+    narrowed: HashMap<String, Type>,
+    widened_outer_vars: Vec<(usize, HashSet<String>)>,
     current_return_type: Option<Type>,
     current_type_params: Vec<String>,
     loop_depth: usize,
@@ -72,6 +88,8 @@ impl TypeChecker {
             errors: HashSet::new(),
             imports: HashMap::new(),
             scopes: Vec::new(),
+            narrowed: HashMap::new(),
+            widened_outer_vars: Vec::new(),
             current_return_type: None,
             current_type_params: Vec::new(),
             loop_depth: 0,
@@ -97,11 +115,14 @@ impl TypeChecker {
 
     fn exit_scope(&mut self) -> Result<(), TypeError> {
         if let Some(scope) = self.scopes.pop() {
-            for (name, (ty, span, used)) in scope {
-                if !used && !name.starts_with('_') && self.contains_error(&ty) {
+            for (name, binding) in scope {
+                if !binding.used && !name.starts_with('_') && self.contains_error(&binding.base_ty) {
                     return Err(TypeError {
-                        message: format!("Unused variable '{}' of error type '{}' must be handled", name, ty),
-                        span,
+                        message: format!(
+                            "Unused variable '{}' of error type '{}' must be handled",
+                            name, binding.base_ty
+                        ),
+                        span: binding.span,
                     });
                 }
             }
@@ -109,20 +130,172 @@ impl TypeChecker {
         Ok(())
     }
 
-    fn define_variable(&mut self, name: String, ty: Type, span: Span) {
+    fn define_variable(&mut self, name: String, ty: Type, is_mutable: bool, span: Span) {
+        self.narrowed.remove(&name);
         if let Some(current_scope) = self.scopes.last_mut() {
-            current_scope.insert(name, (ty, span, false));
+            current_scope.insert(
+                name,
+                VarBinding {
+                    base_ty: ty,
+                    is_mutable,
+                    span,
+                    used: false,
+                },
+            );
+        }
+    }
+
+    fn define_used_variable(&mut self, name: String, ty: Type, is_mutable: bool, span: Span) {
+        self.narrowed.remove(&name);
+        if let Some(current_scope) = self.scopes.last_mut() {
+            current_scope.insert(
+                name,
+                VarBinding {
+                    base_ty: ty,
+                    is_mutable,
+                    span,
+                    used: true,
+                },
+            );
         }
     }
 
     fn lookup_variable(&mut self, name: &str) -> Option<Type> {
         for scope in self.scopes.iter_mut().rev() {
-            if let Some((ty, _, used)) = scope.get_mut(name) {
-                *used = true;
-                return Some(ty.clone());
+            if let Some(binding) = scope.get_mut(name) {
+                binding.used = true;
+                if let Some(narrowed_ty) = self.narrowed.get(name) {
+                    return Some(narrowed_ty.clone());
+                }
+                return Some(binding.base_ty.clone());
             }
         }
         None
+    }
+
+    fn lookup_variable_binding_mut(&mut self, name: &str) -> Option<(usize, &mut VarBinding)> {
+        let len = self.scopes.len();
+        for (rev_idx, scope) in self.scopes.iter_mut().rev().enumerate() {
+            if let Some(binding) = scope.get_mut(name) {
+                binding.used = true;
+                return Some((len - 1 - rev_idx, binding));
+            }
+        }
+        None
+    }
+
+    fn lookup_effective_type_unmarked(&self, name: &str) -> Option<Type> {
+        for scope in self.scopes.iter().rev() {
+            if let Some(binding) = scope.get(name) {
+                if let Some(narrowed_ty) = self.narrowed.get(name) {
+                    return Some(narrowed_ty.clone());
+                }
+                return Some(binding.base_ty.clone());
+            }
+        }
+        None
+    }
+
+    fn narrowed_non_nil_type(ty: &Type) -> Option<Type> {
+        match ty {
+            Type::Optional(inner) => Some(inner.as_ref().clone()),
+            Type::Union(variants) if variants.contains(&Type::Nil) => {
+                let remaining: Vec<Type> = variants
+                    .iter()
+                    .filter(|v| *v != &Type::Nil)
+                    .cloned()
+                    .collect();
+                if remaining.is_empty() {
+                    None
+                } else {
+                    Some(Type::union(remaining))
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn type_may_be_nil(ty: &Type) -> bool {
+        match ty {
+            Type::Nil | Type::Optional(_) | Type::Any => true,
+            Type::Union(variants) => variants.iter().any(Self::type_may_be_nil),
+            _ => false,
+        }
+    }
+
+    fn extract_nil_check_var(left: &Expr, right: &Expr) -> Option<String> {
+        match (&left.kind, &right.kind) {
+            (ExprKind::Ident(name), ExprKind::Nil) | (ExprKind::Nil, ExprKind::Ident(name)) => {
+                Some(name.clone())
+            }
+            _ => None,
+        }
+    }
+
+    fn extract_non_nil_vars(expr: &Expr, expect_true: bool) -> Vec<String> {
+        match &expr.kind {
+            ExprKind::Binary { op: BinaryOp::NotEq, left, right } if expect_true => {
+                Self::extract_nil_check_var(left, right).into_iter().collect()
+            }
+            ExprKind::Binary { op: BinaryOp::Eq, left, right } if !expect_true => {
+                Self::extract_nil_check_var(left, right).into_iter().collect()
+            }
+            ExprKind::Unary { op: UnaryOp::Not, expr: inner } => {
+                Self::extract_non_nil_vars(inner, !expect_true)
+            }
+            ExprKind::Binary { op: BinaryOp::And, left, right } if expect_true => {
+                let mut vars = Self::extract_non_nil_vars(left, true);
+                vars.extend(Self::extract_non_nil_vars(right, true));
+                vars
+            }
+            ExprKind::Binary { op: BinaryOp::Or, left, right } if !expect_true => {
+                let mut vars = Self::extract_non_nil_vars(left, false);
+                vars.extend(Self::extract_non_nil_vars(right, false));
+                vars
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn apply_non_nil_narrowings(&mut self, names: &[String]) {
+        for name in names {
+            if let Some(cur_ty) = self.lookup_effective_type_unmarked(name) {
+                if let Some(non_nil) = Self::narrowed_non_nil_type(&cur_ty) {
+                    self.narrowed.insert(name.clone(), non_nil);
+                }
+            }
+        }
+    }
+
+    fn mark_widened(&mut self, name: &str, def_scope_idx: usize) {
+        self.narrowed.remove(name);
+        for (branch_depth, widened_set) in &mut self.widened_outer_vars {
+            if def_scope_idx < *branch_depth {
+                widened_set.insert(name.to_string());
+            }
+        }
+    }
+
+    fn check_narrowed_block(&mut self, narrow_vars: &[String], block: &Block) -> Result<(), TypeError> {
+        let saved_narrowed = self.narrowed.clone();
+        let branch_depth = self.scopes.len();
+        self.widened_outer_vars.push((branch_depth, HashSet::new()));
+        self.apply_non_nil_narrowings(narrow_vars);
+
+        self.enter_scope();
+        let res = self.check_block(block);
+        let exit_res = self.exit_scope();
+
+        let (_, widened_set) = self.widened_outer_vars.pop().unwrap_or_default();
+        self.narrowed = saved_narrowed;
+        if !block_always_exits_branch(block) {
+            for name in widened_set {
+                self.narrowed.remove(&name);
+            }
+        }
+        res?;
+        exit_res?;
+        Ok(())
     }
 
     fn current_module_id(&self) -> ModuleId {
@@ -143,7 +316,16 @@ impl TypeChecker {
         for p in type_params {
             if matches!(
                 p.as_str(),
-                "Int" | "String" | "Bool" | "Void" | "Nil" | "Map" | "IndexError" | "KeyError"
+                "Int"
+                    | "Float"
+                    | "String"
+                    | "Bool"
+                    | "Void"
+                    | "Nil"
+                    | "Map"
+                    | "IndexError"
+                    | "KeyError"
+                    | "ParseError"
             ) {
                 return Err(TypeError {
                     message: format!("Type parameter cannot use built-in name '{}'", p),
@@ -168,11 +350,38 @@ impl TypeChecker {
         }
     }
 
+    fn is_locally_declared_type(
+        &self,
+        name: &str,
+        current_module: &ModuleId,
+        local_types: Option<&HashSet<String>>,
+    ) -> bool {
+        if let Some(set) = local_types {
+            if set.contains(name) {
+                return true;
+            }
+        }
+        match current_module {
+            ModuleId::Program => self.structs.contains_key(name),
+            ModuleId::Local(path) => {
+                if self.current_module_path.as_deref() == Some(path.as_path()) {
+                    self.structs.contains_key(name)
+                } else {
+                    self.module_info
+                        .get(path)
+                        .map_or(false, |info| info.structs.contains_key(name))
+                }
+            }
+            ModuleId::Builtin | ModuleId::Native(_) => false,
+        }
+    }
+
     fn resolve_target_type_id(
         &self,
         name: &str,
         current_module: &ModuleId,
         imports: &HashMap<String, ModuleTarget>,
+        local_types: Option<&HashSet<String>>,
         span: Span,
     ) -> Result<TypeId, TypeError> {
         if let Some((alias, item_name)) = name.split_once('.') {
@@ -184,7 +393,9 @@ impl TypeChecker {
                 ModuleTarget::Native(nat_name) => Ok(TypeId::native(nat_name.clone(), item_name)),
                 ModuleTarget::Local(path) => Ok(TypeId::local(path.clone(), item_name)),
             }
-        } else if name == "IndexError" || name == "KeyError" {
+        } else if matches!(name, "IndexError" | "KeyError" | "ParseError")
+            && !self.is_locally_declared_type(name, current_module, local_types)
+        {
             Ok(TypeId::builtin(name))
         } else {
             Ok(TypeId {
@@ -200,6 +411,7 @@ impl TypeChecker {
         current_module: &ModuleId,
         imports: &HashMap<String, ModuleTarget>,
         type_params: &[String],
+        local_types: Option<&HashSet<String>>,
         span: Span,
     ) -> Result<Type, TypeError> {
         match name {
@@ -216,7 +428,7 @@ impl TypeChecker {
                 if !name.contains('.') && type_params.iter().any(|p| p == name) {
                     return Ok(Type::TypeParam(name.to_string()));
                 }
-                let type_id = self.resolve_target_type_id(name, current_module, imports, span)?;
+                let type_id = self.resolve_target_type_id(name, current_module, imports, local_types, span)?;
                 Ok(Type::Custom(type_id))
             }
         }
@@ -228,11 +440,12 @@ impl TypeChecker {
         current_module: &ModuleId,
         imports: &HashMap<String, ModuleTarget>,
         type_params: &[String],
+        local_types: Option<&HashSet<String>>,
         span: Span,
     ) -> Result<Type, TypeError> {
         match expr {
             TypeExpr::Named(name) => {
-                self.resolve_type_name_in_ctx(name, current_module, imports, type_params, span)
+                self.resolve_type_name_in_ctx(name, current_module, imports, type_params, local_types, span)
             }
             TypeExpr::Generic { name, type_args } => {
                 if name == "Map" {
@@ -250,6 +463,7 @@ impl TypeChecker {
                         current_module,
                         imports,
                         type_params,
+                        local_types,
                         span,
                     )?;
                     Self::validate_map_key_type(&key_ty, span, true)?;
@@ -258,6 +472,7 @@ impl TypeChecker {
                         current_module,
                         imports,
                         type_params,
+                        local_types,
                         span,
                     )?;
                     return Ok(Type::Map(Box::new(key_ty), Box::new(val_ty)));
@@ -268,13 +483,16 @@ impl TypeChecker {
                         span,
                     });
                 }
-                if matches!(name.as_str(), "Int" | "String" | "Bool" | "Void" | "IndexError" | "KeyError") {
+                if matches!(name.as_str(), "Int" | "Float" | "String" | "Bool" | "Void")
+                    || (matches!(name.as_str(), "IndexError" | "KeyError" | "ParseError")
+                        && !self.is_locally_declared_type(name, current_module, local_types))
+                {
                     return Err(TypeError {
                         message: format!("Type '{}' is not generic", name),
                         span,
                     });
                 }
-                let type_id = self.resolve_target_type_id(name, current_module, imports, span)?;
+                let type_id = self.resolve_target_type_id(name, current_module, imports, local_types, span)?;
                 let mut resolved_args = Vec::with_capacity(type_args.len());
                 for ta in type_args {
                     resolved_args.push(self.resolve_type_expr_in_ctx(
@@ -282,6 +500,7 @@ impl TypeChecker {
                         current_module,
                         imports,
                         type_params,
+                        local_types,
                         span,
                     )?);
                 }
@@ -295,6 +514,7 @@ impl TypeChecker {
                 current_module,
                 imports,
                 type_params,
+                local_types,
                 span,
             )?))),
             TypeExpr::Optional(inner) => Ok(Type::Optional(Box::new(self.resolve_type_expr_in_ctx(
@@ -302,6 +522,7 @@ impl TypeChecker {
                 current_module,
                 imports,
                 type_params,
+                local_types,
                 span,
             )?))),
             TypeExpr::Union(variants) => {
@@ -312,6 +533,7 @@ impl TypeChecker {
                         current_module,
                         imports,
                         type_params,
+                        local_types,
                         span,
                     )?);
                 }
@@ -325,6 +547,7 @@ impl TypeChecker {
                         current_module,
                         imports,
                         type_params,
+                        local_types,
                         span,
                     )?);
                 }
@@ -338,6 +561,7 @@ impl TypeChecker {
                         current_module,
                         imports,
                         type_params,
+                        local_types,
                         span,
                     )?);
                 }
@@ -346,6 +570,7 @@ impl TypeChecker {
                     current_module,
                     imports,
                     type_params,
+                    local_types,
                     span,
                 )?);
                 Ok(Type::Function {
@@ -358,7 +583,7 @@ impl TypeChecker {
 
     fn resolve_type_expr(&self, expr: &TypeExpr, span: Span) -> Result<Type, TypeError> {
         let mod_id = self.current_module_id();
-        self.resolve_type_expr_in_ctx(expr, &mod_id, &self.imports, &self.current_type_params, span)
+        self.resolve_type_expr_in_ctx(expr, &mod_id, &self.imports, &self.current_type_params, None, span)
     }
 
     fn lookup_struct_sig_in<'a>(
@@ -404,6 +629,19 @@ impl TypeChecker {
             fields.insert("message".to_string(), Type::String);
             Some((
                 TypeId::builtin("KeyError"),
+                StructSignature {
+                    type_params: Vec::new(),
+                    fields,
+                    field_annotations: HashMap::new(),
+                    is_exported: true,
+                },
+            ))
+        } else if name == "ParseError" {
+            let mut fields = HashMap::new();
+            fields.insert("value".to_string(), Type::String);
+            fields.insert("message".to_string(), Type::String);
+            Some((
+                TypeId::builtin("ParseError"),
                 StructSignature {
                     type_params: Vec::new(),
                     fields,
@@ -757,7 +995,7 @@ impl TypeChecker {
     pub fn is_error_type(&self, ty: &Type) -> bool {
         match ty {
             Type::Custom(type_id) => match &type_id.module {
-                ModuleId::Builtin => matches!(type_id.name.as_str(), "IndexError" | "KeyError"),
+                ModuleId::Builtin => matches!(type_id.name.as_str(), "IndexError" | "KeyError" | "ParseError"),
                 ModuleId::Program => self.errors.contains(&type_id.name),
                 ModuleId::Local(path) => {
                     if Some(path) == self.current_module_path.as_ref() {
@@ -895,6 +1133,13 @@ impl TypeChecker {
                 info.imports.insert(alias.clone(), target.clone());
             }
 
+            let mut local_types = HashSet::new();
+            for item in &loaded_mod.program.items {
+                if let ItemKind::Type { name, .. } | ItemKind::Error { name, .. } = &item.kind {
+                    local_types.insert(name.clone());
+                }
+            }
+
             for item in &loaded_mod.program.items {
                 match &item.kind {
                     ItemKind::Type { name, type_params, fields } => {
@@ -907,6 +1152,7 @@ impl TypeChecker {
                                 &mod_id,
                                 &info.imports,
                                 type_params,
+                                Some(&local_types),
                                 item.span,
                             )?;
                             field_map.insert(f.name.clone(), resolved_ty);
@@ -940,6 +1186,7 @@ impl TypeChecker {
                                 &mod_id,
                                 &info.imports,
                                 &[],
+                                Some(&local_types),
                                 item.span,
                             )?;
                             field_map.insert(f.name.clone(), resolved_ty);
@@ -974,6 +1221,7 @@ impl TypeChecker {
                                 &mod_id,
                                 &info.imports,
                                 type_params,
+                                Some(&local_types),
                                 item.span,
                             )?;
                             param_types.push((p.name.clone(), resolved_ty));
@@ -984,6 +1232,7 @@ impl TypeChecker {
                                 &mod_id,
                                 &info.imports,
                                 type_params,
+                                Some(&local_types),
                                 item.span,
                             )?,
                             None => Type::Void,
@@ -1151,9 +1400,11 @@ impl TypeChecker {
                     self.current_return_type = Some(sig.return_type.clone());
                     self.current_type_params = sig.type_params.clone();
 
+                    self.narrowed.clear();
+                    self.widened_outer_vars.clear();
                     self.enter_scope();
                     for (param_name, param_ty) in sig.params {
-                        self.define_variable(param_name, param_ty, item.span);
+                        self.define_variable(param_name, param_ty, false, item.span);
                     }
 
                     let body_res = self.check_block(body);
@@ -1194,6 +1445,13 @@ impl TypeChecker {
             }
         }
 
+        let mut local_types = HashSet::new();
+        for item in &program.items {
+            if let ItemKind::Type { name, .. } | ItemKind::Error { name, .. } = &item.kind {
+                local_types.insert(name.clone());
+            }
+        }
+
         for item in &program.items {
             match &item.kind {
                 ItemKind::Type { name, type_params, fields } => {
@@ -1204,7 +1462,7 @@ impl TypeChecker {
                     for f in fields {
                         field_map.insert(
                             f.name.clone(),
-                            self.resolve_type_expr_in_ctx(&f.ty, &mod_id, &self.imports, type_params, item.span)?,
+                            self.resolve_type_expr_in_ctx(&f.ty, &mod_id, &self.imports, type_params, Some(&local_types), item.span)?,
                         );
                         ann_map.insert(f.name.clone(), f.annotations.clone());
                     }
@@ -1225,10 +1483,14 @@ impl TypeChecker {
                     );
                 }
                 ItemKind::Error { name, fields } => {
+                    let mod_id = self.current_module_id();
                     let mut field_map = HashMap::new();
                     let mut ann_map = HashMap::new();
                     for f in fields {
-                        field_map.insert(f.name.clone(), self.resolve_type_expr(&f.ty, item.span)?);
+                        field_map.insert(
+                            f.name.clone(),
+                            self.resolve_type_expr_in_ctx(&f.ty, &mod_id, &self.imports, &[], Some(&local_types), item.span)?,
+                        );
                         ann_map.insert(f.name.clone(), f.annotations.clone());
                     }
                     if self.structs.contains_key(name) || self.errors.contains(name) {
@@ -1255,11 +1517,11 @@ impl TypeChecker {
                     for p in params {
                         param_types.push((
                             p.name.clone(),
-                            self.resolve_type_expr_in_ctx(&p.ty, &mod_id, &self.imports, type_params, item.span)?,
+                            self.resolve_type_expr_in_ctx(&p.ty, &mod_id, &self.imports, type_params, Some(&local_types), item.span)?,
                         ));
                     }
                     let ret_type = match return_type.as_ref() {
-                        Some(rt) => self.resolve_type_expr_in_ctx(rt, &mod_id, &self.imports, type_params, item.span)?,
+                        Some(rt) => self.resolve_type_expr_in_ctx(rt, &mod_id, &self.imports, type_params, Some(&local_types), item.span)?,
                         None => Type::Void,
                     };
 
@@ -1345,9 +1607,11 @@ impl TypeChecker {
                 self.current_return_type = Some(sig.return_type.clone());
                 self.current_type_params = sig.type_params.clone();
 
+                self.narrowed.clear();
+                self.widened_outer_vars.clear();
                 self.enter_scope();
                 for (param_name, param_ty) in sig.params {
-                    self.define_variable(param_name, param_ty, item.span);
+                    self.define_variable(param_name, param_ty, false, item.span);
                 }
 
                 let body_res = self.check_block(body);
@@ -1529,11 +1793,111 @@ impl TypeChecker {
         Ok(())
     }
 
+    fn check_lvalue_root_mutability(
+        &mut self,
+        expr: &Expr,
+        for_method: Option<&str>,
+    ) -> Result<(String, usize, Type), TypeError> {
+        let mut cur = expr;
+        loop {
+            match &cur.kind {
+                ExprKind::Member { target, .. } => {
+                    cur = target;
+                }
+                ExprKind::Ident(root_name) => {
+                    if self.imports.contains_key(root_name) {
+                        return Err(TypeError {
+                            message: "Invalid assignment target".to_string(),
+                            span: expr.span,
+                        });
+                    }
+                    if let Some((scope_idx, binding)) = self.lookup_variable_binding_mut(root_name) {
+                        if !binding.is_mutable {
+                            return Err(TypeError {
+                                message: format!("Cannot mutate immutable variable '{}'", root_name),
+                                span: expr.span,
+                            });
+                        }
+                        return Ok((root_name.clone(), scope_idx, binding.base_ty.clone()));
+                    }
+                    return Err(TypeError {
+                        message: format!("Unknown variable '{}'", root_name),
+                        span: expr.span,
+                    });
+                }
+                _ => {
+                    let msg = if let Some(m) = for_method {
+                        format!("Cannot call mutating method '{}()' on non-variable expression", m)
+                    } else {
+                        "Invalid assignment target".to_string()
+                    };
+                    return Err(TypeError {
+                        message: msg,
+                        span: expr.span,
+                    });
+                }
+            }
+        }
+    }
+
+    fn bind_for_pattern(&mut self, pattern: &Pattern, ty: &Type) -> Result<(), TypeError> {
+        match &pattern.kind {
+            PatternKind::Wildcard => {
+                if self.contains_error(ty) {
+                    return Err(TypeError {
+                        message: format!(
+                            "Cannot discard potential error type '{}' with wildcard '_'",
+                            ty
+                        ),
+                        span: pattern.span,
+                    });
+                }
+                Ok(())
+            }
+            PatternKind::Ident(var_name) => {
+                self.define_variable(var_name.clone(), ty.clone(), false, pattern.span);
+                Ok(())
+            }
+            PatternKind::Tuple(sub_pats) => {
+                let elem_types = match ty {
+                    Type::Tuple(elems) => elems,
+                    other => {
+                        return Err(TypeError {
+                            message: format!(
+                                "Cannot destructure non-tuple type '{}' in 'for in' loop",
+                                other
+                            ),
+                            span: pattern.span,
+                        });
+                    }
+                };
+                if sub_pats.len() != elem_types.len() {
+                    return Err(TypeError {
+                        message: format!(
+                            "Tuple size mismatch in 'for in': expected {} elements, got {}",
+                            elem_types.len(),
+                            sub_pats.len()
+                        ),
+                        span: pattern.span,
+                    });
+                }
+                for (sub_pat, elem_ty) in sub_pats.iter().zip(elem_types.iter()) {
+                    self.bind_for_pattern(sub_pat, elem_ty)?;
+                }
+                Ok(())
+            }
+            _ => Err(TypeError {
+                message: "Unsupported pattern in 'for in' loop".to_string(),
+                span: pattern.span,
+            }),
+        }
+    }
+
     fn check_stmt(&mut self, stmt: &Stmt) -> Result<(), TypeError> {
         match &stmt.kind {
             StmtKind::Define { name, value } => {
                 let val_ty = self.check_expr(value)?;
-                self.define_variable(name.clone(), val_ty, stmt.span);
+                self.define_variable(name.clone(), val_ty, false, stmt.span);
             }
             StmtKind::DestructureDefine { pattern, value } => {
                 let val_ty = self.check_expr(value)?;
@@ -1565,7 +1929,7 @@ impl TypeChecker {
                                     }
                                 }
                                 PatternKind::Ident(var_name) => {
-                                    self.define_variable(var_name.clone(), elem_ty.clone(), pat.span);
+                                    self.define_variable(var_name.clone(), elem_ty.clone(), false, pat.span);
                                 }
                                 _ => {
                                     return Err(TypeError {
@@ -1603,29 +1967,72 @@ impl TypeChecker {
                             });
                         }
                     }
-                    self.define_variable(name.clone(), declared_ty.unwrap_or(init_ty), stmt.span);
+                    self.define_variable(name.clone(), declared_ty.unwrap_or(init_ty), true, stmt.span);
                 } else {
                     let ty = declared_ty.ok_or_else(|| TypeError {
                         message: format!("Variable '{}' must have an explicit type or default value", name),
                         span: stmt.span,
                     })?;
-                    self.define_variable(name.clone(), ty, stmt.span);
+                    self.define_variable(name.clone(), ty, true, stmt.span);
                 }
             }
             StmtKind::Assign { target, value } => {
-                if matches!(target.kind, ExprKind::Index { .. }) {
-                    return Err(TypeError {
-                        message: "Index assignment 'list[i] = value' is not supported".to_string(),
-                        span: target.span,
-                    });
+                if let ExprKind::Index { target: container, index } = &target.kind {
+                    let container_ty = self.check_expr(container)?;
+                    match container_ty {
+                        Type::List(_) => {
+                            return Err(TypeError {
+                                message: "Index assignment 'list[i] = value' is not supported".to_string(),
+                                span: target.span,
+                            });
+                        }
+                        Type::Map(key_ty, val_ty) => {
+                            self.check_lvalue_root_mutability(container, None)?;
+                            let index_ty = self.check_expr(index)?;
+                            if !index_ty.is_assignable_to(&key_ty) {
+                                return Err(TypeError {
+                                    message: format!("Map key must be '{}', got '{}'", key_ty, index_ty),
+                                    span: index.span,
+                                });
+                            }
+                            let rhs_ty = self.check_expr(value)?;
+                            if !rhs_ty.is_assignable_to(&val_ty) {
+                                return Err(TypeError {
+                                    message: format!("Cannot assign value of type {} to target of type {}", rhs_ty, val_ty),
+                                    span: value.span,
+                                });
+                            }
+                            return Ok(());
+                        }
+                        other => {
+                            return Err(TypeError {
+                                message: format!("Cannot index into non-list type '{}' (only List and Map support indexing)", other),
+                                span: container.span,
+                            });
+                        }
+                    }
                 }
-                let target_ty = self.check_expr(target)?;
+
+                let (root_name, root_scope_idx, root_base_ty) = self.check_lvalue_root_mutability(target, None)?;
+                let is_direct_ident = matches!(target.kind, ExprKind::Ident(_));
+                let target_ty = if is_direct_ident {
+                    root_base_ty
+                } else {
+                    self.check_expr(target)?
+                };
                 let value_ty = self.check_expr(value)?;
                 if !value_ty.is_assignable_to(&target_ty) {
                     return Err(TypeError {
                         message: format!("Cannot assign value of type {} to target of type {}", value_ty, target_ty),
                         span: value.span,
                     });
+                }
+                if is_direct_ident {
+                    if Self::type_may_be_nil(&value_ty) {
+                        self.mark_widened(&root_name, root_scope_idx);
+                    } else if Self::narrowed_non_nil_type(&target_ty).is_some() {
+                        self.narrowed.insert(root_name, value_ty);
+                    }
                 }
             }
             StmtKind::Return(opt_expr) => {
@@ -1652,14 +2059,28 @@ impl TypeChecker {
                         span: condition.span,
                     });
                 }
-                self.enter_scope();
-                self.check_block(then_block)?;
-                self.exit_scope()?;
+                let then_vars = Self::extract_non_nil_vars(condition, true);
+                let else_vars = Self::extract_non_nil_vars(condition, false);
+
+                self.check_narrowed_block(&then_vars, then_block)?;
 
                 if let Some(eb) = else_block {
+                    let saved_after_then = self.narrowed.clone();
+                    let branch_depth = self.scopes.len();
+                    self.widened_outer_vars.push((branch_depth, HashSet::new()));
+                    self.apply_non_nil_narrowings(&else_vars);
                     self.enter_scope();
-                    self.check_block(eb)?;
-                    self.exit_scope()?;
+                    let res = self.check_block(eb);
+                    let exit_res = self.exit_scope();
+                    let (_, widened_set) = self.widened_outer_vars.pop().unwrap_or_default();
+                    self.narrowed = saved_after_then;
+                    if !block_always_exits_branch(eb) {
+                        for name in widened_set {
+                            self.narrowed.remove(&name);
+                        }
+                    }
+                    res?;
+                    exit_res?;
                 }
             }
             StmtKind::Guard { condition, else_block } => {
@@ -1670,36 +2091,85 @@ impl TypeChecker {
                         span: condition.span,
                     });
                 }
-                self.enter_scope();
-                self.check_block(else_block)?;
-                self.exit_scope()?;
+                let else_vars = Self::extract_non_nil_vars(condition, false);
+                self.check_narrowed_block(&else_vars, else_block)?;
 
-                if !block_always_returns(else_block) {
+                if !block_always_exits_branch(else_block) {
                     return Err(TypeError {
-                        message: "Guard 'else' block must terminate with a 'return' statement".to_string(),
+                        message: "Guard 'else' block must terminate with a 'return', 'break', or 'continue' statement".to_string(),
                         span: else_block.span,
                     });
                 }
+
+                let guard_vars = Self::extract_non_nil_vars(condition, true);
+                self.apply_non_nil_narrowings(&guard_vars);
             }
-            StmtKind::ForIn { variable, iterable, body } => {
+            StmtKind::ForIn { pattern, iterable, body } => {
                 let iter_ty = self.check_expr(iterable)?;
                 let item_ty = match iter_ty {
                     Type::List(inner) => *inner,
+                    Type::Map(k, v) => Type::Tuple(vec![*k, *v]),
                     other => {
                         return Err(TypeError {
-                            message: format!("Expected list in 'for in' loop, got {}", other),
+                            message: format!("Expected List or Map in 'for in' loop, got {}", other),
                             span: iterable.span,
                         });
                     }
                 };
 
+                let saved_narrowed = self.narrowed.clone();
+                let branch_depth = self.scopes.len();
+                self.widened_outer_vars.push((branch_depth, HashSet::new()));
+
                 self.loop_depth += 1;
                 self.enter_scope();
-                self.define_variable(variable.clone(), item_ty, stmt.span);
-                let res = self.check_block(body);
+                let bind_res = self.bind_for_pattern(pattern, &item_ty);
+                let body_res = if bind_res.is_ok() {
+                    self.check_block(body)
+                } else {
+                    Ok(())
+                };
                 let exit_res = self.exit_scope();
                 self.loop_depth -= 1;
-                res?;
+
+                let (_, widened_set) = self.widened_outer_vars.pop().unwrap_or_default();
+                self.narrowed = saved_narrowed;
+                for name in widened_set {
+                    self.narrowed.remove(&name);
+                }
+
+                bind_res?;
+                body_res?;
+                exit_res?;
+            }
+            StmtKind::While { condition, body } => {
+                let cond_ty = self.check_expr(condition)?;
+                if cond_ty != Type::Bool {
+                    return Err(TypeError {
+                        message: format!("Condition in 'while' must be Bool, got {}", cond_ty),
+                        span: condition.span,
+                    });
+                }
+
+                let while_vars = Self::extract_non_nil_vars(condition, true);
+                let saved_narrowed = self.narrowed.clone();
+                let branch_depth = self.scopes.len();
+                self.widened_outer_vars.push((branch_depth, HashSet::new()));
+                self.apply_non_nil_narrowings(&while_vars);
+
+                self.loop_depth += 1;
+                self.enter_scope();
+                let body_res = self.check_block(body);
+                let exit_res = self.exit_scope();
+                self.loop_depth -= 1;
+
+                let (_, widened_set) = self.widened_outer_vars.pop().unwrap_or_default();
+                self.narrowed = saved_narrowed;
+                for name in widened_set {
+                    self.narrowed.remove(&name);
+                }
+
+                body_res?;
                 exit_res?;
             }
             StmtKind::Switch { expr, cases } => {
@@ -1709,7 +2179,13 @@ impl TypeChecker {
                     other => vec![other],
                 };
 
+                let saved_before_switch = self.narrowed.clone();
+                let mut widened_in_switch = HashSet::new();
+
                 for case in cases {
+                    self.narrowed = saved_before_switch.clone();
+                    let branch_depth = self.scopes.len();
+                    self.widened_outer_vars.push((branch_depth, HashSet::new()));
                     self.enter_scope();
                     match &case.pattern.kind {
                         PatternKind::Nil => {
@@ -1725,6 +2201,7 @@ impl TypeChecker {
                                 name,
                                 &mod_id,
                                 &self.imports,
+                                None,
                                 case.pattern.span,
                             )?;
                             let custom_ty = match self.resolve_type_name_in_ctx(
@@ -1732,6 +2209,7 @@ impl TypeChecker {
                                 &mod_id,
                                 &self.imports,
                                 &self.current_type_params,
+                                None,
                                 case.pattern.span,
                             ) {
                                 Ok(t) => Some(t),
@@ -1753,9 +2231,7 @@ impl TypeChecker {
                                     span: case.pattern.span,
                                 })?;
                             let matched_ty = remaining.remove(idx);
-                            if let Some(scope) = self.scopes.last_mut() {
-                                scope.insert(binding.clone(), (matched_ty, case.pattern.span, true));
-                            }
+                            self.define_used_variable(binding.clone(), matched_ty, false, case.pattern.span);
                         }
                         PatternKind::Tuple(pats) => {
                             let mut matched_indices = Vec::new();
@@ -1783,7 +2259,7 @@ impl TypeChecker {
                                 let combined_ty = Type::union(pos_types);
                                 match &pats[pos].kind {
                                     PatternKind::Ident(var_name) => {
-                                        self.define_variable(var_name.clone(), combined_ty, pats[pos].span);
+                                        self.define_variable(var_name.clone(), combined_ty, false, pats[pos].span);
                                     }
                                     PatternKind::Wildcard => {}
                                     _ => {
@@ -1804,7 +2280,7 @@ impl TypeChecker {
                             }
                             let bound_ty = Type::union(remaining.clone());
                             remaining.clear();
-                            self.define_variable(binding.clone(), bound_ty, case.pattern.span);
+                            self.define_variable(binding.clone(), bound_ty, false, case.pattern.span);
                         }
                         PatternKind::Wildcard => {
                             if remaining.is_empty() {
@@ -1817,8 +2293,19 @@ impl TypeChecker {
                         }
                     }
 
-                    self.check_block(&case.body)?;
-                    self.exit_scope()?;
+                    let body_res = self.check_block(&case.body);
+                    let exit_res = self.exit_scope();
+                    let (_, case_widened) = self.widened_outer_vars.pop().unwrap_or_default();
+                    if !block_always_exits_branch(&case.body) {
+                        widened_in_switch.extend(case_widened);
+                    }
+                    body_res?;
+                    exit_res?;
+                }
+
+                self.narrowed = saved_before_switch;
+                for name in widened_in_switch {
+                    self.narrowed.remove(&name);
                 }
 
                 if !remaining.is_empty() {
@@ -1861,6 +2348,14 @@ impl TypeChecker {
     fn optional_of(inner: Type) -> Type {
         match inner {
             Type::Optional(_) => inner,
+            Type::Union(ref vars) if vars.contains(&Type::Nil) => {
+                let non_nil: Vec<Type> = vars.iter().filter(|t| *t != &Type::Nil).cloned().collect();
+                if non_nil.len() == 1 {
+                    Type::Optional(Box::new(non_nil.into_iter().next().unwrap()))
+                } else {
+                    inner
+                }
+            }
             other => Type::Optional(Box::new(other)),
         }
     }
@@ -1878,6 +2373,18 @@ impl TypeChecker {
                 "trim" | "lower" | "upper" | "to_string" if args.is_empty() => {
                     return Ok(Type::String);
                 }
+                "to_int" if args.is_empty() => {
+                    return Ok(Type::union(vec![
+                        Type::Int,
+                        Type::Custom(TypeId::builtin("ParseError")),
+                    ]));
+                }
+                "to_float" if args.is_empty() => {
+                    return Ok(Type::union(vec![
+                        Type::Float,
+                        Type::Custom(TypeId::builtin("ParseError")),
+                    ]));
+                }
                 "contains" | "starts_with" | "ends_with" if args.len() == 1 => {
                     let arg_ty = self.check_expr(&args[0])?;
                     if arg_ty == Type::String {
@@ -1885,6 +2392,16 @@ impl TypeChecker {
                     }
                     return Err(TypeError {
                         message: format!("String method '{}()' expects String argument, got {}", field, arg_ty),
+                        span: args[0].span,
+                    });
+                }
+                "index_of" if args.len() == 1 => {
+                    let arg_ty = self.check_expr(&args[0])?;
+                    if arg_ty == Type::String {
+                        return Ok(Self::optional_of(Type::Int));
+                    }
+                    return Err(TypeError {
+                        message: format!("String method 'index_of()' expects String argument, got {}", arg_ty),
                         span: args[0].span,
                     });
                 }
@@ -1897,6 +2414,23 @@ impl TypeChecker {
                         message: format!("String method 'split()' expects String argument, got {}", arg_ty),
                         span: args[0].span,
                     });
+                }
+                "slice" if args.len() == 2 => {
+                    let start_ty = self.check_expr(&args[0])?;
+                    if start_ty != Type::Int {
+                        return Err(TypeError {
+                            message: format!("String method 'slice()' expects Int for first argument, got {}", start_ty),
+                            span: args[0].span,
+                        });
+                    }
+                    let end_ty = self.check_expr(&args[1])?;
+                    if end_ty != Type::Int {
+                        return Err(TypeError {
+                            message: format!("String method 'slice()' expects Int for second argument, got {}", end_ty),
+                            span: args[1].span,
+                        });
+                    }
+                    return Ok(Type::String);
                 }
                 "replace" if args.len() == 2 => {
                     let from_ty = self.check_expr(&args[0])?;
@@ -1945,6 +2479,49 @@ impl TypeChecker {
         if let Type::List(inner) = target_ty {
             match field {
                 "len" if args.is_empty() => return Ok(Type::Int),
+                "reverse" if args.is_empty() => return Ok(Type::List(inner.clone())),
+                "enumerate" if args.is_empty() => {
+                    return Ok(Type::List(Box::new(Type::Tuple(vec![
+                        Type::Int,
+                        inner.as_ref().clone(),
+                    ]))));
+                }
+                "slice" if args.len() == 2 => {
+                    let start_ty = self.check_expr(&args[0])?;
+                    if start_ty != Type::Int {
+                        return Err(TypeError {
+                            message: format!("List method 'slice()' expects Int for first argument, got {}", start_ty),
+                            span: args[0].span,
+                        });
+                    }
+                    let end_ty = self.check_expr(&args[1])?;
+                    if end_ty != Type::Int {
+                        return Err(TypeError {
+                            message: format!("List method 'slice()' expects Int for second argument, got {}", end_ty),
+                            span: args[1].span,
+                        });
+                    }
+                    return Ok(Type::List(inner.clone()));
+                }
+                "join" if args.len() == 1 => {
+                    if **inner != Type::String && **inner != Type::Any {
+                        return Err(TypeError {
+                            message: format!(
+                                "List method 'join()' is only supported on '[String]', got '{}'",
+                                target_ty
+                            ),
+                            span,
+                        });
+                    }
+                    let sep_ty = self.check_expr(&args[0])?;
+                    if sep_ty != Type::String {
+                        return Err(TypeError {
+                            message: format!("List method 'join()' expects String argument, got {}", sep_ty),
+                            span: args[0].span,
+                        });
+                    }
+                    return Ok(Type::String);
+                }
                 "get" if args.len() == 1 => {
                     let arg_ty = self.check_expr(&args[0])?;
                     if arg_ty == Type::Int {
@@ -2391,7 +2968,7 @@ impl TypeChecker {
                     })
                 } else if self.structs.contains_key(name) {
                     Ok(Type::Custom(self.current_type_id(name)))
-                } else if name == "IndexError" || name == "KeyError" {
+                } else if matches!(name.as_str(), "IndexError" | "KeyError" | "ParseError") {
                     Ok(Type::Custom(TypeId::builtin(name)))
                 } else {
                     Err(TypeError {
@@ -2479,16 +3056,20 @@ impl TypeChecker {
 
                 let prev_return_type = self.current_return_type.replace(ret_ty.clone());
                 let prev_loop_depth = self.loop_depth;
+                let saved_narrowed = self.narrowed.clone();
+                let saved_widened = std::mem::take(&mut self.widened_outer_vars);
                 self.loop_depth = 0;
 
                 self.enter_scope();
                 for (param_name, param_ty) in &param_types {
-                    self.define_variable(param_name.clone(), param_ty.clone(), expr.span);
+                    self.define_variable(param_name.clone(), param_ty.clone(), false, expr.span);
                 }
 
                 let body_res = self.check_block(body);
                 let exit_res = self.exit_scope();
 
+                self.narrowed = saved_narrowed;
+                self.widened_outer_vars = saved_widened;
                 self.loop_depth = prev_loop_depth;
                 self.current_return_type = prev_return_type;
 
@@ -2527,7 +3108,25 @@ impl TypeChecker {
             }
             ExprKind::Binary { op, left, right } => {
                 let left_ty = self.check_expr(left)?;
-                let right_ty = self.check_expr(right)?;
+                let right_ty = match op {
+                    BinaryOp::And => {
+                        let saved = self.narrowed.clone();
+                        let vars = Self::extract_non_nil_vars(left, true);
+                        self.apply_non_nil_narrowings(&vars);
+                        let res = self.check_expr(right);
+                        self.narrowed = saved;
+                        res?
+                    }
+                    BinaryOp::Or => {
+                        let saved = self.narrowed.clone();
+                        let vars = Self::extract_non_nil_vars(left, false);
+                        self.apply_non_nil_narrowings(&vars);
+                        let res = self.check_expr(right);
+                        self.narrowed = saved;
+                        res?
+                    }
+                    _ => self.check_expr(right)?,
+                };
 
                 match op {
                     BinaryOp::Add => {
@@ -3092,7 +3691,62 @@ impl TypeChecker {
                         });
                     }
                     let target_ty = self.check_expr(target)?;
-                    return self.check_method_call(&target_ty, field, args, callee.span);
+                    let ret_ty = self.check_method_call(&target_ty, field, args, callee.span)?;
+                    let is_mutating_method = (matches!(target_ty, Type::List(_)) && field == "append")
+                        || (matches!(target_ty, Type::Map(_, _))
+                            && (field == "set" || field == "remove"));
+                    if is_mutating_method {
+                        self.check_lvalue_root_mutability(target, Some(field))?;
+                    }
+                    return Ok(ret_ty);
+                }
+
+                if let ExprKind::OptionalMember { target, field } = &callee.kind {
+                    if !type_args.is_empty() {
+                        return Err(TypeError {
+                            message: "Method calls do not support explicit type arguments".to_string(),
+                            span: callee.span,
+                        });
+                    }
+                    let target_ty = self.check_expr(target)?;
+                    match self.classify_optional_chain(&target_ty) {
+                        OptionalChainTarget::Optional(inner_ty) => {
+                            let ret_ty = self.check_method_call(&inner_ty, field, args, callee.span)?;
+                            if ret_ty == Type::Void {
+                                return Err(TypeError {
+                                    message: format!(
+                                        "Cannot use '?.' with mutating or Void-returning method '{}()'",
+                                        field
+                                    ),
+                                    span: callee.span,
+                                });
+                            }
+                            if self.contains_error(&ret_ty) {
+                                return Err(TypeError {
+                                    message: format!(
+                                        "Cannot use '?.' with error-returning method '{}()' (returns '{}')",
+                                        field, ret_ty
+                                    ),
+                                    span: callee.span,
+                                });
+                            }
+                            return Ok(Self::optional_of(ret_ty));
+                        }
+                        OptionalChainTarget::Fallible(successes, errors) => {
+                            self.validate_propagated_errors(&errors, callee.span)?;
+                            let inner_ty = Type::union(successes);
+                            return self.check_method_call(&inner_ty, field, args, callee.span);
+                        }
+                        OptionalChainTarget::Invalid => {
+                            return Err(TypeError {
+                                message: format!(
+                                    "Operator '?.' requires an optional type 'T?', got '{}'",
+                                    target_ty
+                                ),
+                                span: target.span,
+                            });
+                        }
+                    }
                 }
 
                 if !type_args.is_empty() {
@@ -3140,90 +3794,184 @@ impl TypeChecker {
                 }
 
                 let target_ty = self.check_expr(target)?;
-
-                if let Type::Union(_) = target_ty {
-                    return Err(TypeError {
-                        message: format!("Cannot access field '{}' on union type '{}' without narrowing", field, target_ty),
-                        span: expr.span,
-                    });
-                }
-
-                if let Type::Generic { ref type_id, ref type_args } = target_ty {
-                    if let Some(struct_sig) = self
-                        .lookup_struct_sig_in(type_id, self.current_module_path.as_deref())
-                        .cloned()
-                    {
-                        if let Some(raw_field_ty) = struct_sig.fields.get(field) {
-                            let mut bindings = HashMap::new();
-                            for (tp, ta) in struct_sig.type_params.iter().zip(type_args.iter()) {
-                                bindings.insert(tp.clone(), ta.clone());
-                            }
-                            return Self::substitute_type(raw_field_ty, &bindings, expr.span);
-                        }
+                self.check_member_on_type(&target_ty, field, expr.span)
+            }
+            ExprKind::OptionalMember { target, field } => {
+                let target_ty = self.check_expr(target)?;
+                match self.classify_optional_chain(&target_ty) {
+                    OptionalChainTarget::Optional(inner_ty) => {
+                        let field_ty = self.check_member_on_type(&inner_ty, field, expr.span)?;
+                        Ok(Self::optional_of(field_ty))
                     }
-                }
-
-                if let Type::Custom(ref type_id) = target_ty {
-                    match &type_id.module {
-                        ModuleId::Builtin => {
-                            if type_id.name == "IndexError" {
-                                match field.as_str() {
-                                    "index" | "length" => return Ok(Type::Int),
-                                    "message" => return Ok(Type::String),
-                                    _ => {}
-                                }
-                            } else if type_id.name == "KeyError" {
-                                match field.as_str() {
-                                    "key" | "message" => return Ok(Type::String),
-                                    _ => {}
-                                }
-                            }
-                        }
-                        ModuleId::Program | ModuleId::Local(_) => {
-                            if let Some(struct_sig) = self.lookup_struct_sig_in(type_id, self.current_module_path.as_deref()) {
-                                if let Some(field_ty) = struct_sig.fields.get(field) {
-                                    return Ok(field_ty.clone());
-                                }
-                            }
-                        }
-                        ModuleId::Native(nat_name) => {
-                            if let Some(m) = self.native_registry.get_module(nat_name) {
-                                if let Some(t) = m.types.get(type_id.name.as_str()) {
-                                    for (f_name, f_ty) in &t.fields {
-                                        if *f_name == field {
-                                            return Ok(f_ty.clone());
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                    OptionalChainTarget::Fallible(successes, errors) => {
+                        self.validate_propagated_errors(&errors, expr.span)?;
+                        let inner_ty = Type::union(successes);
+                        self.check_member_on_type(&inner_ty, field, expr.span)
                     }
+                    OptionalChainTarget::Invalid => Err(TypeError {
+                        message: format!(
+                            "Operator '?.' requires an optional type 'T?', got '{}'",
+                            target_ty
+                        ),
+                        span: target.span,
+                    }),
                 }
-
-                Err(TypeError {
-                    message: format!("Type {} has no field '{}'", target_ty, field),
-                    span: expr.span,
-                })
             }
         }
     }
+
+    fn classify_optional_chain(&self, ty: &Type) -> OptionalChainTarget {
+        match ty {
+            Type::Optional(inner) => OptionalChainTarget::Optional(inner.as_ref().clone()),
+            Type::Union(variants) => {
+                let has_nil = variants.contains(&Type::Nil);
+                let (successes, errors) = self.split_success_and_errors(ty);
+                if has_nil && errors.is_empty() {
+                    let non_nil: Vec<Type> = successes
+                        .into_iter()
+                        .filter(|t| t != &Type::Nil)
+                        .collect();
+                    if non_nil.is_empty() {
+                        OptionalChainTarget::Invalid
+                    } else {
+                        OptionalChainTarget::Optional(Type::union(non_nil))
+                    }
+                } else if !has_nil && !errors.is_empty() && !successes.is_empty() {
+                    OptionalChainTarget::Fallible(successes, errors)
+                } else {
+                    OptionalChainTarget::Invalid
+                }
+            }
+            _ => OptionalChainTarget::Invalid,
+        }
+    }
+
+    fn validate_propagated_errors(&self, errors: &[Type], span: Span) -> Result<(), TypeError> {
+        if let Some(ref current_ret) = self.current_return_type {
+            for err in errors {
+                if !err.is_assignable_to(current_ret) {
+                    return Err(TypeError {
+                        message: format!(
+                            "Error '{}' propagated by '?' is not assignable to function return type '{}'",
+                            err, current_ret
+                        ),
+                        span,
+                    });
+                }
+            }
+            Ok(())
+        } else {
+            Err(TypeError {
+                message: "Operator '?' cannot be used outside of a function".to_string(),
+                span,
+            })
+        }
+    }
+
+    fn check_member_on_type(
+        &self,
+        target_ty: &Type,
+        field: &str,
+        span: Span,
+    ) -> Result<Type, TypeError> {
+        if let Type::Union(_) = target_ty {
+            return Err(TypeError {
+                message: format!(
+                    "Cannot access field '{}' on union type '{}' without narrowing",
+                    field, target_ty
+                ),
+                span,
+            });
+        }
+
+        if let Type::Generic { type_id, type_args } = target_ty {
+            if let Some(struct_sig) = self
+                .lookup_struct_sig_in(type_id, self.current_module_path.as_deref())
+                .cloned()
+            {
+                if let Some(raw_field_ty) = struct_sig.fields.get(field) {
+                    let mut bindings = HashMap::new();
+                    for (tp, ta) in struct_sig.type_params.iter().zip(type_args.iter()) {
+                        bindings.insert(tp.clone(), ta.clone());
+                    }
+                    return Self::substitute_type(raw_field_ty, &bindings, span);
+                }
+            }
+        }
+
+        if let Type::Custom(type_id) = target_ty {
+            match &type_id.module {
+                ModuleId::Builtin => {
+                    if type_id.name == "IndexError" {
+                        match field {
+                            "index" | "length" => return Ok(Type::Int),
+                            "message" => return Ok(Type::String),
+                            _ => {}
+                        }
+                    } else if type_id.name == "KeyError" {
+                        match field {
+                            "key" | "message" => return Ok(Type::String),
+                            _ => {}
+                        }
+                    } else if type_id.name == "ParseError" {
+                        match field {
+                            "value" | "message" => return Ok(Type::String),
+                            _ => {}
+                        }
+                    }
+                }
+                ModuleId::Program | ModuleId::Local(_) => {
+                    if let Some(struct_sig) =
+                        self.lookup_struct_sig_in(type_id, self.current_module_path.as_deref())
+                    {
+                        if let Some(field_ty) = struct_sig.fields.get(field) {
+                            return Ok(field_ty.clone());
+                        }
+                    }
+                }
+                ModuleId::Native(nat_name) => {
+                    if let Some(m) = self.native_registry.get_module(nat_name) {
+                        if let Some(t) = m.types.get(type_id.name.as_str()) {
+                            for (f_name, f_ty) in &t.fields {
+                                if *f_name == field {
+                                    return Ok(f_ty.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Err(TypeError {
+            message: format!("Type {} has no field '{}'", target_ty, field),
+            span,
+        })
+    }
 }
 
-fn block_always_returns(block: &Block) -> bool {
+fn block_always_returns_inner(block: &Block, allow_loop_ctrl: bool) -> bool {
     for stmt in &block.stmts {
         match &stmt.kind {
             StmtKind::Return(_) => return true,
+            StmtKind::Break | StmtKind::Continue if allow_loop_ctrl => return true,
             StmtKind::If {
                 then_block,
                 else_block: Some(else_b),
                 ..
             } => {
-                if block_always_returns(then_block) && block_always_returns(else_b) {
+                if block_always_returns_inner(then_block, allow_loop_ctrl)
+                    && block_always_returns_inner(else_b, allow_loop_ctrl)
+                {
                     return true;
                 }
             }
             StmtKind::Switch { cases, .. } => {
-                if !cases.is_empty() && cases.iter().all(|c| block_always_returns(&c.body)) {
+                if !cases.is_empty()
+                    && cases
+                        .iter()
+                        .all(|c| block_always_returns_inner(&c.body, allow_loop_ctrl))
+                {
                     return true;
                 }
             }
@@ -3231,6 +3979,14 @@ fn block_always_returns(block: &Block) -> bool {
         }
     }
     false
+}
+
+fn block_always_returns(block: &Block) -> bool {
+    block_always_returns_inner(block, false)
+}
+
+fn block_always_exits_branch(block: &Block) -> bool {
+    block_always_returns_inner(block, true)
 }
 
 #[cfg(test)]

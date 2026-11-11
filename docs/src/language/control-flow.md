@@ -20,9 +20,9 @@ The condition must evaluate strictly to `Bool`. Conduit does not perform implici
 
 ---
 
-## Loops (`for` / `in`)
+## Loops (`for` / `in` and `while`)
 
-The `for` loop iterates over elements of an iterable collection:
+The `for` loop iterates over lists, ranges, or `Map<K, V>` entries (in deterministic insertion order) and supports tuple destructuring:
 
 ```conduit
 for item in [1, 2, 3, 4, 5] {
@@ -33,6 +33,23 @@ for item in [1, 2, 3, 4, 5] {
         break    // Terminate loop
     }
     print(item)
+}
+
+for (idx, word) in ["a", "b"].enumerate() {
+    print("{idx}: {word}")
+}
+
+for (k, v) in Map.from([("x", 1), ("y", 2)]) {
+    print("{k}={v}")
+}
+```
+
+Use `while` loops for condition-controlled iteration (`Bool` condition required):
+
+```conduit
+var attempt = 0
+while attempt < 3 {
+    attempt = attempt + 1
 }
 ```
 
