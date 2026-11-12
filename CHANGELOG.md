@@ -5,6 +5,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
+## [Unreleased]
+
+### Internal / Refactoring
+
+* Split `src/check.rs`, `src/interp.rs`, and `src/parser.rs` into focused submodules under `src/check/`, `src/interp/`, and `src/parser/` with every file under 800 lines.
+* Decomposed large dispatcher functions (`TypeChecker::check_expr`, `TypeChecker::check_stmt`, `TypeChecker::check_project`, `TypeChecker::check_method_call`, `Interpreter::eval_expr`, `Interpreter::eval_stmt`, `Interpreter::eval_method_on_value`) into smaller single-purpose methods with no behavioral changes.
+
 ## [0.1.11] - 2026-11-11
 
 ### Added & Changed

@@ -9,7 +9,7 @@ use conduit::reachability::ReachabilityAnalyzer;
 fn load_and_check(files: &[(&str, &str)]) -> Result<(ModuleLoader, PathBuf), String> {
     let mut loader = ModuleLoader::new();
     for (path, src) in files {
-        loader.with_virtual_file(&PathBuf::from(path), *src);
+        loader.with_virtual_file(PathBuf::from(path), *src);
     }
     let root = loader
         .load_project(&PathBuf::from(files[0].0))

@@ -121,8 +121,8 @@ impl<'a> ReachabilityAnalyzer<'a> {
                 self.reachable_functions.insert((loaded_mod.canonical_path.clone(), func_name.clone()));
 
                 for item in &loaded_mod.program.items {
-                    if let ItemKind::Func { ref name, ref body, ref params, ref return_type, .. } = item.kind {
-                        if name == &func_name {
+                    if let ItemKind::Func { ref name, ref body, ref params, ref return_type, .. } = item.kind
+                        && name == &func_name {
                             for p in params {
                                 self.scan_type_expr(&p.ty, &loaded_mod.canonical_path, loaded_mod, &mut worklist);
                             }
@@ -132,7 +132,6 @@ impl<'a> ReachabilityAnalyzer<'a> {
                             self.scan_block(body, &loaded_mod.canonical_path, loaded_mod, &mut worklist);
                             break;
                         }
-                    }
                 }
             }
         }
@@ -358,8 +357,8 @@ impl<'a> ReachabilityAnalyzer<'a> {
         };
 
         for item in &loaded_mod.program.items {
-            if let ItemKind::Type { name, fields, .. } = &item.kind {
-                if name == type_name {
+            if let ItemKind::Type { name, fields, .. } = &item.kind
+                && name == type_name {
                     for f in fields {
                         self.scan_type_expr(&f.ty, &canon, loaded_mod, worklist);
                         for ann in &f.annotations {
@@ -381,7 +380,6 @@ impl<'a> ReachabilityAnalyzer<'a> {
                     }
                     break;
                 }
-            }
         }
     }
 

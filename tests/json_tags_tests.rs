@@ -7,7 +7,7 @@ use conduit::loader::ModuleLoader;
 fn run_project(files: &[(&str, &str)]) -> Result<(), String> {
     let mut loader = ModuleLoader::new();
     for (path, source) in files {
-        loader.with_virtual_file(&PathBuf::from(path), *source);
+        loader.with_virtual_file(PathBuf::from(path), *source);
     }
     let root = loader
         .load_project(&PathBuf::from(files[0].0))

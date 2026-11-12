@@ -55,7 +55,7 @@ impl NativeValue for JsonValue {
         other
             .as_any()
             .downcast_ref::<JsonValue>()
-            .map_or(false, |o| self.0 == o.0)
+            .is_some_and(|o| self.0 == o.0)
     }
 }
 
@@ -129,10 +129,13 @@ pub fn parse_json(raw: &str) -> Result<JsonNode, (String, String)> {
     parser::parse_borrowed_json(raw).map(parser::BorrowedJsonNode::into_owned)
 }
 
+pub(crate) type StructFieldResolver<'a> =
+    &'a dyn Fn(&TypeId, &[Type]) -> Option<Vec<(String, String, Type)>>;
+
 pub(crate) fn decode_json_with_plan(
     raw: &str,
     plan: &JsonDecodePlan,
-    resolve_struct: &dyn Fn(&TypeId, &[Type]) -> Option<Vec<(String, String, Type)>>,
+    resolve_struct: StructFieldResolver<'_>,
 ) -> Result<Value, (String, String)> {
     let node = parser::parse_borrowed_json(raw)?;
     decode::decode_borrowed_json(node, plan, "", resolve_struct)
@@ -274,11 +277,10 @@ pub fn create_json_module() -> NativeModule {
         return_type: Type::String,
         is_validator: false,
         implementation: |args| {
-            if let Some(Value::Native(nat)) = args.into_iter().next() {
-                if let Some(jv) = nat.as_any().downcast_ref::<JsonValue>() {
+            if let Some(Value::Native(nat)) = args.into_iter().next()
+                && let Some(jv) = nat.as_any().downcast_ref::<JsonValue>() {
                     return Ok(Value::String(stringify_json_node(&jv.0)));
                 }
-            }
             Ok(Value::String("null".to_string()))
         },
     });

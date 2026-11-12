@@ -421,15 +421,13 @@ fn decode_node(
 }
 
 fn find_field_index(schema: &StructPlan, key: &str, cursor: &mut usize) -> Option<usize> {
-    if !schema.has_duplicate_json_names {
-        if let Some(field) = schema.fields.get(*cursor) {
-            if field.json_name == key {
+    if !schema.has_duplicate_json_names
+        && let Some(field) = schema.fields.get(*cursor)
+            && field.json_name == key {
                 let idx = *cursor;
                 *cursor += 1;
                 return Some(idx);
             }
-        }
-    }
     let found = if schema.fields.len() <= 8 {
         if schema.has_duplicate_json_names {
             schema.fields.iter().rposition(|field| field.json_name == key)

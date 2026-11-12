@@ -189,6 +189,10 @@ impl OrderedMap {
         self.entries.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     pub fn entries(&self) -> &[(MapKey, Value)] {
         &self.entries
     }
@@ -206,6 +210,12 @@ impl OrderedMap {
             .iter()
             .map(|(k, v)| Value::Tuple(vec![k.to_value(), v.clone()]))
             .collect()
+    }
+}
+
+impl Default for OrderedMap {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -425,7 +435,7 @@ impl Value {
             Value::Float(v) => *v != 0.0,
             Value::String(s) => !s.is_empty(),
             Value::List(l) => !l.is_empty(),
-            Value::Map(m) => m.len() > 0,
+            Value::Map(m) => !m.is_empty(),
             Value::Tuple(_) => true,
             Value::Struct { .. } | Value::Error { .. } => true,
             Value::Native(_) => true,

@@ -166,11 +166,10 @@ impl Type {
             return true;
         }
 
-        if let Type::Optional(inner) = self {
-            if let Type::Union(_) = target {
+        if let Type::Optional(inner) = self
+            && let Type::Union(_) = target {
                 return inner.is_assignable_to(target) && Type::Nil.is_assignable_to(target);
             }
-        }
 
         if let Type::Union(src_variants) = self {
             return src_variants.iter().all(|v| v.is_assignable_to(target));
@@ -180,11 +179,10 @@ impl Type {
             return dst_variants.iter().any(|v| self.is_assignable_to(v));
         }
 
-        if self == &Type::Nil {
-            if let Type::Optional(_) = target {
+        if self == &Type::Nil
+            && let Type::Optional(_) = target {
                 return true;
             }
-        }
 
         if let Type::Optional(inner) = target {
             return self.is_assignable_to(inner);

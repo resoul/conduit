@@ -173,8 +173,8 @@ pub fn create_time_module() -> NativeModule {
         is_validator: false,
         implementation: |args| {
             let start_val = args.into_iter().next().unwrap();
-            if let Value::Native(ref nat) = start_val {
-                if let Some(inst) = nat.as_any().downcast_ref::<Instant>() {
+            if let Value::Native(ref nat) = start_val
+                && let Some(inst) = nat.as_any().downcast_ref::<Instant>() {
                     let now = StdInstant::now();
                     if now < inst.0 {
                         return Ok(make_time_error("Monotonic clock went backwards or start is in the future"));
@@ -182,7 +182,6 @@ pub fn create_time_module() -> NativeModule {
                     let dur = now.duration_since(inst.0);
                     return Ok(Value::Native(Arc::new(Duration(dur))));
                 }
-            }
             Ok(make_time_error("Expected time.Instant argument"))
         },
     });

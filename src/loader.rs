@@ -96,7 +96,7 @@ impl ModuleLoader {
             return Ok(path.to_path_buf());
         }
 
-        for (vpath, _) in &self.virtual_files {
+        for vpath in self.virtual_files.keys() {
             if normalize_path(vpath) == norm {
                 return Ok(vpath.clone());
             }
@@ -118,7 +118,7 @@ impl ModuleLoader {
         if self.virtual_files.contains_key(&abs_norm) {
             return Ok(abs_norm);
         }
-        for (vpath, _) in &self.virtual_files {
+        for vpath in self.virtual_files.keys() {
             if normalize_path(vpath) == abs_norm {
                 return Ok(vpath.clone());
             }

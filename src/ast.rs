@@ -48,6 +48,13 @@ pub struct NamedArg {
     pub value: Expr,
 }
 
+#[derive(Clone, Copy)]
+pub struct CallArgs<'a> {
+    pub type_args: &'a [TypeExpr],
+    pub args: &'a [Expr],
+    pub named_args: &'a [NamedArg],
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExprKind {
     Int(i64),

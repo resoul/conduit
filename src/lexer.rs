@@ -188,7 +188,7 @@ impl<'a> Lexer<'a> {
         }
 
         if self.peek_char() == Some('.')
-            && self.peek_next_char().map_or(false, |c| c.is_ascii_digit())
+            && self.peek_next_char().is_some_and(|c| c.is_ascii_digit())
         {
             self.bump_char();
             while let Some(ch) = self.peek_char() {

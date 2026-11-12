@@ -17,11 +17,7 @@ pub fn run_lsp_server() -> io::Result<()> {
 pub fn run_server_loop(mut reader: impl BufRead, mut writer: impl Write) -> io::Result<()> {
     let mut documents: HashMap<String, String> = HashMap::new();
 
-    loop {
-        let msg = match read_message(&mut reader)? {
-            Some(m) => m,
-            None => break,
-        };
+    while let Some(msg) = read_message(&mut reader)? {
 
         let method = extract_json_string(&msg, "method").unwrap_or_default();
         let id = extract_json_id(&msg);
@@ -89,11 +85,10 @@ fn read_message(reader: &mut impl BufRead) -> io::Result<Option<String>> {
             break;
         }
 
-        if let Some(rest) = trimmed.strip_prefix("Content-Length:") {
-            if let Ok(len) = rest.trim().parse::<usize>() {
+        if let Some(rest) = trimmed.strip_prefix("Content-Length:")
+            && let Ok(len) = rest.trim().parse::<usize>() {
                 content_length = Some(len);
             }
-        }
     }
 
     let len = match content_length {
@@ -108,7 +103,7 @@ fn read_message(reader: &mut impl BufRead) -> io::Result<Option<String>> {
 }
 
 fn send_message(writer: &mut impl Write, payload: &str) -> io::Result<()> {
-    let len = payload.as_bytes().len();
+    let len = payload.len();
     write!(writer, "Content-Length: {}\r\n\r\n{}", len, payload)?;
     writer.flush()
 }
@@ -324,19 +319,19 @@ fn handle_completion(msg: &str, id: &str, documents: &HashMap<String, String>) -
                 {"label":"TimeError","kind":7,"detail":"time.TimeError error"}
             ]"#;
             return format!(r#"{{"jsonrpc":"2.0","id":{},"result":{}}}"#, id, items);
-        } else if let Some(uri) = extract_uri(msg) {
-            if let Some(doc) = documents.get(&uri) {
+        } else if let Some(uri) = extract_uri(msg)
+            && let Some(doc) = documents.get(&uri) {
                 let file_path = uri_to_path(&uri);
                 let mut loader = ModuleLoader::new();
                 for (doc_uri, doc_text) in documents {
                     loader.with_virtual_file(uri_to_path(doc_uri), doc_text.clone());
                 }
                 loader.with_virtual_file(&file_path, doc.clone());
-                if let Ok(root_canon) = loader.load_project(&file_path) {
-                    if let Some(loaded_mod) = loader.modules.get(&root_canon) {
-                        if let Some((target, _)) = loaded_mod.imports.get(&alias) {
-                            if let crate::loader::ModuleTarget::Local(path) = target {
-                                if let Some(target_mod) = loader.modules.get(path) {
+                if let Ok(root_canon) = loader.load_project(&file_path)
+                    && let Some(loaded_mod) = loader.modules.get(&root_canon)
+                        && let Some((target, _)) = loaded_mod.imports.get(&alias)
+                            && let crate::loader::ModuleTarget::Local(path) = target
+                                && let Some(target_mod) = loader.modules.get(path) {
                                     let mut items = Vec::new();
                                     for item in &target_mod.program.items {
                                         if item.is_exported {
@@ -357,12 +352,7 @@ fn handle_completion(msg: &str, id: &str, documents: &HashMap<String, String>) -
                                     let json_arr = format!("[{}]", items.join(","));
                                     return format!(r#"{{"jsonrpc":"2.0","id":{},"result":{}}}"#, id, json_arr);
                                 }
-                            }
-                        }
-                    }
-                }
             }
-        }
     }
 
     let items = r#"[
@@ -447,8 +437,7 @@ fn get_dot_prefix_alias(text: &str, line_idx: usize, char_idx: usize) -> Option<
 
     let before: String = chars[..char_idx].iter().collect();
     let trimmed = before.trim_end();
-    if trimmed.ends_with('.') {
-        let without_dot = &trimmed[..trimmed.len() - 1];
+    if let Some(without_dot) = trimmed.strip_suffix('.') {
         let mut start = without_dot.len();
         let bytes = without_dot.as_bytes();
         while start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_') {
@@ -511,8 +500,7 @@ fn extract_json_string(json: &str, key: &str) -> Option<String> {
     let needle = format!("\"{}\":", key);
     let pos = json.find(&needle)?;
     let rest = &json[pos + needle.len()..].trim_start();
-    if rest.starts_with('"') {
-        let content = &rest[1..];
+    if let Some(content) = rest.strip_prefix('"') {
         let end = content.find('"')?;
         Some(content[..end].to_string())
     } else {
@@ -531,8 +519,7 @@ fn extract_json_num(json: &str, key: &str) -> Option<usize> {
 fn extract_json_id(json: &str) -> String {
     if let Some(pos) = json.find("\"id\":") {
         let rest = &json[pos + 5..].trim_start();
-        if rest.starts_with('"') {
-            let content = &rest[1..];
+        if let Some(content) = rest.strip_prefix('"') {
             if let Some(end) = content.find('"') {
                 return format!("\"{}\"", &content[..end]);
             }
@@ -553,9 +540,9 @@ fn extract_uri(json: &str) -> Option<String> {
 fn extract_open_text(json: &str) -> Option<String> {
     let needle = "\"text\":";
     let pos = json.find(needle)?;
-    let rest = &json[pos + needle.len()..].trim_start();
-    if rest.starts_with('"') {
-        parse_escaped_string(&rest[1..])
+    let rest = json[pos + needle.len()..].trim_start();
+    if let Some(stripped) = rest.strip_prefix('"') {
+        parse_escaped_string(stripped)
     } else {
         None
     }
@@ -566,9 +553,9 @@ fn extract_change_text(json: &str) -> Option<String> {
     let pos = json.find(needle)?;
     let rest = &json[pos + needle.len()..];
     let text_pos = rest.find("\"text\":")?;
-    let text_rest = &rest[text_pos + 7..].trim_start();
-    if text_rest.starts_with('"') {
-        parse_escaped_string(&text_rest[1..])
+    let text_rest = rest[text_pos + 7..].trim_start();
+    if let Some(stripped) = text_rest.strip_prefix('"') {
+        parse_escaped_string(stripped)
     } else {
         None
     }
