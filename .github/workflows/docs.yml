@@ -26,13 +26,8 @@ jobs:
       - name: Setup Rust toolchain
         run: rustup default stable
 
-      - name: Run doc examples verification
-        run: cargo test --test doc_examples_test
-
-      - name: Verify deterministic library doc generator
-        run: |
-          cargo run -- doc cdt.time
-          cargo run -- doc cdt.validation
+      - name: Run test suite
+        run: cargo test
 
       - name: Install mdBook (v0.4.40)
         run: |

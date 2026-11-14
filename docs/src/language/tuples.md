@@ -67,29 +67,30 @@ switch pair {
 
 ## Runnable Example
 
-The following program demonstrates tuple creation, multi-value returns, destructuring with wildcards, and pattern matching:
-
 ```conduit
-{{#include ../../../examples/docs/language/tuples.cdt}}
+func get_dimensions() -> (Int, Int, String) {
+    return (1920, 1080, "16:9")
+}
+
+func main() -> Void {
+    (w, h, aspect) := get_dimensions()
+    print(w)
+    print(h)
+    print(aspect)
+}
 ```
 
 ### Running the Example
 
 ```bash
-conduit run examples/docs/language/tuples.cdt
+conduit run tuples.cdt
 ```
 
 Output:
 
 ```text
-10
-20
 1920
 1080
 16:9
-1920
-Matched pair:
-100
-200
 ```
 

@@ -1,0 +1,628 @@
+use std::collections::{HashMap, HashSet};
+
+use crate::frontend::ast::*;
+use crate::frontend::parse_source;
+
+fn is_native_module(path: &str) -> bool {
+    matches!(path, "cdt.json" | "cdt.time" | "cdt.validation")
+}
+
+struct LinkState<'a> {
+    modules: &'a HashMap<&'a str, &'a str>,
+    loaded: HashMap<String, (HashMap<String, String>, HashSet<String>)>,
+    visiting: HashSet<String>,
+    used_names: HashSet<String>,
+    preferred: HashMap<(String, String), String>,
+    merged_items: Vec<Item>,
+    next_mod_id: usize,
+}
+
+struct RewriteEnv {
+    sym_map: HashMap<String, String>,
+    ns_map: HashMap<String, HashMap<String, String>>,
+    ns_all_defs: HashMap<String, HashSet<String>>,
+    nat_ns_rename: HashMap<String, String>,
+}
+
+fn resolve_module<'a>(
+    modules: &'a HashMap<&'a str, &'a str>,
+    path: &str,
+) -> Option<(String, &'a str)> {
+    let trimmed = path.trim_start_matches("./");
+    if let Some(&src) = modules.get(path) {
+        return Some((trimmed.to_string(), src));
+    }
+    if let Some(&src) = modules.get(trimmed) {
+        return Some((trimmed.to_string(), src));
+    }
+    let dotted = format!("./{}", trimmed);
+    modules
+        .get(dotted.as_str())
+        .map(|&src| (trimmed.to_string(), src))
+}
+
+fn collect_local_defs(items: &[Item]) -> HashSet<String> {
+    let mut defs = HashSet::new();
+    for item in items {
+        match &item.kind {
+            ItemKind::Func { name, .. }
+            | ItemKind::Struct { name, .. }
+            | ItemKind::TypeAlias { name, .. }
+            | ItemKind::Error { name, .. } => {
+                defs.insert(name.clone());
+            }
+            ItemKind::Import { .. } | ItemKind::ExportList { .. } => {}
+        }
+    }
+    defs
+}
+
+fn rename_item_decl(item: &mut Item, rename: &HashMap<String, String>) {
+    match &mut item.kind {
+        ItemKind::Func { name, .. }
+        | ItemKind::Struct { name, .. }
+        | ItemKind::TypeAlias { name, .. }
+        | ItemKind::Error { name, .. } => {
+            if let Some(new_name) = rename.get(name) {
+                *name = new_name.clone();
+            }
+        }
+        ItemKind::Import { .. } | ItemKind::ExportList { .. } => {}
+    }
+}
+
+/// Link `import` items (other than built-in `cdt.json`) from `modules` into `program`.
+pub fn link_imports(
+    program: &mut Program,
+    modules: &HashMap<&str, &str>,
+) -> Result<(), String> {
+    let root_defs = collect_local_defs(&program.items);
+    let mut preferred: HashMap<(String, String), String> = HashMap::new();
+    let mut claimed: HashSet<String> = root_defs.clone();
+
+    for item in &program.items {
+        if let ItemKind::Import { path, names, .. } = &item.kind
+            && !is_native_module(path)
+        {
+            let norm = path.trim_start_matches("./").to_string();
+            for spec in names {
+                if !claimed.contains(&spec.alias) {
+                    preferred.insert((norm.clone(), spec.name.clone()), spec.alias.clone());
+                    claimed.insert(spec.alias.clone());
+                }
+            }
+        }
+    }
+
+    let mut state = LinkState {
+        modules,
+        loaded: HashMap::new(),
+        visiting: HashSet::new(),
+        used_names: root_defs.clone(),
+        preferred,
+        merged_items: Vec::new(),
+        next_mod_id: 0,
+    };
+
+    let env = process_module_imports(&program.items, &root_defs, &mut state, None)?;
+    rewrite_items(&mut program.items, &env)?;
+
+    let mut remaining = Vec::with_capacity(program.items.len() + state.merged_items.len());
+    for item in std::mem::take(&mut program.items) {
+        if let ItemKind::Import { path, .. } = &item.kind
+            && !is_native_module(path)
+        {
+            continue;
+        }
+        remaining.push(item);
+    }
+    let mut final_items = state.merged_items;
+    final_items.extend(remaining);
+    program.items = final_items;
+    Ok(())
+}
+
+fn process_module_imports(
+    items: &[Item],
+    local_defs: &HashSet<String>,
+    state: &mut LinkState<'_>,
+    scope_mod_id: Option<usize>,
+) -> Result<RewriteEnv, String> {
+    let mut env = RewriteEnv {
+        sym_map: HashMap::new(),
+        ns_map: HashMap::new(),
+        ns_all_defs: HashMap::new(),
+        nat_ns_rename: HashMap::new(),
+    };
+
+    for item in items {
+        let ItemKind::Import { path, alias, names } = &item.kind else {
+            continue;
+        };
+        if is_native_module(path) {
+            if let Some(mid) = scope_mod_id {
+                if let Some(ns) = alias {
+                    let scoped = format!("__m{}_nat_{}", mid, ns);
+                    env.nat_ns_rename.insert(ns.clone(), scoped);
+                }
+                for spec in names {
+                    let scoped = format!("__m{}_nat_{}", mid, spec.alias);
+                    env.sym_map.insert(spec.alias.clone(), scoped);
+                }
+            }
+            continue;
+        }
+        let (exports, all_defs) = load_module(path, state)?;
+        if let Some(ns) = alias {
+            if local_defs.contains(ns) || env.ns_map.contains_key(ns) || env.sym_map.contains_key(ns) {
+                return Err(format!("Duplicate import alias '{}'", ns));
+            }
+            env.ns_map.insert(ns.clone(), exports.clone());
+            env.ns_all_defs.insert(ns.clone(), all_defs.clone());
+        }
+        for spec in names {
+            let Some(global_name) = exports.get(&spec.name) else {
+                if all_defs.contains(&spec.name) {
+                    return Err(format!("Symbol '{}' is private in module '{}'", spec.name, path));
+                }
+                return Err(format!(
+                    "Module '{}' has no exported member '{}'",
+                    path, spec.name
+                ));
+            };
+            if local_defs.contains(&spec.alias) || env.ns_map.contains_key(&spec.alias) {
+                return Err(format!("Duplicate identifier '{}'", spec.alias));
+            }
+            if let Some(prev) = env.sym_map.insert(spec.alias.clone(), global_name.clone())
+                && prev != *global_name
+            {
+                return Err(format!("Duplicate imported identifier '{}'", spec.alias));
+            }
+        }
+    }
+    Ok(env)
+}
+
+fn load_module(
+    path: &str,
+    state: &mut LinkState<'_>,
+) -> Result<(HashMap<String, String>, HashSet<String>), String> {
+    let (norm, src) = resolve_module(state.modules, path)
+        .ok_or_else(|| format!("Cannot find imported module '{}'", path))?;
+
+    if let Some(cached) = state.loaded.get(&norm) {
+        return Ok(cached.clone());
+    }
+    if !state.visiting.insert(norm.clone()) {
+        return Err(format!("Cyclic module import involving '{}'", path));
+    }
+
+    let mod_id = state.next_mod_id;
+    state.next_mod_id += 1;
+
+    let mut mod_prog = parse_source(src)?;
+    let local_defs = collect_local_defs(&mod_prog.items);
+    let mut env = process_module_imports(&mod_prog.items, &local_defs, state, Some(mod_id))?;
+
+    let mut local_to_global: HashMap<String, String> = HashMap::new();
+    for def in &local_defs {
+        let preferred = state.preferred.get(&(norm.clone(), def.clone())).cloned();
+        let mut gname = match preferred {
+            Some(p) if !state.used_names.contains(&p) => p,
+            _ => format!("__m{}_{}", mod_id, def),
+        };
+        while state.used_names.contains(&gname) {
+            gname = format!("__m{}_{}_{}", mod_id, def, state.used_names.len());
+        }
+        state.used_names.insert(gname.clone());
+        local_to_global.insert(def.clone(), gname);
+    }
+
+    let mut exports: HashMap<String, String> = HashMap::new();
+    for item in &mod_prog.items {
+        if item.is_exported {
+            match &item.kind {
+                ItemKind::Func { name, .. }
+                | ItemKind::Struct { name, .. }
+                | ItemKind::TypeAlias { name, .. }
+                | ItemKind::Error { name, .. } => {
+                    exports.insert(name.clone(), local_to_global[name].clone());
+                }
+                ItemKind::ExportList { names } => {
+                    for spec in names {
+                        let resolved = local_to_global
+                            .get(&spec.name)
+                            .or_else(|| env.sym_map.get(&spec.name))
+                            .ok_or_else(|| {
+                                format!(
+                                    "Cannot export unknown symbol '{}' from '{}'",
+                                    spec.name, path
+                                )
+                            })?;
+                        exports.insert(spec.alias.clone(), resolved.clone());
+                    }
+                }
+                ItemKind::Import { .. } => {}
+            }
+        }
+    }
+
+    env.sym_map.extend(local_to_global.clone());
+    rewrite_items(&mut mod_prog.items, &env)?;
+
+    for mut item in mod_prog.items {
+        if matches!(item.kind, ItemKind::ExportList { .. }) {
+            continue;
+        }
+        if let ItemKind::Import {
+            path: imp_path,
+            alias,
+            names,
+        } = &mut item.kind
+        {
+            if !is_native_module(imp_path) {
+                continue;
+            }
+            if let Some(ns) = alias
+                && let Some(scoped) = env.nat_ns_rename.get(ns)
+            {
+                *ns = scoped.clone();
+            }
+            for spec in names {
+                if let Some(scoped) = env.sym_map.get(&spec.alias) {
+                    spec.alias = scoped.clone();
+                }
+            }
+        }
+        rename_item_decl(&mut item, &local_to_global);
+        item.is_imported = true;
+        item.is_exported = false;
+        state.merged_items.push(item);
+    }
+
+    state.visiting.remove(&norm);
+    state.loaded.insert(norm, (exports.clone(), local_defs.clone()));
+    Ok((exports, local_defs))
+}
+
+fn rewrite_items(items: &mut [Item], env: &RewriteEnv) -> Result<(), String> {
+    if env.sym_map.is_empty() && env.ns_map.is_empty() && env.nat_ns_rename.is_empty() {
+        return Ok(());
+    }
+    for item in items {
+        match &mut item.kind {
+            ItemKind::Func {
+                params,
+                return_type,
+                body,
+                ..
+            } => {
+                for p in params.iter_mut() {
+                    rewrite_type_expr(&mut p.ty, env)?;
+                }
+                if let Some(rt) = return_type {
+                    rewrite_type_expr(rt, env)?;
+                }
+                let mut scopes = vec![params.iter().map(|p| p.name.clone()).collect()];
+                rewrite_block_stmts(body, env, &mut scopes)?;
+            }
+            ItemKind::Struct { fields, .. } | ItemKind::Error { fields, .. } => {
+                for f in fields {
+                    rewrite_type_expr(&mut f.ty, env)?;
+                    for ann in &mut f.annotations {
+                        let mut empty_scopes = Vec::new();
+                        for a in &mut ann.args {
+                            rewrite_expr(a, env, &mut empty_scopes)?;
+                        }
+                        if ann.target == "json" {
+                            continue;
+                        }
+                        if let Some((ns, member)) = ann.target.split_once('.') {
+                            if let Some(exports) = env.ns_map.get(ns) {
+                                if let Some(resolved) = exports.get(member) {
+                                    ann.target = resolved.clone();
+                                } else if env
+                                    .ns_all_defs
+                                    .get(ns)
+                                    .is_some_and(|defs| defs.contains(member))
+                                {
+                                    return Err(format!(
+                                        "Cannot use private validator '{}' from module '{}'",
+                                        member, ns
+                                    ));
+                                } else {
+                                    return Err(format!(
+                                        "Module alias '{}' has no exported validator '{}'",
+                                        ns, member
+                                    ));
+                                }
+                            } else if let Some(scoped) = env.nat_ns_rename.get(ns) {
+                                ann.target = format!("{}.{}", scoped, member);
+                            }
+                        } else if let Some(mapped) = env.sym_map.get(&ann.target) {
+                            ann.target = mapped.clone();
+                        }
+                    }
+                }
+            }
+            ItemKind::TypeAlias { target, .. } => {
+                rewrite_type_expr(target, env)?;
+            }
+            ItemKind::ExportList { names } => {
+                for spec in names {
+                    if let Some(mapped) = env.sym_map.get(&spec.name) {
+                        spec.name = mapped.clone();
+                    }
+                }
+            }
+            ItemKind::Import { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_type_expr(te: &mut TypeExpr, env: &RewriteEnv) -> Result<(), String> {
+    match te {
+        TypeExpr::Named(name) => {
+            if let Some(dot) = name.find('.') {
+                let (ns, member) = (&name[..dot], &name[dot + 1..]);
+                if let Some(exports) = env.ns_map.get(ns) {
+                    let resolved = exports.get(member).ok_or_else(|| {
+                        if env.ns_all_defs.get(ns).is_some_and(|d| d.contains(member)) {
+                            format!("Type '{}' is private in module '{}'", member, ns)
+                        } else {
+                            format!("Module alias '{}' has no exported member '{}'", ns, member)
+                        }
+                    })?;
+                    *name = resolved.clone();
+                } else if let Some(scoped) = env.nat_ns_rename.get(ns) {
+                    *name = format!("{}.{}", scoped, member);
+                }
+            } else if let Some(mapped) = env.sym_map.get(name) {
+                *name = mapped.clone();
+            }
+        }
+        TypeExpr::Generic { type_args, .. } => {
+            for a in type_args {
+                rewrite_type_expr(a, env)?;
+            }
+        }
+        TypeExpr::List(inner) | TypeExpr::Optional(inner) => {
+            rewrite_type_expr(inner, env)?;
+        }
+        TypeExpr::Union(vars) | TypeExpr::Tuple(vars) => {
+            for v in vars {
+                rewrite_type_expr(v, env)?;
+            }
+        }
+        TypeExpr::Func {
+            params,
+            return_type,
+        } => {
+            for p in params {
+                rewrite_type_expr(p, env)?;
+            }
+            rewrite_type_expr(return_type, env)?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn is_shadowed(scopes: &[HashSet<String>], name: &str) -> bool {
+    scopes.iter().rev().any(|s| s.contains(name))
+}
+
+pub(crate) fn bind_pat_names(pat: &Pattern, scope: &mut HashSet<String>) {
+    match &pat.kind {
+        PatternKind::Ident(n) | PatternKind::Type { binding: n, .. } => {
+            scope.insert(n.clone());
+        }
+        PatternKind::Tuple(ps) => {
+            for p in ps {
+                bind_pat_names(p, scope);
+            }
+        }
+        PatternKind::Nil | PatternKind::Wildcard => {}
+    }
+}
+
+fn rewrite_block_stmts(
+    block: &mut Block,
+    env: &RewriteEnv,
+    scopes: &mut Vec<HashSet<String>>,
+) -> Result<(), String> {
+    scopes.push(HashSet::new());
+    for s in &mut block.stmts {
+        match &mut s.kind {
+            StmtKind::Define { name, value } => {
+                rewrite_expr(value, env, scopes)?;
+                if let Some(top) = scopes.last_mut() {
+                    top.insert(name.clone());
+                }
+            }
+            StmtKind::DestructureDefine { pattern, value } => {
+                rewrite_expr(value, env, scopes)?;
+                if let Some(top) = scopes.last_mut() {
+                    bind_pat_names(pattern, top);
+                }
+            }
+            StmtKind::VarDecl { name, ty, init } => {
+                if let Some(te) = ty {
+                    rewrite_type_expr(te, env)?;
+                }
+                if let Some(e) = init {
+                    rewrite_expr(e, env, scopes)?;
+                }
+                if let Some(top) = scopes.last_mut() {
+                    top.insert(name.clone());
+                }
+            }
+            StmtKind::Assign { target, value } => {
+                rewrite_expr(target, env, scopes)?;
+                rewrite_expr(value, env, scopes)?;
+            }
+            StmtKind::Return(Some(e)) | StmtKind::Expr(e) => {
+                rewrite_expr(e, env, scopes)?;
+            }
+            StmtKind::Return(None) | StmtKind::Break | StmtKind::Continue => {}
+            StmtKind::If {
+                condition,
+                then_block,
+                else_block,
+            } => {
+                rewrite_expr(condition, env, scopes)?;
+                rewrite_block_stmts(then_block, env, scopes)?;
+                if let Some(eb) = else_block {
+                    rewrite_block_stmts(eb, env, scopes)?;
+                }
+            }
+            StmtKind::Guard {
+                condition,
+                else_block,
+            } => {
+                rewrite_expr(condition, env, scopes)?;
+                rewrite_block_stmts(else_block, env, scopes)?;
+            }
+            StmtKind::ForIn {
+                pattern,
+                iterable,
+                body,
+            } => {
+                rewrite_expr(iterable, env, scopes)?;
+                let mut loop_scope = HashSet::new();
+                bind_pat_names(pattern, &mut loop_scope);
+                scopes.push(loop_scope);
+                rewrite_block_stmts(body, env, scopes)?;
+                scopes.pop();
+            }
+            StmtKind::While { condition, body } => {
+                rewrite_expr(condition, env, scopes)?;
+                rewrite_block_stmts(body, env, scopes)?;
+            }
+            StmtKind::Switch { expr, cases } => {
+                rewrite_expr(expr, env, scopes)?;
+                for case in cases {
+                    if let PatternKind::Type { name, .. } = &mut case.pattern.kind {
+                        if let Some(dot) = name.find('.') {
+                            let (ns, member) = (&name[..dot], &name[dot + 1..]);
+                            if let Some(exports) = env.ns_map.get(ns) {
+                                if let Some(resolved) = exports.get(member) {
+                                    *name = resolved.clone();
+                                } else {
+                                    return Err(format!(
+                                        "Module alias '{}' has no exported type '{}'",
+                                        ns, member
+                                    ));
+                                }
+                            } else if let Some(scoped) = env.nat_ns_rename.get(ns) {
+                                *name = format!("{}.{}", scoped, member);
+                            }
+                        } else if let Some(mapped) = env.sym_map.get(name) {
+                            *name = mapped.clone();
+                        }
+                    }
+                    let mut case_scope = HashSet::new();
+                    bind_pat_names(&case.pattern, &mut case_scope);
+                    scopes.push(case_scope);
+                    rewrite_block_stmts(&mut case.body, env, scopes)?;
+                    scopes.pop();
+                }
+            }
+        }
+    }
+    scopes.pop();
+    Ok(())
+}
+
+fn rewrite_expr(
+    expr: &mut Expr,
+    env: &RewriteEnv,
+    scopes: &mut Vec<HashSet<String>>,
+) -> Result<(), String> {
+    match &mut expr.kind {
+        ExprKind::Ident(name) => {
+            if !is_shadowed(scopes, name)
+                && let Some(mapped) = env.sym_map.get(name)
+            {
+                *name = mapped.clone();
+            }
+        }
+        ExprKind::Member { target, field } => {
+            if let ExprKind::Ident(ns) = &mut target.kind
+                && !is_shadowed(scopes, ns)
+            {
+                if let Some(exports) = env.ns_map.get(ns.as_str()) {
+                    let resolved = exports.get(field).ok_or_else(|| {
+                        if env.ns_all_defs.get(ns.as_str()).is_some_and(|d| d.contains(field)) {
+                            format!("Symbol '{}' is private in module '{}'", field, ns)
+                        } else {
+                            format!("Module alias '{}' has no exported member '{}'", ns, field)
+                        }
+                    })?;
+                    expr.kind = ExprKind::Ident(resolved.clone());
+                    return Ok(());
+                }
+                if let Some(scoped) = env.nat_ns_rename.get(ns.as_str()) {
+                    *ns = scoped.clone();
+                    return Ok(());
+                }
+            }
+            rewrite_expr(target, env, scopes)?;
+        }
+        ExprKind::OptionalMember { target, .. } | ExprKind::Try(target) => {
+            rewrite_expr(target, env, scopes)?;
+        }
+        ExprKind::Binary { left, right, .. } => {
+            rewrite_expr(left, env, scopes)?;
+            rewrite_expr(right, env, scopes)?;
+        }
+        ExprKind::Unary { expr: inner, .. } => rewrite_expr(inner, env, scopes)?,
+        ExprKind::List(es) | ExprKind::Tuple(es) => {
+            for e in es {
+                rewrite_expr(e, env, scopes)?;
+            }
+        }
+        ExprKind::Call {
+            callee,
+            type_args,
+            args,
+            named_args,
+        } => {
+            rewrite_expr(callee, env, scopes)?;
+            for t in type_args {
+                rewrite_type_expr(t, env)?;
+            }
+            for a in args {
+                rewrite_expr(a, env, scopes)?;
+            }
+            for na in named_args {
+                rewrite_expr(&mut na.value, env, scopes)?;
+            }
+        }
+        ExprKind::Index { target, index } => {
+            rewrite_expr(target, env, scopes)?;
+            rewrite_expr(index, env, scopes)?;
+        }
+        ExprKind::Closure {
+            params,
+            return_type,
+            body,
+        } => {
+            for p in params.iter_mut() {
+                rewrite_type_expr(&mut p.ty, env)?;
+            }
+            if let Some(rt) = return_type {
+                rewrite_type_expr(rt, env)?;
+            }
+            scopes.push(params.iter().map(|p| p.name.clone()).collect());
+            rewrite_block_stmts(body, env, scopes)?;
+            scopes.pop();
+        }
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::String(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Nil => {}
+    }
+    Ok(())
+}

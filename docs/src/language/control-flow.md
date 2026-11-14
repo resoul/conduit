@@ -105,27 +105,46 @@ Pipelines can be written with or without parentheses on single-argument function
 
 ## Runnable Example
 
-The following program demonstrates `if`/`else`, `for` loops with `break` and `continue`, `guard` clauses, and the pipeline operator `|>`:
-
 ```conduit
-{{#include ../../../examples/docs/language/control_flow.cdt}}
+func double(x: Int) -> Int {
+    return x * 2
+}
+
+func check_positive(n: Int) -> Int {
+    guard n > 0 else {
+        return 0
+    }
+    return n
+}
+
+func main() -> Void {
+    for item in [1, 2, 3, 4, 5] {
+        if item == 2 {
+            continue
+        }
+        if item > 4 {
+            break
+        }
+        print(item)
+    }
+    print(check_positive(-5))
+    print(5 |> double)
+}
 ```
 
 ### Running the Example
 
 ```bash
-conduit run examples/docs/language/control_flow.cdt
+conduit run control_flow.cdt
 ```
 
 Output:
 
 ```text
-Normal
 1
 3
 4
 0
-7
-20
+10
 ```
 

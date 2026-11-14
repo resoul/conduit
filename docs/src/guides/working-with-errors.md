@@ -64,24 +64,45 @@ for item in results {
 
 ## Complete Runnable Recipe
 
-The following standalone recipe demonstrates input validation, error propagation through helper functions, and exhaustive resolution in `main()`:
-
 ```conduit
-{{#include ../../../examples/docs/guides/error_recipe.cdt}}
+error InputError {
+    detail: String
+}
+
+func parse_positive(s: String) -> Int | InputError | ParseError {
+    guard s.len() > 0 else {
+        return InputError(detail: "empty string")
+    }
+    return s.to_int()?
+}
+
+func process_input(s: String) -> Int | InputError | ParseError {
+    val := parse_positive(s)?
+    return val * 2
+}
+
+func main() -> Void {
+    for raw in ["42", "", "unknown"] {
+        switch process_input(raw) {
+            case Int(v): print("Processed integer: {v}")
+            case InputError(e): print("Input error: {e.detail}")
+            case ParseError(e): print("Could not parse: {e.value}")
+        }
+    }
+}
 ```
 
 ### Running the Recipe
 
 ```bash
-conduit run examples/docs/guides/error_recipe.cdt
+conduit run error_recipe.cdt
 ```
 
 Output:
 
 ```text
-Processed integer:
-84
-Validation failed on input: empty string
+Processed integer: 84
+Input error: empty string
 Could not parse: unknown
 ```
 

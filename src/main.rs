@@ -1,200 +1,158 @@
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
 use std::process;
 
-use conduit::check::TypeChecker;
-use conduit::interp::Interpreter;
-use conduit::lexer::Lexer;
-use conduit::loader::ModuleLoader;
-use conduit::native::NativeRegistry;
-use conduit::parser::Parser;
-use conduit::reachability::ReachabilityAnalyzer;
+use conduit::benchmarks;
+use conduit::frontend;
+use conduit::frontend::types::Type;
+use conduit::ir::lower::compile_program;
+use conduit::vm::{ExecResult, Vm};
 
 fn main() {
-    let args: Vec<String> = env::args().collect();
-
-    if args.len() < 2 {
-        print_usage();
-        return;
-    }
-
-    match args[1].as_str() {
-        "--version" | "-v" => {
-            println!("Conduit v{}", conduit::VERSION);
-        }
-        "--help" | "-h" => {
-            print_usage();
-        }
-        "tokens" => {
-            if args.len() < 3 {
-                eprintln!("Error: missing file path for 'tokens' command");
-                eprintln!("Usage: conduit tokens <file.cdt>");
-                process::exit(1);
+    let args: Vec<String> = env::args().skip(1).collect();
+    match args.first().map(|s| s.as_str()) {
+        Some("bench") | None => {
+            let mut filter: Option<&str> = None;
+            let mut strict = false;
+            let mut i = if args.first().map(|s| s.as_str()) == Some("bench") {
+                1
+            } else {
+                0
+            };
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--filter" => {
+                        i += 1;
+                        if i < args.len() {
+                            filter = Some(args[i].as_str());
+                        } else {
+                            eprintln!("Missing pattern after --filter");
+                            process::exit(2);
+                        }
+                    }
+                    "--strict" => strict = true,
+                    other => {
+                        eprintln!("Unknown argument: {}", other);
+                        process::exit(2);
+                    }
+                }
+                i += 1;
             }
-            let file_path = &args[2];
-            let content = read_file(file_path);
-
-            let mut lexer = Lexer::new(&content);
-            match lexer.tokenize_all() {
-                Ok(tokens) => {
-                    for tok in tokens {
-                        println!("[{:3}:{:3}] {:?}", tok.span.line, tok.span.col, tok.kind);
+            match benchmarks::run_all(filter) {
+                Ok(all_passed) => {
+                    if !all_passed {
+                        eprintln!("\nOne or more benchmark target gates FAILED.");
+                        if strict {
+                            process::exit(1);
+                        }
+                    } else {
+                        println!("\nAll benchmark target gates PASSED.");
                     }
                 }
                 Err(err) => {
-                    eprintln!("{}", err);
+                    eprintln!("Benchmark error: {}", err);
                     process::exit(1);
                 }
             }
         }
-        "ast" => {
-            if args.len() < 3 {
-                eprintln!("Error: missing file path for 'ast' command");
-                eprintln!("Usage: conduit ast <file.cdt>");
-                process::exit(1);
-            }
-            let file_path = &args[2];
-            let content = read_file(file_path);
+        Some("check") => run_check_cmd(args.get(1)),
+        Some("disasm") => run_disasm_cmd(args.get(1)),
+        Some("run") => run_exec_cmd(args.get(1)),
+        Some("--help" | "-h" | "help") => {
+            println!("Usage:\n  conduit bench [--filter <pat>] [--strict]\n  conduit check <file.cdt>\n  conduit disasm <file.cdt>\n  conduit run <file.cdt>");
+        }
+        Some(cmd) => {
+            eprintln!("Unknown command '{}'. Usage: conduit <bench|check|disasm|run> ...", cmd);
+            process::exit(2);
+        }
+    }
+}
 
-            let mut lexer = Lexer::new(&content);
-            let tokens = match lexer.tokenize_all() {
-                Ok(t) => t,
-                Err(err) => {
-                    eprintln!("{}", err);
-                    process::exit(1);
-                }
-            };
-
-            let mut parser = Parser::new(tokens);
-            match parser.parse_program() {
-                Ok(program) => {
-                    println!("{:#?}", program);
-                }
-                Err(err) => {
-                    eprintln!("{}", err);
-                    process::exit(1);
-                }
-            }
-        }
-        "check" => {
-            if args.len() < 3 {
-                eprintln!("Error: missing file path for 'check' command");
-                eprintln!("Usage: conduit check <file.cdt>");
-                process::exit(1);
-            }
-            let file_path = &args[2];
-            let _ = load_and_check(file_path);
-            println!("Check passed: '{}' is valid.", file_path);
-        }
-        "run" => {
-            if args.len() < 3 {
-                eprintln!("Error: missing file path for 'run' command");
-                eprintln!("Usage: conduit run <file.cdt>");
-                process::exit(1);
-            }
-            let file_path = &args[2];
-            let (root, loader) = load_and_check(file_path);
-
-            let mut interpreter = Interpreter::new();
-            if let Err(err) = interpreter.run_project(&root, &loader) {
-                eprintln!("{}", err);
-                process::exit(1);
-            }
-        }
-        "reachability" => {
-            if args.len() < 3 {
-                eprintln!("Error: missing file path for 'reachability' command");
-                eprintln!("Usage: conduit reachability <file.cdt>");
-                process::exit(1);
-            }
-            let file_path = &args[2];
-            let (root, loader) = load_and_check(file_path);
-            let native_reg = NativeRegistry::new();
-            let mut analyzer = ReachabilityAnalyzer::new(&loader.modules, &native_reg);
-            let report = analyzer.analyze(&root, &[]);
-            println!("=== Reachability Analysis Report ===");
-            println!("Root module: {}", report.root_module.display());
-            println!(
-                "Reachable functions: {} / {} total ({} unused)",
-                report.reachable_functions_count, report.total_functions, report.unused_functions_count
-            );
-            println!("Reachable native functions ({}):", report.reachable_native_functions.len());
-            for (m, f) in &report.reachable_native_functions {
-                println!("  - {}.{}()", m, f);
-            }
-        }
-        "lsp" => {
-            if let Err(err) = conduit::lsp::run_lsp_server() {
-                eprintln!("LSP server error: {}", err);
-                process::exit(1);
-            }
-        }
-        "doc" => {
-            let native_reg = NativeRegistry::new();
-            if args.len() < 3 {
-                for module in native_reg.modules() {
-                    print!("{}", module.generate_markdown_docs());
-                }
-            } else {
-                let mod_name = &args[2];
-                if let Some(module) = native_reg.get_module(mod_name) {
-                    print!("{}", module.generate_markdown_docs());
-                } else {
-                    eprintln!("Error: native module '{}' not found in registry", mod_name);
-                    process::exit(1);
-                }
-            }
-        }
-        cmd => {
-            eprintln!("Unknown command: '{}'", cmd);
-            print_usage();
+fn read_source_arg(arg: Option<&String>, cmd: &str) -> String {
+    let Some(path) = arg else {
+        eprintln!("Usage: conduit {} <file.cdt>", cmd);
+        process::exit(2);
+    };
+    match fs::read_to_string(path) {
+        Ok(src) => src,
+        Err(e) => {
+            eprintln!("Failed to read '{}': {}", path, e);
             process::exit(1);
         }
     }
 }
 
-fn load_and_check(file_path: &str) -> (PathBuf, ModuleLoader) {
-    let path = Path::new(file_path);
-    let mut loader = ModuleLoader::new();
-    let root = match loader.load_project(path) {
-        Ok(r) => r,
-        Err(err) => {
-            eprintln!("{}", err);
+fn run_check_cmd(arg: Option<&String>) {
+    let src = read_source_arg(arg, "check");
+    match frontend::check_source(&src) {
+        Ok((_, checked)) => {
+            println!(
+                "OK: {} type(s), {} function(s)",
+                checked.structs.len(),
+                checked.funcs.len()
+            );
+        }
+        Err(e) => {
+            eprintln!("Check error: {}", e);
+            process::exit(1);
+        }
+    }
+}
+
+fn run_disasm_cmd(arg: Option<&String>) {
+    let src = read_source_arg(arg, "disasm");
+    match frontend::compile_source(&src) {
+        Ok(module) => print!("{}", module.disassemble()),
+        Err(e) => {
+            eprintln!("Compile error: {}", e);
+            process::exit(1);
+        }
+    }
+}
+
+fn run_exec_cmd(arg: Option<&String>) {
+    let src = read_source_arg(arg, "run");
+    let (program, checked) = match frontend::check_source(&src) {
+        Ok(res) => res,
+        Err(e) => {
+            eprintln!("Check error: {}", e);
             process::exit(1);
         }
     };
-
-    let mut checker = TypeChecker::new();
-    if let Err(err) = checker.check_project(&root, &loader) {
-        eprintln!("{}", err);
+    let module = match compile_program(&program, &checked) {
+        Ok(m) => {
+            if let Err(e) = m.validate() {
+                eprintln!("Validation error: {}", e);
+                process::exit(1);
+            }
+            m
+        }
+        Err(e) => {
+            eprintln!("Compile error: {}", e);
+            process::exit(1);
+        }
+    };
+    let Some(fid) = checked.func_by_name.get("main").copied() else {
+        eprintln!("No 'main' function found");
+        process::exit(1);
+    };
+    let sig = &checked.funcs[fid as usize];
+    if !sig.params.is_empty() {
+        eprintln!("'main' must take 0 parameters for CLI run");
         process::exit(1);
     }
-
-    (root, loader)
-}
-
-fn read_file(path: &str) -> String {
-    match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(err) => {
-            eprintln!("Error reading '{}': {}", path, err);
+    let mut vm = Vm::new();
+    match vm.call(&module, fid, &[], &[]) {
+        Ok(ExecResult::Void) => {}
+        Ok(ExecResult::Scalar(v)) => match sig.return_type {
+            Type::Float => println!("{}", f64::from_bits(v)),
+            Type::Bool => println!("{}", v != 0),
+            _ => println!("{}", v as i64),
+        },
+        Ok(ExecResult::Obj(obj)) => println!("{:?}", obj),
+        Err(e) => {
+            eprintln!("Runtime error: {}", e);
             process::exit(1);
         }
     }
-}
-
-fn print_usage() {
-    println!("Conduit Programming Language v{}", conduit::VERSION);
-    println!();
-    println!("Usage:");
-    println!("  conduit run <file.cdt>          Type-check and execute a source file");
-    println!("  conduit check <file.cdt>        Type-check a source file and its imports");
-    println!("  conduit reachability <file.cdt> Analyze reachable functions and native dependencies");
-    println!("  conduit doc [module]            Generate Markdown API documentation from NativeRegistry");
-    println!("  conduit ast <file.cdt>          Parse and display the AST of a source file");
-    println!("  conduit tokens <file.cdt>       Print tokens of a source file");
-    println!("  conduit lsp                     Start the Language Server Protocol (LSP) server");
-    println!("  conduit --version               Show version");
-    println!("  conduit --help                  Show this help message");
 }

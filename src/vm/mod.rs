@@ -1,0 +1,172 @@
+pub mod exec;
+pub(crate) mod exec_cold;
+pub(crate) mod exec_map;
+pub(crate) mod exec_union;
+pub mod opcode;
+pub mod pipeline;
+pub(crate) mod pipeline_leaf;
+pub mod value;
+#[cfg(test)]
+mod tests;
+
+use value::Obj;
+
+use crate::ir::Module;
+
+pub const MAX_CALL_DEPTH: usize = 256;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeError {
+    pub message: String,
+}
+
+impl std::fmt::Display for RuntimeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Runtime error: {}", self.message)
+    }
+}
+
+impl std::error::Error for RuntimeError {}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CallFrame {
+    pub func_id: u32,
+    pub return_ip: usize,
+    pub s_base: usize,
+    pub o_base: usize,
+    pub ret_reg: u16,
+    pub prev_closure_slot: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExecResult {
+    Scalar(u64),
+    Obj(Obj),
+    Void,
+}
+
+pub struct Vm {
+    pub scalars: Vec<u64>,
+    pub objs: Vec<Obj>,
+    pub(crate) frames: Vec<CallFrame>,
+}
+
+impl Vm {
+    pub fn new() -> Self {
+        Self {
+            scalars: vec![0u64; 4096],
+            objs: vec![Obj::Empty; 4096],
+            frames: Vec::with_capacity(MAX_CALL_DEPTH),
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn ensure_capacity(&mut self, s_needed: usize, o_needed: usize) {
+        if s_needed > self.scalars.len() {
+            self.grow_scalars(s_needed);
+        }
+        if o_needed > self.objs.len() {
+            self.grow_objs(o_needed);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow_scalars(&mut self, needed: usize) {
+        let new_len = needed.next_power_of_two().max(4096);
+        self.scalars.resize(new_len, 0);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow_objs(&mut self, needed: usize) {
+        let new_len = needed.next_power_of_two().max(4096);
+        self.objs.resize(new_len, Obj::Empty);
+    }
+
+    #[inline]
+    pub fn clear_obj_range(&mut self, start: usize, count: usize) {
+        if count > 0 {
+            for slot in &mut self.objs[start..start + count] {
+                if !matches!(slot, Obj::Empty) {
+                    *slot = Obj::Empty;
+                }
+            }
+        }
+    }
+
+    pub fn call_scalar(
+        &mut self,
+        module: &Module,
+        func_id: u32,
+        scalar_args: &[u64],
+        obj_args: &[Obj],
+    ) -> Result<u64, RuntimeError> {
+        match self.call(module, func_id, scalar_args, obj_args)? {
+            ExecResult::Scalar(v) => Ok(v),
+            ExecResult::Void => Ok(0),
+            ExecResult::Obj(_) => Err(RuntimeError {
+                message: "Expected scalar return value".to_string(),
+            }),
+        }
+    }
+
+    pub fn call_obj(
+        &mut self,
+        module: &Module,
+        func_id: u32,
+        scalar_args: &[u64],
+        obj_args: &[Obj],
+    ) -> Result<Obj, RuntimeError> {
+        match self.call(module, func_id, scalar_args, obj_args)? {
+            ExecResult::Obj(v) => Ok(v),
+            _ => Err(RuntimeError {
+                message: "Expected object return value".to_string(),
+            }),
+        }
+    }
+
+    pub fn call(
+        &mut self,
+        module: &Module,
+        func_id: u32,
+        scalar_args: &[u64],
+        obj_args: &[Obj],
+    ) -> Result<ExecResult, RuntimeError> {
+        module
+            .validate()
+            .map_err(|message| RuntimeError { message })?;
+        let func = module.functions.get(func_id as usize).ok_or_else(|| RuntimeError {
+            message: format!("Function {} not found", func_id),
+        })?;
+        if scalar_args.len() != func.scalar_params as usize
+            || obj_args.len() != func.obj_params as usize
+        {
+            return Err(RuntimeError {
+                message: format!(
+                    "Arity mismatch calling '{}': expected ({}, {}), got ({}, {})",
+                    func.name,
+                    func.scalar_params,
+                    func.obj_params,
+                    scalar_args.len(),
+                    obj_args.len()
+                ),
+            });
+        }
+        self.frames.clear();
+        self.ensure_capacity(func.num_scalars as usize, func.num_objs as usize);
+        if !scalar_args.is_empty() {
+            self.scalars[..scalar_args.len()].copy_from_slice(scalar_args);
+        }
+        for (idx, obj) in obj_args.iter().enumerate() {
+            self.objs[idx] = obj.clone();
+        }
+        self.exec_from(module, func_id, 0, 0, usize::MAX)
+    }
+}
+
+impl Default for Vm {
+    fn default() -> Self {
+        Self::new()
+    }
+}

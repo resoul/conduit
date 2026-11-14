@@ -1,78 +1,49 @@
 # Architecture & Pipeline
 
-Conduit is implemented as a clean, multi-stage compiler and execution pipeline written in pure Rust with zero external dependencies.
+Conduit 0.2.0 is implemented as a multi-stage compiler and register-based bytecode VM written in pure Rust (`std` only) with zero external dependencies.
 
 ---
 
 ## Compiler & Runtime Pipeline
 
-When you execute `conduit run main.cdt` or `conduit check main.cdt`, source files pass through the following pipeline:
+When you execute `conduit run main.cdt`, source files pass through the following pipeline:
 
 ```text
 Source Code (.cdt)
        │
        ▼
-  [ 1. Lexer ]           ──> Token Stream (conduit tokens)
+  [ 1. Lexer ]           ──> Token Stream (`frontend/lexer.rs`)
        │
        ▼
-  [ 2. Parser ]          ──> Abstract Syntax Tree (AST) (conduit ast)
+  [ 2. Parser ]          ──> AST (`frontend/parser*.rs`)
        │
        ▼
-[ 3. Module Loader ]     ──> Module Dependency Graph & Cycle Detection
+  [ 3. Linker ]          ──> TS-style Module Graph (`frontend/linker.rs`)
        │
        ▼
-[ 4. Type Checker ]      ──> Static Semantic Analysis & Error Verification (conduit check)
-       │
-       ├─────────────────> [ 5. Reachability Analyzer ] (conduit reachability)
+  [ 4. Monomorphizer ]   ──> Generic Specialization (`frontend/monomorph*.rs`)
        │
        ▼
-[ 6. Interpreter ]       ──> Tree-Walk AST Execution (conduit run)
+  [ 5. Type Checker ]    ──> Static Semantics & Exhaustiveness (`frontend/check*.rs`)
        │
        ▼
-[ 7. Native Registry ]   ──> Standard Library Host Bridge (cdt.time)
+  [ 6. Reachability ]    ──> Dead-Code Tree-Shaking (`frontend/reachability.rs`)
+       │
+       ▼
+  [ 7. IR Lowering ]     ──> Register Bytecode (`ir/lower*.rs`, `conduit disasm`)
+       │
+       ▼
+  [ 8. Bytecode VM ]     ──> Split Scalar/Object Register Execution (`vm/exec*.rs`)
 ```
-
----
-
-## Detailed Stages
-
-### 1. Lexer (`src/lexer.rs`)
-The lexer scans the raw UTF-8 source string character by character, emitting strongly typed tokens (`TokenKind`) along with precise source coordinates (`Span { line, col }`). Comments (`//`) and whitespace are stripped.
-
-### 2. Parser (`src/parser.rs`)
-A hand-written recursive descent parser constructs the Abstract Syntax Tree (AST). It handles operator precedence (such as the pipeline operator `|>`), desugaring, pattern structures, and control flow blocks without external parser generators.
-
-### 3. Module Loader (`src/loader.rs`)
-The module loader reads relative imports starting from the root file, canonicalizes cross-platform paths, loads dependent `.cdt` files into a module graph, and verifies that no circular dependencies exist.
-
-### 4. Type Checker (`src/check.rs`)
-The static type checker traverses the loaded project AST to enforce:
-- Type compatibility across assignments, parameters, and returns.
-- Exhaustiveness and non-redundancy of `switch` pattern matching.
-- Strict error checking: error types cannot be discarded or ignored.
-- Safety of the `?` try operator (ensuring it is only used with error-returning functions).
-- Module privacy boundaries: unexported symbols cannot be accessed, and private types cannot leak in public signatures.
-
-### 5. Reachability Analyzer (`src/reachability.rs`)
-Starting from `func main()` in the root module, the analyzer traces all function call expressions and callback references across the entire loaded project. It identifies dead code and records all accessed host native functions.
-
-### 6. Interpreter (`src/interp.rs`)
-A high-performance tree-walk interpreter evaluates AST nodes directly. Scopes and variable environments are managed dynamically without requiring an intermediate bytecode VM or JIT compiler.
-
-### 7. Native Registry (`src/native/`)
-The `NativeRegistry` hosts all built-in standard library implementations (such as `cdt.time`). It provides type-safe boundaries, preventing Conduit programs from mutating host state arbitrarily while enabling deterministic documentation generation (`conduit doc`).
 
 ---
 
 ## Source Code Organization
 
-The core compiler modules in `src/` correspond directly to the pipeline stages:
-- `src/lexer.rs`: Token scanner and lexical error diagnostics.
-- `src/parser.rs`: Recursive-descent grammar and AST construction.
-- `src/loader.rs`: Path canonicalization, module loading, and cycle detection.
-- `src/check.rs`: Type system, pattern exhaustiveness, and visibility checks.
-- `src/reachability.rs`: Dead code analysis and call graph tracing.
-- `src/interp.rs`: Tree-walk execution engine and value representations.
-- `src/native/`: Unified registry and host-native implementations (`cdt.time`).
+The modules in `src/` correspond directly to the compiler and VM stages:
 
-
+- `src/frontend/`: Lexer (`lexer.rs`), recursive-descent parser (`parser.rs`, `parser_expr.rs`, `parser_stmt.rs`), module linker (`linker.rs`), generic monomorphization (`monomorph*.rs`), static type checker (`check*.rs`), and reachability tree-shaking (`reachability.rs`).
+- `src/ir/`: IR `Module` validator/disassembler (`mod.rs`) and register bytecode lowering (`lower*.rs`), including fused `RunPipeline` planning.
+- `src/vm/`: Compact 16-byte `Op` and `Obj` definitions (`opcode.rs`, `value.rs`), main VM dispatch loop (`exec.rs`, `exec_cold.rs`, `exec_union.rs`, `exec_map.rs`), and fused pipeline execution (`pipeline.rs`, `pipeline_leaf.rs`).
+- `src/native/`: Zero-dependency host implementations for `cdt.json`, `cdt.time`, and `cdt.validation`.
+- `src/benchmarks/`: Built-in `conduit bench` suite covering 34 VM workloads.

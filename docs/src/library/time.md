@@ -3,7 +3,7 @@
 The `cdt.time` standard library provides system and monotonic clock operations, duration arithmetic, and UTC Unix epoch conversions.
 
 ```conduit
-import cdt.time as time
+import * as time from "cdt.time"
 ```
 
 ---
@@ -35,27 +35,31 @@ Conduit maintains a strict distinction between wall-clock system time and monoto
 
 ## Runnable Example
 
-The following program demonstrates reading timestamps, constructing durations, and measuring elapsed intervals:
-
 ```conduit
-{{#include ../../../examples/docs/library/time.cdt}}
+import * as time from "cdt.time"
+
+func run_timer() -> Void | time.TimeError {
+    ts := time.now()?
+    print("Timestamp seconds: {ts.unix_seconds()?}")
+    dur := time.seconds(5)?
+    print("Duration seconds: {dur.seconds()?}")
+    start := time.monotonic()
+    _elapsed := time.elapsed(start)?
+    print("Time measurement completed successfully.")
+}
+
+func main() -> Void {
+    switch run_timer() {
+        case Void: {}
+        case TimeError(e): print(e.message)
+    }
+}
 ```
 
 ### Running the Example
 
 ```bash
-conduit run examples/docs/library/time.cdt
-```
-
-Output:
-
-```text
-Timestamp seconds:
-1794346890
-Duration seconds:
-5
-Elapsed duration measured.
-Time measurement completed successfully.
+conduit run time_demo.cdt
 ```
 
 ---

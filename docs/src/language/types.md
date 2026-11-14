@@ -24,18 +24,19 @@ Conduit features built-in primitive types:
 
 | Method | Signature | Behavior |
 | :--- | :--- | :--- |
-| `.len()` | `() -> Int` | Returns **UTF-8 byte length** (`O(1)`). Use `.char_count()` when counting characters. |
-| `.char_count()` | `() -> Int` | Returns the count of **Unicode scalar values** (`"café".char_count() == 4`, whereas `"café".len() == 5`). |
+| `.len()` | `() -> Int` | Returns UTF-8 byte length (`O(1)`). |
 | `.trim()` | `() -> String` | Strips leading and trailing whitespace. |
-| `.lower()` / `.upper()` | `() -> String` | Converts ASCII/Unicode text to lowercase or uppercase. |
+| `.lower()` / `.upper()` | `() -> String` | Converts text to lowercase or uppercase. |
 | `.contains(sub)` | `(String) -> Bool` | Checks whether `sub` occurs in the string. |
 | `.starts_with(prefix)` | `(String) -> Bool` | Checks whether the string begins with `prefix`. |
 | `.ends_with(suffix)` | `(String) -> Bool` | Checks whether the string ends with `suffix`. |
-| `.split(sep)` | `(String) -> [String]` | Splits on `sep` (returns `[s]` if `sep` is not found; `[""]` when `s == ""` and `sep != ""`). |
+| `.split(sep)` | `(String) -> [String]` | Splits on `sep`. |
 | `.replace(from, to)` | `(String, String) -> String` | Replaces all occurrences of `from` with `to` (returns the original string unchanged when `from == ""`). |
+| `.to_int()` | `() -> Int \| ParseError` | Parses a strict decimal integer without surrounding whitespace. |
+| `.to_float()` | `() -> Float \| ParseError` | Parses a finite floating-point number without surrounding whitespace. |
 | `.to_string()` | `() -> String` | Identity conversion on `String`. |
 
-> **Note:** `cdt.validation` constraints `min` and `max` measure string character count in Unicode scalar values (matching `.char_count()`), while `String.len()` returns raw UTF-8 bytes.
+> **Note:** `cdt.validation` constraints `min` and `max` measure string character count in Unicode scalar values, while `String.len()` returns raw UTF-8 bytes.
 
 ### Explicit `.to_string()` Conversion
 
@@ -53,7 +54,7 @@ msg := "count=" + count.to_string() + ", ratio=" + ratio.to_string() + ", ok=" +
 Conduit enforces strict separation between `Int` and `Float` (`f64`): arithmetic (`+`, `-`, `*`, `/`), unary `-`, and comparisons (`<`, `<=`, `>`, `>=`, `==`, `!=`) require matching operand types. Dividing a `Float` by `0.0` raises a `Runtime error: Division by zero` rather than propagating `NaN` or `Infinity`.
 
 - Convert integers explicitly via `n.to_float() -> Float`.
-- Convert or inspect floats via `.floor() -> Int`, `.ceil() -> Int`, `.round() -> Int`, `.trunc() -> Int`, `.to_string() -> String`, `.is_nan() -> Bool`, `.is_infinite() -> Bool`, and `.is_finite() -> Bool`.
+- Round or format floats via `.floor() -> Float`, `.ceil() -> Float`, `.round() -> Float`, and `.to_string() -> String`.
 
 ## Optional Types (`T?`) and `nil`
 
@@ -77,15 +78,9 @@ score = 42
 updated_score := score ?? 0 // Evaluates to 42
 ```
 
-### Optional Chaining (`?.`) and Flow-Sensitive Narrowing
+### Flow-Sensitive Narrowing
 
-Use `?.` to safely traverse optional fields and call non-`Void`, non-error-returning methods without nested `switch` blocks. Chained accesses flatten cleanly to `U?` and short-circuit immediately on `nil`:
-
-```conduit
-city_upper := user?.profile?.city?.upper() ?? "UNKNOWN"
-```
-
-Comparing an optional binding against `nil` automatically narrows `T?` to `T` inside `guard x != nil else { ... }`, `if x != nil { ... }`, `while x != nil { ... }`, and short-circuit boolean conditions (`x != nil && x.active`, `x == nil || x.active`). Assigning `nil` back to a `var x: T?` resets the narrowed type back to `T?`.
+Comparing an optional binding against `nil` narrows `T?` to `T` inside `guard x != nil else { ... }`, `if x != nil { ... }`, and `while x != nil { ... }`. Assigning `nil` back to a `var x: T?` resets the narrowed type back to `T?`.
 
 ### Strict String Number Parsing (`ParseError`)
 
@@ -96,7 +91,7 @@ n := "42".to_int()?
 f := "3.14".to_float()?
 ```
 
-Both methods reject surrounding whitespace unless `.trim()` is called first, and `.to_float()` rejects non-finite values such as `"NaN"` or `"Infinity"`. Strings also provide Unicode-scalar-indexed `.index_of(sub: String) -> Int?` and `.slice(start: Int, end: Int) -> String`.
+Both methods reject surrounding whitespace unless `.trim()` is called first, and `.to_float()` rejects non-finite values such as `"NaN"` or `"Infinity"`.
 
 > [!IMPORTANT]
 > **Difference between `T?` and `T | Error`:**
@@ -157,29 +152,30 @@ Different type arguments produce distinct, incompatible types (`Page<Int>` canno
 
 ## Runnable Example
 
-The following complete program demonstrates primitive types, optional unwrapping with `??`, record definition, and field access:
-
 ```conduit
-{{#include ../../../examples/docs/language/types.cdt}}
+type Point {
+    x: Int
+    y: Int
+}
+
+func main() -> Void {
+    var score: Int? = nil
+    print(score ?? 100)
+    pt := Point(x: 10, y: 20)
+    print("{pt.x}:{pt.y}")
+}
 ```
 
 ### Running the Example
 
 ```bash
-conduit run examples/docs/language/types.cdt
+conduit run types.cdt
 ```
 
 Output:
 
 ```text
-42
-hello
-true
 100
-25
-10
-20
-5:4
-2
+10:20
 ```
 

@@ -50,11 +50,11 @@ export func compute_stats(items: [Int]) -> Stats | EmptyData {
 
 ## 3. Consuming Modules with Meaningful Aliases
 
-In `main.cdt`, use relative imports and clear alias names:
+In `main.cdt`, use TypeScript-style relative and standard library imports:
 
 ```conduit
-import "./math" as math
-import cdt.time as clock
+import { compute_stats, Stats, EmptyData } from "./math"
+import * as clock from "cdt.time"
 ```
 
 ---
@@ -64,51 +64,68 @@ import cdt.time as clock
 ### Module Implementation (`module_recipe_math.cdt`)
 
 ```conduit
-{{#include ../../../examples/docs/guides/module_recipe_math.cdt}}
+export type Stats {
+    count: Int
+    sum: Int
+}
+
+export error EmptyData {}
+
+func internal_sum(items: [Int]) -> Int {
+    var total: Int = 0
+    for x in items {
+        total = total + x
+    }
+    return total
+}
+
+export func compute_stats(items: [Int]) -> Stats | EmptyData {
+    guard items.len() > 0 else {
+        return EmptyData()
+    }
+    return Stats(count: items.len(), sum: internal_sum(items))
+}
 ```
 
 ### Main Entrypoint (`module_recipe_main.cdt`)
 
 ```conduit
-{{#include ../../../examples/docs/guides/module_recipe_main.cdt}}
+import { compute_stats, Stats, EmptyData } from "./module_recipe_math"
+import { monotonic, elapsed } from "cdt.time"
+
+func main() -> Void {
+    start := monotonic()
+    switch compute_stats([10, 20, 30, 40]) {
+        case Stats(s):
+            print("Item count: {s.count}")
+            print("Total sum: {s.sum}")
+        case EmptyData(_):
+            print("Empty input")
+    }
+    switch elapsed(start) {
+        case Duration(_): print("Completed successfully.")
+        case TimeError(e): print(e.message)
+    }
+}
 ```
 
 ### Running the Recipe
 
 ```bash
-conduit run examples/docs/guides/module_recipe_main.cdt
+conduit run module_recipe_main.cdt
 ```
 
 Output:
 
 ```text
-Item count:
-4
-Total sum:
-100
-Benchmark completed successfully.
+Item count: 4
+Total sum: 100
+Completed successfully.
 ```
 
 ---
 
-## 4. Running Reachability Analysis
+## 4. Automatic Dead-Code Elimination (Tree-Shaking)
 
-Conduit provides a built-in reachability analyzer to detect dead code or verify that private helper functions are actually utilized by the entry point:
-
-```bash
-conduit reachability examples/docs/guides/module_recipe_main.cdt
-```
-
-Output:
-
-```text
-=== Reachability Analysis Report ===
-Root module: /workspace/examples/docs/guides/module_recipe_main.cdt
-Reachable functions: 4 / 4 total (0 unused)
-Reachable native functions (2):
-  - cdt.time.monotonic()
-  - cdt.time.elapsed()
-```
-
-If an unused private function is added to `module_recipe_math.cdt`, `conduit reachability` will flag it as unused, keeping your codebase clean.
+During compilation, Conduit automatically performs reachability analysis starting from `main()` across all imported modules, omitting unused functions from the final compiled bytecode module.
 

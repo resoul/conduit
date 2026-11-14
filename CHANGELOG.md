@@ -5,12 +5,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
-## [Unreleased]
+## [0.2.0] - 2026-11-14
 
-### Internal / Refactoring
+### Added & Changed
 
-* Split `src/check.rs`, `src/interp.rs`, and `src/parser.rs` into focused submodules under `src/check/`, `src/interp/`, and `src/parser/` with every file under 800 lines.
-* Decomposed large dispatcher functions (`TypeChecker::check_expr`, `TypeChecker::check_stmt`, `TypeChecker::check_project`, `TypeChecker::check_method_call`, `Interpreter::eval_expr`, `Interpreter::eval_stmt`, `Interpreter::eval_method_on_value`) into smaller single-purpose methods with no behavioral changes.
+* **Register Bytecode VM & Compiler Architecture**:
+  * Replaced the tree-walking AST interpreter with a register-based bytecode VM (`Op`, `Module`, `Vm`) using split scalar (`u64`) and object (`Obj`) register files (`size_of::<Obj>() <= 16`, `size_of::<Op>() <= 16`).
+  * Added IR lowering (`FnLowerer`) with preallocated local slots, copy-on-write (`Arc`) semantics for collections/records/strings, fused `RunPipeline` execution for `|>` / `map` / `filter` chains, and `Op::ExtOp` compact dispatch.
+  * Preserved zero external dependencies (pure Rust `std` only) and kept all source files under 700 lines.
+
+* **Language Features, Generics & Module System**:
+  * Added TypeScript-style named and namespace imports (`import { a, b } from "..."`, `import * as ns from "..."`) with reachability tree-shaking of unused functions.
+  * Added compile-time monomorphization for generic structs and functions (`type Box<T>`, `func f<T>`), string interpolation (`"hello {x}"`), and tuple destructuring (`(a, b) := expr`).
+  * Added `print(msg)` builtin, `Float.ceil()`, prelude error constructors (`IndexError`, `KeyError`, `ParseError`), `String.to_int()` / `String.to_float()`, and full `Map<K, V>` support (`.set`, `.get`, `.contains_key`, `.remove`, `.keys`, `.values`, `.entries`, `Map.from`, `map[k] -> V | KeyError`, `for (k, v) in map`).
+
+* **Native Standard Libraries & Benchmarks**:
+  * Rebuilt native `cdt.json` (`decode`, `encode`, `parse`, `stringify`), `cdt.time` (`now`, `monotonic`, `elapsed`, `seconds`, `milliseconds`, `Timestamp`, `Duration`), and `cdt.validation` (`min`, `max`, `email`, `check`, custom `[#validator]` attributes) on top of the VM.
+  * Added built-in `conduit bench [--strict]` suite covering 34 compute, call, closure, collection, pipeline, and JSON workloads.
 
 ## [0.1.11] - 2026-11-11
 

@@ -94,26 +94,35 @@ Generic functions compose naturally with closures to build reusable collection c
 
 ## Runnable Example
 
-The following program demonstrates function declarations, void procedures, higher-order callback execution, anonymous lambdas, and lexical closures:
-
 ```conduit
-{{#include ../../../examples/docs/language/functions.cdt}}
+func add(a: Int, b: Int) -> Int {
+    return a + b
+}
+
+func apply_binary(op: (Int, Int) -> Int, x: Int, y: Int) -> Int {
+    return op(x, y)
+}
+
+func main() -> Void {
+    print(apply_binary(add, 10, 20))
+    double := func(x: Int) -> Int {
+        return x * 2
+    }
+    print(double(21))
+}
 ```
 
 ### Running the Example
 
 ```bash
-conduit run examples/docs/language/functions.cdt
+conduit run functions.cdt
 ```
 
 Output:
 
 ```text
-42
 30
-Welcome, Explorer
 42
-15
 ```
 
 ---
