@@ -100,24 +100,40 @@ switch res {
 
 ## Runnable Example
 
-The following program demonstrates error declarations, propagation with `?`, and exhaustive `switch` pattern matching:
-
 ```conduit
-{{#include ../../../examples/docs/language/errors.cdt}}
+error NotFound {
+    id: Int
+}
+
+func fetch_resource(id: Int) -> String | NotFound {
+    guard id > 0 else {
+        return NotFound(id: id)
+    }
+    return "Resource data"
+}
+
+func main() -> Void {
+    switch fetch_resource(42) {
+        case String(data): print("Success: " + data)
+        case NotFound(e): print("Missing item id: {e.id}")
+    }
+    switch fetch_resource(-1) {
+        case String(data): print("Success: " + data)
+        case NotFound(e): print("Missing item id: {e.id}")
+    }
+}
 ```
 
 ### Running the Example
 
 ```bash
-conduit run examples/docs/language/errors.cdt
+conduit run errors.cdt
 ```
 
 Output:
 
 ```text
 Success: Resource data
-Missing item id:
--1
-Access denied for guest
+Missing item id: -1
 ```
 

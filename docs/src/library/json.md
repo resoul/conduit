@@ -3,7 +3,7 @@
 The `cdt.json` standard library provides strict typed JSON decoding (`json.decode<T>`), deterministic encoding (`json.encode`), and dynamic JSON tree navigation (`json.parse`, `json.stringify`, `json.Value`).
 
 ```conduit
-import cdt.json as json
+import * as json from "cdt.json"
 ```
 
 ---
@@ -47,20 +47,42 @@ Only a JSON field-name override is supported; comma-separated tag options such a
 ## Runnable Example
 
 ```conduit
-{{#include ../../../examples/docs/library/json.cdt}}
+import * as json from "cdt.json"
+import * as validation from "cdt.validation"
+
+type User {
+    name: String `json:"display_name"` @validation.min(2)
+    email: String @validation.email
+    score: Float
+}
+
+func main() -> Void {
+    raw := "{\"display_name\":\"Alice\",\"email\":\"alice@example.com\",\"score\":98.5}"
+    switch json.decode<User>(raw) {
+        case User(u):
+            switch validation.check(u) {
+                case User(ok):
+                    switch json.encode(ok) {
+                        case String(out): print(out)
+                        case EncodeError(e): print(e.message)
+                    }
+                case ValidationError(e): print(e.issues[0]?.message ?? "invalid")
+            }
+        case DecodeError(e): print(e.message)
+    }
+}
 ```
 
 ### Running the Example
 
 ```bash
-conduit run examples/docs/library/json.cdt
+conduit run json_demo.cdt
 ```
 
 Output:
 
 ```text
 {"display_name":"Alice","email":"alice@example.com","score":98.5}
-{"items":[10,20]}
 ```
 
 ---

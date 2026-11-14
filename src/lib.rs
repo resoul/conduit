@@ -1,13 +1,5 @@
-pub mod ast;
-pub mod check;
-pub mod interp;
-pub mod lexer;
-pub mod loader;
-pub mod lsp;
+pub mod benchmarks;
+pub mod frontend;
+pub mod ir;
 pub mod native;
-pub mod parser;
-pub mod reachability;
-pub mod types;
-pub mod value;
-
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub mod vm;

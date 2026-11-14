@@ -39,25 +39,32 @@ score = score * 2
 
 ## Runnable Example
 
-The following complete program demonstrates variable declarations, type inference, explicit annotations, and reassignment:
-
 ```conduit
-{{#include ../../../examples/docs/language/variables.cdt}}
+func main() -> Void {
+    name := "Conduit"
+    version := 2
+    var count: Int = 10
+    print(name)
+    print(version)
+    print(count)
+    count = count + 5
+    print(count)
+}
 ```
 
 ### Running the Example
 
 ```bash
-conduit run examples/docs/language/variables.cdt
+conduit run variables.cdt
 ```
 
 Output:
 
 ```text
 Conduit
-1
+2
 10
-10
+15
 ```
 
 ---

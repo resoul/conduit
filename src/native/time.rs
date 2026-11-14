@@ -1,376 +1,249 @@
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration as StdDuration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use super::{NativeFuncDef, NativeMethodDef, NativeModule, NativeTypeDef, NativeValue};
-use crate::types::{Type, TypeId};
-use crate::value::{StructSchema, Value};
+use crate::vm::exec_cold::err_msg;
+use crate::vm::value::{
+    Obj, SCHEMA_TIME_DURATION, SCHEMA_TIME_ERROR, SCHEMA_TIME_INSTANT, SCHEMA_TIME_TIMESTAMP,
+    StructData,
+};
+use crate::vm::{RuntimeError, Vm};
 
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Timestamp(pub SystemTime);
+pub enum TimeOpKind {
+    Now = 0,
+    Monotonic = 1,
+    Elapsed = 2,
+    Seconds = 3,
+    Milliseconds = 4,
+    UnixSeconds = 5,
+    UnixMilliseconds = 6,
+    DurSeconds = 7,
+    DurMilliseconds = 8,
+    DurNanoseconds = 9,
+}
 
-impl NativeValue for Timestamp {
-    fn type_id(&self) -> TypeId {
-        TypeId::native("cdt.time", "Timestamp")
-    }
-
-    fn type_name(&self) -> &'static str {
-        "time.Timestamp"
-    }
-
-    fn display(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "time.Timestamp({:?})", self.0)
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn dyn_eq(&self, other: &dyn NativeValue) -> bool {
-        if let Some(other_ts) = other.as_any().downcast_ref::<Timestamp>() {
-            self.0 == other_ts.0
-        } else {
-            false
+impl TimeOpKind {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Now),
+            1 => Some(Self::Monotonic),
+            2 => Some(Self::Elapsed),
+            3 => Some(Self::Seconds),
+            4 => Some(Self::Milliseconds),
+            5 => Some(Self::UnixSeconds),
+            6 => Some(Self::UnixMilliseconds),
+            7 => Some(Self::DurSeconds),
+            8 => Some(Self::DurMilliseconds),
+            9 => Some(Self::DurNanoseconds),
+            _ => None,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Instant(pub StdInstant);
+static BASE_INSTANT: OnceLock<Instant> = OnceLock::new();
 
-impl NativeValue for Instant {
-    fn type_id(&self) -> TypeId {
-        TypeId::native("cdt.time", "Instant")
-    }
+#[inline]
+fn base_instant() -> Instant {
+    *BASE_INSTANT.get_or_init(Instant::now)
+}
 
-    fn type_name(&self) -> &'static str {
-        "time.Instant"
-    }
+pub fn make_time_error(msg: impl Into<String>) -> Obj {
+    let mut rec = StructData::new(SCHEMA_TIME_ERROR, 0, 1);
+    rec.inline_objs[0] = Obj::str(msg);
+    Obj::Record(Arc::new(rec))
+}
 
-    fn display(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "time.Instant({:?})", self.0)
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn dyn_eq(&self, other: &dyn NativeValue) -> bool {
-        if let Some(other_inst) = other.as_any().downcast_ref::<Instant>() {
-            self.0 == other_inst.0
-        } else {
-            false
+pub fn make_timestamp(st: SystemTime) -> Obj {
+    let (secs, nanos) = match st.duration_since(UNIX_EPOCH) {
+        Ok(dur) => {
+            let s = dur.as_secs();
+            if s > i64::MAX as u64 {
+                return make_time_error("Timestamp seconds overflow i64");
+            }
+            (s as i64, dur.subsec_nanos() as u64)
         }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Duration(pub StdDuration);
-
-impl NativeValue for Duration {
-    fn type_id(&self) -> TypeId {
-        TypeId::native("cdt.time", "Duration")
-    }
-
-    fn type_name(&self) -> &'static str {
-        "time.Duration"
-    }
-
-    fn display(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "time.Duration({:?})", self.0)
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn dyn_eq(&self, other: &dyn NativeValue) -> bool {
-        if let Some(other_dur) = other.as_any().downcast_ref::<Duration>() {
-            self.0 == other_dur.0
-        } else {
-            false
-        }
-    }
-}
-
-pub fn make_time_error(message: impl Into<String>) -> Value {
-    static SCHEMA: OnceLock<Arc<StructSchema>> = OnceLock::new();
-    let schema = Arc::clone(SCHEMA.get_or_init(|| {
-        StructSchema::new(TypeId::native("cdt.time", "TimeError"), ["message".into()])
-    }));
-    Value::Error {
-        schema,
-        values: vec![Value::String(message.into())],
-    }
-}
-
-pub fn create_time_module() -> NativeModule {
-    let mut module = NativeModule::new("cdt.time", "time", "Standard library for system and monotonic time operations");
-
-    let timestamp_ty = Type::Custom(TypeId::native("cdt.time", "Timestamp"));
-    let instant_ty = Type::Custom(TypeId::native("cdt.time", "Instant"));
-    let duration_ty = Type::Custom(TypeId::native("cdt.time", "Duration"));
-    let time_error_ty = Type::Custom(TypeId::native("cdt.time", "TimeError"));
-
-    module.add_type(NativeTypeDef {
-        name: "Timestamp",
-        qualified_name: "time.Timestamp",
-        doc: "Moment of system time measured from the system clock",
-        is_error: false,
-        fields: vec![],
-    });
-
-    module.add_type(NativeTypeDef {
-        name: "Instant",
-        qualified_name: "time.Instant",
-        doc: "Monotonically increasing clock measurement point for benchmarks and elapsed timing",
-        is_error: false,
-        fields: vec![],
-    });
-
-    module.add_type(NativeTypeDef {
-        name: "Duration",
-        qualified_name: "time.Duration",
-        doc: "Non-negative time span representation",
-        is_error: false,
-        fields: vec![],
-    });
-
-    module.add_type(NativeTypeDef {
-        name: "TimeError",
-        qualified_name: "time.TimeError",
-        doc: "Error occurring during time operations (overflow, negative duration, invalid order)",
-        is_error: true,
-        fields: vec![("message", Type::String)],
-    });
-
-    module.add_function(NativeFuncDef {
-        name: "now",
-        doc: "Reads the current system clock time",
-        params: vec![],
-        return_type: Type::union(vec![timestamp_ty.clone(), time_error_ty.clone()]),
-        is_validator: false,
-        implementation: |_args| {
-            Ok(Value::Native(Arc::new(Timestamp(SystemTime::now()))))
-        },
-    });
-
-    module.add_function(NativeFuncDef {
-        name: "monotonic",
-        doc: "Reads the current monotonic clock instant",
-        params: vec![],
-        return_type: instant_ty.clone(),
-        is_validator: false,
-        implementation: |_args| {
-            Ok(Value::Native(Arc::new(Instant(StdInstant::now()))))
-        },
-    });
-
-    module.add_function(NativeFuncDef {
-        name: "elapsed",
-        doc: "Calculates the duration elapsed since the given monotonic instant",
-        params: vec![("start", instant_ty.clone())],
-        return_type: Type::union(vec![duration_ty.clone(), time_error_ty.clone()]),
-        is_validator: false,
-        implementation: |args| {
-            let start_val = args.into_iter().next().unwrap();
-            if let Value::Native(ref nat) = start_val
-                && let Some(inst) = nat.as_any().downcast_ref::<Instant>() {
-                    let now = StdInstant::now();
-                    if now < inst.0 {
-                        return Ok(make_time_error("Monotonic clock went backwards or start is in the future"));
-                    }
-                    let dur = now.duration_since(inst.0);
-                    return Ok(Value::Native(Arc::new(Duration(dur))));
+        Err(before) => {
+            let dur = before.duration();
+            let s = dur.as_secs();
+            let sub = dur.subsec_nanos();
+            if sub == 0 {
+                if s > (i64::MAX as u64) + 1 {
+                    return make_time_error("Timestamp seconds overflow i64");
                 }
-            Ok(make_time_error("Expected time.Instant argument"))
-        },
-    });
-
-    module.add_function(NativeFuncDef {
-        name: "seconds",
-        doc: "Creates a duration from the given number of seconds",
-        params: vec![("value", Type::Int)],
-        return_type: Type::union(vec![duration_ty.clone(), time_error_ty.clone()]),
-        is_validator: false,
-        implementation: |args| {
-            let val = match args.into_iter().next().unwrap() {
-                Value::Int(n) => n,
-                _ => return Ok(make_time_error("Expected Int")),
-            };
-            if val < 0 {
-                return Ok(make_time_error("Duration cannot be negative"));
+                ((s as i64).wrapping_neg(), 0)
+            } else {
+                let Some(total) = s.checked_add(1) else {
+                    return make_time_error("Timestamp seconds overflow i64");
+                };
+                if total > (i64::MAX as u64) + 1 {
+                    return make_time_error("Timestamp seconds overflow i64");
+                }
+                ((total as i64).wrapping_neg(), (1_000_000_000 - sub) as u64)
             }
-            Ok(Value::Native(Arc::new(Duration(StdDuration::from_secs(val as u64)))))
-        },
-    });
+        }
+    };
+    let mut rec = StructData::new(SCHEMA_TIME_TIMESTAMP, 2, 0);
+    rec.inline_scalars[0] = secs as u64;
+    rec.inline_scalars[1] = nanos;
+    Obj::Record(Arc::new(rec))
+}
 
-    module.add_function(NativeFuncDef {
-        name: "milliseconds",
-        doc: "Creates a duration from the given number of milliseconds",
-        params: vec![("value", Type::Int)],
-        return_type: Type::union(vec![duration_ty.clone(), time_error_ty.clone()]),
-        is_validator: false,
-        implementation: |args| {
-            let val = match args.into_iter().next().unwrap() {
-                Value::Int(n) => n,
-                _ => return Ok(make_time_error("Expected Int")),
-            };
-            if val < 0 {
-                return Ok(make_time_error("Duration cannot be negative"));
-            }
-            Ok(Value::Native(Arc::new(Duration(StdDuration::from_millis(val as u64)))))
-        },
-    });
+pub fn make_duration(d: Duration) -> Obj {
+    let mut rec = StructData::new(SCHEMA_TIME_DURATION, 2, 0);
+    rec.inline_scalars[0] = d.as_secs();
+    rec.inline_scalars[1] = d.subsec_nanos() as u64;
+    Obj::Record(Arc::new(rec))
+}
 
-    module.add_method(
-        "Timestamp",
-        NativeMethodDef {
-            name: "unix_seconds",
-            doc: "Returns Unix timestamp in seconds (UTC). Rounded down for values before epoch.",
-            params: vec![],
-            return_type: Type::union(vec![Type::Int, time_error_ty.clone()]),
-            implementation: |receiver, _args| {
-                if let Some(ts) = receiver.as_any().downcast_ref::<Timestamp>() {
-                    match ts.0.duration_since(UNIX_EPOCH) {
-                        Ok(dur) => {
-                            let secs = dur.as_secs();
-                            if secs > i64::MAX as u64 {
-                                return Ok(make_time_error("Timestamp seconds overflow i64"));
-                            }
-                            Ok(Value::Int(secs as i64))
-                        }
-                        Err(before) => {
-                            let dur = before.duration();
-                            let secs = dur.as_secs();
-                            let extra = if dur.subsec_nanos() > 0 { 1 } else { 0 };
-                            let total = secs.checked_add(extra).ok_or_else(|| {
-                                make_time_error("Timestamp seconds overflow i64")
-                            });
-                            match total {
-                                Ok(t) => {
-                                    if t > (i64::MAX as u64) + 1 {
-                                        return Ok(make_time_error("Timestamp seconds overflow i64"));
-                                    }
-                                    let res = -(t as i64);
-                                    Ok(Value::Int(res))
-                                }
-                                Err(err) => Ok(err),
-                            }
-                        }
+pub fn make_monotonic_now() -> Obj {
+    let d = Instant::now().saturating_duration_since(base_instant());
+    let mut rec = StructData::new(SCHEMA_TIME_INSTANT, 2, 0);
+    rec.inline_scalars[0] = d.as_secs();
+    rec.inline_scalars[1] = d.subsec_nanos() as u64;
+    Obj::Record(Arc::new(rec))
+}
+
+impl Vm {
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn exec_time_op(
+        &mut self,
+        s_base: usize,
+        o_base: usize,
+        kind: u8,
+        dst_obj: u16,
+        arg_reg: u16,
+    ) -> Result<(), RuntimeError> {
+        let Some(op) = TimeOpKind::from_u8(kind) else {
+            return Err(err_msg("Invalid TimeOp kind"));
+        };
+        let out = match op {
+            TimeOpKind::Now => make_timestamp(SystemTime::now()),
+            TimeOpKind::Monotonic => make_monotonic_now(),
+            TimeOpKind::Elapsed => {
+                let Obj::Record(rec) = &self.objs[o_base + arg_reg as usize] else {
+                    self.objs[o_base + dst_obj as usize] =
+                        make_time_error("Expected time.Instant argument");
+                    return Ok(());
+                };
+                if rec.schema_id != SCHEMA_TIME_INSTANT {
+                    self.objs[o_base + dst_obj as usize] =
+                        make_time_error("Expected time.Instant argument");
+                    return Ok(());
+                }
+                let start_off = Duration::new(rec.inline_scalars[0], rec.inline_scalars[1] as u32);
+                if let Some(start) = base_instant().checked_add(start_off) {
+                    let now = Instant::now();
+                    if let Some(dur) = now.checked_duration_since(start) {
+                        make_duration(dur)
+                    } else {
+                        make_time_error("Monotonic clock went backwards or start is in the future")
                     }
                 } else {
-                    Ok(make_time_error("Invalid receiver for unix_seconds"))
+                    make_time_error("Monotonic instant overflow")
                 }
-            },
-        },
-    );
-
-    module.add_method(
-        "Timestamp",
-        NativeMethodDef {
-            name: "unix_milliseconds",
-            doc: "Returns Unix timestamp in milliseconds (UTC). Rounded down for values before epoch.",
-            params: vec![],
-            return_type: Type::union(vec![Type::Int, time_error_ty.clone()]),
-            implementation: |receiver, _args| {
-                if let Some(ts) = receiver.as_any().downcast_ref::<Timestamp>() {
-                    match ts.0.duration_since(UNIX_EPOCH) {
-                        Ok(dur) => {
-                            let ms = dur.as_millis();
-                            if ms > i64::MAX as u128 {
-                                return Ok(make_time_error("Timestamp milliseconds overflow i64"));
-                            }
-                            Ok(Value::Int(ms as i64))
-                        }
-                        Err(before) => {
-                            let dur = before.duration();
-                            let ms = dur.as_millis();
-                            let extra = if (dur.subsec_nanos() % 1_000_000) > 0 { 1 } else { 0 };
-                            let total = ms.checked_add(extra).ok_or_else(|| {
-                                make_time_error("Timestamp milliseconds overflow i64")
-                            });
-                            match total {
-                                Ok(t) => {
-                                    if t > (i64::MAX as u128) + 1 {
-                                        return Ok(make_time_error("Timestamp milliseconds overflow i64"));
-                                    }
-                                    let res = -(t as i64);
-                                    Ok(Value::Int(res))
-                                }
-                                Err(err) => Ok(err),
-                            }
-                        }
-                    }
+            }
+            TimeOpKind::Seconds => {
+                let val = self.scalars[s_base + arg_reg as usize] as i64;
+                if val < 0 {
+                    make_time_error("Duration cannot be negative")
                 } else {
-                    Ok(make_time_error("Invalid receiver for unix_milliseconds"))
+                    make_duration(Duration::from_secs(val as u64))
                 }
-            },
-        },
-    );
-
-    module.add_method(
-        "Duration",
-        NativeMethodDef {
-            name: "seconds",
-            doc: "Returns the number of full seconds in the duration",
-            params: vec![],
-            return_type: Type::union(vec![Type::Int, time_error_ty.clone()]),
-            implementation: |receiver, _args| {
-                if let Some(dur) = receiver.as_any().downcast_ref::<Duration>() {
-                    let s = dur.0.as_secs();
+            }
+            TimeOpKind::Milliseconds => {
+                let val = self.scalars[s_base + arg_reg as usize] as i64;
+                if val < 0 {
+                    make_time_error("Duration cannot be negative")
+                } else {
+                    make_duration(Duration::from_millis(val as u64))
+                }
+            }
+            TimeOpKind::UnixSeconds => {
+                let Obj::Record(rec) = &self.objs[o_base + arg_reg as usize] else {
+                    self.objs[o_base + dst_obj as usize] =
+                        make_time_error("Invalid receiver for unix_seconds");
+                    return Ok(());
+                };
+                if rec.schema_id != SCHEMA_TIME_TIMESTAMP {
+                    make_time_error("Invalid receiver for unix_seconds")
+                } else {
+                    Obj::boxed_int(rec.inline_scalars[0] as i64)
+                }
+            }
+            TimeOpKind::UnixMilliseconds => {
+                let Obj::Record(rec) = &self.objs[o_base + arg_reg as usize] else {
+                    self.objs[o_base + dst_obj as usize] =
+                        make_time_error("Invalid receiver for unix_milliseconds");
+                    return Ok(());
+                };
+                if rec.schema_id != SCHEMA_TIME_TIMESTAMP {
+                    make_time_error("Invalid receiver for unix_milliseconds")
+                } else {
+                    let secs = rec.inline_scalars[0] as i64;
+                    let sub_ms = (rec.inline_scalars[1] / 1_000_000) as i64;
+                    match secs.checked_mul(1000).and_then(|v| v.checked_add(sub_ms)) {
+                        Some(ms) => Obj::boxed_int(ms),
+                        None => make_time_error("Timestamp milliseconds overflow i64"),
+                    }
+                }
+            }
+            TimeOpKind::DurSeconds => {
+                let Obj::Record(rec) = &self.objs[o_base + arg_reg as usize] else {
+                    self.objs[o_base + dst_obj as usize] =
+                        make_time_error("Invalid receiver for seconds");
+                    return Ok(());
+                };
+                if rec.schema_id != SCHEMA_TIME_DURATION {
+                    make_time_error("Invalid receiver for seconds")
+                } else {
+                    let s = rec.inline_scalars[0];
                     if s > i64::MAX as u64 {
-                        return Ok(make_time_error("Duration seconds overflow i64"));
+                        make_time_error("Duration seconds overflow i64")
+                    } else {
+                        Obj::boxed_int(s as i64)
                     }
-                    Ok(Value::Int(s as i64))
-                } else {
-                    Ok(make_time_error("Invalid receiver for seconds"))
                 }
-            },
-        },
-    );
-
-    module.add_method(
-        "Duration",
-        NativeMethodDef {
-            name: "milliseconds",
-            doc: "Returns the number of full milliseconds in the duration",
-            params: vec![],
-            return_type: Type::union(vec![Type::Int, time_error_ty.clone()]),
-            implementation: |receiver, _args| {
-                if let Some(dur) = receiver.as_any().downcast_ref::<Duration>() {
-                    let ms = dur.0.as_millis();
+            }
+            TimeOpKind::DurMilliseconds => {
+                let Obj::Record(rec) = &self.objs[o_base + arg_reg as usize] else {
+                    self.objs[o_base + dst_obj as usize] =
+                        make_time_error("Invalid receiver for milliseconds");
+                    return Ok(());
+                };
+                if rec.schema_id != SCHEMA_TIME_DURATION {
+                    make_time_error("Invalid receiver for milliseconds")
+                } else {
+                    let ms = (rec.inline_scalars[0] as u128) * 1000
+                        + (rec.inline_scalars[1] as u128) / 1_000_000;
                     if ms > i64::MAX as u128 {
-                        return Ok(make_time_error("Duration milliseconds overflow i64"));
+                        make_time_error("Duration milliseconds overflow i64")
+                    } else {
+                        Obj::boxed_int(ms as i64)
                     }
-                    Ok(Value::Int(ms as i64))
-                } else {
-                    Ok(make_time_error("Invalid receiver for milliseconds"))
                 }
-            },
-        },
-    );
-
-    module.add_method(
-        "Duration",
-        NativeMethodDef {
-            name: "nanoseconds",
-            doc: "Returns the number of full nanoseconds in the duration",
-            params: vec![],
-            return_type: Type::union(vec![Type::Int, time_error_ty.clone()]),
-            implementation: |receiver, _args| {
-                if let Some(dur) = receiver.as_any().downcast_ref::<Duration>() {
-                    let ns = dur.0.as_nanos();
+            }
+            TimeOpKind::DurNanoseconds => {
+                let Obj::Record(rec) = &self.objs[o_base + arg_reg as usize] else {
+                    self.objs[o_base + dst_obj as usize] =
+                        make_time_error("Invalid receiver for nanoseconds");
+                    return Ok(());
+                };
+                if rec.schema_id != SCHEMA_TIME_DURATION {
+                    make_time_error("Invalid receiver for nanoseconds")
+                } else {
+                    let ns = (rec.inline_scalars[0] as u128) * 1_000_000_000
+                        + (rec.inline_scalars[1] as u128);
                     if ns > i64::MAX as u128 {
-                        return Ok(make_time_error("Duration nanoseconds overflow i64"));
+                        make_time_error("Duration nanoseconds overflow i64")
+                    } else {
+                        Obj::boxed_int(ns as i64)
                     }
-                    Ok(Value::Int(ns as i64))
-                } else {
-                    Ok(make_time_error("Invalid receiver for nanoseconds"))
                 }
-            },
-        },
-    );
-
-    module
+            }
+        };
+        self.objs[o_base + dst_obj as usize] = out;
+        Ok(())
+    }
 }
-

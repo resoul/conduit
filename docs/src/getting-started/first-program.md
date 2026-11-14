@@ -9,12 +9,14 @@ Creating and running a program in Conduit requires only a single `.cdt` file.
 Create a file named `hello.cdt`:
 
 ```conduit
-{{#include ../../../examples/docs/getting_started/hello.cdt}}
+func main() -> Void {
+    print("Hello, Conduit!")
+}
 ```
 
 ### Key Elements:
 - `func main()`: The entry point of an executable Conduit program. Every root module intended for execution must define a `main()` function.
-- `print(...)`: A built-in function that formats and prints any supported value to standard output, followed by a newline.
+- `print(...)`: A built-in function that formats and prints any non-`Void` value to standard output, followed by a newline.
 
 ---
 
@@ -26,13 +28,7 @@ Before running any program, you can perform static validation with the `conduit 
 conduit check hello.cdt
 ```
 
-Output:
-
-```text
-Check passed: 'hello.cdt' is valid.
-```
-
-The type checker analyzes the entire program (including any imported modules), verifies type safety, exhaustiveness of pattern matches, error handling, and private symbol access boundaries without executing the code.
+The type checker analyzes the program, verifies type safety, exhaustiveness of pattern matches, error handling, and private symbol access boundaries without executing the code.
 
 ---
 
@@ -50,5 +46,4 @@ Output:
 Hello, Conduit!
 ```
 
-`conduit run` runs the static type checker first. If any compile-time or type errors are discovered, execution halts immediately with precise source coordinates (`[line:col]`) and descriptive diagnostic messages.
-
+`conduit run` runs the static type checker and bytecode compiler first. If any compile-time or type errors are discovered, execution halts immediately with descriptive diagnostics.

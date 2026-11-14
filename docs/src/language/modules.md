@@ -75,23 +75,22 @@ Modules are imported using the `import` statement at the top of a file.
 
 ### Local Relative Imports
 
-Local modules are imported using relative paths (without the `.cdt` extension) and an explicit alias:
+Local modules support TypeScript-style named imports, aliased imports, and namespace imports:
 
 ```conduit
-import "./users" as users
+import { User, find_user } from "./users"
+import * as users from "./users"
 ```
 
-Items from the imported module are accessed with qualified syntax:
-- `users.User`
-- `users.UserNotFound`
-- `users.find_user(42)`
+Items imported via namespace alias are accessed with qualified syntax (`users.User`, `users.find_user(42)`).
 
 ### Standard Library Imports
 
 Standard libraries are imported from the `cdt.*` namespace:
 
 ```conduit
-import cdt.time as time
+import { now, elapsed } from "cdt.time"
+import * as time from "cdt.time"
 ```
 
 ---
@@ -100,7 +99,7 @@ import cdt.time as time
 
 Every `type` and `error` in Conduit is uniquely identified by its canonical declaring module path together with its declaration name. Import aliases only affect how a symbol is spelled locally:
 
-- Importing the same module under two aliases (`import "./users" as u1` and `import "./users" as u2`) yields the exact same canonical type, so `u1.User` and `u2.User` are interchangeable across assignments, function calls, and `switch` patterns.
+- Importing the same module under two aliases (`import * as u1 from "./users"` and `import * as u2 from "./users"`) yields the exact same canonical type, so `u1.User` and `u2.User` are interchangeable across assignments, function calls, and `switch` patterns.
 - Same-named declarations in distinct modules (such as `a.User` and `b.User`) remain strictly separate, incompatible types at both compile time and runtime. Struct schemas used by `cdt.validation.check` also follow canonical identity and never collide across modules.
 
 ---
@@ -120,19 +119,43 @@ Loader error: Cyclic import detected: ./a -> ./b -> ./c -> ./a
 ### Module Definition (`modules_user.cdt`)
 
 ```conduit
-{{#include ../../../examples/docs/language/modules_user.cdt}}
+export type User {
+    name: String
+}
+
+export error MissingUser {
+    id: Int
+}
+
+export func load_user(id: Int) -> User | MissingUser {
+    guard id > 0 else {
+        return MissingUser(id: id)
+    }
+    return User(name: "Alice")
+}
 ```
 
 ### Module Consumer (`modules_main.cdt`)
 
 ```conduit
-{{#include ../../../examples/docs/language/modules_main.cdt}}
+import { load_user, User, MissingUser } from "./modules_user"
+
+func main() -> Void {
+    switch load_user(1) {
+        case User(u): print("Hello, {u.name}")
+        case MissingUser(_): print("Missing user")
+    }
+    switch load_user(0) {
+        case User(_): print("Found")
+        case MissingUser(_): print("Successfully caught missing user error")
+    }
+}
 ```
 
 ### Running the Multi-Module Project
 
 ```bash
-conduit run examples/docs/language/modules_main.cdt
+conduit run modules_main.cdt
 ```
 
 Output:

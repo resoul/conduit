@@ -3,7 +3,7 @@
 The `cdt.validation` standard library provides schema validation primitives, standard validation rules (`min`, `max`, `email`), and an explicit evaluation engine via `validation.check()`.
 
 ```conduit
-import cdt.validation as validation
+import * as validation from "cdt.validation"
 ```
 
 ---
@@ -54,27 +54,39 @@ validation.check(value: T) -> T | validation.ValidationError
 
 ## Runnable Example
 
-The following program demonstrates custom validators, standard rules, optional field skipping, and violation handling:
-
 ```conduit
-{{#include ../../../examples/docs/library/validation.cdt}}
+import * as validation from "cdt.validation"
+
+type User {
+    username: String @validation.min(3)
+    email: String? @validation.email
+    age: Int @validation.min(18)
+}
+
+func main() -> Void {
+    bad := User(username: "al", email: "bad", age: 15)
+    switch validation.check(bad) {
+        case User(u): print("Valid: {u.username}")
+        case ValidationError(err):
+            for v in err.issues {
+                print("[{v.path}] {v.code}: {v.message}")
+            }
+    }
+}
 ```
 
 ### Running the Example
 
 ```bash
-conduit run examples/docs/library/validation.cdt
+conduit run validation_demo.cdt
 ```
 
 Output:
 
 ```text
-Testing validation library...
-Valid user successfully registered: alice
-Validation caught violations:
-  [username] reserved: Username 'admin' is reserved
-  [email] email: Invalid email address format
-  [age] min: Value 15 is less than minimum 18
+[username] min: Value length 2 is less than minimum 3
+[email] email: Invalid email address format
+[age] min: Value 15 is less than minimum 18
 ```
 
 ---
@@ -106,10 +118,10 @@ Validation caught violations:
 ### Functions
 
 #### `min(value, min_val) -> Void | validation.Issue`
-- Validates that a numeric value (`Int` or `Float`), string character count (**Unicode scalar values**, matching `.char_count()` rather than `.len()` UTF-8 bytes), list element count, or map entry count meets a minimum bound (inclusive). `Float` values must use a `Float` bound and reject non-finite values (`NaN`/`Infinity`).
+- Validates that a numeric value (`Int` or `Float`), string character count (**Unicode scalar values**), list element count, or map entry count meets a minimum bound (inclusive). `Float` values must use a `Float` bound and reject non-finite values (`NaN`/`Infinity`).
 
 #### `max(value, max_val) -> Void | validation.Issue`
-- Validates that a numeric value (`Int` or `Float`), string character count (**Unicode scalar values**, matching `.char_count()` rather than `.len()` UTF-8 bytes), list element count, or map entry count does not exceed a maximum bound (inclusive). `Float` values must use a `Float` bound and reject non-finite values (`NaN`/`Infinity`).
+- Validates that a numeric value (`Int` or `Float`), string character count (**Unicode scalar values**), list element count, or map entry count does not exceed a maximum bound (inclusive). `Float` values must use a `Float` bound and reject non-finite values (`NaN`/`Infinity`).
 
 #### `email(value: String) -> Void | validation.Issue`
 - Validates that a string conforms to basic email format (non-empty local part, single `@`, and valid domain with dot).

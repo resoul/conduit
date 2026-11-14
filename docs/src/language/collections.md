@@ -76,7 +76,7 @@ scores.set("alice", 10)
 scores.set("bob", 20)
 
 by_id := Map.from([(1, "one"), (2, "two")])
-empty := Map.from<String, Int>([])
+empty := Map<String, Int>()
 ```
 
 ### Indexing (`map[key]`) & `KeyError`
@@ -93,8 +93,6 @@ func find_upper(m: Map<String, String>, key: String) -> String | KeyError {
 Use `.get(key) -> V?` when missing keys are expected rather than errors, alongside `.set(key, val)`, `.remove(key) -> V?`, `.contains_key(key) -> Bool`, `.len() -> Int`, `.keys() -> [K]`, `.values() -> [V]`, and `.entries() -> [(K, V)]`.
 
 Updating an existing key via `.set(key, new_val)` replaces the value **in place**, preserving the key's original position in `.keys()`, `.values()`, and `.entries()`. Calling `.remove(key)` followed by `.set(key, val)` appends the re-inserted key at the end.
-
-Mutable `var` maps also support index assignment `m[key] = value`, and mutable `var` structs allow nested field writes (`order.meta.updated = true`) and collection mutations (`order.items.append(x)`). Immutable `:=` bindings forbid mutation of the variable, its fields, and nested collections.
 
 ---
 
@@ -155,28 +153,40 @@ positives := filter([-2, 5, -1, 8], is_positive) // [5, 8]
 
 ## Runnable Example
 
-The following program demonstrates list construction, safe indexing, `.get()`, mapping, boolean filtering, and error preservation:
-
 ```conduit
-{{#include ../../../examples/docs/language/collections.cdt}}
+func double(n: Int) -> Int {
+    return n * 2
+}
+
+func is_positive(n: Int) -> Bool {
+    return n > 0
+}
+
+func main() -> Void {
+    nums := [-2, 1, 5]
+    print(nums.get(1) ?? 0)
+    print(map(nums, double))
+    print(filter(nums, is_positive))
+
+    scores := Map.from([("alice", 10), ("bob", 20)])
+    print(scores.keys().join(","))
+    print(scores.get("bob") ?? 0)
+}
 ```
 
 ### Running the Example
 
 ```bash
-conduit run examples/docs/language/collections.cdt
+conduit run collections.cdt
 ```
 
 Output:
 
 ```text
-[1, 2, 3, 4, 5]
-First: 1
--1
-[1, 4, 9, 16, 25]
-[5, 8]
-[InvalidItem(id: -1), 10, InvalidItem(id: -2)]
-[alice, bob]
+1
+[-4, 2, 10]
+[1, 5]
+alice,bob
 20
 ```
 
