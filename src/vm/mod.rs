@@ -49,6 +49,7 @@ pub struct Vm {
     pub scalars: Vec<u64>,
     pub objs: Vec<Obj>,
     pub(crate) frames: Vec<CallFrame>,
+    pub script_args: Option<Vec<String>>,
 }
 
 impl Vm {
@@ -57,6 +58,7 @@ impl Vm {
             scalars: vec![0u64; 4096],
             objs: vec![Obj::Empty; 4096],
             frames: Vec::with_capacity(MAX_CALL_DEPTH),
+            script_args: None,
         }
     }
 

@@ -166,6 +166,9 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 if self.mc.checked.env_aliases.contains(alias) {
                     return self.lower_env_call(field, type_args, args, named_args);
                 }
+                if self.mc.checked.cli_aliases.contains(alias) {
+                    return self.lower_cli_call(field, type_args, args, named_args);
+                }
             }
             if let Some(reg) = self.lower_builtin_obj_method(target, field, args)? {
                 return Ok(reg);
@@ -207,6 +210,14 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             if let Some(sym) = self.mc.checked.env_direct_types.get(name) {
                 let sym = sym.clone();
                 return self.lower_env_call(&sym, type_args, args, named_args);
+            }
+            if let Some(sym) = self.mc.checked.cli_direct_fns.get(name) {
+                let sym = sym.clone();
+                return self.lower_cli_call(&sym, type_args, args, named_args);
+            }
+            if let Some(sym) = self.mc.checked.cli_direct_types.get(name) {
+                let sym = sym.clone();
+                return self.lower_cli_call(&sym, type_args, args, named_args);
             }
             if name == "Map" {
                 let dst_obj = self.alloc_temp_o();

@@ -53,6 +53,7 @@ impl<'a> ModuleCompiler<'a> {
         module.struct_schemas = checked.struct_schemas.clone();
         module.validation_plans = checked.validation_plans.clone();
         module.env_plans = checked.env_plans.clone();
+        module.cli_plans = checked.cli_plans.iter().map(|(_, p)| p.clone()).collect();
         // Reserve slots 0..N for top-level functions so forward calls keep stable indices.
         module.functions = checked
             .funcs

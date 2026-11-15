@@ -9,11 +9,12 @@ pub(crate) mod lower_prealloc;
 use std::fmt::Write;
 
 use crate::vm::opcode::{
-    EXT_ENV_ARGS, EXT_ENV_GET, EXT_ENV_LOAD, EXT_ENV_REQUIRE, EXT_FLOAT_CEIL, EXT_FLOAT_MATH,
-    EXT_INT_MATH, EXT_LIST_FIRST, EXT_LIST_IS_EMPTY, EXT_LIST_LAST, EXT_LIST_SORT,
-    EXT_MAP_CONTAINS_KEY, EXT_MAP_ENTRIES, EXT_MAP_FROM, EXT_MAP_GET, EXT_MAP_INDEX, EXT_MAP_KEYS,
-    EXT_MAP_REMOVE, EXT_MAP_SET, EXT_MAP_VALUES, EXT_PRINT_OBJ, EXT_PRINT_SCALAR, EXT_STR_IS_EMPTY,
-    EXT_STR_PRED, EXT_STR_SPLIT, EXT_STR_TO_FLOAT, EXT_STR_TO_INT, Op,
+    EXT_CLI_HELP, EXT_CLI_PARSE, EXT_CLI_PARSE_ARGS, EXT_ENV_ARGS, EXT_ENV_GET, EXT_ENV_LOAD,
+    EXT_ENV_REQUIRE, EXT_FLOAT_CEIL, EXT_FLOAT_MATH, EXT_INT_MATH, EXT_LIST_FIRST,
+    EXT_LIST_IS_EMPTY, EXT_LIST_LAST, EXT_LIST_SORT, EXT_MAP_CONTAINS_KEY, EXT_MAP_ENTRIES,
+    EXT_MAP_FROM, EXT_MAP_GET, EXT_MAP_INDEX, EXT_MAP_KEYS, EXT_MAP_REMOVE, EXT_MAP_SET,
+    EXT_MAP_VALUES, EXT_PRINT_OBJ, EXT_PRINT_SCALAR, EXT_STR_IS_EMPTY, EXT_STR_PRED, EXT_STR_SPLIT,
+    EXT_STR_TO_FLOAT, EXT_STR_TO_INT, Op,
 };
 use crate::vm::value::Obj;
 
@@ -82,6 +83,7 @@ pub struct Module {
     pub json_plans: Vec<crate::native::JsonDecodePlan>,
     pub validation_plans: Vec<crate::native::validation::ValidationStructPlan>,
     pub env_plans: Vec<crate::native::env::EnvLoadPlan>,
+    pub cli_plans: Vec<crate::native::cli::CliPlan>,
 }
 
 impl Module {
@@ -651,6 +653,19 @@ impl Module {
                                 check_o(a, &ctx)?;
                                 if (b as usize) >= self.env_plans.len() {
                                     return Err(format!("{}: env_plan {} out of bounds", ctx, b));
+                                }
+                            }
+                            EXT_CLI_PARSE | EXT_CLI_HELP => {
+                                check_o(a, &ctx)?;
+                                if (b as usize) >= self.cli_plans.len() {
+                                    return Err(format!("{}: cli_plan {} out of bounds", ctx, b));
+                                }
+                            }
+                            EXT_CLI_PARSE_ARGS => {
+                                check_o(a, &ctx)?;
+                                check_o(c, &ctx)?;
+                                if (b as usize) >= self.cli_plans.len() {
+                                    return Err(format!("{}: cli_plan {} out of bounds", ctx, b));
                                 }
                             }
                             _ => return Err(format!("Invalid ExtOp kind {}", kind)),

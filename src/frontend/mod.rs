@@ -1,6 +1,7 @@
 pub mod ast;
 pub mod check;
 pub(crate) mod check_call;
+pub(crate) mod check_cli;
 pub(crate) mod check_native;
 pub(crate) mod check_validation;
 pub mod lexer;
@@ -9,6 +10,7 @@ pub(crate) mod monomorph;
 pub(crate) mod monomorph_reg;
 pub(crate) mod monomorph_subst;
 pub mod parser;
+pub(crate) mod parser_cli;
 pub mod parser_expr;
 pub mod parser_stmt;
 pub mod reachability;
@@ -28,7 +30,7 @@ use crate::ir::Module;
 use crate::ir::lower::compile_program;
 
 fn is_native_mod(path: &str) -> bool {
-    matches!(path, "cdt.json" | "cdt.time" | "cdt.validation" | "cdt.env")
+    matches!(path, "cdt.json" | "cdt.time" | "cdt.validation" | "cdt.env" | "cdt.cli")
 }
 
 fn resolve_import_file(base_dir: &Path, root_dir: &Path, imp: &str) -> Result<PathBuf, String> {

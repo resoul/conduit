@@ -21,7 +21,7 @@ Conduit is designed from first principles with a strong focus on runtime perform
    Conduit eliminates hidden exception handling and unchecked runtime failures. Functions declare error types directly in union signatures (`T | Error`). The compiler strictly prevents discarding error values, enforces exhaustive pattern matching with `switch`, and provides ergonomic propagation with the `?` operator.
 
 5. **First-Class Standard Library (`cdt.*`)**
-   Standard modules—`cdt.json`, `cdt.time`, and `cdt.validation`—are implemented natively in pure Rust and integrated directly with the type checker and VM.
+   Standard modules—`cdt.json`, `cdt.time`, `cdt.validation`, `cdt.env`, and `cdt.cli`—are implemented natively in pure Rust and integrated directly with the type checker and VM.
 
 ---
 
@@ -29,6 +29,6 @@ Conduit is designed from first principles with a strong focus on runtime perform
 
 - **[Getting Started](getting-started/installation.md)**: Walk through installing the binary, writing your first program, and exploring the CLI commands.
 - **[Language Reference](language/variables.md)**: Explore the grammar, type system, functions as first-class values, error handling rules, collection transformations, and module encapsulation.
-- **[Standard Library](library/index.md)**: Detailed API references for `cdt.json`, `cdt.time`, and `cdt.validation`.
+- **[Standard Library](library/index.md)**: Detailed API references for `cdt.json`, `cdt.time`, `cdt.validation`, `cdt.env`, and `cdt.cli`.
 - **[Practical Guides](guides/working-with-errors.md)**: Real-world patterns for resilient error pipelines and modular application layout.
 - **[Internals](internals/architecture.md)**: An overview of the compiler pipeline from source text to register bytecode execution.

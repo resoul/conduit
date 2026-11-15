@@ -7,16 +7,17 @@ use crate::ir::{FunctionProto, RecordDesc};
 use crate::native::time::TimeOpKind;
 use crate::native::validation::ValOpKind;
 use crate::vm::opcode::{
-    EXT_ENV_ARGS, EXT_ENV_GET, EXT_ENV_LOAD, EXT_ENV_REQUIRE, EXT_LIST_FIRST, EXT_LIST_LAST,
-    EXT_LIST_SORT, EXT_MAP_ENTRIES, EXT_MAP_GET, EXT_MAP_KEYS, EXT_MAP_REMOVE, EXT_MAP_VALUES,
-    EXT_STR_SPLIT, EXT_STR_TO_FLOAT, EXT_STR_TO_INT, Op,
+    EXT_CLI_HELP, EXT_CLI_PARSE, EXT_CLI_PARSE_ARGS, EXT_ENV_ARGS, EXT_ENV_GET, EXT_ENV_LOAD,
+    EXT_ENV_REQUIRE, EXT_LIST_FIRST, EXT_LIST_LAST, EXT_LIST_SORT, EXT_MAP_ENTRIES, EXT_MAP_GET,
+    EXT_MAP_KEYS, EXT_MAP_REMOVE, EXT_MAP_VALUES, EXT_STR_SPLIT, EXT_STR_TO_FLOAT,
+    EXT_STR_TO_INT, Op,
 };
 use crate::vm::value::{
-    SCHEMA_BOXED_BOOL, SCHEMA_BOXED_FLOAT, SCHEMA_BOXED_INT, SCHEMA_EMPTY_TAG, SCHEMA_ENV_ERROR,
-    SCHEMA_INDEX_ERROR, SCHEMA_JSON_DECODE_ERROR, SCHEMA_JSON_ENCODE_ERROR, SCHEMA_KEY_ERROR,
-    SCHEMA_LIST_TAG, SCHEMA_MAP_TAG, SCHEMA_PARSE_ERROR, SCHEMA_STR_TAG, SCHEMA_TIME_DURATION,
-    SCHEMA_TIME_ERROR, SCHEMA_TIME_INSTANT, SCHEMA_TIME_TIMESTAMP, SCHEMA_VALIDATION_ERROR,
-    SCHEMA_VALIDATION_ISSUE, SCHEMA_VALIDATION_VIOLATION,
+    SCHEMA_BOXED_BOOL, SCHEMA_BOXED_FLOAT, SCHEMA_BOXED_INT, SCHEMA_CLI_ERROR, SCHEMA_EMPTY_TAG,
+    SCHEMA_ENV_ERROR, SCHEMA_INDEX_ERROR, SCHEMA_JSON_DECODE_ERROR, SCHEMA_JSON_ENCODE_ERROR,
+    SCHEMA_KEY_ERROR, SCHEMA_LIST_TAG, SCHEMA_MAP_TAG, SCHEMA_PARSE_ERROR, SCHEMA_STR_TAG,
+    SCHEMA_TIME_DURATION, SCHEMA_TIME_ERROR, SCHEMA_TIME_INSTANT, SCHEMA_TIME_TIMESTAMP,
+    SCHEMA_VALIDATION_ERROR, SCHEMA_VALIDATION_ISSUE, SCHEMA_VALIDATION_VIOLATION,
 };
 
 #[inline]
@@ -58,6 +59,7 @@ pub(crate) fn type_tag_for_switch(ty: &Type, checked: &CheckedProgram) -> Result
                 ("cdt.json", "DecodeError") => Ok(SCHEMA_JSON_DECODE_ERROR),
                 ("cdt.json", "EncodeError") => Ok(SCHEMA_JSON_ENCODE_ERROR),
                 ("cdt.env", "EnvError") => Ok(SCHEMA_ENV_ERROR),
+                ("cdt.cli", "CliError") => Ok(SCHEMA_CLI_ERROR),
                 _ => Err(format!("Unsupported native type '{}' in switch pattern", tid)),
             },
             _ => Err(format!("Unsupported type '{}' in switch pattern", tid)),
@@ -258,6 +260,46 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 Ok(dst_obj)
             }
             other => Err(format!("Unsupported cdt.env symbol '{}'", other)),
+        }
+    }
+
+    pub(crate) fn lower_cli_call(
+        &mut self,
+        sym: &str,
+        type_args: &[TypeExpr],
+        args: &[Expr],
+        named_args: &[NamedArg],
+    ) -> Result<u16, String> {
+        match sym {
+            "CliError" => self.lower_native_record(SCHEMA_CLI_ERROR, &["kind", "message"], args, named_args),
+            "parse" | "parse_args" | "help" => {
+                let ty = self.mc.checked.resolve_type(&type_args[0])?;
+                let Type::Custom(tid) = ty else {
+                    return Err(format!("cli.{}<T>() requires a struct type", sym));
+                };
+                let plan_idx = self
+                    .mc
+                    .checked
+                    .cli_plans
+                    .iter()
+                    .position(|(name, _)| name == &tid.name)
+                    .ok_or_else(|| format!("Missing CliPlan for '{}'", tid.name))?;
+                let (kind, c_reg) = match sym {
+                    "parse" => (EXT_CLI_PARSE, 0),
+                    "help" => (EXT_CLI_HELP, 0),
+                    _ => (EXT_CLI_PARSE_ARGS, self.lower_obj(&args[0])?),
+                };
+                let dst_obj = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp {
+                    kind,
+                    aux: 0,
+                    a: dst_obj,
+                    b: plan_idx as u16,
+                    c: c_reg,
+                });
+                Ok(dst_obj)
+            }
+            other => Err(format!("Unsupported cdt.cli symbol '{}'", other)),
         }
     }
 

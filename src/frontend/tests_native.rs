@@ -370,3 +370,139 @@ func strict_trap(n: Int) -> Int {
 
     assert_ne!(SCHEMA_TIME_ERROR, SCHEMA_VALIDATION_ERROR);
 }
+
+#[test]
+fn cdt_cli_dsl_annotations_help_and_bundle_e2e() {
+    let src = r#"
+import cli from "cdt.cli"
+import { CliError } from "cdt.cli"
+
+cli Tool "Demo CLI" {
+    flag verbose "v" "Verbose output"
+    opt port: Int "p" "Listen port" = 8080
+    group db "Database commands" {
+        cmd migrate "Run migrations" {
+            arg target: String "Migration target"
+            flag dry_run "Dry run"
+        }
+    }
+    cmd run "Run script" {
+        arg entry: String "Entry file"
+        rest args "Extra args"
+    }
+}
+
+struct AnnRun {
+    entry: String @cli.arg("Entry file")
+    extra: [String] @cli.rest("Extra args") = []
+}
+
+struct AnnTool {
+    verbose: Bool @cli.flag("v", "Verbose") = false
+    port: Int @cli.opt("p", "Port") = 3000
+    run: AnnRun? @cli.cmd("Run script")
+}
+
+export func run_dsl(raw: [String]) -> String {
+    res := cli.parse_args<Tool>(raw)
+    switch res {
+        case CliError(e):
+            return e.kind + ":" + e.message
+        case Tool(app):
+            v := "0"
+            if app.verbose { v = "1" }
+            switch app.db {
+                case Tool_db(db):
+                    switch db.migrate {
+                        case Tool_db_migrate(m):
+                            dr := "live"
+                            if m.dry_run { dr = "dry" }
+                            return "migrate:" + m.target + ":" + dr + ":" + v + ":" + app.port.to_string()
+                    }
+            }
+            switch app.run {
+                case Tool_run(r):
+                    return "run:" + r.entry + ":" + r.args.len().to_string() + ":" + v + ":" + app.port.to_string()
+            }
+            return "root:" + v + ":" + app.port.to_string()
+    }
+    return "unreachable"
+}
+
+export func run_ann(raw: [String]) -> String {
+    res := cli.parse_args<AnnTool>(raw)
+    switch res {
+        case CliError(e):
+            return e.kind
+        case AnnTool(app):
+            v := "0"
+            if app.verbose { v = "1" }
+            switch app.run {
+                case AnnRun(r):
+                    return "ann:" + r.entry + ":" + r.extra.len().to_string() + ":" + v + ":" + app.port.to_string()
+            }
+            return "ann-root:" + v + ":" + app.port.to_string()
+    }
+    return "unreachable"
+}
+
+export func get_help() -> String {
+    return cli.help<Tool>()
+}
+"#;
+    let module = compile_source(src).expect("cdt.cli program should compile");
+
+    // Roundtrip through bytecode bundle to verify cli_plans serialization.
+    let dsl_fid_orig = module.func_id("run_dsl").unwrap();
+    let bytes = crate::ir::bundle::encode_bundle(&module, dsl_fid_orig, 1).expect("bundle encode");
+    let (decoded, _, _) = crate::ir::bundle::decode_bundle(&bytes).expect("bundle decode");
+
+    let mut vm = Vm::new();
+    let dsl_fid = decoded.func_id("run_dsl").unwrap();
+    let ann_fid = decoded.func_id("run_ann").unwrap();
+    let help_fid = decoded.func_id("get_help").unwrap();
+
+    let mk_args = |items: &[&str]| -> Obj {
+        Obj::List(crate::vm::value::ListStorage::Obj(std::sync::Arc::new(
+            items.iter().map(|s| Obj::str(*s)).collect(),
+        )))
+    };
+
+    // Subcommand inside group + global short flag + default port
+    let r1 = vm
+        .call_obj(&decoded, dsl_fid, &[], &[mk_args(&["-v", "db", "migrate", "prod", "--dry-run"])])
+        .unwrap();
+    assert_eq!(r1, Obj::str("migrate:prod:dry:1:8080"));
+
+    // Subcommand with rest args + option=val
+    let r2 = vm
+        .call_obj(&decoded, dsl_fid, &[], &[mk_args(&["--port=9090", "run", "main.cdt", "--", "a", "b"])])
+        .unwrap();
+    assert_eq!(r2, Obj::str("run:main.cdt:2:0:9090"));
+
+    // --help returns CliError with kind == "help"
+    let r_help = vm
+        .call_obj(&decoded, dsl_fid, &[], &[mk_args(&["--help"])])
+        .unwrap();
+    let Obj::Str(help_s) = r_help else { panic!("expected Str") };
+    assert!(help_s.starts_with("help:"), "got {}", help_s);
+    assert!(help_s.contains("Demo CLI"), "got {}", help_s);
+
+    // Unknown flag returns CliError
+    let r_err = vm
+        .call_obj(&decoded, dsl_fid, &[], &[mk_args(&["--nope"])])
+        .unwrap();
+    let Obj::Str(err_s) = r_err else { panic!("expected Str") };
+    assert!(err_s.starts_with("unknown:"), "got {}", err_s);
+
+    // Struct annotation syntax
+    let r_ann = vm
+        .call_obj(&decoded, ann_fid, &[], &[mk_args(&["-v", "-p", "4000", "run", "app.cdt", "x", "y"])])
+        .unwrap();
+    assert_eq!(r_ann, Obj::str("ann:app.cdt:2:1:4000"));
+
+    // cli.help<Tool>()
+    let h = vm.call_obj(&decoded, help_fid, &[], &[]).unwrap();
+    let Obj::Str(hs) = h else { panic!("expected Str") };
+    assert!(hs.contains("db") && hs.contains("run"), "got {}", hs);
+}

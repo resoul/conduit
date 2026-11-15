@@ -1,0 +1,19 @@
+services:
+  dev:
+    image: airlance/conduit:0.2.3
+    working_dir: /work
+    volumes:
+      - .:/work
+    environment:
+      APP_ENV: dev
+      MIN_SCORE: "50"
+      APP_TAG: local
+    command: ["watch", "main.cdt", "--", "--verbose", "run"]
+
+  prod:
+    build: .
+    environment:
+      APP_ENV: prod
+      MIN_SCORE: "60"
+      APP_TAG: release
+    command: ["--verbose", "run"]

@@ -67,7 +67,11 @@ pub(crate) fn build_validation_plans(
             let nested = build_nested_val(&inner_ty, &checked.struct_by_name);
             let mut rules = Vec::new();
             for ann in &f_ast.annotations {
-                if ann.target == "json" || ann.target == "env" {
+                if ann.target == "json"
+                    || ann.target == "env"
+                    || ann.target.starts_with("cli.")
+                    || matches!(ann.target.as_str(), "flag" | "opt" | "arg" | "rest" | "cmd" | "group")
+                {
                     continue;
                 }
                 rules.push(compile_field_rule(ann, &inner_ty, checked)?);

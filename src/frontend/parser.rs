@@ -20,11 +20,12 @@ impl std::error::Error for ParserError {}
 pub struct Parser {
     pub(super) tokens: Vec<Token>,
     pub(super) cursor: usize,
+    pub(super) pending_items: Vec<Item>,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, cursor: 0 }
+        Self { tokens, cursor: 0, pending_items: Vec::new() }
     }
 
     pub(super) fn peek(&self) -> &Token {
@@ -94,7 +95,9 @@ impl Parser {
     pub fn parse_program(&mut self) -> Result<Program, ParserError> {
         let mut items = Vec::new();
         while !self.check(&TokenKind::Eof) {
-            items.push(self.parse_item()?);
+            let item = self.parse_item()?;
+            items.append(&mut self.pending_items);
+            items.push(item);
         }
         Ok(Program { items })
     }
@@ -165,11 +168,12 @@ impl Parser {
                 true,
             ));
         }
-        match tok.kind {
+        match &tok.kind {
             TokenKind::KwFunc => self.parse_func_item(is_exported, is_validator),
             TokenKind::KwStruct => self.parse_struct_item(is_exported),
             TokenKind::KwType => self.parse_type_alias_item(is_exported),
             TokenKind::KwError => self.parse_error_item(is_exported),
+            TokenKind::Ident(kw) if kw == "cli" => self.parse_cli_item(is_exported),
             TokenKind::KwImport => {
                 if is_exported {
                     return Err(ParserError {

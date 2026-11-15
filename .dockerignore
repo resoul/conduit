@@ -1,0 +1,8 @@
+target/
+.git/
+.github/
+.idea/
+.DS_Store
+docs/book/
+dist/
+*.cdtb

@@ -24,6 +24,7 @@
 - [cdt.time](library/time.md)
 - [cdt.validation](library/validation.md)
 - [cdt.env](library/env.md)
+- [cdt.cli](library/cli.md)
 
 # Practical Guides
 - [Working with Errors](guides/working-with-errors.md)

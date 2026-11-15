@@ -221,6 +221,7 @@ pub const SCHEMA_INDEX_ERROR: u32 = 0xFFFF_0032;
 pub const SCHEMA_KEY_ERROR: u32 = 0xFFFF_0033;
 pub const SCHEMA_PARSE_ERROR: u32 = 0xFFFF_0034;
 pub const SCHEMA_ENV_ERROR: u32 = 0xFFFF_0035;
+pub const SCHEMA_CLI_ERROR: u32 = 0xFFFF_0036;
 
 #[inline]
 pub fn is_builtin_error_schema(schema_id: u32) -> bool {
@@ -235,6 +236,7 @@ pub fn is_builtin_error_schema(schema_id: u32) -> bool {
             | SCHEMA_KEY_ERROR
             | SCHEMA_PARSE_ERROR
             | SCHEMA_ENV_ERROR
+            | SCHEMA_CLI_ERROR
     )
 }
 
@@ -619,7 +621,7 @@ impl Obj {
                 SCHEMA_BOXED_INT => (rec.inline_scalars[0] as i64).to_string(),
                 SCHEMA_BOXED_FLOAT => format_float(f64::from_bits(rec.inline_scalars[0])),
                 SCHEMA_BOXED_BOOL => (rec.inline_scalars[0] != 0).to_string(),
-                SCHEMA_KEY_ERROR | SCHEMA_PARSE_ERROR | SCHEMA_ENV_ERROR if rec.inline_objs.len() >= 2 => {
+                SCHEMA_KEY_ERROR | SCHEMA_PARSE_ERROR | SCHEMA_ENV_ERROR | SCHEMA_CLI_ERROR if rec.inline_objs.len() >= 2 => {
                     rec.inline_objs[1].format_obj()
                 }
                 _ if !rec.inline_objs.is_empty() && matches!(&rec.inline_objs[0], Obj::Str(_)) => {

@@ -1,0 +1,63 @@
+import cli from "cdt.cli"
+import { CliError } from "cdt.cli"
+import { EnvError } from "cdt.env"
+import { ValidationError } from "cdt.validation"
+import { DecodeError, EncodeError } from "cdt.json"
+import { TimeError } from "cdt.time"
+import { load_config, AppConfig } from "./config"
+import { process_events } from "./pipeline"
+
+cli Worker "Conduit starter worker" {
+    flag verbose "v" "Print detailed status"
+    cmd check "Validate environment configuration"
+    cmd run "Process sample JSON events" {
+        opt min_score: Int "m" "Override MIN_SCORE threshold" = -1
+    }
+}
+
+func sample_payload() -> String {
+    return "[{\"id\":1,\"user\":\"alice\",\"score\":80},{\"id\":2,\"user\":\"bob\",\"score\":30},{\"id\":3,\"user\":\"carol\",\"score\":95}]"
+}
+
+func run_app() -> String | CliError | EnvError | ValidationError | DecodeError | EncodeError | TimeError {
+    app := cli.parse<Worker>()?
+    cfg := load_config()?
+
+    switch app.check {
+        case Worker_check(_):
+            return "config ok: env={cfg.app_env}, min_score={cfg.min_score}, tag={cfg.tag}"
+    }
+
+    switch app.run {
+        case Worker_run(r):
+            threshold := cfg.min_score
+            if r.min_score >= 0 {
+                threshold = r.min_score
+            }
+            if app.verbose {
+                print("[worker] env={cfg.app_env} threshold={threshold}")
+            }
+            return process_events(sample_payload(), cfg.app_env, cfg.tag, threshold)?
+    }
+
+    return cli.help<Worker>()
+}
+
+func main() -> Void {
+    switch run_app() {
+        case String(out):
+            print(out)
+        case CliError(e):
+            print(e.message)
+        case EnvError(e):
+            print("Env error [{e.name}]: {e.message}")
+        case ValidationError(e):
+            print("Validation error: {e.issues.len()} issue(s)")
+        case DecodeError(e):
+            print("JSON decode error: {e.message}")
+        case EncodeError(e):
+            print("JSON encode error: {e.message}")
+        case TimeError(e):
+            print("Time error: {e.message}")
+    }
+}

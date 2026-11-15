@@ -274,6 +274,7 @@ pub struct Item {
     pub span: Span,
     pub is_exported: bool,
     pub is_imported: bool,
+    pub doc: Option<String>,
 }
 
 impl Item {
@@ -283,6 +284,7 @@ impl Item {
             span,
             is_exported,
             is_imported: false,
+            doc: None,
         }
     }
 }

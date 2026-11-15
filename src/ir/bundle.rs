@@ -7,6 +7,7 @@ use crate::ir::{
     CallableRef, ClosureProto, ElemKind, FunctionProto, Module, PipelinePlan, PipelineStage,
     RecordDesc,
 };
+use crate::native::cli::{CliDefault, CliFieldPlan, CliKind, CliNodePlan, CliPlan, CliValKind};
 use crate::native::env::{EnvDefault, EnvFieldKind, EnvFieldPlan, EnvLoadPlan};
 use crate::native::validation::{
     CompiledValidationRule, NestedValidation, ValidationFieldPlan, ValidationStructPlan,
@@ -434,6 +435,30 @@ pub fn encode_bundle(module: &Module, main_fid: u32, main_ret_tag: u8) -> Result
             Ok(())
         })
     })?;
+    w.list(&module.cli_plans, |w, cp| {
+        w.list(&cp.nodes, |w, n| {
+            w.str(&n.name); w.str(&n.about); w.u32(n.schema_id); w.u16(n.scalar_len); w.u16(n.obj_len);
+            w.list(&n.fields, |w, f| {
+                w.str(&f.field_name); w.str(&f.cli_name);
+                match f.short { Some(c) => { w.u8(1); w.u32(c as u32); } None => w.u8(0), }
+                w.str(&f.help);
+                w.u8(match f.kind { CliKind::Flag => 0, CliKind::Opt => 1, CliKind::Arg => 2, CliKind::Rest => 3, CliKind::Cmd => 4, CliKind::Group => 5 });
+                w.u8(match f.val_kind { CliValKind::String => 0, CliValKind::Int => 1, CliValKind::Float => 2, CliValKind::Bool => 3, CliValKind::ListStr => 4, CliValKind::SubStruct => 5 });
+                w.bool(f.is_optional); w.bool(f.is_scalar); w.u16(f.slot_idx);
+                match &f.default {
+                    None => w.u8(0),
+                    Some(CliDefault::Int(v)) => { w.u8(1); w.i64(*v); }
+                    Some(CliDefault::Float(b)) => { w.u8(2); w.u64(*b); }
+                    Some(CliDefault::Bool(b)) => { w.u8(3); w.bool(*b); }
+                    Some(CliDefault::Str(s)) => { w.u8(4); w.str(s); }
+                    Some(CliDefault::Nil) => w.u8(5),
+                    Some(CliDefault::EmptyList) => w.u8(6),
+                }
+                match f.sub_node { Some(s) => { w.u8(1); w.u16(s); } None => w.u8(0), }
+                Ok(())
+            })
+        })
+    })?;
 
     Ok(w.0)
 }
@@ -547,6 +572,24 @@ pub fn decode_bundle(bytes: &[u8]) -> Result<(Module, u32, u8), String> {
                 })
             })?.into_boxed_slice(),
         })
+    })?;
+    module.cli_plans = r.vec(|r| {
+        let nodes = r.vec(|r| {
+            let name = r.str()?; let about = r.str()?; let schema_id = r.u32()?; let scalar_len = r.u16()?; let obj_len = r.u16()?;
+            let fields = r.vec(|r| {
+                let field_name = r.str()?; let cli_name = r.str()?;
+                let short = if r.u8()? == 1 { Some(char::from_u32(r.u32()?).ok_or_else(|| "Invalid char in bundle".to_string())?) } else { None };
+                let help = r.str()?;
+                let kind = match r.u8()? { 0 => CliKind::Flag, 1 => CliKind::Opt, 2 => CliKind::Arg, 3 => CliKind::Rest, 4 => CliKind::Cmd, 5 => CliKind::Group, t => return Err(format!("Invalid CliKind {}", t)) };
+                let val_kind = match r.u8()? { 0 => CliValKind::String, 1 => CliValKind::Int, 2 => CliValKind::Float, 3 => CliValKind::Bool, 4 => CliValKind::ListStr, 5 => CliValKind::SubStruct, t => return Err(format!("Invalid CliValKind {}", t)) };
+                let is_optional = r.bool()?; let is_scalar = r.bool()?; let slot_idx = r.u16()?;
+                let default = match r.u8()? { 0 => None, 1 => Some(CliDefault::Int(r.i64()?)), 2 => Some(CliDefault::Float(r.u64()?)), 3 => Some(CliDefault::Bool(r.bool()?)), 4 => Some(CliDefault::Str(r.str()?)), 5 => Some(CliDefault::Nil), 6 => Some(CliDefault::EmptyList), t => return Err(format!("Invalid CliDefault {}", t)) };
+                let sub_node = if r.u8()? == 1 { Some(r.u16()?) } else { None };
+                Ok(CliFieldPlan { field_name, cli_name, short, help, kind, val_kind, is_optional, is_scalar, slot_idx, default, sub_node })
+            })?.into_boxed_slice();
+            Ok(CliNodePlan { name, about, schema_id, scalar_len, obj_len, fields })
+        })?.into_boxed_slice();
+        Ok(CliPlan { nodes })
     })?;
 
     module.validate()?;

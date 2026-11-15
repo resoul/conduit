@@ -12,6 +12,7 @@ pub(crate) fn is_valid_native_type(mod_name: &str, ty_name: &str) -> bool {
         "cdt.time" => matches!(ty_name, "Timestamp" | "Instant" | "Duration" | "TimeError"),
         "cdt.validation" => matches!(ty_name, "Issue" | "Violation" | "ValidationError"),
         "cdt.env" => ty_name == "EnvError",
+        "cdt.cli" => ty_name == "CliError",
         _ => false,
     }
 }
@@ -102,6 +103,24 @@ pub(crate) fn register_native_imports(
                     }
                 }
             }
+            "cdt.cli" => {
+                if let Some(a) = alias {
+                    checked.cli_aliases.insert(a.clone());
+                }
+                for spec in names {
+                    match spec.name.as_str() {
+                        "parse" | "parse_args" | "help" => {
+                            insert_unique(&mut checked.cli_direct_fns, &spec.alias, &spec.name)?;
+                        }
+                        "CliError" => {
+                            checked.cli_direct_types.insert(spec.alias.clone(), spec.name.clone());
+                        }
+                        other => {
+                            return Err(format!("Module 'cdt.cli' has no exported member '{}'", other));
+                        }
+                    }
+                }
+            }
             other => return Err(format!("Unknown or unlinked module '{}'", other)),
         }
     }
@@ -159,6 +178,10 @@ pub fn resolve_type_expr(te: &TypeExpr, checked: &CheckedProgram) -> Result<Type
                 "cdt.env",
                 &checked.env_direct_types[name],
             ))),
+            _ if checked.cli_direct_types.contains_key(name) => Ok(Type::Custom(TypeId::native(
+                "cdt.cli",
+                &checked.cli_direct_types[name],
+            ))),
             _ if name.contains('.') => {
                 let mut parts = name.splitn(2, '.');
                 let alias = parts.next().unwrap_or("");
@@ -171,6 +194,8 @@ pub fn resolve_type_expr(te: &TypeExpr, checked: &CheckedProgram) -> Result<Type
                     "cdt.validation"
                 } else if checked.env_aliases.contains(alias) {
                     "cdt.env"
+                } else if checked.cli_aliases.contains(alias) {
+                    "cdt.cli"
                 } else {
                     return Err(format!("Unknown type '{}'", name));
                 };
@@ -271,6 +296,7 @@ pub(crate) fn is_error_type(ty: &Type, checked: &CheckedProgram) -> bool {
             "cdt.time" => name == "TimeError",
             "cdt.validation" => matches!(name.as_str(), "Issue" | "ValidationError"),
             "cdt.env" => name == "EnvError",
+            "cdt.cli" => name == "CliError",
             _ => false,
         },
         Type::Custom(TypeId {
@@ -347,6 +373,8 @@ pub(crate) fn native_member_field(tid: &TypeId, field: &str) -> Result<(Type, u1
         ("cdt.json", "EncodeError", "message") => Ok((Type::String, 0)),
         ("cdt.env", "EnvError", "name") => Ok((Type::String, 0)),
         ("cdt.env", "EnvError", "message") => Ok((Type::String, 1)),
+        ("cdt.cli", "CliError", "kind") => Ok((Type::String, 0)),
+        ("cdt.cli", "CliError", "message") => Ok((Type::String, 1)),
         _ => Err(format!("Type '{}' has no field '{}'", tid, field)),
     }
 }
@@ -778,7 +806,7 @@ fn expr_to_env_default(expr: &Expr) -> Option<crate::native::env::EnvDefault> {
     }
 }
 
-fn check_fields_ctor(
+pub(crate) fn check_fields_ctor(
     tc: &mut Checker<'_>,
     name: &str,
     fields: &[(&str, Type)],

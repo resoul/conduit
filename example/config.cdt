@@ -1,0 +1,13 @@
+import * as env from "cdt.env"
+import * as validation from "cdt.validation"
+
+export struct AppConfig {
+    app_env: String @env("APP_ENV") = "dev"
+    min_score: Int @env("MIN_SCORE") @validation.min(0) = 50
+    tag: String @env("APP_TAG") = "starter"
+}
+
+export func load_config() -> AppConfig | env.EnvError | validation.ValidationError {
+    cfg := env.load<AppConfig>()?
+    return validation.check(cfg)?
+}

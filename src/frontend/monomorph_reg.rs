@@ -27,6 +27,9 @@ pub(crate) fn register_program_types(
     for item in &program.items {
         match &item.kind {
             ItemKind::Struct { name, type_params, fields } => {
+                if let Some(doc) = &item.doc {
+                    checked.struct_abouts.insert(name.clone(), doc.clone());
+                }
                 if !type_params.is_empty() {
                     check_unique_type_params(type_params)?;
                     if checked.struct_by_name.contains_key(name)
@@ -163,6 +166,10 @@ pub(crate) fn register_program_types(
                     }
                 });
             }
+            let cli_ann = f.annotations.iter().find(|ann| {
+                ann.target.starts_with("cli.")
+                    || matches!(ann.target.as_str(), "flag" | "opt" | "arg" | "rest" | "cmd" | "group")
+            }).cloned();
             resolved_fields.push(ResolvedField {
                 name: f.name.clone(),
                 json_name,
@@ -170,6 +177,7 @@ pub(crate) fn register_program_types(
                 is_scalar,
                 slot_idx,
                 env_name,
+                cli_ann,
                 default: None,
             });
         }
@@ -206,6 +214,7 @@ pub(crate) fn register_program_types(
                 || checked.time_direct_fns.contains_key(name)
                 || checked.val_direct_fns.contains_key(name)
                 || checked.env_direct_fns.contains_key(name)
+                || checked.cli_direct_fns.contains_key(name)
             {
                 return Err(format!("Function '{}' conflicts with imported identifier", name));
             }

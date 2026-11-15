@@ -14,7 +14,7 @@ Conduit is designed with explicit control flow, strict types, and composable sta
 - **Errors as Values**: Functions return explicit union types (`T | Error`), inspected via exhaustive `switch` or propagated via `?`—zero exceptions.
 - **Strict Numbers (`Int` & `Float`)**: 64-bit integers (`Int`) and IEEE 754 floats (`Float`) never mix implicitly; conversions (`.to_float()`, `.floor()`, `.ceil()`, `.round()`, `.to_string()`) are always explicit.
 - **Explicit Schema Validation**: Mark validators with `[#validator]`, attach `@rule` / `@module.rule(...)` annotations to fields, and execute recursive checks explicitly via `validation.check()`.
-- **Standard Library (`cdt.*`)**: Built-in host-native modules for JSON (`cdt.json`), schema validation (`cdt.validation`), and time (`cdt.time`).
+- **Standard Library (`cdt.*`)**: Built-in host-native modules for JSON (`cdt.json`), schema validation (`cdt.validation`), time (`cdt.time`), environment config (`cdt.env`), and CLI parsing (`cdt.cli`).
 
 ## Standard Library
 
@@ -23,6 +23,8 @@ Conduit is designed with explicit control flow, strict types, and composable sta
 | `cdt.json` | Strict RFC 8259 typed decoding (`json.decode<T>`), deterministic encoding (`json.encode`), and unstructured `json.Value` trees (`json.parse`, `json.stringify`) | [cdt.json](docs/src/library/json.md) |
 | `cdt.validation` | Field annotations, custom `[#validator]` functions, built-in `min`/`max`/`email` rules, and recursive `validation.check()` | [cdt.validation](docs/src/library/validation.md) |
 | `cdt.time` | System clock (`Timestamp`), monotonic time (`Instant`), arithmetic (`Duration`), and safe `TimeError` handling | [cdt.time](docs/src/library/time.md) |
+| `cdt.env` | Typed environment configuration (`@env`, `env.load<T>()`), `get`/`require`, and raw `args()` | [cdt.env](docs/src/library/env.md) |
+| `cdt.cli` | Typed CLI parser (`cli { ... }` DSL and `@cli.*` annotations), subcommands, groups, and `--help` | [cdt.cli](docs/src/library/cli.md) |
 
 ## Installation
 
@@ -46,6 +48,12 @@ conduit check main.cdt
 
 # Run a Conduit program
 conduit run main.cdt
+
+# Watch and auto-reload on .cdt changes
+conduit watch main.cdt
+
+# Build a standalone native executable
+conduit build main.cdt -o app
 
 # Disassemble compiled VM bytecode
 conduit disasm main.cdt

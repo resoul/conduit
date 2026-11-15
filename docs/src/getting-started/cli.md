@@ -10,6 +10,7 @@ The `conduit` CLI provides tools for checking, compiling, executing, disassembli
 | :--- | :--- | :--- |
 | `conduit build` | `<file.cdt> [-o <output>]` | Compiles and bundles the program (including relative imports) into a standalone executable. |
 | `conduit run` | `<file.cdt>` | Type-checks, compiles to bytecode, and executes `main()` in the VM. |
+| `conduit watch` | `<file.cdt> [args...]` | Watches `.cdt` files and automatically recompiles and restarts on changes. |
 | `conduit check` | `<file.cdt>` | Performs static semantic analysis and type checking without running code. |
 | `conduit disasm` | `<file.cdt>` | Compiles the program and prints the disassembled register bytecode. |
 | `conduit bench` | `[--filter <pat>] [--strict]` | Runs the built-in VM benchmark suite and checks target performance gates. |
@@ -55,4 +56,12 @@ conduit build main.cdt -o my_app
 ./my_app
 ```
 
-Resolves all relative module imports, performs tree-shaking and type-checking ahead of time, and emits a self-contained executable with embedded bytecode (`CDTB0001`). Runtime arguments passed to `./my_app` are forwarded directly to `env.args()`.
+Resolves all relative module imports, performs tree-shaking and type-checking ahead of time, and emits a self-contained executable with embedded bytecode (`CDTB0001`). Runtime arguments passed to `./my_app` are forwarded directly to `env.args()` and `cdt.cli`.
+
+### Watching & Auto-Reloading in Development
+
+```bash
+conduit watch main.cdt
+```
+
+Polls `.cdt` files in the project directory and automatically stops, recompiles, and restarts `conduit run` whenever any file changes.

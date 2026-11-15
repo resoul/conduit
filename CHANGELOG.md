@@ -5,6 +5,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
+## [0.2.3] - 2026-11-15
+
+### Added
+
+* **`cdt.cli` Command-Line Parser & DSL**:
+  * Added the `cdt.cli` standard library module (`cli.parse<T>()`, `cli.parse_args<T>()`, `cli.help<T>()`, `CliError`) with support for flags, options, positional arguments, `rest` arguments, nested subcommands, command groups, and automatic `-h`/`--help` generation.
+  * Added **both** the declarative `cli Name { flag, opt, arg, rest, cmd, group }` DSL (desugaring to structs at parse time) and `@cli.flag` / `@cli.opt` / `@cli.arg` / `@cli.rest` / `@cli.cmd` / `@cli.group` struct field annotations on a single shared native `CliPlan` engine (`EXT_CLI_*` opcodes + `.cdtb` bundle serialization).
+  * Added [cdt.cli documentation](docs/src/library/cli.md) and updated TextMate syntax highlighting (`editors/textmate/conduit.tmLanguage.json`).
+* **`conduit watch` & Docker**:
+  * Added `conduit watch <file.cdt> [args...]` for automatic recompilation and restart when `.cdt` files change.
+  * Added multi-stage Alpine/musl `Dockerfile`, `.dockerignore`, and `.github/workflows/docker.yml` for multi-arch (`linux/amd64`, `linux/arm64`) publishing to `ghcr.io` and Docker Hub.
+
 ## [0.2.2] - 2026-11-15
 
 ### Added

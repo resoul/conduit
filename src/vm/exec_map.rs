@@ -1,14 +1,16 @@
 use std::sync::Arc;
 
 use crate::vm::exec_cold::err_msg;
+use crate::native::cli::{exec_cli_parse, format_cli_help};
 use crate::native::env::{exec_env_load, make_env_error};
 use crate::vm::exec_union::list_get_or_index;
 use crate::vm::opcode::{
-    EXT_ENV_ARGS, EXT_ENV_GET, EXT_ENV_LOAD, EXT_ENV_REQUIRE, EXT_FLOAT_CEIL, EXT_FLOAT_MATH,
-    EXT_INT_MATH, EXT_LIST_FIRST, EXT_LIST_IS_EMPTY, EXT_LIST_LAST, EXT_LIST_SORT,
-    EXT_MAP_CONTAINS_KEY, EXT_MAP_ENTRIES, EXT_MAP_FROM, EXT_MAP_GET, EXT_MAP_INDEX, EXT_MAP_KEYS,
-    EXT_MAP_REMOVE, EXT_MAP_SET, EXT_MAP_VALUES, EXT_PRINT_OBJ, EXT_PRINT_SCALAR, EXT_STR_IS_EMPTY,
-    EXT_STR_PRED, EXT_STR_SPLIT, EXT_STR_TO_FLOAT, EXT_STR_TO_INT,
+    EXT_CLI_HELP, EXT_CLI_PARSE, EXT_CLI_PARSE_ARGS, EXT_ENV_ARGS, EXT_ENV_GET, EXT_ENV_LOAD,
+    EXT_ENV_REQUIRE, EXT_FLOAT_CEIL, EXT_FLOAT_MATH, EXT_INT_MATH, EXT_LIST_FIRST,
+    EXT_LIST_IS_EMPTY, EXT_LIST_LAST, EXT_LIST_SORT, EXT_MAP_CONTAINS_KEY, EXT_MAP_ENTRIES,
+    EXT_MAP_FROM, EXT_MAP_GET, EXT_MAP_INDEX, EXT_MAP_KEYS, EXT_MAP_REMOVE, EXT_MAP_SET,
+    EXT_MAP_VALUES, EXT_PRINT_OBJ, EXT_PRINT_SCALAR, EXT_STR_IS_EMPTY, EXT_STR_PRED, EXT_STR_SPLIT,
+    EXT_STR_TO_FLOAT, EXT_STR_TO_INT,
 };
 use crate::vm::value::{
     ListStorage, MapKey, MapVal, Obj, OrderedMap, SCHEMA_BOXED_BOOL, SCHEMA_BOXED_FLOAT,
@@ -171,6 +173,42 @@ impl Vm {
                     .get(b as usize)
                     .ok_or_else(|| err_msg("Missing EnvLoadPlan"))?;
                 self.objs[o_base + a as usize] = exec_env_load(plan);
+            }
+            EXT_CLI_PARSE => {
+                let plan = module
+                    .cli_plans
+                    .get(b as usize)
+                    .ok_or_else(|| err_msg("Missing CliPlan"))?;
+                let args: Vec<String> = self
+                    .script_args
+                    .clone()
+                    .unwrap_or_else(|| std::env::args().skip(1).collect());
+                self.objs[o_base + a as usize] = exec_cli_parse(plan, &args);
+            }
+            EXT_CLI_PARSE_ARGS => {
+                let plan = module
+                    .cli_plans
+                    .get(b as usize)
+                    .ok_or_else(|| err_msg("Missing CliPlan"))?;
+                let Obj::List(ListStorage::Obj(items)) = &self.objs[o_base + c as usize] else {
+                    return Err(err_msg("Expected [String] in cli.parse_args()"));
+                };
+                let mut args = Vec::with_capacity(items.len());
+                for item in items.iter() {
+                    let Obj::Str(s) = item else {
+                        return Err(err_msg("Expected String element in cli.parse_args()"));
+                    };
+                    args.push(s.as_ref().clone());
+                }
+                self.objs[o_base + a as usize] = exec_cli_parse(plan, &args);
+            }
+            EXT_CLI_HELP => {
+                let plan = module
+                    .cli_plans
+                    .get(b as usize)
+                    .ok_or_else(|| err_msg("Missing CliPlan"))?;
+                let root = plan.nodes.first().map(|n| vec![n.name.clone()]).unwrap_or_default();
+                self.objs[o_base + a as usize] = Obj::str(format_cli_help(plan, 0, &root));
             }
             EXT_STR_TO_INT => {
                 let Obj::Str(s) = &self.objs[o_base + b as usize] else {

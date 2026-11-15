@@ -50,6 +50,35 @@ Because Conduit contains **zero external crate dependencies**, building from sou
 
 ---
 
+## Docker
+
+Multi-architecture images (`linux/amd64`, `linux/arm64`) are available on Docker Hub and GitHub Container Registry:
+
+```bash
+# Run a Conduit script directly
+docker run --rm -v "$PWD:/work" airlance/conduit:latest run main.cdt
+
+# Auto-reload during development
+docker run --rm -it -v "$PWD:/work" airlance/conduit:latest watch main.cdt
+```
+
+You can also use the image as a builder stage with `conduit build` to produce minimal `FROM scratch` production containers:
+
+```dockerfile
+FROM airlance/conduit:0.2.3 AS builder
+WORKDIR /app
+COPY . .
+RUN conduit build main.cdt -o /app/my_app
+
+FROM scratch
+COPY --from=builder /app/my_app /my_app
+ENTRYPOINT ["/my_app"]
+```
+
+*(Also published as `ghcr.io/resoul/conduit`.)*
+
+---
+
 ## Verifying the Installation
 
 Verify that the CLI is accessible and prints the correct version:
@@ -61,6 +90,6 @@ conduit --version
 Expected output:
 
 ```text
-Conduit v0.2.2
+Conduit v0.2.3
 ```
 

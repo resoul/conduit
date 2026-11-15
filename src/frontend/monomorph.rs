@@ -114,6 +114,7 @@ pub(crate) fn ensure_monomorphized_struct(
             is_scalar,
             slot_idx,
             env_name,
+            cli_ann: None,
             default: None,
         });
         subst_fields.push(f_clone);
@@ -130,6 +131,7 @@ pub(crate) fn ensure_monomorphized_struct(
     checked.pending_mono_items.push(Item {
         is_exported: false,
         is_imported: false,
+        doc: None,
         kind: ItemKind::Struct {
             name: mono_name.clone(),
             type_params: Vec::new(),

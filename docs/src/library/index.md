@@ -22,4 +22,5 @@ All standard libraries reside in the reserved `cdt.*` namespace.
 | [cdt.time](time.md) | `cdt.time` | System clock, monotonic timestamps, high-resolution duration calculation, and epoch conversion. |
 | [cdt.validation](validation.md) | `cdt.validation` | Schema validation, field rule annotations, issue aggregation, and standard rules (`min`, `max`, `email`). |
 | [cdt.env](env.md) | `cdt.env` | Typed environment configuration (`@env`, `load<T>`), `get`/`require`, and CLI `args()`. |
+| [cdt.cli](cli.md) | `cdt.cli` | Typed CLI parser (`cli { ... }` DSL and `@cli.*` annotations), subcommands, and `--help`. |
 

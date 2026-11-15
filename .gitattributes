@@ -1,0 +1,11 @@
+# Normalize line endings for Conduit source files
+*.cdt text eol=lf
+
+# Highlight .cdt files on GitHub using Rust syntax until Conduit is added to github-linguist/linguist
+*.cdt linguist-language=Rust
+
+# Treat compiled bytecode bundles as binary
+*.cdtb binary
+
+# Exclude generated mdbook output from GitHub language statistics and diffs
+docs/book/** linguist-generated=true

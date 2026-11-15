@@ -2,6 +2,8 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process;
 
+mod watch;
+
 use conduit::benchmarks;
 use conduit::frontend;
 use conduit::frontend::types::Type;
@@ -101,18 +103,19 @@ fn main() {
         Some("build") => run_build_cmd(&args[1..]),
         Some("check") => run_check_cmd(args.get(1)),
         Some("disasm") => run_disasm_cmd(args.get(1)),
-        Some("run") => run_exec_cmd(args.get(1)),
+        Some("run") => run_exec_cmd(&args[1..]),
+        Some("watch") => watch::run_watch_cmd(&args[1..]),
         Some("--version" | "-V" | "version") => {
             println!("Conduit v{}", env!("CARGO_PKG_VERSION"));
         }
         Some("--help" | "-h" | "help") => {
             println!(
-                "Conduit v{}\n\nUsage:\n  conduit bench [--filter <pat>] [--strict]\n  conduit build <file.cdt> [-o <output>]\n  conduit check <file.cdt>\n  conduit disasm <file.cdt>\n  conduit run <file.cdt>\n  conduit --version, -V\n  conduit --help, -h",
+                "Conduit v{}\n\nUsage:\n  conduit bench [--filter <pat>] [--strict]\n  conduit build <file.cdt> [-o <output>]\n  conduit check <file.cdt>\n  conduit disasm <file.cdt>\n  conduit run <file.cdt>\n  conduit watch <file.cdt> [args...]\n  conduit --version, -V\n  conduit --help, -h",
                 env!("CARGO_PKG_VERSION")
             );
         }
         Some(cmd) => {
-            eprintln!("Unknown command '{}'. Usage: conduit <bench|build|check|disasm|run> ...", cmd);
+            eprintln!("Unknown command '{}'. Usage: conduit <bench|build|check|disasm|run|watch> ...", cmd);
             process::exit(2);
         }
     }
@@ -154,8 +157,14 @@ fn run_disasm_cmd(arg: Option<&String>) {
     }
 }
 
-fn run_exec_cmd(arg: Option<&String>) {
-    let path = require_path_arg(arg, "run");
+fn run_exec_cmd(args: &[String]) {
+    let path = require_path_arg(args.first(), "run");
+    let extra = args.get(1..).unwrap_or(&[]);
+    let script_args: Vec<String> = if extra.first().map(|s| s.as_str()) == Some("--") {
+        extra[1..].to_vec()
+    } else {
+        extra.to_vec()
+    };
     let (program, checked) = match frontend::check_file(path) {
         Ok(res) => res,
         Err(e) => {
@@ -187,6 +196,7 @@ fn run_exec_cmd(arg: Option<&String>) {
     }
     let ret_tag = type_to_ret_tag(&sig.return_type);
     let mut vm = Vm::new();
+    vm.script_args = Some(script_args);
     match vm.call(&module, fid, &[], &[]) {
         Ok(res) => print_exec_result(res, ret_tag),
         Err(e) => {

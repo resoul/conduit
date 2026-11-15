@@ -1,0 +1,37 @@
+import * as json from "cdt.json"
+import * as time from "cdt.time"
+
+export struct Event {
+    id: Int
+    user: String
+    score: Int
+}
+
+export struct Report {
+    env: String
+    tag: String
+    kept: Int
+    total_score: Int
+    elapsed_us: Int
+}
+
+export func process_events(raw_json: String, env_name: String, tag: String, min_score: Int) -> String | json.DecodeError | json.EncodeError | time.TimeError {
+    started := time.monotonic()
+    events := json.decode<[Event]>(raw_json)?
+
+    kept := events
+        |> filter((e: Event) => e.score >= min_score)
+
+    total := reduce(kept, 0, (acc: Int, e: Event) => acc + e.score)
+    elapsed := time.elapsed(started)?
+    elapsed_us := elapsed.nanoseconds()? / 1000
+
+    report := Report(
+        env: env_name,
+        tag: tag,
+        kept: kept.len(),
+        total_score: total,
+        elapsed_us: elapsed_us,
+    )
+    return json.encode(report)?
+}
