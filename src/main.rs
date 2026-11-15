@@ -1,24 +1,67 @@
 use std::env;
-use std::fs;
+use std::path::{Path, PathBuf};
 use std::process;
 
 use conduit::benchmarks;
 use conduit::frontend;
 use conduit::frontend::types::Type;
+use conduit::ir::bundle::{
+    RET_BOOL, RET_FLOAT, RET_INT, RET_OBJ, RET_VOID, decode_bundle, encode_bundle,
+    extract_bundle_from_exe, write_standalone_binary,
+};
 use conduit::ir::lower::compile_program;
 use conduit::vm::{ExecResult, Vm};
 
+fn print_exec_result(res: ExecResult, ret_tag: u8) {
+    match res {
+        ExecResult::Void => {}
+        ExecResult::Scalar(v) => match ret_tag {
+            RET_FLOAT => println!("{}", f64::from_bits(v)),
+            RET_BOOL => println!("{}", v != 0),
+            _ => println!("{}", v as i64),
+        },
+        ExecResult::Obj(obj) => println!("{:?}", obj),
+    }
+}
+
+fn type_to_ret_tag(ty: &Type) -> u8 {
+    match ty {
+        Type::Void => RET_VOID,
+        Type::Float => RET_FLOAT,
+        Type::Bool => RET_BOOL,
+        Type::Int => RET_INT,
+        _ => RET_OBJ,
+    }
+}
+
 fn main() {
+    if let Ok(exe) = env::current_exe()
+        && let Ok(Some(bundle)) = extract_bundle_from_exe(&exe)
+    {
+        let (module, main_fid, main_ret_tag) = match decode_bundle(&bundle) {
+            Ok(res) => res,
+            Err(e) => {
+                eprintln!("Bundle error: {}", e);
+                process::exit(1);
+            }
+        };
+        let mut vm = Vm::new();
+        match vm.call(&module, main_fid, &[], &[]) {
+            Ok(res) => print_exec_result(res, main_ret_tag),
+            Err(e) => {
+                eprintln!("Runtime error: {}", e);
+                process::exit(1);
+            }
+        }
+        return;
+    }
+
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(|s| s.as_str()) {
         Some("bench") | None => {
             let mut filter: Option<&str> = None;
             let mut strict = false;
-            let mut i = if args.first().map(|s| s.as_str()) == Some("bench") {
-                1
-            } else {
-                0
-            };
+            let mut i = usize::from(args.first().map(|s| s.as_str()) == Some("bench"));
             while i < args.len() {
                 match args[i].as_str() {
                     "--filter" => {
@@ -55,6 +98,7 @@ fn main() {
                 }
             }
         }
+        Some("build") => run_build_cmd(&args[1..]),
         Some("check") => run_check_cmd(args.get(1)),
         Some("disasm") => run_disasm_cmd(args.get(1)),
         Some("run") => run_exec_cmd(args.get(1)),
@@ -62,32 +106,29 @@ fn main() {
             println!("Conduit v{}", env!("CARGO_PKG_VERSION"));
         }
         Some("--help" | "-h" | "help") => {
-            println!("Conduit v{}\n\nUsage:\n  conduit bench [--filter <pat>] [--strict]\n  conduit check <file.cdt>\n  conduit disasm <file.cdt>\n  conduit run <file.cdt>\n  conduit --version, -V\n  conduit --help, -h", env!("CARGO_PKG_VERSION"));
+            println!(
+                "Conduit v{}\n\nUsage:\n  conduit bench [--filter <pat>] [--strict]\n  conduit build <file.cdt> [-o <output>]\n  conduit check <file.cdt>\n  conduit disasm <file.cdt>\n  conduit run <file.cdt>\n  conduit --version, -V\n  conduit --help, -h",
+                env!("CARGO_PKG_VERSION")
+            );
         }
         Some(cmd) => {
-            eprintln!("Unknown command '{}'. Usage: conduit <bench|check|disasm|run> ...", cmd);
+            eprintln!("Unknown command '{}'. Usage: conduit <bench|build|check|disasm|run> ...", cmd);
             process::exit(2);
         }
     }
 }
 
-fn read_source_arg(arg: Option<&String>, cmd: &str) -> String {
+fn require_path_arg<'a>(arg: Option<&'a String>, cmd: &str) -> &'a Path {
     let Some(path) = arg else {
         eprintln!("Usage: conduit {} <file.cdt>", cmd);
         process::exit(2);
     };
-    match fs::read_to_string(path) {
-        Ok(src) => src,
-        Err(e) => {
-            eprintln!("Failed to read '{}': {}", path, e);
-            process::exit(1);
-        }
-    }
+    Path::new(path)
 }
 
 fn run_check_cmd(arg: Option<&String>) {
-    let src = read_source_arg(arg, "check");
-    match frontend::check_source(&src) {
+    let path = require_path_arg(arg, "check");
+    match frontend::check_file(path) {
         Ok((_, checked)) => {
             println!(
                 "OK: {} type(s), {} function(s)",
@@ -103,8 +144,8 @@ fn run_check_cmd(arg: Option<&String>) {
 }
 
 fn run_disasm_cmd(arg: Option<&String>) {
-    let src = read_source_arg(arg, "disasm");
-    match frontend::compile_source(&src) {
+    let path = require_path_arg(arg, "disasm");
+    match frontend::compile_file(path) {
         Ok(module) => print!("{}", module.disassemble()),
         Err(e) => {
             eprintln!("Compile error: {}", e);
@@ -114,8 +155,8 @@ fn run_disasm_cmd(arg: Option<&String>) {
 }
 
 fn run_exec_cmd(arg: Option<&String>) {
-    let src = read_source_arg(arg, "run");
-    let (program, checked) = match frontend::check_source(&src) {
+    let path = require_path_arg(arg, "run");
+    let (program, checked) = match frontend::check_file(path) {
         Ok(res) => res,
         Err(e) => {
             eprintln!("Check error: {}", e);
@@ -144,18 +185,117 @@ fn run_exec_cmd(arg: Option<&String>) {
         eprintln!("'main' must take 0 parameters for CLI run");
         process::exit(1);
     }
+    let ret_tag = type_to_ret_tag(&sig.return_type);
     let mut vm = Vm::new();
     match vm.call(&module, fid, &[], &[]) {
-        Ok(ExecResult::Void) => {}
-        Ok(ExecResult::Scalar(v)) => match sig.return_type {
-            Type::Float => println!("{}", f64::from_bits(v)),
-            Type::Bool => println!("{}", v != 0),
-            _ => println!("{}", v as i64),
-        },
-        Ok(ExecResult::Obj(obj)) => println!("{:?}", obj),
+        Ok(res) => print_exec_result(res, ret_tag),
         Err(e) => {
             eprintln!("Runtime error: {}", e);
             process::exit(1);
         }
     }
+}
+
+fn run_build_cmd(args: &[String]) {
+    let mut input: Option<String> = None;
+    let mut output: Option<String> = None;
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-o" | "--output" => {
+                i += 1;
+                if i < args.len() {
+                    output = Some(args[i].clone());
+                } else {
+                    eprintln!("Missing path after {}", args[i - 1]);
+                    process::exit(2);
+                }
+            }
+            arg if !arg.starts_with('-') && input.is_none() => {
+                input = Some(arg.to_string());
+            }
+            other => {
+                eprintln!("Usage: conduit build <file.cdt> [-o <output>] (unexpected '{}')", other);
+                process::exit(2);
+            }
+        }
+        i += 1;
+    }
+
+    let Some(in_str) = input else {
+        eprintln!("Usage: conduit build <file.cdt> [-o <output>]");
+        process::exit(2);
+    };
+    let in_path = Path::new(&in_str);
+    let out_path: PathBuf = match output {
+        Some(o) => PathBuf::from(o),
+        None => {
+            let stem = in_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("app");
+            PathBuf::from(stem)
+        }
+    };
+    let same_file = in_path == out_path
+        || (in_path.canonicalize().ok().is_some()
+            && in_path.canonicalize().ok() == out_path.canonicalize().ok());
+    if same_file {
+        eprintln!("Refusing to overwrite input source file '{}'", in_path.display());
+        process::exit(2);
+    }
+
+    let (program, checked) = match frontend::check_file(in_path) {
+        Ok(res) => res,
+        Err(e) => {
+            eprintln!("Check error: {}", e);
+            process::exit(1);
+        }
+    };
+    let Some(fid) = checked.func_by_name.get("main").copied() else {
+        eprintln!("No 'main' function found");
+        process::exit(1);
+    };
+    let sig = &checked.funcs[fid as usize];
+    if !sig.params.is_empty() {
+        eprintln!("'main' must take 0 parameters for conduit build");
+        process::exit(1);
+    }
+    let ret_tag = type_to_ret_tag(&sig.return_type);
+
+    let module = match compile_program(&program, &checked) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Compile error: {}", e);
+            process::exit(1);
+        }
+    };
+    if let Err(e) = module.validate() {
+        eprintln!("Validation error: {}", e);
+        process::exit(1);
+    }
+    let bundle = match encode_bundle(&module, fid, ret_tag) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("Bundle error: {}", e);
+            process::exit(1);
+        }
+    };
+    let base_exe = match env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Failed to locate conduit executable: {}", e);
+            process::exit(1);
+        }
+    };
+    if let Err(e) = write_standalone_binary(&base_exe, &out_path, &bundle) {
+        eprintln!("Build error: {}", e);
+        process::exit(1);
+    }
+    println!(
+        "Built standalone binary '{}' ({} bytes bytecode)",
+        out_path.display(),
+        bundle.len()
+    );
 }

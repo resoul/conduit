@@ -1,3 +1,4 @@
+pub mod bundle;
 pub mod lower;
 pub(crate) mod lower_call;
 pub(crate) mod lower_expr;

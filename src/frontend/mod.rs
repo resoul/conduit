@@ -14,9 +14,11 @@ pub mod parser_stmt;
 pub mod reachability;
 pub mod types;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
 
-use ast::Program;
+use ast::{ItemKind, Program};
 use check::{CheckedProgram, check_program, check_program_with_roots};
 use lexer::Lexer;
 use linker::link_imports;
@@ -24,6 +26,73 @@ use parser::Parser;
 
 use crate::ir::Module;
 use crate::ir::lower::compile_program;
+
+fn is_native_mod(path: &str) -> bool {
+    matches!(path, "cdt.json" | "cdt.time" | "cdt.validation" | "cdt.env")
+}
+
+fn resolve_import_file(base_dir: &Path, root_dir: &Path, imp: &str) -> Result<PathBuf, String> {
+    let rel = imp.strip_prefix("./").unwrap_or(imp);
+    let mut candidates = vec![base_dir.join(rel), root_dir.join(rel)];
+    if !rel.ends_with(".cdt") {
+        let with_ext = format!("{}.cdt", rel);
+        candidates.insert(1, base_dir.join(&with_ext));
+        candidates.push(root_dir.join(&with_ext));
+    }
+    candidates
+        .into_iter()
+        .find(|p| p.is_file())
+        .ok_or_else(|| format!("Cannot find imported module '{}'", imp))
+}
+
+fn collect_file_imports(
+    prog: &Program,
+    cur_dir: &Path,
+    root_dir: &Path,
+    seen: &mut HashSet<String>,
+    out: &mut HashMap<String, String>,
+) -> Result<(), String> {
+    for item in &prog.items {
+        let ItemKind::Import { path: imp, .. } = &item.kind else {
+            continue;
+        };
+        if is_native_mod(imp) || !seen.insert(imp.clone()) {
+            continue;
+        }
+        let target = resolve_import_file(cur_dir, root_dir, imp)?;
+        let src = fs::read_to_string(&target)
+            .map_err(|e| format!("Failed to read imported module '{}': {}", target.display(), e))?;
+        let sub_prog = parse_source(&src)?;
+        let sub_dir = target.parent().unwrap_or(cur_dir);
+        collect_file_imports(&sub_prog, sub_dir, root_dir, seen, out)?;
+        out.insert(imp.clone(), src);
+    }
+    Ok(())
+}
+
+pub fn check_file(path: &Path) -> Result<(Program, CheckedProgram), String> {
+    let src = fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read '{}': {}", path.display(), e))?;
+    let mut program = parse_source(&src)?;
+    let root_dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let mut owned_mods = HashMap::new();
+    let mut seen = HashSet::new();
+    collect_file_imports(&program, root_dir, root_dir, &mut seen, &mut owned_mods)?;
+    if !owned_mods.is_empty() {
+        let mod_refs: HashMap<&str, &str> =
+            owned_mods.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        link_imports(&mut program, &mod_refs)?;
+    }
+    let checked = check_program(&mut program)?;
+    Ok((program, checked))
+}
+
+pub fn compile_file(path: &Path) -> Result<Module, String> {
+    let (program, checked) = check_file(path)?;
+    let module = compile_program(&program, &checked)?;
+    module.validate()?;
+    Ok(module)
+}
 
 pub fn parse_source(src: &str) -> Result<Program, String> {
     let mut lexer = Lexer::new(src);

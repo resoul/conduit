@@ -8,6 +8,7 @@ The `conduit` CLI provides tools for checking, compiling, executing, disassembli
 
 | Command | Arguments | Description |
 | :--- | :--- | :--- |
+| `conduit build` | `<file.cdt> [-o <output>]` | Compiles and bundles the program (including relative imports) into a standalone executable. |
 | `conduit run` | `<file.cdt>` | Type-checks, compiles to bytecode, and executes `main()` in the VM. |
 | `conduit check` | `<file.cdt>` | Performs static semantic analysis and type checking without running code. |
 | `conduit disasm` | `<file.cdt>` | Compiles the program and prints the disassembled register bytecode. |
@@ -46,3 +47,12 @@ conduit bench --strict
 ```
 
 Executes the 34 built-in compute, call, closure, collection, pipeline, and JSON workloads and verifies all target latency gates.
+
+### Building a Standalone Executable
+
+```bash
+conduit build main.cdt -o my_app
+./my_app
+```
+
+Resolves all relative module imports, performs tree-shaking and type-checking ahead of time, and emits a self-contained executable with embedded bytecode (`CDTB0001`). Runtime arguments passed to `./my_app` are forwarded directly to `env.args()`.
