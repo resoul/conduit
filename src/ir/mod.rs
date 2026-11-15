@@ -8,9 +8,11 @@ pub(crate) mod lower_prealloc;
 use std::fmt::Write;
 
 use crate::vm::opcode::{
-    EXT_FLOAT_CEIL, EXT_MAP_CONTAINS_KEY, EXT_MAP_ENTRIES, EXT_MAP_FROM, EXT_MAP_GET,
-    EXT_MAP_INDEX, EXT_MAP_KEYS, EXT_MAP_REMOVE, EXT_MAP_SET, EXT_MAP_VALUES, EXT_PRINT_OBJ,
-    EXT_PRINT_SCALAR, EXT_STR_TO_FLOAT, EXT_STR_TO_INT, Op,
+    EXT_ENV_ARGS, EXT_ENV_GET, EXT_ENV_LOAD, EXT_ENV_REQUIRE, EXT_FLOAT_CEIL, EXT_FLOAT_MATH,
+    EXT_INT_MATH, EXT_LIST_FIRST, EXT_LIST_IS_EMPTY, EXT_LIST_LAST, EXT_LIST_SORT,
+    EXT_MAP_CONTAINS_KEY, EXT_MAP_ENTRIES, EXT_MAP_FROM, EXT_MAP_GET, EXT_MAP_INDEX, EXT_MAP_KEYS,
+    EXT_MAP_REMOVE, EXT_MAP_SET, EXT_MAP_VALUES, EXT_PRINT_OBJ, EXT_PRINT_SCALAR, EXT_STR_IS_EMPTY,
+    EXT_STR_PRED, EXT_STR_SPLIT, EXT_STR_TO_FLOAT, EXT_STR_TO_INT, Op,
 };
 use crate::vm::value::Obj;
 
@@ -78,6 +80,7 @@ pub struct Module {
     pub struct_schemas: Vec<crate::native::StructSchema>,
     pub json_plans: Vec<crate::native::JsonDecodePlan>,
     pub validation_plans: Vec<crate::native::validation::ValidationStructPlan>,
+    pub env_plans: Vec<crate::native::env::EnvLoadPlan>,
 }
 
 impl Module {
@@ -349,6 +352,18 @@ impl Module {
                         check_o(dst_obj, &ctx)?;
                         check_o(src_obj, &ctx)?;
                     }
+                    Op::StrReplace { dst_obj, str_obj, from_obj, to_obj } => {
+                        check_o(dst_obj, &ctx)?;
+                        check_o(str_obj, &ctx)?;
+                        check_o(from_obj, &ctx)?;
+                        check_o(to_obj, &ctx)?;
+                    }
+                    Op::ClampScalar { dst_s, val_s, lo_s, hi_s, .. } => {
+                        check_s(dst_s, &ctx)?;
+                        check_s(val_s, &ctx)?;
+                        check_s(lo_s, &ctx)?;
+                        check_s(hi_s, &ctx)?;
+                    }
                     Op::ListIndex { dst_obj, list_obj, idx_s, .. }
                     | Op::ListGet { dst_obj, list_obj, idx_s, .. } => {
                         check_o(dst_obj, &ctx)?;
@@ -594,6 +609,48 @@ impl Module {
                             EXT_MAP_KEYS | EXT_MAP_VALUES | EXT_MAP_ENTRIES | EXT_MAP_FROM => {
                                 check_o(a, &ctx)?;
                                 check_o(b, &ctx)?;
+                            }
+                            EXT_STR_IS_EMPTY => {
+                                check_s(a, &ctx)?;
+                                check_o(b, &ctx)?;
+                            }
+                            EXT_STR_PRED => {
+                                check_s(a, &ctx)?;
+                                check_o(b, &ctx)?;
+                                check_o(c, &ctx)?;
+                            }
+                            EXT_STR_SPLIT => {
+                                check_o(a, &ctx)?;
+                                check_o(b, &ctx)?;
+                                check_o(c, &ctx)?;
+                            }
+                            EXT_INT_MATH | EXT_FLOAT_MATH => {
+                                check_s(a, &ctx)?;
+                                check_s(b, &ctx)?;
+                                if aux != 0 {
+                                    check_s(c, &ctx)?;
+                                }
+                            }
+                            EXT_LIST_IS_EMPTY => {
+                                check_s(a, &ctx)?;
+                                check_o(b, &ctx)?;
+                            }
+                            EXT_LIST_FIRST | EXT_LIST_LAST | EXT_LIST_SORT => {
+                                check_o(a, &ctx)?;
+                                check_o(b, &ctx)?;
+                            }
+                            EXT_ENV_GET | EXT_ENV_REQUIRE => {
+                                check_o(a, &ctx)?;
+                                check_o(b, &ctx)?;
+                            }
+                            EXT_ENV_ARGS => {
+                                check_o(a, &ctx)?;
+                            }
+                            EXT_ENV_LOAD => {
+                                check_o(a, &ctx)?;
+                                if (b as usize) >= self.env_plans.len() {
+                                    return Err(format!("{}: env_plan {} out of bounds", ctx, b));
+                                }
                             }
                             _ => return Err(format!("Invalid ExtOp kind {}", kind)),
                         }

@@ -25,7 +25,7 @@ In `math.cdt`, only items marked with `export` are accessible to outside callers
 
 ```conduit
 // math.cdt
-export type Stats {
+export struct Stats {
     count: Int
     sum: Int
 }
@@ -64,7 +64,7 @@ import * as clock from "cdt.time"
 ### Module Implementation (`module_recipe_math.cdt`)
 
 ```conduit
-export type Stats {
+export struct Stats {
     count: Int
     sum: Int
 }

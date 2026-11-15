@@ -149,6 +149,14 @@ positives := filter([-2, 5, -1, 8], is_positive) // [5, 8]
 > [!WARNING]
 > The predicate function passed to `filter` **must** return pure `Bool`. Passing a callback that returns an error type (`Bool | Error`) is strictly rejected by the type checker. Filtering cannot silently swallow errors.
 
+### Additional List Methods & `reduce`
+
+Lists also provide `.is_empty() -> Bool`, `.first() -> T?`, `.last() -> T?`, `.sort() -> [T]` (for `[Int]`, `[Float]`, and `[String]`), `.find(pred) -> T?`, `.any(pred) -> Bool`, `.all(pred) -> Bool`, and the global `reduce(list, init, fn)` function (which composes cleanly with `|>`):
+
+```conduit
+total := [3, 1, 2].sort() |> reduce(0, (acc, n) => acc + n) // 6
+```
+
 ---
 
 ## Runnable Example

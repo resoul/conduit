@@ -29,7 +29,7 @@ export func rule_name(value: T, extra_params...) -> Void | validation.Issue
 Annotations apply rules to struct fields:
 
 ```conduit
-type User {
+struct User {
     name: String @validation.min(3) @custom_rule
     email: String? @validation.email
 }
@@ -57,7 +57,7 @@ validation.check(value: T) -> T | validation.ValidationError
 ```conduit
 import * as validation from "cdt.validation"
 
-type User {
+struct User {
     username: String @validation.min(3)
     email: String? @validation.email
     age: Int @validation.min(18)
@@ -67,7 +67,7 @@ func main() -> Void {
     bad := User(username: "al", email: "bad", age: 15)
     switch validation.check(bad) {
         case User(u): print("Valid: {u.username}")
-        case ValidationError(err):
+        case validation.ValidationError(err):
             for v in err.issues {
                 print("[{v.path}] {v.code}: {v.message}")
             }

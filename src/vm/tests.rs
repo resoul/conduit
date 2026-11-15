@@ -509,5 +509,191 @@ fn json_struct_errors_depth_and_fixture_vm_ops() {
     assert_eq!(res, Obj::str(raw));
 }
 
+#[test]
+fn string_methods_e2e() {
+    let src = r#"
+func main() -> String {
+    s := "  hello,conduit,world  ".trim()
+    if "".is_empty() && !s.is_empty() && s.contains("conduit") && s.starts_with("hello") && s.ends_with("world") {
+        parts := s.split(",")
+        joined := parts.join("-")
+        unchanged := joined.replace("", "x")
+        return unchanged.replace("conduit", "cdt")
+    }
+    return "fail"
+}
+"#;
+    let module = crate::frontend::compile_source(src).unwrap();
+    module.validate().unwrap();
+    let mut vm = Vm::new();
+    let fid = module.func_id("main").unwrap();
+    let res = vm.call_obj(&module, fid, &[], &[]).unwrap();
+    assert_eq!(res, Obj::str("hello-cdt-world"));
+}
+
+#[test]
+fn list_reduce_and_number_methods_e2e() {
+    let src = r#"
+func main() -> String {
+    nums := [5, -2, 10, 3, 1]
+    sorted := nums.sort()
+    words := ["pear", "apple", "fig"].sort()
+    floats := [3.5, -1.25, 2.0].sort()
+
+    var empty: [Int] = []
+    if !empty.is_empty() || nums.is_empty() {
+        return "fail_empty"
+    }
+
+    f := sorted.first() ?? -999
+    l := sorted.last() ?? -999
+    ef := empty.first() ?? -999
+    el := empty.last() ?? -999
+
+    found := sorted.find((x) => x > 4) ?? -1
+    none := sorted.find((x) => x > 100) ?? -1
+
+    has_big := sorted.any((x) => x >= 10)
+    all_pos := sorted.all((x) => x > 0)
+
+    sum := sorted
+        |> filter((x) => x > 0)
+        |> map((x) => x * 2)
+        |> reduce(0, (acc, x) => acc + x)
+
+    ia := (-42).abs()
+    im := 10.min(3).max(5).clamp(0, 4)
+    fa := (-3.5).abs()
+    fm := 1.5.min(2.5).max(0.5).clamp(1.0, 2.0)
+
+    w0 := words.first() ?? ""
+    f0 := floats.first() ?? 0.0
+
+    return "{f},{l},{ef},{el},{found},{none},{has_big},{all_pos},{sum},{ia},{im},{fa},{fm},{w0},{f0}"
+}
+"#;
+    let module = crate::frontend::compile_source(src).unwrap();
+    module.validate().unwrap();
+    let mut vm = Vm::new();
+    let fid = module.func_id("main").unwrap();
+    let res = vm.call_obj(&module, fid, &[], &[]).unwrap();
+    assert_eq!(
+        res,
+        Obj::str("-2,10,-999,-999,5,-1,true,false,38,42,4,3.5,1.5,apple,-1.25")
+    );
+}
+
+#[test]
+fn optional_chaining_and_defaults_e2e() {
+    let src = r#"
+import * as validation from "cdt.validation"
+
+struct Addr {
+    city: String = "Kyiv"
+}
+
+struct Config {
+    host: String @validation.min(1) = "localhost"
+    port: Int = 8080
+    addr: Addr? = nil
+}
+
+func greet(name: String, prefix: String = "Hello") -> String {
+    return "{prefix}, {name}!"
+}
+
+func main() -> String {
+    c1 := Config()
+    c2 := Config(port: 9090, addr: Addr())
+    c3 := Config("0.0.0.0")
+
+    var opt_none: Config? = nil
+    var opt_some: Config? = c2
+
+    p1 := opt_none?.port ?? -1
+    p2 := opt_some?.port ?? -1
+    city1 := opt_none?.addr?.city ?? "none"
+    city2 := opt_some?.addr?.city ?? "none"
+
+    g1 := greet("Alice")
+    g2 := greet("Bob", "Hi")
+
+    bad := Config(host: "", port: 80)
+    var msg: String = "ok"
+    switch validation.check(bad) {
+        case Config(_):
+        case validation.ValidationError(e):
+            msg = e.issues.first()?.path ?? "empty"
+    }
+
+    return "{c1.host}:{c1.port}|{c3.host}:{c3.port}|{p1},{p2}|{city1},{city2}|{g1}|{g2}|{msg}"
+}
+"#;
+    let module = crate::frontend::compile_source(src).unwrap();
+    module.validate().unwrap();
+    let mut vm = Vm::new();
+    let fid = module.func_id("main").unwrap();
+    let res = vm.call_obj(&module, fid, &[], &[]).unwrap();
+    assert_eq!(
+        res,
+        Obj::str("localhost:8080|0.0.0.0:8080|-1,9090|none,Kyiv|Hello, Alice!|Hi, Bob!|host")
+    );
+}
+
+#[test]
+fn cdt_env_and_load_e2e() {
+    unsafe {
+        std::env::set_var("CONDUIT_TEST_PORT", "9090");
+        std::env::set_var("CONDUIT_TEST_DEBUG", "true");
+        std::env::remove_var("CONDUIT_TEST_MISSING");
+    }
+
+    let src = r#"
+import * as env from "cdt.env"
+import * as validation from "cdt.validation"
+
+struct Config {
+    conduit_test_port: Int @env @validation.min(1024)
+    debug: Bool @env("CONDUIT_TEST_DEBUG")
+    host: String @env = "127.0.0.1"
+    opt_tag: String? @env("CONDUIT_TEST_MISSING")
+}
+
+func run_env() -> String | env.EnvError | validation.ValidationError {
+    cfg := env.load<Config>()?
+    checked := validation.check(cfg)?
+    got := env.get("CONDUIT_TEST_PORT") ?? "none"
+    req := env.require("CONDUIT_TEST_PORT")?
+    tag := checked.opt_tag ?? "no-tag"
+    args_len := env.args().len()
+    has_args := args_len >= 0
+    return "{checked.host}:{checked.conduit_test_port}:{checked.debug}:{got}:{req}:{tag}:{has_args}"
+}
+
+func main() -> String {
+    switch run_env() {
+        case String(s): return s
+        case env.EnvError(e): return "env_err:{e.name}:{e.message}"
+        case validation.ValidationError(e): return "val_err:{e.issues.len()}"
+    }
+}
+"#;
+    let module = crate::frontend::compile_source(src).unwrap();
+    module.validate().unwrap();
+    let mut vm = Vm::new();
+    let fid = module.func_id("main").unwrap();
+    let res = vm.call_obj(&module, fid, &[], &[]).unwrap();
+
+    unsafe {
+        std::env::remove_var("CONDUIT_TEST_PORT");
+        std::env::remove_var("CONDUIT_TEST_DEBUG");
+    }
+
+    assert_eq!(
+        res,
+        Obj::str("127.0.0.1:9090:true:9090:9090:no-tag:true")
+    );
+}
+
 #[allow(dead_code)]
 fn _keep_record_desc(_: RecordDesc) {}

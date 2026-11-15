@@ -50,8 +50,8 @@ func run_timer() -> Void | time.TimeError {
 
 func main() -> Void {
     switch run_timer() {
-        case Void: {}
-        case TimeError(e): print(e.message)
+        case Void:
+        case time.TimeError(e): print(e.message)
     }
 }
 ```

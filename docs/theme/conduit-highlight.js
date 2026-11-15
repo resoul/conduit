@@ -8,10 +8,10 @@
                 name: 'Conduit',
                 aliases: ['cdt'],
                 keywords: {
-                    keyword: 'func return if else guard while for in break continue switch case default var type error export import as',
-                    type: 'Int Float Bool String Void IndexError Duration Instant Timestamp TimeError Issue Violation ValidationError',
+                    keyword: 'func return if else guard while for in break continue switch case var struct type error export import as',
+                    type: 'Int Float Bool String Void Map IndexError KeyError ParseError DecodeError EncodeError Duration Instant Timestamp TimeError Issue Violation ValidationError',
                     literal: 'true false nil',
-                    built_in: 'print map filter'
+                    built_in: 'print map filter reduce'
                 },
                 contains: [
                     hljs.C_LINE_COMMENT_MODE,

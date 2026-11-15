@@ -52,6 +52,7 @@ impl<'a> ModuleCompiler<'a> {
         let mut module = Module::new();
         module.struct_schemas = checked.struct_schemas.clone();
         module.validation_plans = checked.validation_plans.clone();
+        module.env_plans = checked.env_plans.clone();
         // Reserve slots 0..N for top-level functions so forward calls keep stable indices.
         module.functions = checked
             .funcs
@@ -412,6 +413,10 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 let dst_obj = self.alloc_temp_o();
                 self.ops.push(Op::LoadConstObj { dst_obj, idx });
                 self.ops.push(Op::ReturnObj { src: dst_obj });
+            } else if self.has_jump_to_end() {
+                // Exhaustive branches/switches that all return can still leave a fallthrough jump
+                // pointing to `ops.len()`; emit an unreachable terminator so jump targets stay in bounds.
+                self.ops.push(Op::ReturnVoid);
             }
         }
     }

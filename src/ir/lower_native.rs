@@ -7,15 +7,16 @@ use crate::ir::{FunctionProto, RecordDesc};
 use crate::native::time::TimeOpKind;
 use crate::native::validation::ValOpKind;
 use crate::vm::opcode::{
-    EXT_MAP_ENTRIES, EXT_MAP_GET, EXT_MAP_KEYS, EXT_MAP_REMOVE, EXT_MAP_VALUES, EXT_STR_TO_FLOAT,
-    EXT_STR_TO_INT, Op,
+    EXT_ENV_ARGS, EXT_ENV_GET, EXT_ENV_LOAD, EXT_ENV_REQUIRE, EXT_LIST_FIRST, EXT_LIST_LAST,
+    EXT_LIST_SORT, EXT_MAP_ENTRIES, EXT_MAP_GET, EXT_MAP_KEYS, EXT_MAP_REMOVE, EXT_MAP_VALUES,
+    EXT_STR_SPLIT, EXT_STR_TO_FLOAT, EXT_STR_TO_INT, Op,
 };
 use crate::vm::value::{
-    SCHEMA_BOXED_BOOL, SCHEMA_BOXED_FLOAT, SCHEMA_BOXED_INT, SCHEMA_EMPTY_TAG, SCHEMA_INDEX_ERROR,
-    SCHEMA_JSON_DECODE_ERROR, SCHEMA_JSON_ENCODE_ERROR, SCHEMA_KEY_ERROR, SCHEMA_LIST_TAG,
-    SCHEMA_MAP_TAG, SCHEMA_PARSE_ERROR, SCHEMA_STR_TAG, SCHEMA_TIME_DURATION, SCHEMA_TIME_ERROR,
-    SCHEMA_TIME_INSTANT, SCHEMA_TIME_TIMESTAMP, SCHEMA_VALIDATION_ERROR, SCHEMA_VALIDATION_ISSUE,
-    SCHEMA_VALIDATION_VIOLATION,
+    SCHEMA_BOXED_BOOL, SCHEMA_BOXED_FLOAT, SCHEMA_BOXED_INT, SCHEMA_EMPTY_TAG, SCHEMA_ENV_ERROR,
+    SCHEMA_INDEX_ERROR, SCHEMA_JSON_DECODE_ERROR, SCHEMA_JSON_ENCODE_ERROR, SCHEMA_KEY_ERROR,
+    SCHEMA_LIST_TAG, SCHEMA_MAP_TAG, SCHEMA_PARSE_ERROR, SCHEMA_STR_TAG, SCHEMA_TIME_DURATION,
+    SCHEMA_TIME_ERROR, SCHEMA_TIME_INSTANT, SCHEMA_TIME_TIMESTAMP, SCHEMA_VALIDATION_ERROR,
+    SCHEMA_VALIDATION_ISSUE, SCHEMA_VALIDATION_VIOLATION,
 };
 
 #[inline]
@@ -56,6 +57,7 @@ pub(crate) fn type_tag_for_switch(ty: &Type, checked: &CheckedProgram) -> Result
                 ("cdt.validation", "ValidationError") => Ok(SCHEMA_VALIDATION_ERROR),
                 ("cdt.json", "DecodeError") => Ok(SCHEMA_JSON_DECODE_ERROR),
                 ("cdt.json", "EncodeError") => Ok(SCHEMA_JSON_ENCODE_ERROR),
+                ("cdt.env", "EnvError") => Ok(SCHEMA_ENV_ERROR),
                 _ => Err(format!("Unsupported native type '{}' in switch pattern", tid)),
             },
             _ => Err(format!("Unsupported type '{}' in switch pattern", tid)),
@@ -195,6 +197,67 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 self.lower_native_record(SCHEMA_VALIDATION_ERROR, &["issues"], args, named_args)
             }
             other => Err(format!("Unsupported cdt.validation symbol '{}'", other)),
+        }
+    }
+
+    pub(crate) fn lower_env_call(
+        &mut self,
+        sym: &str,
+        type_args: &[TypeExpr],
+        args: &[Expr],
+        named_args: &[NamedArg],
+    ) -> Result<u16, String> {
+        match sym {
+            "EnvError" => self.lower_native_record(SCHEMA_ENV_ERROR, &["name", "message"], args, named_args),
+            "get" | "require" => {
+                let name_obj = self.lower_obj(&args[0])?;
+                let dst_obj = self.alloc_temp_o();
+                let kind = if sym == "get" { EXT_ENV_GET } else { EXT_ENV_REQUIRE };
+                self.ops.push(Op::ExtOp {
+                    kind,
+                    aux: 0,
+                    a: dst_obj,
+                    b: name_obj,
+                    c: 0,
+                });
+                Ok(dst_obj)
+            }
+            "args" => {
+                let dst_obj = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_ENV_ARGS,
+                    aux: 0,
+                    a: dst_obj,
+                    b: 0,
+                    c: 0,
+                });
+                Ok(dst_obj)
+            }
+            "load" => {
+                let ty = self.mc.checked.resolve_type(&type_args[0])?;
+                let Type::Custom(tid) = ty else {
+                    return Err("env.load<T>() requires a struct type".to_string());
+                };
+                let sid = self.mc.checked.struct_by_name[&tid.name];
+                let schema_id = self.mc.checked.structs[sid].schema_id;
+                let plan_idx = self
+                    .mc
+                    .checked
+                    .env_plans
+                    .iter()
+                    .position(|p| p.schema_id == schema_id)
+                    .ok_or_else(|| format!("Missing EnvLoadPlan for '{}'", tid.name))?;
+                let dst_obj = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_ENV_LOAD,
+                    aux: 0,
+                    a: dst_obj,
+                    b: plan_idx as u16,
+                    c: 0,
+                });
+                Ok(dst_obj)
+            }
+            other => Err(format!("Unsupported cdt.env symbol '{}'", other)),
         }
     }
 
@@ -376,6 +439,32 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 self.ops.push(Op::StrMethod { dst_obj, src_obj, kind });
                 Ok(Some(dst_obj))
             }
+            (Type::String, "split") => {
+                let str_obj = self.lower_obj(target)?;
+                let sep_obj = self.lower_obj(&args[0])?;
+                let dst_obj = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_STR_SPLIT,
+                    aux: 0,
+                    a: dst_obj,
+                    b: str_obj,
+                    c: sep_obj,
+                });
+                Ok(Some(dst_obj))
+            }
+            (Type::String, "replace") => {
+                let str_obj = self.lower_obj(target)?;
+                let from_obj = self.lower_obj(&args[0])?;
+                let to_obj = self.lower_obj(&args[1])?;
+                let dst_obj = self.alloc_temp_o();
+                self.ops.push(Op::StrReplace {
+                    dst_obj,
+                    str_obj,
+                    from_obj,
+                    to_obj,
+                });
+                Ok(Some(dst_obj))
+            }
             (Type::List(elem), "get") => {
                 let list_obj = self.lower_obj(target)?;
                 let idx_s = self.lower_scalar(&args[0])?;
@@ -388,6 +477,37 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 });
                 Ok(Some(dst_obj))
             }
+            (Type::List(elem), "first" | "last") => {
+                let list_obj = self.lower_obj(target)?;
+                let dst_obj = self.alloc_temp_o();
+                let kind = if method == "first" { EXT_LIST_FIRST } else { EXT_LIST_LAST };
+                self.ops.push(Op::ExtOp {
+                    kind,
+                    aux: elem_tag_for(elem),
+                    a: dst_obj,
+                    b: list_obj,
+                    c: 0,
+                });
+                Ok(Some(dst_obj))
+            }
+            (Type::List(elem), "sort") => {
+                let list_obj = self.lower_obj(target)?;
+                let dst_obj = self.alloc_temp_o();
+                let aux = match elem.as_ref() {
+                    Type::Int => 0,
+                    Type::Float => 1,
+                    _ => 2,
+                };
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_LIST_SORT,
+                    aux,
+                    a: dst_obj,
+                    b: list_obj,
+                    c: 0,
+                });
+                Ok(Some(dst_obj))
+            }
+            (Type::List(_), "find") => Ok(Some(self.lower_list_pred_loop(target, &args[0], 2)?)),
             (Type::List(_), "slice") => {
                 let list_obj = self.lower_obj(target)?;
                 let start_s = self.lower_scalar(&args[0])?;

@@ -430,9 +430,9 @@ impl<'a> JsonDecoder<'a> {
             ));
         }
         if schema.fields.len() > 64 {
-            for idx in 64..schema.fields.len() {
-                if !schema.fields[idx].is_optional && !seen_extra[idx] {
-                    let name = &schema.fields[idx].json_name;
+            for (f, seen) in schema.fields[64..].iter().zip(&seen_extra[64..]) {
+                if !f.is_optional && !seen {
+                    let name = &f.json_name;
                     return Err(JsonError::new(
                         join_field_path("", name),
                         format!("Missing required field '{}'", name),

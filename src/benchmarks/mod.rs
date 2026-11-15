@@ -11,6 +11,8 @@ use crate::ir::Module;
 use crate::vm::Vm;
 use crate::vm::value::Obj;
 
+pub type AfterCheckFn = Box<dyn Fn(&[Obj]) -> Result<(), String>>;
+
 pub struct WorkloadState {
     pub module: Module,
     pub bench_func: u32,
@@ -18,7 +20,7 @@ pub struct WorkloadState {
     pub scalar_args: Vec<u64>,
     pub obj_args: Vec<Obj>,
     pub expected_per_op: i64,
-    pub after_check: Option<Box<dyn Fn(&[Obj]) -> Result<(), String>>>,
+    pub after_check: Option<AfterCheckFn>,
 }
 
 pub struct Workload {

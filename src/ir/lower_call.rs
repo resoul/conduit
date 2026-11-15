@@ -2,14 +2,16 @@ use std::collections::HashSet;
 
 use crate::frontend::ast::*;
 use crate::frontend::check::type_to_json_type;
+use crate::frontend::check_native::scalar_kind;
 use crate::frontend::types::{ModuleId, Type};
 use crate::ir::lower::FnLowerer;
-use crate::ir::lower_loops::collect_free_vars;
+use crate::ir::lower_loops::{collect_free_vars, patch_jump};
 use crate::ir::lower_native::elem_tag_for;
 use crate::ir::{CallableRef, ElemKind, PipelinePlan, PipelineStage, RecordDesc};
 use crate::vm::opcode::{
-    EXT_FLOAT_CEIL, EXT_MAP_CONTAINS_KEY, EXT_MAP_FROM, EXT_MAP_SET, EXT_PRINT_OBJ,
-    EXT_PRINT_SCALAR, Op,
+    EXT_FLOAT_CEIL, EXT_FLOAT_MATH, EXT_INT_MATH, EXT_LIST_IS_EMPTY, EXT_MAP_CONTAINS_KEY,
+    EXT_MAP_FROM, EXT_MAP_SET, EXT_PRINT_OBJ, EXT_PRINT_SCALAR, EXT_STR_IS_EMPTY, EXT_STR_PRED,
+    Op,
 };
 
 impl<'a, 'b> FnLowerer<'a, 'b> {
@@ -102,6 +104,12 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
         if let ExprKind::Member { target, field } = &callee.kind {
             return self.lower_scalar_method(target, field, args);
         }
+        if let ExprKind::Ident(fn_name) = &callee.kind
+            && self.lookup_local(fn_name).is_none()
+            && fn_name == "reduce"
+        {
+            return self.lower_reduce_call(&args[0], &args[1], &args[2], &expr.ty);
+        }
         self.lower_func_call(callee, args, true, false)
     }
 
@@ -115,6 +123,12 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             && (fn_name == "map" || fn_name == "filter")
         {
             return self.lower_pipeline_call(expr);
+        }
+        if let ExprKind::Ident(fn_name) = &callee.kind
+            && self.lookup_local(fn_name).is_none()
+            && fn_name == "reduce"
+        {
+            return self.lower_reduce_call(&args[0], &args[1], &args[2], &expr.ty);
         }
 
         if let ExprKind::Member { target, field } = &callee.kind {
@@ -149,6 +163,9 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 if self.mc.checked.val_aliases.contains(alias) {
                     return self.lower_validation_call(field, args, named_args);
                 }
+                if self.mc.checked.env_aliases.contains(alias) {
+                    return self.lower_env_call(field, type_args, args, named_args);
+                }
             }
             if let Some(reg) = self.lower_builtin_obj_method(target, field, args)? {
                 return Ok(reg);
@@ -182,6 +199,14 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             if let Some(sym) = self.mc.checked.val_direct_types.get(name) {
                 let sym = sym.clone();
                 return self.lower_validation_call(&sym, args, named_args);
+            }
+            if let Some(sym) = self.mc.checked.env_direct_fns.get(name) {
+                let sym = sym.clone();
+                return self.lower_env_call(&sym, type_args, args, named_args);
+            }
+            if let Some(sym) = self.mc.checked.env_direct_types.get(name) {
+                let sym = sym.clone();
+                return self.lower_env_call(&sym, type_args, args, named_args);
             }
             if name == "Map" {
                 let dst_obj = self.alloc_temp_o();
@@ -273,6 +298,20 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 self.ops.push(Op::ListLen { dst_s, list_obj });
                 Ok(dst_s)
             }
+            (Type::List(_), "is_empty") => {
+                let list_obj = self.lower_obj(target)?;
+                let dst_s = self.alloc_temp_s();
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_LIST_IS_EMPTY,
+                    aux: 0,
+                    a: dst_s,
+                    b: list_obj,
+                    c: 0,
+                });
+                Ok(dst_s)
+            }
+            (Type::List(_), "any") => self.lower_list_pred_loop(target, &args[0], 0),
+            (Type::List(_), "all") => self.lower_list_pred_loop(target, &args[0], 1),
             (Type::List(elem), "contains") => {
                 let list_obj = self.lower_obj(target)?;
                 let dst_s = self.alloc_temp_s();
@@ -290,6 +329,36 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 let str_obj = self.lower_obj(target)?;
                 let dst_s = self.alloc_temp_s();
                 self.ops.push(Op::StrLen { dst_s, str_obj });
+                Ok(dst_s)
+            }
+            (Type::String, "is_empty") => {
+                let str_obj = self.lower_obj(target)?;
+                let dst_s = self.alloc_temp_s();
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_STR_IS_EMPTY,
+                    aux: 0,
+                    a: dst_s,
+                    b: str_obj,
+                    c: 0,
+                });
+                Ok(dst_s)
+            }
+            (Type::String, "contains" | "starts_with" | "ends_with") => {
+                let str_obj = self.lower_obj(target)?;
+                let arg_obj = self.lower_obj(&args[0])?;
+                let dst_s = self.alloc_temp_s();
+                let aux = match method {
+                    "contains" => 0,
+                    "starts_with" => 1,
+                    _ => 2,
+                };
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_STR_PRED,
+                    aux,
+                    a: dst_s,
+                    b: str_obj,
+                    c: arg_obj,
+                });
                 Ok(dst_s)
             }
             (Type::Map(_, _), "len") => {
@@ -321,6 +390,36 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 let dst = self.alloc_temp_s();
                 self.ops.push(Op::ExtOp { kind: EXT_FLOAT_CEIL, aux: 0, a: dst, b: src, c: 0 });
                 Ok(dst)
+            }
+            (Type::Int, "abs") | (Type::Float, "abs") => {
+                let src = self.lower_scalar(target)?;
+                let dst = self.alloc_temp_s();
+                let kind = if target.ty == Type::Int { EXT_INT_MATH } else { EXT_FLOAT_MATH };
+                self.ops.push(Op::ExtOp { kind, aux: 0, a: dst, b: src, c: 0 });
+                Ok(dst)
+            }
+            (Type::Int, "min" | "max") | (Type::Float, "min" | "max") => {
+                let src = self.lower_scalar(target)?;
+                let other = self.lower_scalar(&args[0])?;
+                let dst = self.alloc_temp_s();
+                let kind = if target.ty == Type::Int { EXT_INT_MATH } else { EXT_FLOAT_MATH };
+                let aux = if method == "min" { 1 } else { 2 };
+                self.ops.push(Op::ExtOp { kind, aux, a: dst, b: src, c: other });
+                Ok(dst)
+            }
+            (Type::Int, "clamp") | (Type::Float, "clamp") => {
+                let val_s = self.lower_scalar(target)?;
+                let lo_s = self.lower_scalar(&args[0])?;
+                let hi_s = self.lower_scalar(&args[1])?;
+                let dst_s = self.alloc_temp_s();
+                self.ops.push(Op::ClampScalar {
+                    dst_s,
+                    val_s,
+                    lo_s,
+                    hi_s,
+                    is_float: target.ty == Type::Float,
+                });
+                Ok(dst_s)
             }
             (Type::Map(k, _), "contains_key") => {
                 let map_obj = self.lower_obj(target)?;
@@ -605,5 +704,220 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
         }
 
         Ok(ret_reg)
+    }
+
+    fn resolve_direct_or_obj(&mut self, callee: &Expr) -> Result<(Option<u32>, Option<u16>), String> {
+        if let ExprKind::Ident(name) = &callee.kind
+            && self.lookup_local(name).is_none()
+            && let Some(&fid) = self.mc.checked.func_by_name.get(name)
+        {
+            Ok((Some(fid), None))
+        } else {
+            Ok((None, Some(self.lower_obj(callee)?)))
+        }
+    }
+
+    fn emit_resolved_call(
+        &mut self,
+        direct_fid: Option<u32>,
+        callee_obj: Option<u16>,
+        s_regs: &[u16],
+        o_regs: &[u16],
+        ret_scalar: bool,
+    ) -> Result<u16, String> {
+        let arg_base_s = self.alloc_window_s(s_regs.len() as u16);
+        for (i, &src) in s_regs.iter().enumerate() {
+            let dst = arg_base_s + i as u16;
+            if src != dst {
+                self.ops.push(Op::MoveScalar { dst, src });
+            }
+        }
+        let arg_base_o = self.alloc_window_o(o_regs.len() as u16);
+        for (i, &src) in o_regs.iter().enumerate() {
+            let dst_obj = arg_base_o + i as u16;
+            if src != dst_obj {
+                self.ops.push(Op::MoveObj { dst_obj, src });
+            }
+        }
+        let ret_reg = if ret_scalar { self.alloc_temp_s() } else { self.alloc_temp_o() };
+        if let Some(fid) = direct_fid {
+            self.ops.push(Op::CallDirect {
+                func_id: fid as u16,
+                arg_base_s,
+                arg_base_o,
+                ret_reg,
+            });
+        } else {
+            let cobj = callee_obj.unwrap();
+            if cobj >= arg_base_o {
+                return Err("Internal lowering invariant: callee_obj >= arg_base_o".to_string());
+            }
+            self.ops.push(Op::CallCallable {
+                callee_obj: cobj,
+                arg_base_s,
+                arg_base_o,
+                ret_reg,
+            });
+        }
+        Ok(ret_reg)
+    }
+
+    pub(crate) fn lower_list_pred_loop(
+        &mut self,
+        target: &Expr,
+        pred_expr: &Expr,
+        mode: u8,
+    ) -> Result<u16, String> {
+        let Type::List(elem_ty) = &target.ty else {
+            return Err(format!("Expected List, got {}", target.ty));
+        };
+        let list_obj = self.lower_obj(target)?;
+        let (direct_fid, callee_obj) = self.resolve_direct_or_obj(pred_expr)?;
+
+        let result_reg = if mode == 2 {
+            let dst_obj = self.alloc_temp_o();
+            let nil_idx = self.mc.intern_empty()?;
+            self.ops.push(Op::LoadConstObj { dst_obj, idx: nil_idx });
+            dst_obj
+        } else {
+            let dst_s = self.alloc_temp_s();
+            self.ops.push(Op::LoadBool { dst: dst_s, val: mode == 1 });
+            dst_s
+        };
+
+        let idx_s = self.alloc_temp_s();
+        self.ops.push(Op::LoadImmInt { dst: idx_s, imm: 0 });
+        let elem_is_scalar = elem_ty.is_scalar();
+        let elem_reg = if elem_is_scalar { self.alloc_temp_s() } else { self.alloc_temp_o() };
+
+        let head_pc = self.ops.len();
+        if elem_is_scalar {
+            self.ops.push(Op::ForListInt { list_obj, idx_s, elem_s: elem_reg, exit_target: 0 });
+        } else {
+            self.ops.push(Op::ForListObj { list_obj, idx_s, elem_obj: elem_reg, exit_target: 0 });
+        }
+
+        let param_is_obj = match &pred_expr.ty {
+            Type::Function { params, .. } => params.first().is_some_and(|p| p.is_obj()),
+            _ => !elem_is_scalar,
+        };
+        let cond_s = if elem_is_scalar && !param_is_obj {
+            self.emit_resolved_call(direct_fid, callee_obj, &[elem_reg], &[], true)?
+        } else if elem_is_scalar {
+            let boxed = self.emit_box_scalar_from(elem_reg, elem_ty);
+            self.emit_resolved_call(direct_fid, callee_obj, &[], &[boxed], true)?
+        } else {
+            self.emit_resolved_call(direct_fid, callee_obj, &[], &[elem_reg], true)?
+        };
+
+        let branch_pc = self.ops.len();
+        if mode == 1 {
+            self.ops.push(Op::JumpIfTrue { cond: cond_s, target: 0 });
+            self.ops.push(Op::LoadBool { dst: result_reg, val: false });
+        } else {
+            self.ops.push(Op::JumpIfFalse { cond: cond_s, target: 0 });
+            if mode == 0 {
+                self.ops.push(Op::LoadBool { dst: result_reg, val: true });
+            } else if elem_is_scalar {
+                self.ops.push(Op::BoxScalar {
+                    dst_obj: result_reg,
+                    src_s: elem_reg,
+                    kind: scalar_kind(elem_ty),
+                });
+            } else {
+                self.ops.push(Op::MoveObj { dst_obj: result_reg, src: elem_reg });
+            }
+        }
+        let break_pc = self.ops.len();
+        self.ops.push(Op::Jump { target: 0 });
+
+        let next_pc = self.ops.len() as u32;
+        patch_jump(&mut self.ops[branch_pc], next_pc);
+        self.ops.push(Op::Jump { target: head_pc as u32 });
+
+        let done_pc = self.ops.len() as u32;
+        patch_jump(&mut self.ops[head_pc], done_pc);
+        patch_jump(&mut self.ops[break_pc], done_pc);
+
+        Ok(result_reg)
+    }
+
+    fn lower_reduce_call(
+        &mut self,
+        list_expr: &Expr,
+        init_expr: &Expr,
+        fn_expr: &Expr,
+        acc_ty: &Type,
+    ) -> Result<u16, String> {
+        let Type::List(elem_ty) = &list_expr.ty else {
+            return Err(format!("reduce expects List, got {}", list_expr.ty));
+        };
+        let list_obj = self.lower_obj(list_expr)?;
+        let acc_is_scalar = acc_ty.is_scalar();
+        let acc_reg = if acc_is_scalar {
+            let init_s = self.lower_scalar(init_expr)?;
+            let r = self.alloc_temp_s();
+            if init_s != r {
+                self.ops.push(Op::MoveScalar { dst: r, src: init_s });
+            }
+            r
+        } else {
+            let init_o = if init_expr.ty.is_scalar() {
+                let s = self.lower_scalar(init_expr)?;
+                self.emit_box_scalar_from(s, &init_expr.ty)
+            } else {
+                self.lower_obj(init_expr)?
+            };
+            let r = self.alloc_temp_o();
+            if init_o != r {
+                self.ops.push(Op::MoveObj { dst_obj: r, src: init_o });
+            }
+            r
+        };
+        let (direct_fid, callee_obj) = self.resolve_direct_or_obj(fn_expr)?;
+
+        let idx_s = self.alloc_temp_s();
+        self.ops.push(Op::LoadImmInt { dst: idx_s, imm: 0 });
+        let elem_is_scalar = elem_ty.is_scalar();
+        let elem_reg = if elem_is_scalar { self.alloc_temp_s() } else { self.alloc_temp_o() };
+
+        let head_pc = self.ops.len();
+        if elem_is_scalar {
+            self.ops.push(Op::ForListInt { list_obj, idx_s, elem_s: elem_reg, exit_target: 0 });
+        } else {
+            self.ops.push(Op::ForListObj { list_obj, idx_s, elem_obj: elem_reg, exit_target: 0 });
+        }
+
+        let elem_param_is_obj = match &fn_expr.ty {
+            Type::Function { params, .. } => params.get(1).is_some_and(|p| p.is_obj()),
+            _ => !elem_is_scalar,
+        };
+        let mut s_regs = Vec::new();
+        let mut o_regs = Vec::new();
+        if acc_is_scalar {
+            s_regs.push(acc_reg);
+        } else {
+            o_regs.push(acc_reg);
+        }
+        if elem_is_scalar && !elem_param_is_obj {
+            s_regs.push(elem_reg);
+        } else if elem_is_scalar {
+            o_regs.push(self.emit_box_scalar_from(elem_reg, elem_ty));
+        } else {
+            o_regs.push(elem_reg);
+        }
+
+        let ret_reg = self.emit_resolved_call(direct_fid, callee_obj, &s_regs, &o_regs, acc_is_scalar)?;
+        if acc_is_scalar {
+            self.ops.push(Op::MoveScalar { dst: acc_reg, src: ret_reg });
+        } else {
+            self.ops.push(Op::MoveObj { dst_obj: acc_reg, src: ret_reg });
+        }
+        self.ops.push(Op::Jump { target: head_pc as u32 });
+
+        let done_pc = self.ops.len() as u32;
+        patch_jump(&mut self.ops[head_pc], done_pc);
+
+        Ok(acc_reg)
     }
 }

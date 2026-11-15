@@ -18,7 +18,7 @@ To expose an item to external modules, prefix its declaration with the `export` 
 
 ```conduit
 // users.cdt
-export type User {
+export struct User {
     id: Int
     name: String
 }
@@ -51,7 +51,7 @@ func format_name(n: String) -> String {
 To prevent encapsulation leaks, the type checker enforces that **exported functions and types cannot leak private types in their public signatures**:
 
 ```conduit
-type SecretConfig {
+struct SecretConfig {
     key: String
 }
 
@@ -119,7 +119,7 @@ Loader error: Cyclic import detected: ./a -> ./b -> ./c -> ./a
 ### Module Definition (`modules_user.cdt`)
 
 ```conduit
-export type User {
+export struct User {
     name: String
 }
 

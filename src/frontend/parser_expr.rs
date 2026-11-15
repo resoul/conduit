@@ -377,6 +377,7 @@ impl Parser {
                             params: vec![Param {
                                 name,
                                 ty: TypeExpr::Named("_".to_string()),
+                                default: None,
                                 span: tok.span,
                             }],
                             return_type: None,
@@ -484,7 +485,7 @@ impl Parser {
                 } else {
                     TypeExpr::Named("_".to_string())
                 };
-                params.push(Param { name, ty, span: p_span });
+                params.push(Param { name, ty, default: None, span: p_span });
                 if !self.match_token(&TokenKind::Comma) {
                     break;
                 }

@@ -1,6 +1,6 @@
 use crate::frontend::ast::*;
 use crate::frontend::check::CheckedProgram;
-use crate::frontend::check_native::can_propagate_try;
+use crate::frontend::check_native::{can_propagate_try, native_member_field, scalar_kind};
 use crate::frontend::types::{ModuleId, Type};
 use crate::ir::lower::FnLowerer;
 use crate::ir::lower_loops::{as_i16_lit, as_neg_i16_lit};
@@ -287,6 +287,46 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                     .ok_or_else(|| format!("Unknown field '.{}' on {}", field, tid.name))?;
                 let dst_obj = self.alloc_temp_o();
                 self.ops.push(Op::GetFieldObj { dst_obj, rec_obj, field_idx: f.slot_idx });
+                Ok(dst_obj)
+            }
+            ExprKind::OptionalMember { target, field } => {
+                let Type::Optional(inner_ty) = &target.ty else {
+                    return Err(format!("Optional member '.{}' on non-optional {}", field, target.ty));
+                };
+                let Type::Custom(tid) = inner_ty.as_ref() else {
+                    return Err(format!("Optional member '.{}' on non-struct {}", field, inner_ty));
+                };
+                let (field_ty, field_idx) = if tid.module != ModuleId::Program {
+                    native_member_field(tid, field)?
+                } else {
+                    let sid = self.mc.checked.struct_by_name[&tid.name];
+                    let f = self.mc.checked.structs[sid]
+                        .field(field)
+                        .ok_or_else(|| format!("Unknown field '.{}' on {}", field, tid.name))?;
+                    (f.ty.clone(), f.slot_idx)
+                };
+                let lhs_o = self.lower_obj(target)?;
+                let emp = self.alloc_temp_o();
+                let emp_idx = self.mc.intern_empty()?;
+                self.ops.push(Op::LoadConstObj { dst_obj: emp, idx: emp_idx });
+                let is_nil = self.alloc_temp_s();
+                self.ops.push(Op::EqObj { dst_s: is_nil, a_obj: lhs_o, b_obj: emp });
+                let dst_obj = self.alloc_temp_o();
+                self.ops.push(Op::LoadConstObj { dst_obj, idx: emp_idx });
+                let jt_pc = self.ops.len();
+                self.ops.push(Op::JumpIfTrue { cond: is_nil, target: 0 });
+                if field_ty.is_scalar() {
+                    let tmp_s = self.alloc_temp_s();
+                    self.ops.push(Op::GetFieldScalar { dst_s: tmp_s, rec_obj: lhs_o, field_idx });
+                    self.ops.push(Op::BoxScalar {
+                        dst_obj,
+                        src_s: tmp_s,
+                        kind: scalar_kind(&field_ty),
+                    });
+                } else {
+                    self.ops.push(Op::GetFieldObj { dst_obj, rec_obj: lhs_o, field_idx });
+                }
+                self.patch_here(jt_pc);
                 Ok(dst_obj)
             }
             ExprKind::Try(inner) => {

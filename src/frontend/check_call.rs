@@ -73,8 +73,8 @@ impl<'a> Checker<'a> {
         &mut self,
         callee: &mut Expr,
         type_args: &mut Vec<TypeExpr>,
-        args: &mut [Expr],
-        named_args: &mut [NamedArg],
+        args: &mut Vec<Expr>,
+        named_args: &mut Vec<NamedArg>,
     ) -> Result<Type, String> {
         if let ExprKind::Member { target, field } = &mut callee.kind {
             if let ExprKind::Ident(mod_alias) = &target.kind
@@ -92,6 +92,9 @@ impl<'a> Checker<'a> {
                 if self.checked.val_aliases.contains(mod_alias) {
                     return self.check_validation_call(field, type_args, args, named_args);
                 }
+                if self.checked.env_aliases.contains(mod_alias) {
+                    return self.check_env_call(field, type_args, args, named_args);
+                }
             }
             self.check_expr(target, None)?;
             return self.check_method_call(target, field, args, named_args);
@@ -103,6 +106,7 @@ impl<'a> Checker<'a> {
             match name.as_str() {
                 "map" => return self.check_builtin_map(args, named_args),
                 "filter" => return self.check_builtin_filter(args, named_args),
+                "reduce" => return self.check_builtin_reduce(args, named_args),
                 "print" => {
                     if !type_args.is_empty() || !named_args.is_empty() || args.len() != 1 {
                         return Err("print() expects 1 argument".to_string());
@@ -148,6 +152,14 @@ impl<'a> Checker<'a> {
                     let sym = self.checked.val_direct_types[name].clone();
                     return self.check_validation_call(&sym, type_args, args, named_args);
                 }
+                _ if self.checked.env_direct_fns.contains_key(name) => {
+                    let sym = self.checked.env_direct_fns[name].clone();
+                    return self.check_env_call(&sym, type_args, args, named_args);
+                }
+                _ if self.checked.env_direct_types.contains_key(name) => {
+                    let sym = self.checked.env_direct_types[name].clone();
+                    return self.check_env_call(&sym, type_args, args, named_args);
+                }
                 _ if self.checked.generic_structs.contains_key(name) => {
                     let base = name.clone();
                     let mono = crate::frontend::monomorph::check_generic_struct_ctor(
@@ -187,6 +199,26 @@ impl<'a> Checker<'a> {
         };
         if !named_args.is_empty() {
             return Err("Named arguments are only supported on type constructors".to_string());
+        }
+        if args.len() < params.len()
+            && let ExprKind::Ident(fn_name) = &callee.kind
+            && !self.is_local(fn_name)
+            && let Some(&fid) = self.checked.func_by_name.get(fn_name)
+        {
+            let defaults = self.checked.funcs[fid as usize].defaults.clone();
+            let provided = args.len();
+            for (i, def) in defaults.iter().enumerate().skip(provided) {
+                if let Some(def_expr) = def {
+                    args.push(def_expr.clone());
+                } else {
+                    return Err(format!(
+                        "Expected {} arguments (missing parameter {}), got {}",
+                        params.len(),
+                        i + 1,
+                        provided
+                    ));
+                }
+            }
         }
         if args.len() != params.len() {
             return Err(format!(
@@ -268,6 +300,59 @@ impl<'a> Checker<'a> {
                 }
                 Ok(Type::Int)
             }
+            (Type::List(_), "is_empty") => {
+                if !args.is_empty() {
+                    return Err(".is_empty() takes 0 arguments".to_string());
+                }
+                Ok(Type::Bool)
+            }
+            (Type::List(elem), "first" | "last") => {
+                if !args.is_empty() {
+                    return Err(format!(".{}() takes 0 arguments", method));
+                }
+                if matches!(**elem, Type::Optional(_)) {
+                    Ok((**elem).clone())
+                } else {
+                    Ok(Type::Optional(elem.clone()))
+                }
+            }
+            (Type::List(elem), "sort") => {
+                if !args.is_empty() {
+                    return Err(".sort() takes 0 arguments".to_string());
+                }
+                if !matches!(**elem, Type::Int | Type::Float | Type::String) {
+                    return Err(format!(
+                        "Cannot sort list of type {}; .sort() supports [Int], [Float], and [String]",
+                        target.ty
+                    ));
+                }
+                Ok(Type::List(elem.clone()))
+            }
+            (Type::List(elem), "find" | "any" | "all") => {
+                if args.len() != 1 {
+                    return Err(format!(".{}(pred) expects 1 argument", method));
+                }
+                let expected_pred = Type::Function {
+                    params: vec![(**elem).clone()],
+                    return_type: Box::new(Type::Bool),
+                };
+                self.check_expr(&mut args[0], Some(&expected_pred))?;
+                let Type::Function { params, return_type } = args[0].ty.clone() else {
+                    return Err(format!(".{} predicate must be a function, got {}", method, args[0].ty));
+                };
+                if params.len() != 1 || !elem.is_assignable_to(&params[0]) || *return_type != Type::Bool {
+                    return Err(format!(".{} predicate must take list element and return Bool", method));
+                }
+                if method == "find" {
+                    if matches!(**elem, Type::Optional(_)) {
+                        Ok((**elem).clone())
+                    } else {
+                        Ok(Type::Optional(elem.clone()))
+                    }
+                } else {
+                    Ok(Type::Bool)
+                }
+            }
             (Type::List(elem), "append") => {
                 if args.len() != 1 {
                     return Err(".append(val) expects 1 argument".to_string());
@@ -347,6 +432,46 @@ impl<'a> Checker<'a> {
                 }
                 Ok(Type::String)
             }
+            (Type::String, "is_empty") => {
+                if !args.is_empty() {
+                    return Err(".is_empty() takes 0 arguments".to_string());
+                }
+                Ok(Type::Bool)
+            }
+            (Type::String, "contains" | "starts_with" | "ends_with") => {
+                if args.len() != 1 {
+                    return Err(format!(".{}() expects 1 argument", method));
+                }
+                self.check_expr(&mut args[0], Some(&Type::String))?;
+                if args[0].ty != Type::String {
+                    return Err(format!(".{} expects String, got {}", method, args[0].ty));
+                }
+                Ok(Type::Bool)
+            }
+            (Type::String, "split") => {
+                if args.len() != 1 {
+                    return Err(".split(sep) expects 1 argument".to_string());
+                }
+                self.check_expr(&mut args[0], Some(&Type::String))?;
+                if args[0].ty != Type::String {
+                    return Err(format!(".split expects String, got {}", args[0].ty));
+                }
+                Ok(Type::List(Box::new(Type::String)))
+            }
+            (Type::String, "replace") => {
+                if args.len() != 2 {
+                    return Err(".replace(from, to) expects 2 arguments".to_string());
+                }
+                self.check_expr(&mut args[0], Some(&Type::String))?;
+                self.check_expr(&mut args[1], Some(&Type::String))?;
+                if args[0].ty != Type::String {
+                    return Err(format!(".replace 'from' expects String, got {}", args[0].ty));
+                }
+                if args[1].ty != Type::String {
+                    return Err(format!(".replace 'to' expects String, got {}", args[1].ty));
+                }
+                Ok(Type::String)
+            }
             (Type::String, "to_int" | "to_float") => {
                 if !args.is_empty() {
                     return Err(format!(".{}() takes 0 arguments", method));
@@ -419,6 +544,38 @@ impl<'a> Checker<'a> {
                     return Err(format!(".{}() takes 0 arguments", method));
                 }
                 Ok(Type::Float)
+            }
+            (Type::Int, "abs") | (Type::Float, "abs") => {
+                if !args.is_empty() {
+                    return Err(".abs() takes 0 arguments".to_string());
+                }
+                Ok(target.ty.clone())
+            }
+            (Type::Int, "min" | "max") | (Type::Float, "min" | "max") => {
+                if args.len() != 1 {
+                    return Err(format!(".{}(other) expects 1 argument", method));
+                }
+                let expected = target.ty.clone();
+                self.check_expr(&mut args[0], Some(&expected))?;
+                if args[0].ty != expected {
+                    return Err(format!(".{} expects {}, got {}", method, expected, args[0].ty));
+                }
+                Ok(expected)
+            }
+            (Type::Int, "clamp") | (Type::Float, "clamp") => {
+                if args.len() != 2 {
+                    return Err(".clamp(lo, hi) expects 2 arguments".to_string());
+                }
+                let expected = target.ty.clone();
+                self.check_expr(&mut args[0], Some(&expected))?;
+                self.check_expr(&mut args[1], Some(&expected))?;
+                if args[0].ty != expected {
+                    return Err(format!(".clamp 'lo' expects {}, got {}", expected, args[0].ty));
+                }
+                if args[1].ty != expected {
+                    return Err(format!(".clamp 'hi' expects {}, got {}", expected, args[1].ty));
+                }
+                Ok(expected)
             }
             (Type::Custom(tid), m) if matches!(tid.module, ModuleId::Native(_)) => {
                 self.check_native_method(tid, m, args)
@@ -498,11 +655,55 @@ impl<'a> Checker<'a> {
         Ok(list_slice[0].ty.clone())
     }
 
+    fn check_builtin_reduce(
+        &mut self,
+        args: &mut [Expr],
+        named_args: &[NamedArg],
+    ) -> Result<Type, String> {
+        if !named_args.is_empty() || args.len() != 3 {
+            return Err("reduce(list, init, fn) expects 3 arguments".to_string());
+        }
+        let (list_slice, rest) = args.split_at_mut(1);
+        let (init_slice, cb_slice) = rest.split_at_mut(1);
+        self.check_expr(&mut list_slice[0], None)?;
+        let Type::List(elem_ty) = list_slice[0].ty.clone() else {
+            return Err(format!("reduce expects a List, got {}", list_slice[0].ty));
+        };
+        self.check_expr(&mut init_slice[0], None)?;
+        let init_ty = init_slice[0].ty.clone();
+        let expected_cb = Type::Function {
+            params: vec![init_ty.clone(), (*elem_ty).clone()],
+            return_type: Box::new(init_ty.clone()),
+        };
+        self.check_expr(&mut cb_slice[0], Some(&expected_cb))?;
+        let Type::Function {
+            params,
+            return_type,
+        } = cb_slice[0].ty.clone()
+        else {
+            return Err(format!(
+                "reduce callback must be a function, got {}",
+                cb_slice[0].ty
+            ));
+        };
+        if params.len() != 2
+            || !init_ty.is_assignable_to(&params[0])
+            || !elem_ty.is_assignable_to(&params[1])
+            || !return_type.is_assignable_to(&params[0])
+        {
+            return Err(
+                "reduce callback must have signature (Acc, Elem) -> Acc matching init and list elements"
+                    .to_string(),
+            );
+        }
+        Ok(params[0].clone())
+    }
+
     fn check_struct_ctor(
         &mut self,
         name: &str,
-        args: &mut [Expr],
-        named_args: &mut [NamedArg],
+        args: &mut Vec<Expr>,
+        named_args: &mut Vec<NamedArg>,
     ) -> Result<Type, String> {
         let sid = self.checked.struct_by_name[name];
         let fields = self.checked.structs[sid].fields.clone();
@@ -511,7 +712,8 @@ impl<'a> Checker<'a> {
                 return Err(format!("Cannot mix positional and named args in '{}'", name));
             }
             let expected_rec = Type::Custom(TypeId::program(name));
-            let explicit_named = if named_args[0].name == ".." {
+            let has_spread = named_args[0].name == "..";
+            let explicit_named = if has_spread {
                 self.check_expr(&mut named_args[0].value, Some(&expected_rec))?;
                 if !named_args[0].value.ty.is_assignable_to(&expected_rec) {
                     return Err(format!(
@@ -521,14 +723,6 @@ impl<'a> Checker<'a> {
                 }
                 &mut named_args[1..]
             } else {
-                if named_args.len() != fields.len() {
-                    return Err(format!(
-                        "'{}' expects {} fields, got {}",
-                        name,
-                        fields.len(),
-                        named_args.len()
-                    ));
-                }
                 &mut named_args[..]
             };
             let mut seen = HashSet::new();
@@ -551,8 +745,25 @@ impl<'a> Checker<'a> {
                     ));
                 }
             }
+            if !has_spread {
+                for f in &fields {
+                    if !seen.contains(&f.name) {
+                        if let Some(def_expr) = &f.default {
+                            named_args.push(NamedArg {
+                                name: f.name.clone(),
+                                value: def_expr.clone(),
+                            });
+                        } else {
+                            return Err(format!(
+                                "'{}' missing required field '{}'",
+                                name, f.name
+                            ));
+                        }
+                    }
+                }
+            }
         } else {
-            if args.len() != fields.len() {
+            if args.len() > fields.len() {
                 return Err(format!(
                     "'{}' expects {} arguments, got {}",
                     name,
@@ -566,6 +777,19 @@ impl<'a> Checker<'a> {
                     return Err(format!(
                         "Field '{}' expected {}, got {}",
                         f.name, f.ty, arg.ty
+                    ));
+                }
+            }
+            let provided = args.len();
+            for f in &fields[provided..] {
+                if let Some(def_expr) = &f.default {
+                    args.push(def_expr.clone());
+                } else {
+                    return Err(format!(
+                        "'{}' expects {} arguments, got {}",
+                        name,
+                        fields.len(),
+                        provided
                     ));
                 }
             }

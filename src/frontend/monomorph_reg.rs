@@ -66,10 +66,10 @@ pub(crate) fn register_program_types(
                 checked.error_structs.insert(name.clone());
                 struct_defs.push((id, name.clone(), fields.clone()));
             }
-            ItemKind::TypeAlias { name, target } => {
-                if aliases.insert(name.clone(), target.clone()).is_some() {
-                    return Err(format!("Duplicate type alias '{}'", name));
-                }
+            ItemKind::TypeAlias { name, target }
+                if aliases.insert(name.clone(), target.clone()).is_some() =>
+            {
+                return Err(format!("Duplicate type alias '{}'", name));
             }
             _ => {}
         }
@@ -141,12 +141,36 @@ pub(crate) fn register_program_types(
                     ty: jty,
                 });
             }
+            let mut env_name = None;
+            for ann in &f.annotations {
+                if ann.target != "env" {
+                    continue;
+                }
+                if env_name.is_some() {
+                    return Err(format!("Duplicate @env annotation on '{}.{}'", name, f.name));
+                }
+                env_name = Some(match ann.args.as_slice() {
+                    [] => f.name.to_ascii_uppercase(),
+                    [crate::frontend::ast::Expr {
+                        kind: crate::frontend::ast::ExprKind::String(s),
+                        ..
+                    }] if !s.is_empty() => s.clone(),
+                    _ => {
+                        return Err(format!(
+                            "@env on '{}.{}' expects 0 arguments or 1 non-empty String literal",
+                            name, f.name
+                        ));
+                    }
+                });
+            }
             resolved_fields.push(ResolvedField {
                 name: f.name.clone(),
                 json_name,
                 ty,
                 is_scalar,
                 slot_idx,
+                env_name,
+                default: None,
             });
         }
         checked.structs[*id] = ResolvedStruct {
@@ -181,6 +205,7 @@ pub(crate) fn register_program_types(
             if checked.json_direct_fns.contains_key(name)
                 || checked.time_direct_fns.contains_key(name)
                 || checked.val_direct_fns.contains_key(name)
+                || checked.env_direct_fns.contains_key(name)
             {
                 return Err(format!("Function '{}' conflicts with imported identifier", name));
             }
@@ -228,9 +253,11 @@ pub(crate) fn register_program_types(
                 Some(rt) => checked.resolve_type_mut(rt)?,
                 None => Type::Void,
             };
+            let defaults = vec![None; p_tys.len()];
             checked.funcs.push(FuncSig {
                 name: name.clone(),
                 params: p_tys,
+                defaults,
                 return_type: ret_ty,
             });
         }

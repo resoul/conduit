@@ -261,6 +261,7 @@ impl Vm {
         Ok(out)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn run_pipeline(
         &mut self,
         module: &Module,

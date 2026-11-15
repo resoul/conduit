@@ -497,10 +497,10 @@ fn block_assigns_var(stmts: &[Stmt], var_name: &str) -> bool {
                     return true;
                 }
             }
-            StmtKind::Switch { cases, .. } => {
-                if cases.iter().any(|c| block_assigns_var(&c.body.stmts, var_name)) {
-                    return true;
-                }
+            StmtKind::Switch { cases, .. }
+                if cases.iter().any(|c| block_assigns_var(&c.body.stmts, var_name)) =>
+            {
+                return true;
             }
             _ => {}
         }
@@ -524,10 +524,10 @@ fn block_has_top_continue(stmts: &[Stmt]) -> bool {
                     return true;
                 }
             }
-            StmtKind::Switch { cases, .. } => {
-                if cases.iter().any(|c| block_has_top_continue(&c.body.stmts)) {
-                    return true;
-                }
+            StmtKind::Switch { cases, .. }
+                if cases.iter().any(|c| block_has_top_continue(&c.body.stmts)) =>
+            {
+                return true;
             }
             _ => {}
         }

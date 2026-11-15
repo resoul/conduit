@@ -25,7 +25,7 @@ checked := validation.check(user)?
 By default, a Conduit field maps to a JSON key with the same name. Add a Go-style `json` field tag after the field type to rename that key for both decoding and encoding:
 
 ```conduit
-type Point {
+struct Point {
     x: Int `json:"x_coord"`
     y: Int `json:"y_coord"`
 }
@@ -50,7 +50,7 @@ Only a JSON field-name override is supported; comma-separated tag options such a
 import * as json from "cdt.json"
 import * as validation from "cdt.validation"
 
-type User {
+struct User {
     name: String `json:"display_name"` @validation.min(2)
     email: String @validation.email
     score: Float
@@ -64,11 +64,14 @@ func main() -> Void {
                 case User(ok):
                     switch json.encode(ok) {
                         case String(out): print(out)
-                        case EncodeError(e): print(e.message)
+                        case json.EncodeError(e): print(e.message)
                     }
-                case ValidationError(e): print(e.issues[0]?.message ?? "invalid")
+                case validation.ValidationError(e):
+                    for v in e.issues {
+                        print("[{v.path}] {v.code}: {v.message}")
+                    }
             }
-        case DecodeError(e): print(e.message)
+        case json.DecodeError(e): print(e.message)
     }
 }
 ```

@@ -98,12 +98,23 @@ pub(crate) fn ensure_monomorphized_struct(
                 ty: jty,
             });
         }
+        let env_name = f.annotations.iter().find_map(|ann| {
+            if ann.target != "env" {
+                return None;
+            }
+            match ann.args.as_slice() {
+                [crate::frontend::ast::Expr { kind: crate::frontend::ast::ExprKind::String(s), .. }] => Some(s.clone()),
+                _ => Some(f.name.to_ascii_uppercase()),
+            }
+        });
         resolved_fields.push(ResolvedField {
             name: f.name.clone(),
             json_name,
             ty: fty,
             is_scalar,
             slot_idx,
+            env_name,
+            default: None,
         });
         subst_fields.push(f_clone);
     }
@@ -178,9 +189,11 @@ pub(crate) fn ensure_monomorphized_func(
     }
     let fid = checked.funcs.len() as u32;
     checked.func_by_name.insert(mono_name.clone(), fid);
+    let defaults = vec![None; concrete_params.len()];
     checked.funcs.push(FuncSig {
         name: mono_name.clone(),
         params: concrete_params,
+        defaults,
         return_type: concrete_ret,
     });
     checked.pending_mono_items.push(item);
