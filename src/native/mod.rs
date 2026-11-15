@@ -263,6 +263,7 @@ pub(crate) enum PlanNode {
 
 #[derive(Debug, Clone)]
 pub struct JsonDecodePlan {
+    pub root_ty: JsonType,
     pub(crate) nodes: Vec<PlanNode>,
     pub(crate) root: usize,
 }
@@ -276,6 +277,7 @@ impl JsonDecodePlan {
         };
         let root = compiler.add(root_ty);
         Self {
+            root_ty: root_ty.clone(),
             nodes: compiler.nodes,
             root,
         }

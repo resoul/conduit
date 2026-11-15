@@ -695,5 +695,51 @@ func main() -> String {
     );
 }
 
+#[test]
+fn bundle_and_standalone_binary_e2e() {
+    let src = r#"
+import * as json from "cdt.json"
+import * as validation from "cdt.validation"
+import * as env from "cdt.env"
+[#validator] func min_str(s: String, n: Int) -> Void | validation.Issue { if s.len() < n { return validation.Issue("short", "too short") } }
+struct User { id: Int @validation.min(1), name: String @min_str(2) }
+struct EnvCfg { bundle_host: String @env = "localhost" }
+func run_check() -> String | json.DecodeError | validation.ValidationError | env.EnvError {
+    offset := 10
+    nums := [1, 2, 3] |> map((x) => x + offset) |> filter((x) => x > 11)
+    u := json.decode<User>("{\"id\":7,\"name\":\"Ada\"}")?
+    checked := validation.check(u)?
+    cfg := env.load<EnvCfg>()?
+    n := nums.len()
+    return "{checked.name}:{n}:{cfg.bundle_host}"
+}
+func main() -> String {
+    switch run_check() {
+        case String(s): return s
+        case json.DecodeError(e): return e.message
+        case validation.ValidationError(e): return "val:{e.issues.len()}"
+        case env.EnvError(e): return e.message
+    }
+}
+"#;
+    let module = crate::frontend::compile_source(src).unwrap();
+    let main_fid = module.func_id("main").unwrap();
+    let bundled = crate::ir::bundle::encode_bundle(&module, main_fid, crate::ir::bundle::RET_OBJ).unwrap();
+    let (decoded, dec_fid, dec_tag) = crate::ir::bundle::decode_bundle(&bundled).unwrap();
+    assert_eq!((dec_fid, dec_tag), (main_fid, crate::ir::bundle::RET_OBJ));
+    let mut vm = Vm::new();
+    let out = vm.call_obj(&decoded, dec_fid, &[], &[]).unwrap();
+    assert_eq!(out, Obj::str("Ada:2:localhost"));
+
+    let base_exe = std::env::temp_dir().join("conduit_dummy_base_bin");
+    let out_exe = std::env::temp_dir().join("conduit_dummy_out_bin");
+    std::fs::write(&base_exe, b"DUMMY_BASE_BINARY").unwrap();
+    crate::ir::bundle::write_standalone_binary(&base_exe, &out_exe, &bundled).unwrap();
+    let extracted = crate::ir::bundle::extract_bundle_from_exe(&out_exe).unwrap().unwrap();
+    assert_eq!(extracted, bundled);
+    let _ = std::fs::remove_file(&base_exe);
+    let _ = std::fs::remove_file(&out_exe);
+}
+
 #[allow(dead_code)]
 fn _keep_record_desc(_: RecordDesc) {}

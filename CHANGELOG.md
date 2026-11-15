@@ -5,6 +5,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
+## [0.2.2] - 2026-11-15
+
+### Added
+
+* **`conduit build` Standalone Executables**:
+  * Added `conduit build <file.cdt> [-o <output>]` to bundle a compiled `Module` (`CDTB0001` trailer) into a self-contained native executable with zero external dependencies, including automatic Mach-O `__LINKEDIT` extension and ad-hoc `codesign` on macOS.
+  * Standalone binaries skip frontend parsing/type-checking on startup and forward CLI arguments directly to `env.args()`.
+* **Multi-File CLI Resolution**:
+  * Added filesystem relative `import` resolution (`import ... from "./..."`) across `conduit build`, `conduit run`, `conduit check`, and `conduit disasm`.
+
 ## [0.2.1] - 2026-11-15
 
 ### Added
