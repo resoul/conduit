@@ -25,6 +25,7 @@ Conduit features built-in primitive types:
 | Method | Signature | Behavior |
 | :--- | :--- | :--- |
 | `.len()` | `() -> Int` | Returns UTF-8 byte length (`O(1)`). |
+| `.is_empty()` | `() -> Bool` | Returns `true` when the string has length `0`. |
 | `.trim()` | `() -> String` | Strips leading and trailing whitespace. |
 | `.lower()` / `.upper()` | `() -> String` | Converts text to lowercase or uppercase. |
 | `.contains(sub)` | `(String) -> Bool` | Checks whether `sub` occurs in the string. |
@@ -55,6 +56,7 @@ Conduit enforces strict separation between `Int` and `Float` (`f64`): arithmetic
 
 - Convert integers explicitly via `n.to_float() -> Float`.
 - Round or format floats via `.floor() -> Float`, `.ceil() -> Float`, `.round() -> Float`, and `.to_string() -> String`.
+- Both `Int` and `Float` provide `.abs()`, `.min(other)`, `.max(other)`, and `.clamp(lo, hi)`.
 
 ## Optional Types (`T?`) and `nil`
 
@@ -76,6 +78,14 @@ actual_score := score ?? 0 // Evaluates to 0
 
 score = 42
 updated_score := score ?? 0 // Evaluates to 42
+```
+
+### Optional Chaining (`?.`)
+
+Access fields on an optional struct (`T?`) safely with `?.`. If the target is `nil`, the expression evaluates to `nil` without evaluating further chained fields:
+
+```conduit
+city := user?.address?.city ?? "Unknown"
 ```
 
 ### Flow-Sensitive Narrowing
@@ -100,15 +110,26 @@ Both methods reject surrounding whitespace unless `.trim()` is called first, and
 
 ---
 
-## Custom Record Types (`type`)
+## Custom Struct Types (`struct`)
 
-Custom data records are defined with the `type` keyword:
+Custom data structs are defined with the `struct` keyword:
 
 ```conduit
-type Point {
+struct Point {
     x: Int
     y: Int
 }
+```
+
+Struct fields can also specify default values (`= expr`), allowing omitted fields in constructors:
+
+```conduit
+struct Config {
+    host: String = "localhost"
+    port: Int = 8080
+}
+
+cfg := Config(port: 9090) // host defaults to "localhost"
 ```
 
 ### Instantiation
@@ -128,17 +149,17 @@ print(pt.x) // 10
 print(pt.y) // 20
 ```
 
-### Generic Record Types (`type Name<T, ...>`)
+### Generic Struct Types (`struct Name<T, ...>`)
 
-Records can declare non-empty, unique type parameters to parameterize their fields across arbitrary concrete types (including nested generic containers):
+Structs can declare non-empty, unique type parameters to parameterize their fields across arbitrary concrete types (including nested generic containers):
 
 ```conduit
-type Page<T> {
+struct Page<T> {
     items: [T]
     total: Int
 }
 
-type Pair<A, B> {
+struct Pair<A, B> {
     first: A
     second: B
 }
@@ -153,7 +174,7 @@ Different type arguments produce distinct, incompatible types (`Page<Int>` canno
 ## Runnable Example
 
 ```conduit
-type Point {
+struct Point {
     x: Int
     y: Int
 }

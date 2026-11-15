@@ -72,6 +72,8 @@ pub enum Op {
     ScalarToStr { dst_obj: u16, src_s: u16, tag: u8 },
     ObjToStr { dst_obj: u16, src_obj: u16 },
     StrMethod { dst_obj: u16, src_obj: u16, kind: u8 },
+    StrReplace { dst_obj: u16, str_obj: u16, from_obj: u16, to_obj: u16 },
+    ClampScalar { dst_s: u16, val_s: u16, lo_s: u16, hi_s: u16, is_float: bool },
     ListIndex { dst_obj: u16, list_obj: u16, idx_s: u16, elem_tag: u8 },
     ListGet { dst_obj: u16, list_obj: u16, idx_s: u16, elem_tag: u8 },
     ListContainsScalar { dst_s: u16, list_obj: u16, val_s: u16, elem_tag: u8 },
@@ -131,6 +133,19 @@ pub const EXT_MAP_KEYS: u8 = 10;
 pub const EXT_MAP_VALUES: u8 = 11;
 pub const EXT_MAP_ENTRIES: u8 = 12;
 pub const EXT_MAP_FROM: u8 = 13;
+pub const EXT_STR_IS_EMPTY: u8 = 14;
+pub const EXT_STR_PRED: u8 = 15;
+pub const EXT_STR_SPLIT: u8 = 16;
+pub const EXT_INT_MATH: u8 = 17;
+pub const EXT_FLOAT_MATH: u8 = 18;
+pub const EXT_LIST_IS_EMPTY: u8 = 19;
+pub const EXT_LIST_FIRST: u8 = 20;
+pub const EXT_LIST_LAST: u8 = 21;
+pub const EXT_LIST_SORT: u8 = 22;
+pub const EXT_ENV_GET: u8 = 23;
+pub const EXT_ENV_REQUIRE: u8 = 24;
+pub const EXT_ENV_ARGS: u8 = 25;
+pub const EXT_ENV_LOAD: u8 = 26;
 
 #[cfg(test)]
 mod tests {

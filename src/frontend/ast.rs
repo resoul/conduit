@@ -208,6 +208,7 @@ pub struct Block {
 pub struct Param {
     pub name: String,
     pub ty: TypeExpr,
+    pub default: Option<Expr>,
     pub span: Span,
 }
 
@@ -224,6 +225,7 @@ pub struct FieldDef {
     pub ty: TypeExpr,
     pub json_name: Option<String>,
     pub annotations: Vec<FieldAnnotation>,
+    pub default: Option<Expr>,
     pub span: Span,
 }
 

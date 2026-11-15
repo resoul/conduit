@@ -337,11 +337,27 @@ impl Parser {
     ) -> Result<(Vec<Param>, Option<TypeExpr>), ParserError> {
         self.expect(&TokenKind::LParen)?;
         let mut params = Vec::new();
+        let mut seen_default = false;
         while !self.check(&TokenKind::RParen) && !self.check(&TokenKind::Eof) {
             let (name, span) = self.expect_ident()?;
             self.expect(&TokenKind::Colon)?;
             let ty = self.parse_type_expr()?;
-            params.push(Param { name, ty, span });
+            let default = if self.match_token(&TokenKind::Assign) {
+                seen_default = true;
+                Some(self.parse_expr()?)
+            } else {
+                if seen_default {
+                    return Err(ParserError {
+                        message: format!(
+                            "Required parameter '{}' cannot follow a parameter with a default value",
+                            name
+                        ),
+                        span,
+                    });
+                }
+                None
+            };
+            params.push(Param { name, ty, default, span });
             if !self.match_token(&TokenKind::Comma) {
                 break;
             }
@@ -511,11 +527,18 @@ impl Parser {
                 });
             }
 
+            let default = if self.match_token(&TokenKind::Assign) {
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
+
             fields.push(FieldDef {
                 name: field_name,
                 ty: field_ty,
                 json_name,
                 annotations,
+                default,
                 span: field_span,
             });
             self.match_token(&TokenKind::Comma);
@@ -637,6 +660,7 @@ impl Parser {
                 ty: field_ty,
                 json_name: None,
                 annotations: Vec::new(),
+                default: None,
                 span: field_span,
             });
             self.match_token(&TokenKind::Comma);

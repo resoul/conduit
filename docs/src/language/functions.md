@@ -22,6 +22,14 @@ func greet(name: String) {
 }
 ```
 
+Trailing parameters can declare default values (`= expr`):
+
+```conduit
+func greet_with(name: String, prefix: String = "Hello") -> String {
+    return "{prefix}, {name}!"
+}
+```
+
 ---
 
 ## First-Class Functions & Callbacks

@@ -11,6 +11,7 @@ pub(crate) fn is_valid_native_type(mod_name: &str, ty_name: &str) -> bool {
         "cdt.json" => matches!(ty_name, "DecodeError" | "EncodeError"),
         "cdt.time" => matches!(ty_name, "Timestamp" | "Instant" | "Duration" | "TimeError"),
         "cdt.validation" => matches!(ty_name, "Issue" | "Violation" | "ValidationError"),
+        "cdt.env" => ty_name == "EnvError",
         _ => false,
     }
 }
@@ -83,6 +84,24 @@ pub(crate) fn register_native_imports(
                     }
                 }
             }
+            "cdt.env" => {
+                if let Some(a) = alias {
+                    checked.env_aliases.insert(a.clone());
+                }
+                for spec in names {
+                    match spec.name.as_str() {
+                        "get" | "require" | "args" | "load" => {
+                            insert_unique(&mut checked.env_direct_fns, &spec.alias, &spec.name)?;
+                        }
+                        "EnvError" => {
+                            checked.env_direct_types.insert(spec.alias.clone(), spec.name.clone());
+                        }
+                        other => {
+                            return Err(format!("Module 'cdt.env' has no exported member '{}'", other));
+                        }
+                    }
+                }
+            }
             other => return Err(format!("Unknown or unlinked module '{}'", other)),
         }
     }
@@ -136,6 +155,10 @@ pub fn resolve_type_expr(te: &TypeExpr, checked: &CheckedProgram) -> Result<Type
                 "cdt.validation",
                 &checked.val_direct_types[name],
             ))),
+            _ if checked.env_direct_types.contains_key(name) => Ok(Type::Custom(TypeId::native(
+                "cdt.env",
+                &checked.env_direct_types[name],
+            ))),
             _ if name.contains('.') => {
                 let mut parts = name.splitn(2, '.');
                 let alias = parts.next().unwrap_or("");
@@ -146,6 +169,8 @@ pub fn resolve_type_expr(te: &TypeExpr, checked: &CheckedProgram) -> Result<Type
                     "cdt.time"
                 } else if checked.val_aliases.contains(alias) {
                     "cdt.validation"
+                } else if checked.env_aliases.contains(alias) {
+                    "cdt.env"
                 } else {
                     return Err(format!("Unknown type '{}'", name));
                 };
@@ -245,6 +270,7 @@ pub(crate) fn is_error_type(ty: &Type, checked: &CheckedProgram) -> bool {
             "cdt.json" => matches!(name.as_str(), "DecodeError" | "EncodeError"),
             "cdt.time" => name == "TimeError",
             "cdt.validation" => matches!(name.as_str(), "Issue" | "ValidationError"),
+            "cdt.env" => name == "EnvError",
             _ => false,
         },
         Type::Custom(TypeId {
@@ -319,6 +345,8 @@ pub(crate) fn native_member_field(tid: &TypeId, field: &str) -> Result<(Type, u1
         ("cdt.json", "DecodeError", "path") => Ok((Type::String, 0)),
         ("cdt.json", "DecodeError", "message") => Ok((Type::String, 1)),
         ("cdt.json", "EncodeError", "message") => Ok((Type::String, 0)),
+        ("cdt.env", "EnvError", "name") => Ok((Type::String, 0)),
+        ("cdt.env", "EnvError", "message") => Ok((Type::String, 1)),
         _ => Err(format!("Type '{}' has no field '{}'", tid, field)),
     }
 }
@@ -626,6 +654,127 @@ impl<'a> Checker<'a> {
             }
             _ => Err(format!("Type '{}' has no method '.{}()'", tid, method)),
         }
+    }
+
+    pub(crate) fn check_env_call(
+        &mut self,
+        sym: &str,
+        type_args: &[TypeExpr],
+        args: &mut [Expr],
+        named_args: &mut [NamedArg],
+    ) -> Result<Type, String> {
+        let env_err = Type::Custom(TypeId::native("cdt.env", "EnvError"));
+        match sym {
+            "EnvError" => check_fields_ctor(
+                self,
+                "EnvError",
+                &[("name", Type::String), ("message", Type::String)],
+                args,
+                named_args,
+                env_err,
+            ),
+            "get" | "require" => {
+                if !type_args.is_empty() || !named_args.is_empty() || args.len() != 1 {
+                    return Err(format!("env.{}(name) expects 1 String argument", sym));
+                }
+                self.check_expr(&mut args[0], Some(&Type::String))?;
+                if args[0].ty != Type::String {
+                    return Err(format!("env.{} expects String, got {}", sym, args[0].ty));
+                }
+                if sym == "get" {
+                    Ok(Type::Optional(Box::new(Type::String)))
+                } else {
+                    Ok(Type::union(vec![Type::String, env_err]))
+                }
+            }
+            "args" => {
+                if !type_args.is_empty() || !named_args.is_empty() || !args.is_empty() {
+                    return Err("env.args() takes 0 arguments".to_string());
+                }
+                Ok(Type::List(Box::new(Type::String)))
+            }
+            "load" => {
+                if type_args.len() != 1 || !named_args.is_empty() || !args.is_empty() {
+                    return Err("env.load<T>() expects 1 type argument and 0 value arguments".to_string());
+                }
+                let target_ty = self.checked.resolve_type_mut(&type_args[0])?;
+                let Type::Custom(tid) = &target_ty else {
+                    return Err(format!("env.load<T>() requires a struct type, got {}", target_ty));
+                };
+                if tid.module != ModuleId::Program {
+                    return Err(format!("env.load<T>() requires a program struct, got {}", target_ty));
+                }
+                let sid = self.checked.struct_by_name[&tid.name];
+                let st = &self.checked.structs[sid];
+                let mut fields = Vec::with_capacity(st.fields.len());
+                for f in &st.fields {
+                    let env_name = f
+                        .env_name
+                        .clone()
+                        .unwrap_or_else(|| f.name.to_ascii_uppercase());
+                    let (is_optional, inner_ty) = match &f.ty {
+                        Type::Optional(inner) => (true, (**inner).clone()),
+                        other => (false, other.clone()),
+                    };
+                    let kind = match inner_ty {
+                        Type::String => crate::native::env::EnvFieldKind::String,
+                        Type::Int => crate::native::env::EnvFieldKind::Int,
+                        Type::Float => crate::native::env::EnvFieldKind::Float,
+                        Type::Bool => crate::native::env::EnvFieldKind::Bool,
+                        _ => {
+                            return Err(format!(
+                                "env.load<{}>: field '{}' has unsupported type {} (expected String, Int, Float, Bool, or optional)",
+                                tid.name, f.name, f.ty
+                            ));
+                        }
+                    };
+                    let default = match &f.default {
+                        Some(expr) => Some(expr_to_env_default(expr).ok_or_else(|| {
+                            format!(
+                                "env.load<{}>: default value for field '{}' must be a literal constant",
+                                tid.name, f.name
+                            )
+                        })?),
+                        None => None,
+                    };
+                    fields.push(crate::native::env::EnvFieldPlan {
+                        env_name,
+                        kind,
+                        is_optional,
+                        is_scalar: f.is_scalar,
+                        slot_idx: f.slot_idx,
+                        default,
+                    });
+                }
+                if !self.checked.env_plans.iter().any(|p| p.schema_id == st.schema_id) {
+                    self.checked.env_plans.push(crate::native::env::EnvLoadPlan {
+                        schema_id: st.schema_id,
+                        scalar_len: st.scalar_len,
+                        obj_len: st.obj_len,
+                        fields: fields.into_boxed_slice(),
+                    });
+                }
+                Ok(Type::union(vec![target_ty, env_err]))
+            }
+            other => Err(format!("Unknown cdt.env symbol '{}'", other)),
+        }
+    }
+}
+
+fn expr_to_env_default(expr: &Expr) -> Option<crate::native::env::EnvDefault> {
+    use crate::native::env::EnvDefault;
+    match &expr.kind {
+        ExprKind::Int(v) => Some(EnvDefault::Int(*v)),
+        ExprKind::Float(v) => Some(EnvDefault::Float(v.to_bits())),
+        ExprKind::Bool(b) => Some(EnvDefault::Bool(*b)),
+        ExprKind::String(s) => Some(EnvDefault::Str(s.clone())),
+        ExprKind::Nil => Some(EnvDefault::Nil),
+        ExprKind::Unary { op: UnaryOp::Neg, expr: inner } => match &inner.kind {
+            ExprKind::Int(v) => Some(EnvDefault::Int(-*v)),
+            ExprKind::Float(v) => Some(EnvDefault::Float((-*v).to_bits())),
+            _ => None,
+        },
+        _ => None,
     }
 }
 

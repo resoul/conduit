@@ -508,29 +508,26 @@ impl Vm {
                     match o_ref!(list_obj) {
                         Obj::List(ListStorage::Int(arc)) => {
                             if idx < arc.len() {
-                                if target as usize + 1 == ip - 1 {
-                                    if let Op::AddInt { dst, a, b } =
+                                if target as usize + 1 == ip - 1
+                                    && let Op::AddInt { dst, a, b } =
                                         unsafe { *ops_ptr.add(target as usize) }
-                                    {
-                                        if dst == a
-                                            && b == elem_s
-                                            && dst != idx_s
-                                            && dst != elem_s
-                                        {
-                                            let mut acc = s_get!(dst) as i64;
-                                            let slice = &arc[idx..];
-                                            for &v in slice {
-                                                let Some(next_acc) = acc.checked_add(v) else {
-                                                    return Err(err_overflow());
-                                                };
-                                                acc = next_acc;
-                                            }
-                                            s_set!(dst, acc as u64);
-                                            s_set!(elem_s, *slice.last().unwrap() as u64);
-                                            s_set!(idx_s, arc.len() as u64);
-                                            continue;
-                                        }
+                                    && dst == a
+                                    && b == elem_s
+                                    && dst != idx_s
+                                    && dst != elem_s
+                                {
+                                    let mut acc = s_get!(dst) as i64;
+                                    let slice = &arc[idx..];
+                                    for &v in slice {
+                                        let Some(next_acc) = acc.checked_add(v) else {
+                                            return Err(err_overflow());
+                                        };
+                                        acc = next_acc;
                                     }
+                                    s_set!(dst, acc as u64);
+                                    s_set!(elem_s, *slice.last().unwrap() as u64);
+                                    s_set!(idx_s, arc.len() as u64);
+                                    continue;
                                 }
                                 s_set!(elem_s, unsafe { *arc.get_unchecked(idx) } as u64);
                                 s_set!(idx_s, (idx + 1) as u64);
@@ -649,6 +646,8 @@ impl Vm {
                 | Op::ScalarToStr { .. }
                 | Op::ObjToStr { .. }
                 | Op::StrMethod { .. }
+                | Op::StrReplace { .. }
+                | Op::ClampScalar { .. }
                 | Op::ListIndex { .. }
                 | Op::ListGet { .. }
                 | Op::ListContainsScalar { .. }
@@ -659,7 +658,7 @@ impl Vm {
                 | Op::ListJoin { .. }
                 | Op::TupleGetScalar { .. }
                 | Op::TupleGetObj { .. }
-                | Op::ExtOp { .. }) => self.exec_ext_op(s_base, o_base, op)?,
+                | Op::ExtOp { .. }) => self.exec_ext_op(module, s_base, o_base, op)?,
             }
         }
     }

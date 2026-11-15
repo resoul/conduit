@@ -12,7 +12,8 @@ The `conduit` CLI provides tools for checking, compiling, executing, disassembli
 | `conduit check` | `<file.cdt>` | Performs static semantic analysis and type checking without running code. |
 | `conduit disasm` | `<file.cdt>` | Compiles the program and prints the disassembled register bytecode. |
 | `conduit bench` | `[--filter <pat>] [--strict]` | Runs the built-in VM benchmark suite and checks target performance gates. |
-| `conduit --help` | None | Displays the usage instructions. |
+| `conduit --version` (`-V`) | None | Prints the installed Conduit version. |
+| `conduit --help` (`-h`) | None | Displays the usage instructions. |
 
 ---
 

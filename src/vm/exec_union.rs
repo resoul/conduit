@@ -158,6 +158,7 @@ impl Vm {
     #[inline(never)]
     pub(crate) fn exec_ext_op(
         &mut self,
+        module: &crate::ir::Module,
         s_base: usize,
         o_base: usize,
         op: Op,
@@ -203,6 +204,43 @@ impl Vm {
                 };
                 self.objs[o_base + dst_obj as usize] = Obj::str(res);
             }
+            Op::StrReplace { dst_obj, str_obj, from_obj, to_obj } => {
+                let res = match (
+                    &self.objs[o_base + str_obj as usize],
+                    &self.objs[o_base + from_obj as usize],
+                    &self.objs[o_base + to_obj as usize],
+                ) {
+                    (Obj::Str(s), Obj::Str(from), Obj::Str(to)) => {
+                        if from.is_empty() {
+                            s.to_string()
+                        } else {
+                            s.replace(from.as_str(), to.as_str())
+                        }
+                    }
+                    _ => return Err(err_msg("Expected String in StrReplace")),
+                };
+                self.objs[o_base + dst_obj as usize] = Obj::str(res);
+            }
+            Op::ClampScalar { dst_s, val_s, lo_s, hi_s, is_float } => {
+                let out = if is_float {
+                    let val = f64::from_bits(self.scalars[s_base + val_s as usize]);
+                    let lo = f64::from_bits(self.scalars[s_base + lo_s as usize]);
+                    let hi = f64::from_bits(self.scalars[s_base + hi_s as usize]);
+                    if lo.is_nan() || hi.is_nan() || lo > hi {
+                        return Err(err_msg("clamp() called with invalid bounds (lo > hi or NaN)"));
+                    }
+                    val.clamp(lo, hi).to_bits()
+                } else {
+                    let val = self.scalars[s_base + val_s as usize] as i64;
+                    let lo = self.scalars[s_base + lo_s as usize] as i64;
+                    let hi = self.scalars[s_base + hi_s as usize] as i64;
+                    if lo > hi {
+                        return Err(err_msg("clamp() called with lo > hi"));
+                    }
+                    val.clamp(lo, hi) as u64
+                };
+                self.scalars[s_base + dst_s as usize] = out;
+            }
             Op::ListIndex { dst_obj, list_obj, idx_s, elem_tag } => {
                 let idx = self.scalars[s_base + idx_s as usize] as i64;
                 let res = list_get_or_index(&self.objs[o_base + list_obj as usize], idx, elem_tag, true)?;
@@ -221,7 +259,7 @@ impl Vm {
                     }
                     Obj::List(ListStorage::Float(v)) => {
                         let target = f64::from_bits(raw);
-                        v.iter().any(|&x| x == target)
+                        v.contains(&target)
                     }
                     Obj::List(ListStorage::Obj(v)) => {
                         let kind = match elem_tag { 2 => 1, 3 => 2, _ => 0 };
@@ -294,7 +332,7 @@ impl Vm {
                 self.objs[o_base + dst_obj as usize] = elem;
             }
             Op::ExtOp { kind, aux, a, b, c } => {
-                self.exec_ext_dispatch(s_base, o_base, kind, aux, a, b, c)?;
+                self.exec_ext_dispatch(module, s_base, o_base, kind, aux, a, b, c)?;
             }
             _ => unreachable!("unexpected op in exec_ext_op"),
         }
@@ -302,7 +340,7 @@ impl Vm {
     }
 }
 
-fn list_get_or_index(list: &Obj, idx: i64, elem_tag: u8, is_index_err: bool) -> Result<Obj, RuntimeError> {
+pub(crate) fn list_get_or_index(list: &Obj, idx: i64, elem_tag: u8, is_index_err: bool) -> Result<Obj, RuntimeError> {
     let Obj::List(storage) = list else {
         return Err(err_msg("Expected List in indexing"));
     };

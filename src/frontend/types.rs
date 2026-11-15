@@ -282,6 +282,8 @@ pub struct ResolvedField {
     pub ty: Type,
     pub is_scalar: bool,
     pub slot_idx: u16,
+    pub env_name: Option<String>,
+    pub default: Option<crate::frontend::ast::Expr>,
 }
 
 #[derive(Debug, Clone)]
@@ -303,5 +305,6 @@ impl ResolvedStruct {
 pub struct FuncSig {
     pub name: String,
     pub params: Vec<Type>,
+    pub defaults: Vec<Option<crate::frontend::ast::Expr>>,
     pub return_type: Type,
 }

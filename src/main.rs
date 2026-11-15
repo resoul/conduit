@@ -58,8 +58,11 @@ fn main() {
         Some("check") => run_check_cmd(args.get(1)),
         Some("disasm") => run_disasm_cmd(args.get(1)),
         Some("run") => run_exec_cmd(args.get(1)),
+        Some("--version" | "-V" | "version") => {
+            println!("Conduit v{}", env!("CARGO_PKG_VERSION"));
+        }
         Some("--help" | "-h" | "help") => {
-            println!("Usage:\n  conduit bench [--filter <pat>] [--strict]\n  conduit check <file.cdt>\n  conduit disasm <file.cdt>\n  conduit run <file.cdt>");
+            println!("Conduit v{}\n\nUsage:\n  conduit bench [--filter <pat>] [--strict]\n  conduit check <file.cdt>\n  conduit disasm <file.cdt>\n  conduit run <file.cdt>\n  conduit --version, -V\n  conduit --help, -h", env!("CARGO_PKG_VERSION"));
         }
         Some(cmd) => {
             eprintln!("Unknown command '{}'. Usage: conduit <bench|check|disasm|run> ...", cmd);

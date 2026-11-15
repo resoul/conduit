@@ -1,10 +1,14 @@
 use std::sync::Arc;
 
 use crate::vm::exec_cold::err_msg;
+use crate::native::env::{exec_env_load, make_env_error};
+use crate::vm::exec_union::list_get_or_index;
 use crate::vm::opcode::{
-    EXT_FLOAT_CEIL, EXT_MAP_CONTAINS_KEY, EXT_MAP_ENTRIES, EXT_MAP_FROM, EXT_MAP_GET,
-    EXT_MAP_INDEX, EXT_MAP_KEYS, EXT_MAP_REMOVE, EXT_MAP_SET, EXT_MAP_VALUES, EXT_PRINT_OBJ,
-    EXT_PRINT_SCALAR, EXT_STR_TO_FLOAT, EXT_STR_TO_INT,
+    EXT_ENV_ARGS, EXT_ENV_GET, EXT_ENV_LOAD, EXT_ENV_REQUIRE, EXT_FLOAT_CEIL, EXT_FLOAT_MATH,
+    EXT_INT_MATH, EXT_LIST_FIRST, EXT_LIST_IS_EMPTY, EXT_LIST_LAST, EXT_LIST_SORT,
+    EXT_MAP_CONTAINS_KEY, EXT_MAP_ENTRIES, EXT_MAP_FROM, EXT_MAP_GET, EXT_MAP_INDEX, EXT_MAP_KEYS,
+    EXT_MAP_REMOVE, EXT_MAP_SET, EXT_MAP_VALUES, EXT_PRINT_OBJ, EXT_PRINT_SCALAR, EXT_STR_IS_EMPTY,
+    EXT_STR_PRED, EXT_STR_SPLIT, EXT_STR_TO_FLOAT, EXT_STR_TO_INT,
 };
 use crate::vm::value::{
     ListStorage, MapKey, MapVal, Obj, OrderedMap, SCHEMA_BOXED_BOOL, SCHEMA_BOXED_FLOAT,
@@ -15,8 +19,10 @@ use crate::vm::{RuntimeError, Vm};
 impl Vm {
     #[cold]
     #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn exec_ext_dispatch(
         &mut self,
+        module: &crate::ir::Module,
         s_base: usize,
         o_base: usize,
         kind: u8,
@@ -41,6 +47,130 @@ impl Vm {
             EXT_FLOAT_CEIL => {
                 let v = f64::from_bits(self.scalars[s_base + b as usize]).ceil();
                 self.scalars[s_base + a as usize] = v.to_bits();
+            }
+            EXT_STR_IS_EMPTY => {
+                let Obj::Str(s) = &self.objs[o_base + b as usize] else {
+                    return Err(err_msg("Expected String in is_empty()"));
+                };
+                self.scalars[s_base + a as usize] = u64::from(s.is_empty());
+            }
+            EXT_STR_PRED => {
+                let (Obj::Str(s), Obj::Str(arg)) =
+                    (&self.objs[o_base + b as usize], &self.objs[o_base + c as usize])
+                else {
+                    return Err(err_msg("Expected String in string predicate"));
+                };
+                let matched = match aux {
+                    0 => s.contains(arg.as_str()),
+                    1 => s.starts_with(arg.as_str()),
+                    _ => s.ends_with(arg.as_str()),
+                };
+                self.scalars[s_base + a as usize] = u64::from(matched);
+            }
+            EXT_STR_SPLIT => {
+                let (Obj::Str(s), Obj::Str(sep)) =
+                    (&self.objs[o_base + b as usize], &self.objs[o_base + c as usize])
+                else {
+                    return Err(err_msg("Expected String in split()"));
+                };
+                let parts: Vec<Obj> = s
+                    .split(sep.as_str())
+                    .map(|p| Obj::str(p.to_string()))
+                    .collect();
+                self.objs[o_base + a as usize] = Obj::List(ListStorage::Obj(Arc::new(parts)));
+            }
+            EXT_INT_MATH => {
+                let lhs = self.scalars[s_base + b as usize] as i64;
+                let res = match aux {
+                    0 => lhs.checked_abs().ok_or_else(|| err_msg("Integer overflow in abs()"))?,
+                    1 => lhs.min(self.scalars[s_base + c as usize] as i64),
+                    _ => lhs.max(self.scalars[s_base + c as usize] as i64),
+                };
+                self.scalars[s_base + a as usize] = res as u64;
+            }
+            EXT_FLOAT_MATH => {
+                let lhs = f64::from_bits(self.scalars[s_base + b as usize]);
+                let res = match aux {
+                    0 => lhs.abs(),
+                    1 => lhs.min(f64::from_bits(self.scalars[s_base + c as usize])),
+                    _ => lhs.max(f64::from_bits(self.scalars[s_base + c as usize])),
+                };
+                self.scalars[s_base + a as usize] = res.to_bits();
+            }
+            EXT_LIST_IS_EMPTY => {
+                let Obj::List(list) = &self.objs[o_base + b as usize] else {
+                    return Err(err_msg("Expected List in is_empty()"));
+                };
+                self.scalars[s_base + a as usize] = u64::from(list.is_empty());
+            }
+            EXT_LIST_FIRST => {
+                let res = list_get_or_index(&self.objs[o_base + b as usize], 0, aux, false)?;
+                self.objs[o_base + a as usize] = res;
+            }
+            EXT_LIST_LAST => {
+                let obj = &self.objs[o_base + b as usize];
+                let Obj::List(list) = obj else {
+                    return Err(err_msg("Expected List in last()"));
+                };
+                let len = list.len();
+                let res = if len == 0 {
+                    Obj::Empty
+                } else {
+                    list_get_or_index(obj, (len - 1) as i64, aux, false)?
+                };
+                self.objs[o_base + a as usize] = res;
+            }
+            EXT_LIST_SORT => {
+                let Obj::List(list) = &self.objs[o_base + b as usize] else {
+                    return Err(err_msg("Expected List in sort()"));
+                };
+                let sorted = match (aux, list) {
+                    (0, ListStorage::Int(v)) => {
+                        let mut out = v.as_ref().clone();
+                        out.sort_unstable();
+                        Obj::List(ListStorage::Int(Arc::new(out)))
+                    }
+                    (1, ListStorage::Float(v)) => {
+                        let mut out = v.as_ref().clone();
+                        out.sort_by(|x, y| x.total_cmp(y));
+                        Obj::List(ListStorage::Float(Arc::new(out)))
+                    }
+                    (2, ListStorage::Obj(v)) => {
+                        let mut out = v.as_ref().clone();
+                        out.sort_by(|x, y| match (x, y) {
+                            (Obj::Str(sa), Obj::Str(sb)) => sa.cmp(sb),
+                            _ => std::cmp::Ordering::Equal,
+                        });
+                        Obj::List(ListStorage::Obj(Arc::new(out)))
+                    }
+                    _ => return Err(err_msg("Unsupported list storage in sort()")),
+                };
+                self.objs[o_base + a as usize] = sorted;
+            }
+            EXT_ENV_GET | EXT_ENV_REQUIRE => {
+                let Obj::Str(name) = &self.objs[o_base + b as usize] else {
+                    return Err(err_msg("Expected String in cdt.env"));
+                };
+                let res = match std::env::var(name.as_str()) {
+                    Ok(v) if kind == EXT_ENV_GET || !v.is_empty() => Obj::str(v),
+                    _ if kind == EXT_ENV_GET => Obj::Empty,
+                    _ => make_env_error(
+                        name.as_str(),
+                        format!("Missing required environment variable '{}'", name),
+                    ),
+                };
+                self.objs[o_base + a as usize] = res;
+            }
+            EXT_ENV_ARGS => {
+                let args: Vec<Obj> = std::env::args().map(Obj::str).collect();
+                self.objs[o_base + a as usize] = Obj::List(ListStorage::Obj(Arc::new(args)));
+            }
+            EXT_ENV_LOAD => {
+                let plan = module
+                    .env_plans
+                    .get(b as usize)
+                    .ok_or_else(|| err_msg("Missing EnvLoadPlan"))?;
+                self.objs[o_base + a as usize] = exec_env_load(plan);
             }
             EXT_STR_TO_INT => {
                 let Obj::Str(s) = &self.objs[o_base + b as usize] else {

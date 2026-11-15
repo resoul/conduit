@@ -5,6 +5,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
+## [0.2.1] - 2026-11-15
+
+### Added
+
+* **Standard Methods & Numeric Helpers**:
+  * Added `String` methods: `.is_empty()`, `.contains(sub)`, `.starts_with(prefix)`, `.ends_with(suffix)`, `.split(sep)`, and `.replace(from, to)`.
+  * Added `List` (`[T]`) methods: `.is_empty()`, `.first()`, `.last()`, `.sort()` (for `[Int]`, `[Float]`, `[String]`), `.find(pred)`, `.any(pred)`, `.all(pred)`, and global `reduce(list, init, fn)` with `|>` pipeline support.
+  * Added `Int` / `Float` numeric methods: `.abs()`, `.min(other)`, `.max(other)`, and `.clamp(lo, hi)`.
+  * Added `cdt.env` standard library module (`env.load<T>()`, `env.get()`, `env.require()`, `env.args()`, `EnvError`) with `@env` / `@env("VAR")` field annotations and default-value fallbacks.
+* **Language Features**:
+  * Added default values (`= expr`) for `struct` fields and `func` parameters.
+  * Completed optional chaining (`?.`) type-checking and VM lowering across program, builtin, and native structs without double-wrapping `T?`.
+* **CLI & Documentation**:
+  * Added `conduit --version` / `-V` and updated `conduit --help` / `-h` usage output.
+  * Aligned documentation, TextMate grammar, and Highlight.js syntax with `struct` declarations and verified runnable stdlib examples with `conduit check`.
+
 ## [0.2.0] - 2026-11-14
 
 ### Added & Changed
@@ -16,7 +32,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 * **Language Features, Generics & Module System**:
   * Added TypeScript-style named and namespace imports (`import { a, b } from "..."`, `import * as ns from "..."`) with reachability tree-shaking of unused functions.
-  * Added compile-time monomorphization for generic structs and functions (`type Box<T>`, `func f<T>`), string interpolation (`"hello {x}"`), and tuple destructuring (`(a, b) := expr`).
+  * Added compile-time monomorphization for generic structs and functions (`struct Box<T>`, `func f<T>`), string interpolation (`"hello {x}"`), and tuple destructuring (`(a, b) := expr`).
   * Added `print(msg)` builtin, `Float.ceil()`, prelude error constructors (`IndexError`, `KeyError`, `ParseError`), `String.to_int()` / `String.to_float()`, and full `Map<K, V>` support (`.set`, `.get`, `.contains_key`, `.remove`, `.keys`, `.values`, `.entries`, `Map.from`, `map[k] -> V | KeyError`, `for (k, v) in map`).
 
 * **Native Standard Libraries & Benchmarks**:

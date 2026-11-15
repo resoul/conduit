@@ -287,7 +287,7 @@ pub fn call_and_closure_workloads() -> Vec<Workload> {
             php_us: Some(0.024812),
             go_us: Some(1.819),
             rust_us: Some(0.372201),
-            setup: Box::new(|vm| make_invoke_list_closure_workload(vm)),
+            setup: Box::new(make_invoke_list_closure_workload),
         },
         Workload {
             name: "closures.create_empty",
@@ -470,7 +470,7 @@ fn make_create_closure_workload(
         vec![]
     };
 
-    let after_check: Option<Box<dyn Fn(&[Obj]) -> Result<(), String>>> = if with_unused_list {
+    let after_check: Option<super::AfterCheckFn> = if with_unused_list {
         Some(Box::new(|objs| {
             let expected = Obj::List(ListStorage::Int(Arc::new((0..4096).collect())));
             if objs[0] != expected {

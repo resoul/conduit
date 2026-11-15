@@ -32,6 +32,10 @@ pub struct CheckedProgram {
     pub val_aliases: HashSet<String>,
     pub val_direct_fns: HashMap<String, String>,
     pub val_direct_types: HashMap<String, String>,
+    pub env_aliases: HashSet<String>,
+    pub env_direct_fns: HashMap<String, String>,
+    pub env_direct_types: HashMap<String, String>,
+    pub env_plans: Vec<crate::native::env::EnvLoadPlan>,
     pub validator_funcs: HashSet<String>,
     pub error_structs: HashSet<String>,
     pub validation_plans: Vec<ValidationStructPlan>,
@@ -75,6 +79,10 @@ pub fn check_program_with_roots(
         val_aliases: HashSet::new(),
         val_direct_fns: HashMap::new(),
         val_direct_types: HashMap::new(),
+        env_aliases: HashSet::new(),
+        env_direct_fns: HashMap::new(),
+        env_direct_types: HashMap::new(),
+        env_plans: Vec::new(),
         validator_funcs: HashSet::new(),
         error_structs: HashSet::new(),
         validation_plans: Vec::new(),
@@ -87,6 +95,7 @@ pub fn check_program_with_roots(
     register_native_imports(program, &mut checked)?;
     register_program_types(program, &mut checked)?;
     check_validator_contracts(program, &mut checked)?;
+    check_default_exprs(program, &mut checked)?;
 
     let mut idx = 0usize;
     while idx < program.items.len() {
@@ -141,6 +150,59 @@ pub fn check_program_with_roots(
     Ok(checked)
 }
 
+fn check_default_exprs(program: &mut Program, checked: &mut CheckedProgram) -> Result<(), String> {
+    for item in &mut program.items {
+        match &mut item.kind {
+            ItemKind::Struct { name, type_params, fields, .. } if type_params.is_empty() => {
+                let sid = checked.struct_by_name[name];
+                for (i, f) in fields.iter_mut().enumerate() {
+                    if let Some(def_expr) = &mut f.default {
+                        let expected = checked.structs[sid].fields[i].ty.clone();
+                        let mut tc = Checker {
+                            checked,
+                            scopes: vec![HashMap::new()],
+                            current_return: Type::Void,
+                            loop_depth: 0,
+                        };
+                        tc.check_expr(def_expr, Some(&expected))?;
+                        if !def_expr.ty.is_assignable_to(&expected) {
+                            return Err(format!(
+                                "Default value for field '{}.{}' expected {}, got {}",
+                                name, f.name, expected, def_expr.ty
+                            ));
+                        }
+                        checked.structs[sid].fields[i].default = Some(def_expr.clone());
+                    }
+                }
+            }
+            ItemKind::Func { name, type_params, params, .. } if type_params.is_empty() => {
+                let fid = checked.func_by_name[name] as usize;
+                for (i, p) in params.iter_mut().enumerate() {
+                    if let Some(def_expr) = &mut p.default {
+                        let expected = checked.funcs[fid].params[i].clone();
+                        let mut tc = Checker {
+                            checked,
+                            scopes: vec![HashMap::new()],
+                            current_return: Type::Void,
+                            loop_depth: 0,
+                        };
+                        tc.check_expr(def_expr, Some(&expected))?;
+                        if !def_expr.ty.is_assignable_to(&expected) {
+                            return Err(format!(
+                                "Default value for parameter '{}' of '{}' expected {}, got {}",
+                                p.name, name, expected, def_expr.ty
+                            ));
+                        }
+                        checked.funcs[fid].defaults[i] = Some(def_expr.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 pub(crate) struct Checker<'a> {
     pub(crate) checked: &'a mut CheckedProgram,
     scopes: Vec<HashMap<String, Type>>,
@@ -161,6 +223,10 @@ impl<'a> Checker<'a> {
         if let Some(top) = self.scopes.last_mut() {
             top.insert(name, ty);
         }
+    }
+
+    pub(crate) fn is_local(&self, name: &str) -> bool {
+        self.scopes.iter().any(|scope| scope.contains_key(name))
     }
 
     pub(crate) fn lookup(&self, name: &str) -> Option<Type> {
@@ -501,13 +567,28 @@ impl<'a> Checker<'a> {
                     Type::Optional(t) => (**t).clone(),
                     other => return Err(format!("Cannot use '?.' on {}", other)),
                 };
-                if let Type::Custom(tid) = inner
-                    && let Some(&sid) = self.checked.struct_by_name.get(&tid.name)
-                    && let Some(f) = self.checked.structs[sid].field(field)
-                {
-                    Type::Optional(Box::new(f.ty.clone()))
+                let field_ty = match &inner {
+                    Type::Custom(tid) => match &tid.module {
+                        ModuleId::Program => {
+                            let sid = self.checked.struct_by_name.get(&tid.name).ok_or_else(|| {
+                                format!("Unknown struct '{}' on optional field '.{}'", tid, field)
+                            })?;
+                            self.checked.structs[*sid]
+                                .field(field)
+                                .map(|f| f.ty.clone())
+                                .ok_or_else(|| format!("Type '{}' has no field '{}'", tid, field))?
+                        }
+                        ModuleId::Native(_) | ModuleId::Builtin => {
+                            native_member_field(tid, field)?.0
+                        }
+                        _ => return Err(format!("Cannot use '?.' on {}", inner)),
+                    },
+                    _ => return Err(format!("Unknown optional field '.{}'", field)),
+                };
+                if matches!(field_ty, Type::Optional(_)) {
+                    field_ty
                 } else {
-                    return Err(format!("Unknown optional field '.{}'", field));
+                    Type::Optional(Box::new(field_ty))
                 }
             }
             ExprKind::Index { target, index } => {
