@@ -215,6 +215,7 @@ pub(crate) fn register_program_types(
                 || checked.val_direct_fns.contains_key(name)
                 || checked.env_direct_fns.contains_key(name)
                 || checked.cli_direct_fns.contains_key(name)
+                || checked.fs_direct_fns.contains_key(name)
             {
                 return Err(format!("Function '{}' conflicts with imported identifier", name));
             }

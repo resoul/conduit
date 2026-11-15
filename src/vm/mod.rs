@@ -1,10 +1,12 @@
 pub mod exec;
 pub(crate) mod exec_cold;
+pub(crate) mod exec_fs;
 pub(crate) mod exec_map;
 pub(crate) mod exec_union;
 pub mod opcode;
 pub mod pipeline;
 pub(crate) mod pipeline_leaf;
+pub mod string;
 pub mod value;
 #[cfg(test)]
 mod tests;
@@ -50,6 +52,8 @@ pub struct Vm {
     pub objs: Vec<Obj>,
     pub(crate) frames: Vec<CallFrame>,
     pub script_args: Option<Vec<String>>,
+    pub(crate) fs_readers: Vec<Option<std::io::BufReader<std::fs::File>>>,
+    pub(crate) fs_writers: Vec<Option<std::io::BufWriter<std::fs::File>>>,
 }
 
 impl Vm {
@@ -59,6 +63,8 @@ impl Vm {
             objs: vec![Obj::Empty; 4096],
             frames: Vec::with_capacity(MAX_CALL_DEPTH),
             script_args: None,
+            fs_readers: Vec::new(),
+            fs_writers: Vec::new(),
         }
     }
 

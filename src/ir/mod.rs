@@ -10,7 +10,7 @@ use std::fmt::Write;
 
 use crate::vm::opcode::{
     EXT_CLI_HELP, EXT_CLI_PARSE, EXT_CLI_PARSE_ARGS, EXT_ENV_ARGS, EXT_ENV_GET, EXT_ENV_LOAD,
-    EXT_ENV_REQUIRE, EXT_FLOAT_CEIL, EXT_FLOAT_MATH, EXT_INT_MATH, EXT_LIST_FIRST,
+    EXT_ENV_REQUIRE, EXT_FLOAT_CEIL, EXT_FLOAT_MATH, EXT_FS_BINARY, EXT_FS_UNARY, EXT_INT_MATH, EXT_LIST_FIRST,
     EXT_LIST_IS_EMPTY, EXT_LIST_LAST, EXT_LIST_SORT, EXT_MAP_CONTAINS_KEY, EXT_MAP_ENTRIES,
     EXT_MAP_FROM, EXT_MAP_GET, EXT_MAP_INDEX, EXT_MAP_KEYS, EXT_MAP_REMOVE, EXT_MAP_SET,
     EXT_MAP_VALUES, EXT_PRINT_OBJ, EXT_PRINT_SCALAR, EXT_STR_IS_EMPTY, EXT_STR_PRED, EXT_STR_SPLIT,
@@ -666,6 +666,23 @@ impl Module {
                                 check_o(c, &ctx)?;
                                 if (b as usize) >= self.cli_plans.len() {
                                     return Err(format!("{}: cli_plan {} out of bounds", ctx, b));
+                                }
+                            }
+                            EXT_FS_UNARY => {
+                                if matches!(aux, 2..=4) {
+                                    check_s(a, &ctx)?;
+                                } else {
+                                    check_o(a, &ctx)?;
+                                }
+                                check_o(b, &ctx)?;
+                            }
+                            EXT_FS_BINARY => {
+                                check_o(a, &ctx)?;
+                                check_o(b, &ctx)?;
+                                if aux == 7 {
+                                    check_s(c, &ctx)?;
+                                } else {
+                                    check_o(c, &ctx)?;
                                 }
                             }
                             _ => return Err(format!("Invalid ExtOp kind {}", kind)),

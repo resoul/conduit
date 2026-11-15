@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod env;
+pub mod fs;
 pub mod json_decode;
 pub mod json_encode;
 pub(crate) mod json_lexer;

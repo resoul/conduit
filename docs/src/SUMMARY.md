@@ -25,6 +25,7 @@
 - [cdt.validation](library/validation.md)
 - [cdt.env](library/env.md)
 - [cdt.cli](library/cli.md)
+- [cdt.fs: reading and buffered writing](library/fs.md)
 
 # Practical Guides
 - [Working with Errors](guides/working-with-errors.md)

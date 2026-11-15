@@ -7,5 +7,6 @@ RUN conduit build main.cdt -o /app/worker
 
 FROM scratch
 COPY --from=builder /app/worker /worker
+COPY events.json notes.txt ./
 ENTRYPOINT ["/worker"]
 CMD ["--help"]

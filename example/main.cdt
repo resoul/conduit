@@ -1,6 +1,7 @@
 import cli from "cdt.cli"
 import { CliError } from "cdt.cli"
 import { EnvError } from "cdt.env"
+import * as fs from "cdt.fs"
 import { ValidationError } from "cdt.validation"
 import { DecodeError, EncodeError } from "cdt.json"
 import { TimeError } from "cdt.time"
@@ -10,16 +11,16 @@ import { process_events } from "./pipeline"
 cli Worker "Conduit starter worker" {
     flag verbose "v" "Print detailed status"
     cmd check "Validate environment configuration"
-    cmd run "Process sample JSON events" {
+    cmd run "Process JSON events from a file" {
         opt min_score: Int "m" "Override MIN_SCORE threshold" = -1
+        opt file: String "f" "Path to JSON events file" = "events.json"
+    }
+    cmd stream "Stream lines from a text file" {
+        opt file: String "f" "Path to text file" = "notes.txt"
     }
 }
 
-func sample_payload() -> String {
-    return "[{\"id\":1,\"user\":\"alice\",\"score\":80},{\"id\":2,\"user\":\"bob\",\"score\":30},{\"id\":3,\"user\":\"carol\",\"score\":95}]"
-}
-
-func run_app() -> String | CliError | EnvError | ValidationError | DecodeError | EncodeError | TimeError {
+func run_app() -> String | CliError | EnvError | fs.FsError | ValidationError | DecodeError | EncodeError | TimeError {
     app := cli.parse<Worker>()?
     cfg := load_config()?
 
@@ -35,9 +36,20 @@ func run_app() -> String | CliError | EnvError | ValidationError | DecodeError |
                 threshold = r.min_score
             }
             if app.verbose {
-                print("[worker] env={cfg.app_env} threshold={threshold}")
+                print("[worker] env={cfg.app_env} threshold={threshold} file={r.file}")
             }
-            return process_events(sample_payload(), cfg.app_env, cfg.tag, threshold)?
+            raw_json := fs.read_text(r.file)?
+            return process_events(raw_json, cfg.app_env, cfg.tag, threshold)?
+    }
+
+    switch app.stream {
+        case Worker_stream(s):
+            count := fs.each_line(s.file, (line: String) => {
+                if app.verbose {
+                    print("[stream] {line}")
+                }
+            })?
+            return "streamed {count} line(s) from {s.file}"
     }
 
     return cli.help<Worker>()
@@ -51,6 +63,8 @@ func main() -> Void {
             print(e.message)
         case EnvError(e):
             print("Env error [{e.name}]: {e.message}")
+        case fs.FsError(e):
+            print("FS error [{e.kind}] {e.path}: {e.message}")
         case ValidationError(e):
             print("Validation error: {e.issues.len()} issue(s)")
         case DecodeError(e):
