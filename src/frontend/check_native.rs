@@ -13,6 +13,7 @@ pub(crate) fn is_valid_native_type(mod_name: &str, ty_name: &str) -> bool {
         "cdt.validation" => matches!(ty_name, "Issue" | "Violation" | "ValidationError"),
         "cdt.env" => ty_name == "EnvError",
         "cdt.cli" => ty_name == "CliError",
+        "cdt.fs" => matches!(ty_name, "FsError" | "Reader" | "Writer"),
         _ => false,
     }
 }
@@ -121,6 +122,27 @@ pub(crate) fn register_native_imports(
                     }
                 }
             }
+            "cdt.fs" => {
+                if let Some(a) = alias {
+                    checked.fs_aliases.insert(a.clone());
+                }
+                for spec in names {
+                    match spec.name.as_str() {
+                        "read_text" | "write_text" | "append_text" | "write_atomic"
+                        | "read_lines" | "each_line" | "exists" | "is_file" | "is_dir" | "size"
+                        | "list_dir" | "mkdir_all" | "remove" | "copy" | "rename"
+                        | "open_read" | "open_write" | "open_append" => {
+                            insert_unique(&mut checked.fs_direct_fns, &spec.alias, &spec.name)?;
+                        }
+                        "FsError" | "Reader" | "Writer" => {
+                            checked.fs_direct_types.insert(spec.alias.clone(), spec.name.clone());
+                        }
+                        other => {
+                            return Err(format!("Module 'cdt.fs' has no exported member '{}'", other));
+                        }
+                    }
+                }
+            }
             other => return Err(format!("Unknown or unlinked module '{}'", other)),
         }
     }
@@ -182,6 +204,10 @@ pub fn resolve_type_expr(te: &TypeExpr, checked: &CheckedProgram) -> Result<Type
                 "cdt.cli",
                 &checked.cli_direct_types[name],
             ))),
+            _ if checked.fs_direct_types.contains_key(name) => Ok(Type::Custom(TypeId::native(
+                "cdt.fs",
+                &checked.fs_direct_types[name],
+            ))),
             _ if name.contains('.') => {
                 let mut parts = name.splitn(2, '.');
                 let alias = parts.next().unwrap_or("");
@@ -196,6 +222,8 @@ pub fn resolve_type_expr(te: &TypeExpr, checked: &CheckedProgram) -> Result<Type
                     "cdt.env"
                 } else if checked.cli_aliases.contains(alias) {
                     "cdt.cli"
+                } else if checked.fs_aliases.contains(alias) {
+                    "cdt.fs"
                 } else {
                     return Err(format!("Unknown type '{}'", name));
                 };
@@ -297,6 +325,7 @@ pub(crate) fn is_error_type(ty: &Type, checked: &CheckedProgram) -> bool {
             "cdt.validation" => matches!(name.as_str(), "Issue" | "ValidationError"),
             "cdt.env" => name == "EnvError",
             "cdt.cli" => name == "CliError",
+            "cdt.fs" => name == "FsError",
             _ => false,
         },
         Type::Custom(TypeId {
@@ -375,6 +404,9 @@ pub(crate) fn native_member_field(tid: &TypeId, field: &str) -> Result<(Type, u1
         ("cdt.env", "EnvError", "message") => Ok((Type::String, 1)),
         ("cdt.cli", "CliError", "kind") => Ok((Type::String, 0)),
         ("cdt.cli", "CliError", "message") => Ok((Type::String, 1)),
+        ("cdt.fs", "FsError", "kind") => Ok((Type::String, 0)),
+        ("cdt.fs", "FsError", "path") => Ok((Type::String, 1)),
+        ("cdt.fs", "FsError", "message") => Ok((Type::String, 2)),
         _ => Err(format!("Type '{}' has no field '{}'", tid, field)),
     }
 }
@@ -657,13 +689,16 @@ impl<'a> Checker<'a> {
     }
 
     pub(crate) fn check_native_method(
-        &self,
+        &mut self,
         tid: &TypeId,
         method: &str,
-        args: &[Expr],
+        args: &mut [Expr],
     ) -> Result<Type, String> {
         let terr = Type::Custom(TypeId::native("cdt.time", "TimeError"));
         match (tid.module.clone(), tid.name.as_str(), method) {
+            (ModuleId::Native(ref m), _, _) if m == "cdt.fs" => {
+                self.check_fs_method(&tid.name, method, args)
+            }
             (ModuleId::Native(ref m), "Timestamp", "unix_seconds" | "unix_milliseconds")
                 if m == "cdt.time" =>
             {

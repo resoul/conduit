@@ -5,6 +5,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
+## [Unreleased]
+
+### Added
+
+* **`cdt.fs` Standard Library Module (Basic & Streaming File I/O)**:
+  * Added basic file and directory operations: `read_text`, `write_text`, `append_text`, `write_atomic` (temp-file + rename), `read_lines`, `exists`, `is_file`, `is_dir`, `size`, `list_dir`, `mkdir_all`, `remove`, `copy`, and `rename`, returning `FsError { kind, path, message }` on I/O failures.
+  * Added high-throughput streaming operations backed by 64 KB `BufReader`/`BufWriter` VM handles: `open_read` -> `Reader` (`read_line`, `read_chunk`, `close`), `open_write` / `open_append` -> `Writer` (`write`, `write_line`, `flush`, `close`), and `each_line(path, cb)` for zero-list-allocation line streaming.
+  * Added `cdt.fs` type-checking (`src/frontend/check_fs.rs`), IR lowering (`EXT_FS_UNARY`, `EXT_FS_BINARY`), VM execution (`src/native/fs.rs`, `src/vm/exec_fs.rs`), LSP hover/completion docs (`src/lsp_docs.rs`), and end-to-end tests (`cdt_fs_basic_and_streaming`).
+
+### Fixed & Optimized
+
+* **Streaming Performance & UTF-8 Safety (`cdt.fs`)**:
+  * Reused `Arc<String>` line buffers across `fs.each_line` iterations when not retained by the callback, and pre-sized `Vec` capacity in `fs.read_lines`.
+  * Implemented zero-zeroing `BufRead::fill_buf()` fast-paths in `Reader.read_line` and `Reader.read_chunk`, with safe multi-byte UTF-8 boundary handling so chunks never fail mid-character.
+  * Added `sync_frame_ptrs!()` after `Op::ExtOp` in the VM dispatch loop (`src/vm/exec.rs`) to keep cached frame pointers valid when native callbacks grow the VM stack.
+
 ## [0.2.4] - 2026-11-15
 
 ### Added & Improved

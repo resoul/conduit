@@ -59,7 +59,7 @@ impl<'a> JsonDecoder<'a> {
             PlanNode::Pending => unreachable!("decode plan compilation left an unfinished node"),
             PlanNode::String => {
                 let s = self.parse_string_owned("String", depth)?;
-                Ok(Obj::Str(Arc::new(s)))
+                Ok(Obj::str(s))
             }
             PlanNode::Optional(inner) => {
                 self.skip_ws();
@@ -188,7 +188,7 @@ impl<'a> JsonDecoder<'a> {
             let val = self
                 .parse_string_owned("String", depth + 1)
                 .map_err(|e| err_at_index(idx, e))?;
-            items.push(Obj::Str(Arc::new(val)));
+            items.push(Obj::str(val));
             self.skip_ws();
             match self.peek() {
                 Some(b',') => {
@@ -292,7 +292,7 @@ impl<'a> JsonDecoder<'a> {
                 _ => self.decode_node(plan, val_plan, depth + 1).map(MapVal::Obj),
             };
             let decoded = decoded_res.map_err(|e| err_at_field(&key, e))?;
-            map.set(MapKey::Str(Arc::new(key.clone())), decoded);
+            map.set(MapKey::Str(Arc::new(key.clone().into())), decoded);
             self.skip_ws();
             match self.peek() {
                 Some(b',') => {
@@ -377,7 +377,7 @@ impl<'a> JsonDecoder<'a> {
                     }),
                     FieldDecodeKind::Str(slot) => {
                         self.parse_string_owned("String", depth + 1).map(|s| {
-                            rec.set_obj(slot as usize, Obj::Str(Arc::new(s)));
+                            rec.set_obj(slot as usize, Obj::str(s));
                         })
                     }
                     FieldDecodeKind::OptStr(slot) => {
@@ -388,7 +388,7 @@ impl<'a> JsonDecoder<'a> {
                             Ok(())
                         } else {
                             self.parse_string_owned("String", depth + 1).map(|s| {
-                                rec.set_obj(slot as usize, Obj::Str(Arc::new(s)));
+                                rec.set_obj(slot as usize, Obj::str(s));
                             })
                         }
                     }

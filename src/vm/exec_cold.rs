@@ -490,7 +490,7 @@ impl Vm {
                 let mut s = String::with_capacity(a.len() + b.len());
                 s.push_str(a);
                 s.push_str(b);
-                Obj::Str(Arc::new(s))
+                Obj::str(s)
             }
             _ => return Err(err_msg("Expected Str operands in StrConcat")),
         };
@@ -671,7 +671,7 @@ impl Vm {
             encode_json_obj(&src_val, &module.struct_schemas)
                 .map_err(|e| err_msg(&e.to_string()))?
         };
-        self.objs[dst_slot] = Obj::Str(Arc::new(encoded));
+        self.objs[dst_slot] = Obj::str(encoded);
         Ok(())
     }
 }

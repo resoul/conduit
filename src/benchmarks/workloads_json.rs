@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use crate::benchmarks::{Workload, WorkloadState};
 use crate::frontend::compile_source;
 use crate::ir::Module;
@@ -168,7 +166,7 @@ fn setup_decode(count: usize, expected_bytes: usize) -> WorkloadState {
         bench_func: func_id,
         verify_func: func_id,
         scalar_args: vec![],
-        obj_args: vec![Obj::Str(Arc::new(raw))],
+        obj_args: vec![Obj::str(raw)],
         expected_per_op: count as i64,
         after_check: Some(Box::new(move |objs| match &objs[0] {
             Obj::Str(s) if s.len() == expected_bytes => Ok(()),
@@ -249,7 +247,7 @@ fn setup_json_etl(count: usize, expected_raw_bytes: usize) -> WorkloadState {
         bench_func: func_id,
         verify_func: func_id,
         scalar_args: vec![],
-        obj_args: vec![Obj::Str(Arc::new(raw))],
+        obj_args: vec![Obj::str(raw)],
         expected_per_op: expected_etl_bytes,
         after_check: Some(Box::new(move |objs| match &objs[0] {
             Obj::Str(s) if s.len() == expected_raw_bytes => Ok(()),

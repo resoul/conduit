@@ -657,8 +657,11 @@ impl Vm {
                 | Op::ListEnumerate { .. }
                 | Op::ListJoin { .. }
                 | Op::TupleGetScalar { .. }
-                | Op::TupleGetObj { .. }
-                | Op::ExtOp { .. }) => self.exec_ext_op(module, s_base, o_base, op)?,
+                | Op::TupleGetObj { .. }) => self.exec_ext_op(module, s_base, o_base, op)?,
+                Op::ExtOp { .. } => {
+                    self.exec_ext_op(module, s_base, o_base, op)?;
+                    sync_frame_ptrs!();
+                }
             }
         }
     }

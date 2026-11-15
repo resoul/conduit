@@ -1,0 +1,3 @@
+2026-11-15T23:00:00Z INFO worker started
+2026-11-15T23:00:01Z INFO loaded config from env
+2026-11-15T23:00:02Z INFO streaming events with cdt.fs

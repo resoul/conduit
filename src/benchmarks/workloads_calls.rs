@@ -7,7 +7,7 @@ use crate::vm::Vm;
 use crate::vm::value::{ListStorage, MapKey, MapVal, Obj, OrderedMap, StructData};
 
 pub fn make_rows_obj(size: usize) -> Obj {
-    let label = Arc::new("A record with a nontrivial string payload: București".to_string());
+    let label = Arc::new("A record with a nontrivial string payload: București".into());
     let tags = Obj::List(ListStorage::Obj(Arc::new(vec![
         Obj::str("benchmark"),
         Obj::str("collections"),

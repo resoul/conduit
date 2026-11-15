@@ -6,7 +6,8 @@ use crate::native::env::{exec_env_load, make_env_error};
 use crate::vm::exec_union::list_get_or_index;
 use crate::vm::opcode::{
     EXT_CLI_HELP, EXT_CLI_PARSE, EXT_CLI_PARSE_ARGS, EXT_ENV_ARGS, EXT_ENV_GET, EXT_ENV_LOAD,
-    EXT_ENV_REQUIRE, EXT_FLOAT_CEIL, EXT_FLOAT_MATH, EXT_INT_MATH, EXT_LIST_FIRST,
+    EXT_ENV_REQUIRE, EXT_FLOAT_CEIL, EXT_FLOAT_MATH, EXT_FS_BINARY, EXT_FS_UNARY, EXT_INT_MATH,
+    EXT_LIST_FIRST,
     EXT_LIST_IS_EMPTY, EXT_LIST_LAST, EXT_LIST_SORT, EXT_MAP_CONTAINS_KEY, EXT_MAP_ENTRIES,
     EXT_MAP_FROM, EXT_MAP_GET, EXT_MAP_INDEX, EXT_MAP_KEYS, EXT_MAP_REMOVE, EXT_MAP_SET,
     EXT_MAP_VALUES, EXT_PRINT_OBJ, EXT_PRINT_SCALAR, EXT_STR_IS_EMPTY, EXT_STR_PRED, EXT_STR_SPLIT,
@@ -17,6 +18,7 @@ use crate::vm::value::{
     SCHEMA_BOXED_INT, SCHEMA_KEY_ERROR, SCHEMA_PARSE_ERROR, StructData, format_float,
 };
 use crate::vm::{RuntimeError, Vm};
+use crate::vm::string::VmString;
 
 impl Vm {
     #[cold]
@@ -198,7 +200,7 @@ impl Vm {
                     let Obj::Str(s) = item else {
                         return Err(err_msg("Expected String element in cli.parse_args()"));
                     };
-                    args.push(s.as_ref().clone());
+                    args.push(s.as_str().to_owned());
                 }
                 self.objs[o_base + a as usize] = exec_cli_parse(plan, &args);
             }
@@ -209,6 +211,12 @@ impl Vm {
                     .ok_or_else(|| err_msg("Missing CliPlan"))?;
                 let root = plan.nodes.first().map(|n| vec![n.name.clone()]).unwrap_or_default();
                 self.objs[o_base + a as usize] = Obj::str(format_cli_help(plan, 0, &root));
+            }
+            EXT_FS_UNARY => {
+                self.exec_fs_unary(s_base, o_base, aux, a, b)?;
+            }
+            EXT_FS_BINARY => {
+                self.exec_fs_binary(module, s_base, o_base, aux, a, b, c)?;
             }
             EXT_STR_TO_INT => {
                 let Obj::Str(s) = &self.objs[o_base + b as usize] else {
@@ -377,7 +385,7 @@ impl Vm {
     }
 }
 
-fn make_parse_error(value: Arc<String>, message: String) -> Obj {
+fn make_parse_error(value: Arc<VmString>, message: String) -> Obj {
     let mut rec = StructData::new(SCHEMA_PARSE_ERROR, 0, 2);
     rec.inline_objs[0] = Obj::Str(value);
     rec.inline_objs[1] = Obj::str(message);

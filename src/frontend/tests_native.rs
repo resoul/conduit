@@ -506,3 +506,365 @@ export func get_help() -> String {
     let Obj::Str(hs) = h else { panic!("expected Str") };
     assert!(hs.contains("db") && hs.contains("run"), "got {}", hs);
 }
+
+#[test]
+fn cdt_fs_basic_and_streaming() {
+    let dir = std::env::temp_dir().join(format!("conduit_fs_test_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let dir_str = dir.to_string_lossy().replace('\\', "/");
+
+    let src = r#"
+        import * as fs from "cdt.fs"
+
+        export func test_basic(base: String) -> String | fs.FsError {
+            fs.mkdir_all(base + "/sub")?
+            p := base + "/sub/hello.txt"
+            fs.write_text(p, "hello")?
+            fs.append_text(p, " world")?
+            txt := fs.read_text(p)?
+            sz := fs.size(p)?
+
+            ap := base + "/atomic.txt"
+            fs.write_atomic(ap, "line1\nline2\n")?
+            lines := fs.read_lines(ap)?
+
+            cp := base + "/copy.txt"
+            fs.copy(ap, cp)?
+            rn := base + "/renamed.txt"
+            fs.rename(cp, rn)?
+
+            entries := fs.list_dir(base)?
+            ex := fs.exists(rn)
+            isf := fs.is_file(rn)
+            isd := fs.is_dir(base + "/sub")
+
+            each_out := base + "/each_out.txt"
+            ew := fs.open_write(each_out)?
+            n := fs.each_line(rn, (ln: String) => {
+                ew.write(ln + ";")
+            })?
+            ew.close()
+            each_res := fs.read_text(each_out)?
+            fs.remove(each_out)?
+
+            fs.remove(rn)?
+            after_rm := fs.exists(rn)
+
+            return txt + ":" + sz.to_string() + ":" + lines.len().to_string() + ":" + entries.len().to_string() + ":" + ex.to_string() + ":" + isf.to_string() + ":" + isd.to_string() + ":" + n.to_string() + ":" + each_res + ":" + after_rm.to_string()
+        }
+
+        export func test_streaming(base: String) -> String | fs.FsError {
+            sp := base + "/stream.txt"
+            w := fs.open_write(sp)?
+            w.write("a")?
+            w.write_line("b")?
+            w.write_line("cd")?
+            w.flush()?
+            w.close()
+
+            wa := fs.open_append(sp)?
+            wa.write_line("ef")?
+            wa.close()
+
+            r := fs.open_read(sp)?
+            out := ""
+            while true {
+                maybe := r.read_line()
+                switch maybe {
+                    case nil:
+                        break
+                    case fs.FsError(e):
+                        r.close()
+                        return e
+                    case String(s):
+                        out = out + s + "|"
+                }
+            }
+            r.close()
+
+            r2 := fs.open_read(sp)?
+            c1 := r2.read_chunk(3)
+            c2 := r2.read_chunk(100)
+            c3 := r2.read_chunk(10)
+            r2.close()
+
+            s1 := ""
+            switch c1 {
+                case nil:
+                    s1 = "NIL"
+                case fs.FsError(e):
+                    return e
+                case String(s):
+                    s1 = s
+            }
+            s2 := ""
+            switch c2 {
+                case nil:
+                    s2 = "NIL"
+                case fs.FsError(e):
+                    return e
+                case String(s):
+                    s2 = s
+            }
+            s3 := ""
+            switch c3 {
+                case nil:
+                    s3 = "NIL"
+                case fs.FsError(e):
+                    return e
+                case String(s):
+                    s3 = s
+            }
+
+            return out + "::" + s1.len().to_string() + ":" + s2.len().to_string() + ":" + s3
+        }
+
+        export func test_utf8_chunks(base: String) -> String | fs.FsError {
+            up := base + "/utf8.txt"
+            fs.write_text(up, "Привет🦀мир")?
+            r := fs.open_read(up)?
+            acc := ""
+            while true {
+                ch := r.read_chunk(3)
+                switch ch {
+                    case nil:
+                        break
+                    case fs.FsError(e):
+                        r.close()
+                        return e
+                    case String(s):
+                        acc = acc + s + "|"
+                }
+            }
+            r.close()
+            return acc
+        }
+
+        export func test_error(base: String) -> String {
+            res := fs.read_text(base + "/does_not_exist.txt")
+            switch res {
+                case String(s):
+                    return "unexpected:" + s
+                case fs.FsError(e):
+                    return e.kind
+            }
+        }
+        "#;
+
+    let module = crate::frontend::compile_source(src).expect("compile cdt.fs test");
+    let f_basic_orig = module.func_id("test_basic").unwrap();
+    let bytes = crate::ir::bundle::encode_bundle(&module, f_basic_orig, 1).expect("encode");
+    let (decoded, _, _) = crate::ir::bundle::decode_bundle(&bytes).expect("decode");
+
+    let mut vm = Vm::new();
+    let f_basic = decoded.func_id("test_basic").unwrap();
+    let f_stream = decoded.func_id("test_streaming").unwrap();
+    let f_utf8 = decoded.func_id("test_utf8_chunks").unwrap();
+    let f_err = decoded.func_id("test_error").unwrap();
+
+    let r_basic = vm.call_obj(&decoded, f_basic, &[], &[Obj::str(&dir_str)]).unwrap();
+    assert_eq!(
+        r_basic,
+        Obj::str("hello world:11:2:3:true:true:true:2:line1;line2;:false")
+    );
+
+    let r_stream = vm.call_obj(&decoded, f_stream, &[], &[Obj::str(&dir_str)]).unwrap();
+    assert_eq!(r_stream, Obj::str("ab|cd|ef|::3:6:NIL"));
+
+    let r_utf8 = vm.call_obj(&decoded, f_utf8, &[], &[Obj::str(&dir_str)]).unwrap();
+    assert_eq!(r_utf8, Obj::str("П|р|и|в|е|т|🦀|м|и|р|"));
+
+    let r_err = vm.call_obj(&decoded, f_err, &[], &[Obj::str(&dir_str)]).unwrap();
+    assert_eq!(r_err, Obj::str("not_found"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cdt_fs_write_lines_roundtrip_and_closed_writer() {
+    let path = std::env::temp_dir().join(format!(
+        "conduit_fs_write_lines_test_{}.txt",
+        std::process::id()
+    ));
+    let src = r#"
+        import * as fs from "cdt.fs"
+
+        export func write(path: String, lines: [String]) -> Void | fs.FsError {
+            w := fs.open_write(path)?
+            w.write("prefix:")?
+            w.write_lines([])?
+            w.write_lines(lines)?
+            w.write_line("tail")?
+            w.flush()?
+            w.close()
+        }
+
+        export func append(path: String) -> Void | fs.FsError {
+            w := fs.open_append(path)?
+            w.write_lines(["appended", ""])?
+            w.flush()?
+            w.close()
+        }
+
+        export func closed(path: String, lines: [String]) -> String | fs.FsError {
+            w := fs.open_append(path)?
+            w.close()
+            switch w.write_lines(lines) {
+                case Void(_): return "unexpected success"
+                case fs.FsError(e): return e.kind
+            }
+        }
+
+        export func write_existing(w: fs.Writer, lines: [String]) -> Void | fs.FsError {
+            w.write_lines(lines)?
+        }
+
+        export func propagate(path: String) -> Void | fs.FsError {
+            w := fs.open_append(path)?
+            w.close()
+            w.write_lines(["must not be written"])?
+        }
+    "#;
+    let module = compile_source(src).expect("compile write_lines");
+    let bytes = crate::ir::bundle::encode_bundle(
+        &module,
+        module.func_id("write").unwrap(),
+        crate::ir::bundle::RET_OBJ,
+    )
+    .unwrap();
+    let (module, _, _) = crate::ir::bundle::decode_bundle(&bytes).unwrap();
+    let path_obj = Obj::str(path.to_string_lossy().into_owned());
+    let lines = vec![
+        "hello".to_string(),
+        String::new(),
+        "Привет 🌍".to_string(),
+        "embedded\nnewline\r\n".to_string(),
+        "long".repeat(32 * 1024),
+    ];
+    let values: Vec<Obj> = lines.iter().map(Obj::str).collect();
+    let shared = Arc::new(values);
+    let lines_obj = Obj::List(ListStorage::Obj(Arc::clone(&shared)));
+    let mut vm = Vm::new();
+    assert_eq!(
+        vm.call_obj(
+            &module,
+            module.func_id("write").unwrap(),
+            &[],
+            &[path_obj.clone(), lines_obj.clone()],
+        )
+        .unwrap(),
+        Obj::Empty
+    );
+    let mut expected = format!("prefix:{}\ntail\n", lines.join("\n"));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    assert_eq!(shared.as_ref(), &lines.iter().map(Obj::str).collect::<Vec<_>>());
+
+    assert_eq!(
+        vm.call_obj(&module, module.func_id("append").unwrap(), &[], &[path_obj.clone()])
+            .unwrap(),
+        Obj::Empty
+    );
+    expected.push_str("appended\n\n");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    for input in [lines_obj, Obj::List(ListStorage::Obj(Arc::new(Vec::new())))] {
+        assert_eq!(
+            vm.call_obj(
+                &module,
+                module.func_id("closed").unwrap(),
+                &[],
+                &[path_obj.clone(), input],
+            )
+            .unwrap(),
+            Obj::str("io")
+        );
+    }
+    let error = vm
+        .call_obj(&module, module.func_id("propagate").unwrap(), &[], &[path_obj])
+        .unwrap();
+    assert!(matches!(error, Obj::Record(ref rec) if rec.schema_id == crate::vm::value::SCHEMA_FS_ERROR));
+
+    // A read-only file descriptor makes the batch hit a real I/O error, even
+    // though the writer handle is open. A tiny buffer forces the error now.
+    let id = vm.fs_writers.len();
+    vm.fs_writers.push(Some(std::io::BufWriter::with_capacity(
+        1,
+        std::fs::File::open(&path).unwrap(),
+    )));
+    let error = vm
+        .call_obj(
+            &module,
+            module.func_id("write_existing").unwrap(),
+            &[],
+            &[
+                crate::native::fs::make_writer_handle(id),
+                Obj::List(ListStorage::Obj(shared)),
+            ],
+        )
+        .unwrap();
+    assert!(matches!(error, Obj::Record(ref rec) if rec.schema_id == crate::vm::value::SCHEMA_FS_ERROR));
+    vm.fs_writers[id] = None;
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn cdt_fs_write_lines_rejects_invalid_arguments() {
+    for args in ["", "\"text\"", "[1, 2]", "[\"ok\", 1]", "[\"a\"], [\"b\"]"] {
+        let src = format!(
+            "import * as fs from \"cdt.fs\"\n\
+             func f(w: fs.Writer) -> Void | fs.FsError {{ w.write_lines({args})? }}"
+        );
+        assert!(check_source(&src).is_err(), "accepted write_lines({args})");
+    }
+}
+
+#[test]
+fn cdt_fs_shared_lines_string_map_json_and_bundle_interop() {
+    let path = std::env::temp_dir().join(format!("conduit_shared_lines_{}.txt", std::process::id()));
+    std::fs::write(&path, "beta\r\nalpha\n42\n").unwrap();
+    let lines = crate::native::fs::read_lines(path.to_str().unwrap());
+    std::fs::remove_file(&path).unwrap();
+    let src = r#"
+        import * as json from "cdt.json"
+
+        export func exercise(lines: [String]) -> String {
+            first := lines[0]?
+            second := lines[1]?
+            m := Map<String, Int>()
+            m.set(first, 7)
+            m.set("beta", 9)
+            m.set("alpha", 11)
+            n := m[second]?
+            sorted := lines.sort()
+            encoded := json.encode(lines)?
+            decoded := json.decode<[String]>(encoded)?
+            number_text := lines[2]?
+            number := number_text.to_int()?
+            same := first == "beta"
+            joined := sorted.join(",")
+            replaced := first.replace("b", "B")
+            map_len := m.len()
+            value := m[first]?
+            roundtrip := decoded == lines
+            combined := first + second
+            return "{map_len}:{n}:{value}:{same}:{joined}:{roundtrip}:{number}:{replaced}:{combined}"
+        }
+
+        export func constant() -> String { return "placeholder" }
+    "#;
+    let mut module = compile_source(src).unwrap();
+    let mut vm = Vm::new();
+    assert_eq!(
+        vm.call_obj(&module, module.func_id("exercise").unwrap(), &[], &[lines.clone()]).unwrap(),
+        Obj::str("2:11:9:true:42,alpha,beta:true:42:Beta:betaalpha")
+    );
+    let Obj::List(ListStorage::Obj(items)) = &lines else { panic!("expected lines") };
+    let retained = items[0].clone();
+    drop(lines);
+    let constant = module.obj_consts.iter_mut().find(|obj| **obj == Obj::str("placeholder")).unwrap();
+    *constant = retained;
+    let fid = module.func_id("constant").unwrap();
+    let encoded = crate::ir::bundle::encode_bundle(&module, fid, crate::ir::bundle::RET_OBJ).unwrap();
+    let (decoded, entry, _) = crate::ir::bundle::decode_bundle(&encoded).unwrap();
+    assert_eq!(vm.call_obj(&decoded, entry, &[], &[]).unwrap(), Obj::str("beta"));
+}

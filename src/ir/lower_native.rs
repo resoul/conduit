@@ -4,20 +4,28 @@ use crate::frontend::check_native::{native_member_field, scalar_kind};
 use crate::frontend::types::{ModuleId, Type, TypeId};
 use crate::ir::lower::FnLowerer;
 use crate::ir::{FunctionProto, RecordDesc};
+use crate::native::fs::{
+    FS_APPEND_TEXT, FS_COPY, FS_EACH_LINE, FS_EXISTS, FS_IS_DIR, FS_IS_FILE, FS_LIST_DIR,
+    FS_MKDIR_ALL, FS_OPEN_APPEND, FS_OPEN_READ, FS_OPEN_WRITE, FS_READ_LINES, FS_READ_TEXT,
+    FS_READER_CLOSE, FS_READER_READ_CHUNK, FS_READER_READ_LINE, FS_REMOVE, FS_RENAME, FS_SIZE,
+    FS_WRITE_ATOMIC, FS_WRITE_TEXT, FS_WRITER_CLOSE, FS_WRITER_FLUSH, FS_WRITER_WRITE,
+    FS_WRITER_WRITE_LINE, FS_WRITER_WRITE_LINES,
+};
 use crate::native::time::TimeOpKind;
 use crate::native::validation::ValOpKind;
 use crate::vm::opcode::{
     EXT_CLI_HELP, EXT_CLI_PARSE, EXT_CLI_PARSE_ARGS, EXT_ENV_ARGS, EXT_ENV_GET, EXT_ENV_LOAD,
-    EXT_ENV_REQUIRE, EXT_LIST_FIRST, EXT_LIST_LAST, EXT_LIST_SORT, EXT_MAP_ENTRIES, EXT_MAP_GET,
-    EXT_MAP_KEYS, EXT_MAP_REMOVE, EXT_MAP_VALUES, EXT_STR_SPLIT, EXT_STR_TO_FLOAT,
-    EXT_STR_TO_INT, Op,
+    EXT_ENV_REQUIRE, EXT_FS_BINARY, EXT_FS_UNARY, EXT_LIST_FIRST, EXT_LIST_LAST, EXT_LIST_SORT,
+    EXT_MAP_ENTRIES, EXT_MAP_GET, EXT_MAP_KEYS, EXT_MAP_REMOVE, EXT_MAP_VALUES, EXT_STR_SPLIT,
+    EXT_STR_TO_FLOAT, EXT_STR_TO_INT, Op,
 };
 use crate::vm::value::{
     SCHEMA_BOXED_BOOL, SCHEMA_BOXED_FLOAT, SCHEMA_BOXED_INT, SCHEMA_CLI_ERROR, SCHEMA_EMPTY_TAG,
-    SCHEMA_ENV_ERROR, SCHEMA_INDEX_ERROR, SCHEMA_JSON_DECODE_ERROR, SCHEMA_JSON_ENCODE_ERROR,
-    SCHEMA_KEY_ERROR, SCHEMA_LIST_TAG, SCHEMA_MAP_TAG, SCHEMA_PARSE_ERROR, SCHEMA_STR_TAG,
-    SCHEMA_TIME_DURATION, SCHEMA_TIME_ERROR, SCHEMA_TIME_INSTANT, SCHEMA_TIME_TIMESTAMP,
-    SCHEMA_VALIDATION_ERROR, SCHEMA_VALIDATION_ISSUE, SCHEMA_VALIDATION_VIOLATION,
+    SCHEMA_ENV_ERROR, SCHEMA_FS_ERROR, SCHEMA_FS_READER, SCHEMA_FS_WRITER, SCHEMA_INDEX_ERROR,
+    SCHEMA_JSON_DECODE_ERROR, SCHEMA_JSON_ENCODE_ERROR, SCHEMA_KEY_ERROR, SCHEMA_LIST_TAG,
+    SCHEMA_MAP_TAG, SCHEMA_PARSE_ERROR, SCHEMA_STR_TAG, SCHEMA_TIME_DURATION, SCHEMA_TIME_ERROR,
+    SCHEMA_TIME_INSTANT, SCHEMA_TIME_TIMESTAMP, SCHEMA_VALIDATION_ERROR, SCHEMA_VALIDATION_ISSUE,
+    SCHEMA_VALIDATION_VIOLATION,
 };
 
 #[inline]
@@ -60,6 +68,9 @@ pub(crate) fn type_tag_for_switch(ty: &Type, checked: &CheckedProgram) -> Result
                 ("cdt.json", "EncodeError") => Ok(SCHEMA_JSON_ENCODE_ERROR),
                 ("cdt.env", "EnvError") => Ok(SCHEMA_ENV_ERROR),
                 ("cdt.cli", "CliError") => Ok(SCHEMA_CLI_ERROR),
+                ("cdt.fs", "FsError") => Ok(SCHEMA_FS_ERROR),
+                ("cdt.fs", "Reader") => Ok(SCHEMA_FS_READER),
+                ("cdt.fs", "Writer") => Ok(SCHEMA_FS_WRITER),
                 _ => Err(format!("Unsupported native type '{}' in switch pattern", tid)),
             },
             _ => Err(format!("Unsupported type '{}' in switch pattern", tid)),
@@ -334,12 +345,185 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
         Ok(dst_obj)
     }
 
+    pub(crate) fn lower_fs_call(
+        &mut self,
+        sym: &str,
+        args: &[Expr],
+        named_args: &[NamedArg],
+    ) -> Result<u16, String> {
+        match sym {
+            "FsError" => self.lower_native_record(
+                SCHEMA_FS_ERROR,
+                &["kind", "path", "message"],
+                args,
+                named_args,
+            ),
+            "exists" | "is_file" | "is_dir" => {
+                let aux = match sym {
+                    "exists" => FS_EXISTS,
+                    "is_file" => FS_IS_FILE,
+                    "is_dir" => FS_IS_DIR,
+                    _ => unreachable!(),
+                };
+                let b = self.lower_obj(&args[0])?;
+                let dst_s = self.alloc_temp_s();
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_FS_UNARY,
+                    aux,
+                    a: dst_s,
+                    b,
+                    c: 0,
+                });
+                Ok(dst_s)
+            }
+            "read_text" | "read_lines" | "size" | "list_dir" | "mkdir_all" | "remove"
+            | "open_read" | "open_write" | "open_append" => {
+                let aux = match sym {
+                    "read_text" => FS_READ_TEXT,
+                    "read_lines" => FS_READ_LINES,
+                    "size" => FS_SIZE,
+                    "list_dir" => FS_LIST_DIR,
+                    "mkdir_all" => FS_MKDIR_ALL,
+                    "remove" => FS_REMOVE,
+                    "open_read" => FS_OPEN_READ,
+                    "open_write" => FS_OPEN_WRITE,
+                    "open_append" => FS_OPEN_APPEND,
+                    _ => unreachable!(),
+                };
+                let b = self.lower_obj(&args[0])?;
+                let dst_o = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_FS_UNARY,
+                    aux,
+                    a: dst_o,
+                    b,
+                    c: 0,
+                });
+                Ok(dst_o)
+            }
+            "write_text" | "append_text" | "write_atomic" | "copy" | "rename" | "each_line" => {
+                let aux = match sym {
+                    "write_text" => FS_WRITE_TEXT,
+                    "append_text" => FS_APPEND_TEXT,
+                    "write_atomic" => FS_WRITE_ATOMIC,
+                    "copy" => FS_COPY,
+                    "rename" => FS_RENAME,
+                    "each_line" => FS_EACH_LINE,
+                    _ => unreachable!(),
+                };
+                let b = self.lower_obj(&args[0])?;
+                let c = self.lower_obj(&args[1])?;
+                let dst_o = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_FS_BINARY,
+                    aux,
+                    a: dst_o,
+                    b,
+                    c,
+                });
+                Ok(dst_o)
+            }
+            other => Err(format!("Unsupported cdt.fs symbol '{}'", other)),
+        }
+    }
+
+    fn lower_fs_method(
+        &mut self,
+        type_name: &str,
+        target: &Expr,
+        method: &str,
+        args: &[Expr],
+    ) -> Result<u16, String> {
+        let b = self.lower_obj(target)?;
+        let dst_o = self.alloc_temp_o();
+        match (type_name, method) {
+            ("Reader", "read_line") => {
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_FS_UNARY,
+                    aux: FS_READER_READ_LINE,
+                    a: dst_o,
+                    b,
+                    c: 0,
+                });
+            }
+            ("Reader", "close") => {
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_FS_UNARY,
+                    aux: FS_READER_CLOSE,
+                    a: dst_o,
+                    b,
+                    c: 0,
+                });
+            }
+            ("Writer", "flush") => {
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_FS_UNARY,
+                    aux: FS_WRITER_FLUSH,
+                    a: dst_o,
+                    b,
+                    c: 0,
+                });
+            }
+            ("Writer", "close") => {
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_FS_UNARY,
+                    aux: FS_WRITER_CLOSE,
+                    a: dst_o,
+                    b,
+                    c: 0,
+                });
+            }
+            ("Reader", "read_chunk") => {
+                let c = self.lower_scalar(&args[0])?;
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_FS_BINARY,
+                    aux: FS_READER_READ_CHUNK,
+                    a: dst_o,
+                    b,
+                    c,
+                });
+            }
+            ("Writer", "write") => {
+                let c = self.lower_obj(&args[0])?;
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_FS_BINARY,
+                    aux: FS_WRITER_WRITE,
+                    a: dst_o,
+                    b,
+                    c,
+                });
+            }
+            ("Writer", "write_line" | "write_lines") => {
+                let c = self.lower_obj(&args[0])?;
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_FS_BINARY,
+                    aux: if method == "write_lines" {
+                        FS_WRITER_WRITE_LINES
+                    } else {
+                        FS_WRITER_WRITE_LINE
+                    },
+                    a: dst_o,
+                    b,
+                    c,
+                });
+            }
+            _ => return Err(format!("Unsupported cdt.fs method '{}.{}()'", type_name, method)),
+        }
+        Ok(dst_o)
+    }
+
     pub(crate) fn lower_native_method_obj(
         &mut self,
         tid: &TypeId,
         target: &Expr,
         method: &str,
+        args: &[Expr],
     ) -> Result<u16, String> {
+        if let ModuleId::Native(m) = &tid.module
+            && m == "cdt.fs"
+        {
+            return self.lower_fs_method(&tid.name, target, method, args);
+        }
         let kind = match (&tid.module, tid.name.as_str(), method) {
             (ModuleId::Native(m), "Timestamp", "unix_seconds") if m == "cdt.time" => {
                 TimeOpKind::UnixSeconds
