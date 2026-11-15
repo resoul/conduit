@@ -5,6 +5,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
+## [0.2.4] - 2026-11-15
+
+### Added & Improved
+
+* **Language Server (`conduit lsp`)**:
+  * Reintroduced `conduit lsp` over stdio JSON-RPC (`src/lsp.rs`, `src/lsp_docs.rs`) with `check_file_with_overrides` (`src/frontend/mod.rs`) for real-time diagnostics across unsaved buffers and relative imports.
+  * Added `textDocument/hover` showing parameter names/types, return union types, and leading `//` comments for user `func` / `struct` declarations, all 5 `cdt.*` modules, and built-in methods/keywords, plus `\uXXXX` JSON unescaping for JetBrains LSP4IJ (Gson).
+  * Added `textDocument/completion` for `cli.`, `env.`, `json.`, `time.`, `validation.`, user symbols, and keywords.
+* **Editor & Docs**:
+  * Enhanced `editors/textmate/conduit.tmLanguage.json` (stdlib errors/types, `PascalCase` user types, function calls, `reduce`, floats, and `{...}` string interpolation) and added `"publisher": "resoul"` in `editors/textmate/package.json`.
+  * Updated [Editor Setup](docs/src/getting-started/editors.md), [editors/README.md](editors/README.md), and [CLI docs](docs/src/getting-started/cli.md) with `conduit lsp` and JetBrains LSP4IJ instructions.
+
 ## [0.2.3] - 2026-11-15
 
 ### Added

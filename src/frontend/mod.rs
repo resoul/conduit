@@ -47,10 +47,26 @@ fn resolve_import_file(base_dir: &Path, root_dir: &Path, imp: &str) -> Result<Pa
         .ok_or_else(|| format!("Cannot find imported module '{}'", imp))
 }
 
+fn read_with_overrides(
+    path: &Path,
+    overrides: &HashMap<std::path::PathBuf, String>,
+) -> Result<String, String> {
+    if let Some(s) = overrides.get(path) {
+        return Ok(s.clone());
+    }
+    if let Ok(canon) = path.canonicalize()
+        && let Some(s) = overrides.get(&canon)
+    {
+        return Ok(s.clone());
+    }
+    fs::read_to_string(path).map_err(|e| format!("Failed to read '{}': {}", path.display(), e))
+}
+
 fn collect_file_imports(
     prog: &Program,
     cur_dir: &Path,
     root_dir: &Path,
+    overrides: &HashMap<std::path::PathBuf, String>,
     seen: &mut HashSet<String>,
     out: &mut HashMap<String, String>,
 ) -> Result<(), String> {
@@ -62,24 +78,29 @@ fn collect_file_imports(
             continue;
         }
         let target = resolve_import_file(cur_dir, root_dir, imp)?;
-        let src = fs::read_to_string(&target)
-            .map_err(|e| format!("Failed to read imported module '{}': {}", target.display(), e))?;
+        let src = read_with_overrides(&target, overrides)?;
         let sub_prog = parse_source(&src)?;
         let sub_dir = target.parent().unwrap_or(cur_dir);
-        collect_file_imports(&sub_prog, sub_dir, root_dir, seen, out)?;
+        collect_file_imports(&sub_prog, sub_dir, root_dir, overrides, seen, out)?;
         out.insert(imp.clone(), src);
     }
     Ok(())
 }
 
 pub fn check_file(path: &Path) -> Result<(Program, CheckedProgram), String> {
-    let src = fs::read_to_string(path)
-        .map_err(|e| format!("Failed to read '{}': {}", path.display(), e))?;
+    check_file_with_overrides(path, &HashMap::new())
+}
+
+pub fn check_file_with_overrides(
+    path: &Path,
+    overrides: &HashMap<std::path::PathBuf, String>,
+) -> Result<(Program, CheckedProgram), String> {
+    let src = read_with_overrides(path, overrides)?;
     let mut program = parse_source(&src)?;
     let root_dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let mut owned_mods = HashMap::new();
     let mut seen = HashSet::new();
-    collect_file_imports(&program, root_dir, root_dir, &mut seen, &mut owned_mods)?;
+    collect_file_imports(&program, root_dir, root_dir, overrides, &mut seen, &mut owned_mods)?;
     if !owned_mods.is_empty() {
         let mod_refs: HashMap<&str, &str> =
             owned_mods.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();

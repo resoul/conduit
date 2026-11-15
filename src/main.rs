@@ -105,17 +105,23 @@ fn main() {
         Some("disasm") => run_disasm_cmd(args.get(1)),
         Some("run") => run_exec_cmd(&args[1..]),
         Some("watch") => watch::run_watch_cmd(&args[1..]),
+        Some("lsp") => {
+            if let Err(e) = conduit::lsp::run_lsp_server() {
+                eprintln!("LSP error: {}", e);
+                process::exit(1);
+            }
+        }
         Some("--version" | "-V" | "version") => {
             println!("Conduit v{}", env!("CARGO_PKG_VERSION"));
         }
         Some("--help" | "-h" | "help") => {
             println!(
-                "Conduit v{}\n\nUsage:\n  conduit bench [--filter <pat>] [--strict]\n  conduit build <file.cdt> [-o <output>]\n  conduit check <file.cdt>\n  conduit disasm <file.cdt>\n  conduit run <file.cdt>\n  conduit watch <file.cdt> [args...]\n  conduit --version, -V\n  conduit --help, -h",
+                "Conduit v{}\n\nUsage:\n  conduit bench [--filter <pat>] [--strict]\n  conduit build <file.cdt> [-o <output>]\n  conduit check <file.cdt>\n  conduit disasm <file.cdt>\n  conduit run <file.cdt> [-- args...]\n  conduit watch <file.cdt> [-- args...]\n  conduit lsp\n  conduit --version, -V\n  conduit --help, -h",
                 env!("CARGO_PKG_VERSION")
             );
         }
         Some(cmd) => {
-            eprintln!("Unknown command '{}'. Usage: conduit <bench|build|check|disasm|run|watch> ...", cmd);
+            eprintln!("Unknown command '{}'. Usage: conduit <bench|build|check|disasm|run|watch|lsp> ...", cmd);
             process::exit(2);
         }
     }

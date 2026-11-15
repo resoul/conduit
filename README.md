@@ -52,6 +52,9 @@ conduit run main.cdt
 # Watch and auto-reload on .cdt changes
 conduit watch main.cdt
 
+# Start the stdio Language Server (for IDEs)
+conduit lsp
+
 # Build a standalone native executable
 conduit build main.cdt -o app
 
@@ -78,7 +81,7 @@ For syntax guides, language rules, and standard library references, see the docu
 
 ## Editor Support
 
-Conduit provides a TextMate syntax grammar for JetBrains (RustRover), VS Code, and compatible editors. See [editors/README.md](editors/README.md) for setup instructions.
+Conduit provides a TextMate syntax grammar (`editors/textmate`) and a built-in Language Server (`conduit lsp`) for JetBrains (RustRover + LSP4IJ), Antigravity, and VS Code. See [editors/README.md](editors/README.md) for setup instructions.
 
 ## Changelog
 

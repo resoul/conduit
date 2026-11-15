@@ -1,8 +1,15 @@
 # Editor Support for Conduit
 
-Conduit includes a TextMate syntax grammar for `.cdt` files under `editors/textmate`.
+Conduit includes a TextMate syntax grammar under `editors/textmate` and a built-in Language Server (`conduit lsp`).
 
-> **Note:** The built-in `conduit lsp` command from 0.1.x is not yet included in the 0.2.0 bytecode VM rewrite. Syntax highlighting via the TextMate bundle works out of the box.
+---
+
+## Language Server (`conduit lsp`)
+
+`conduit lsp` speaks LSP over stdio (`Content-Length` JSON-RPC) and provides:
+- **Real-time diagnostics** across unsaved buffers and relative imports
+- **Hover** with parameter names/types, return unions, `//` doc comments, and `cdt.*` stdlib docs
+- **Completion** for `cli.`, `env.`, `json.`, `time.`, `validation.`, user symbols, and keywords
 
 ---
 
@@ -12,11 +19,20 @@ Conduit includes a TextMate syntax grammar for `.cdt` files under `editors/textm
 1. Open **Settings** / **Preferences** (`Cmd + ,` on macOS or `Ctrl + Alt + S` on Linux/Windows).
 2. Navigate to **Editor** → **TextMate Bundles**.
 3. Make sure the **TextMate Bundles** plugin is enabled under **Settings** → **Plugins**.
-4. Click the **+** (Add) button and select the `editors/textmate` directory from this repository. This directory contains a `package.json` manifest and the grammar file.
-5. Click **Apply**. All `.cdt` files will now have full syntax highlighting.
+4. Click **+** and select `editors/textmate` from this repository.
+5. Click **Apply**.
+
+### Diagnostics, Hover & Completion (LSP4IJ)
+1. Install **LSP4IJ** from JetBrains Marketplace.
+2. Open **Settings** → **Languages & Frameworks** → **Language Servers** → **+**.
+3. Set **Command** to `conduit lsp` (or `/path/to/conduit lsp`).
+4. Under **Mappings**, add **File name pattern**: `*.cdt` (Language Id: `conduit`).
+5. Click **Apply**.
 
 ---
 
-## Visual Studio Code
+## Antigravity / Visual Studio Code
 
-Copy `editors/textmate/conduit.tmLanguage.json` to your VS Code syntax directory or extension bundle to register the grammar for `source.conduit`.
+1. Open Command Palette (`Cmd + Shift + P` / `Ctrl + Shift + P`).
+2. Run **Developer: Install Extension from Location...** and select `editors/textmate`.
+3. Run **Developer: Reload Window**.
