@@ -154,6 +154,7 @@ pub const EXT_FS_BINARY: u8 = 31;
 pub const EXT_PATH_OP: u8 = 32;
 pub const EXT_PROCESS_OP: u8 = 33;
 pub const EXT_CRYPTO_OP: u8 = 34;
+pub const EXT_PIPELINE_REDUCE: u8 = 35;
 
 #[cfg(test)]
 mod tests {

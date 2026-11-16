@@ -133,6 +133,7 @@ $filtered = array_filter($nums, fn($x) => ($x % 2) === 0);
 $mapped = array_map(fn($x) => $x * 3 + 1, $filtered);
 $sum = array_sum($mapped);
 $msPipe = ms_since($t0);
+printf("CHECK|%d\n", $sum);
 
 printf("BENCH|fs_write_text|%.3f\n", $msWriteText);
 printf("BENCH|fs_write_lines|%.3f\n", $msWriteStream);

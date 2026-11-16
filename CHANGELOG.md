@@ -5,7 +5,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
-## [Unreleased]
+## [0.2.5] - 2026-11-16
 
 ### Added
 
@@ -17,14 +17,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   * Added `cdt.path` (`join`, `join_all`, `dirname`, `basename`, `ext`, `stem`, `normalize`, `is_abs`, `with_ext`) for cross-platform lexical path handling (`EXT_PATH_OP`).
   * Added `cdt.process` (`run`, `status`, `cwd`, `set_cwd`, `pid`, `exit`, `Output`, `ProcessError`) for spawning external processes (`EXT_PROCESS_OP`).
   * Added zero-dependency `cdt.crypto` (`sha256`, `hmac_sha256`, `base64_encode`, `base64_decode`, `hex_encode`, `hex_decode`, `uuid_v4`, `random_bytes_hex`, `random_int`, `CryptoError`) (`EXT_CRYPTO_OP`), with LSP hover/completion, TextMate highlighting, and library docs (`docs/src/library/{path,process,crypto}.md`).
+* **Cross-OS Benchmarks & Starter Example Updates**:
+  * Added `.github/workflows/bench.yml` and `scripts/bench/` (`run_all.py`, `bench.{cdt,go,swift,kt,mjs,php,py}`) for cross-language benchmarking on Linux, macOS, and Windows.
+  * Updated `example/` (`events.json`, `notes.txt`, `main.cdt`, `Dockerfile`, `README.md`) to demonstrate `cdt.fs` reading and streaming.
 
 ### Fixed & Optimized
 
-* **Crypto & Streaming Performance (`cdt.crypto`, `cdt.fs`)**:
-  * Cached `/dev/urandom` in a thread-local `BufReader`, eliminated `format!`/`Vec` allocations in `crypto.uuid_v4` and `crypto.base64_decode` (lookup-table fast-path), and added zero-allocation padding + ARM64 `sha2` hardware acceleration (`std::arch::aarch64`) for `crypto.sha256`/`hmac_sha256`.
-  * Reused `Arc<String>` line buffers across `fs.each_line` iterations when not retained by the callback, and pre-sized `Vec` capacity in `fs.read_lines`.
-  * Implemented zero-zeroing `BufRead::fill_buf()` fast-paths in `Reader.read_line` and `Reader.read_chunk`, with safe multi-byte UTF-8 boundary handling so chunks never fail mid-character.
-  * Added `sync_frame_ptrs!()` after `Op::ExtOp` in the VM dispatch loop (`src/vm/exec.rs`) to keep cached frame pointers valid when native callbacks grow the VM stack.
+* **Pipeline `reduce` Fusion (`filter |> map |> reduce`)**:
+  * Added `PipelineStage::ReduceScalar` and `EXT_PIPELINE_REDUCE` (`src/ir/lower_call.rs`, `src/vm/pipeline.rs`) to execute scalar `map`/`filter`/`reduce` chains in a single fused `exec_scalar_leaf` pass with zero intermediate list allocations and no per-element `CallFrame`.
+* **Crypto, Path & FS Performance & Safety**:
+  * Replaced the insecure non-Unix RNG fallback with Windows `BCryptGenRandom` (`bcrypt.dll`) and `/dev/urandom` behind a 4 KiB thread-local `RNG_BUF` (`src/native/crypto.rs`).
+  * Added hardware SHA-256 acceleration for both `aarch64` (`sha2`) and `x86_64` (`sha`, `sse4.1`, `ssse3`) with zero-allocation tail padding, `B64_LUT` fast-path for `base64_decode`, and `from_utf8_unchecked` for `base64_encode`.
+  * Eliminated input string copies in `src/vm/exec_sys.rs` (`Arc<VmString>`), added Windows fast-paths in `src/native/path.rs`, combined `Writer.write_line` into a single `BufWriter` write for lines `<= 4 KiB`, and enabled `lto = "fat"` + `panic = "abort"` in `Cargo.toml`.
+  * Reused `Arc<String>` line buffers across `fs.each_line` iterations, pre-sized `Vec` capacity in `fs.read_lines`, added zero-zeroing `BufRead::fill_buf()` fast-paths with safe UTF-8 boundary handling in `Reader.read_chunk`, and added `sync_frame_ptrs!()` after `Op::ExtOp`.
+* **Struct Constructor Loop Fix**:
+  * Fixed `lower_struct_ctor` (`src/ir/lower_call.rs`) to emit `Op::NewRecord` instead of `Op::NewRecordMove` so string literals or outer variables in loop-constructed structs are not moved out on the first iteration.
 
 ## [0.2.4] - 2026-11-15
 

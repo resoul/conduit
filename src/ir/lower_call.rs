@@ -10,8 +10,8 @@ use crate::ir::lower_native::elem_tag_for;
 use crate::ir::{CallableRef, ElemKind, PipelinePlan, PipelineStage, RecordDesc};
 use crate::vm::opcode::{
     EXT_FLOAT_CEIL, EXT_FLOAT_MATH, EXT_INT_MATH, EXT_LIST_IS_EMPTY, EXT_MAP_CONTAINS_KEY,
-    EXT_MAP_FROM, EXT_MAP_SET, EXT_PRINT_OBJ, EXT_PRINT_SCALAR, EXT_STR_IS_EMPTY, EXT_STR_PRED,
-    Op,
+    EXT_MAP_FROM, EXT_MAP_SET, EXT_PIPELINE_REDUCE, EXT_PRINT_OBJ, EXT_PRINT_SCALAR,
+    EXT_STR_IS_EMPTY, EXT_STR_PRED, Op,
 };
 
 impl<'a, 'b> FnLowerer<'a, 'b> {
@@ -641,6 +641,37 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
         }
     }
 
+    fn resolve_pipeline_callable(&mut self, cb_expr: &Expr) -> Result<CallableRef, String> {
+        if let ExprKind::Ident(fn_name) = &cb_expr.kind
+            && self.lookup_local(fn_name).is_none()
+            && let Some(&fid) = self.mc.checked.func_by_name.get(fn_name)
+        {
+            Ok(CallableRef::DirectFunc(fid))
+        } else if let ExprKind::Closure { params, body, .. } = &cb_expr.kind {
+            let mut free = HashSet::new();
+            collect_free_vars(body, params, &mut free);
+            let has_captured_locals = free.iter().any(|n| self.lookup_local(n).is_some());
+            if !has_captured_locals
+                && let Type::Function {
+                    params: param_tys,
+                    return_type: ret_ty,
+                } = &cb_expr.ty
+            {
+                let fn_name = format!("__pipe_fn_{}", self.mc.module.functions.len());
+                let proto = self.mc.lower_function(
+                    &fn_name, params, param_tys, ret_ty, body, &[], &[],
+                )?;
+                let fid = self.mc.module.functions.len() as u32;
+                self.mc.module.functions.push(proto);
+                Ok(CallableRef::DirectFunc(fid))
+            } else {
+                Ok(CallableRef::RegObj(self.lower_obj(cb_expr)?))
+            }
+        } else {
+            Ok(CallableRef::RegObj(self.lower_obj(cb_expr)?))
+        }
+    }
+
     fn lower_pipeline_call(&mut self, expr: &Expr) -> Result<u16, String> {
         let mut chain: Vec<(&str, &Expr)> = Vec::new();
         let mut cur = expr;
@@ -960,6 +991,70 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
         let Type::List(elem_ty) = &list_expr.ty else {
             return Err(format!("reduce expects List, got {}", list_expr.ty));
         };
+        let elem_is_scalar = elem_ty.is_scalar();
+        let elem_param_is_obj = match &fn_expr.ty {
+            Type::Function { params, .. } => params.get(1).is_some_and(|p| p.is_obj()),
+            _ => !elem_is_scalar,
+        };
+        if acc_ty.is_scalar() && elem_ty.is_scalar() && !elem_param_is_obj {
+            let mut chain: Vec<(&str, &Expr)> = Vec::new();
+            let mut cur = list_expr;
+            while let ExprKind::Call { callee, args, .. } = &cur.kind
+                && let ExprKind::Ident(fn_name) = &callee.kind
+                && self.lookup_local(fn_name).is_none()
+                && (fn_name == "map" || fn_name == "filter")
+            {
+                chain.push((fn_name.as_str(), &args[1]));
+                cur = &args[0];
+            }
+            chain.reverse();
+            let root_elem_kind = match &cur.ty {
+                Type::List(inner) if inner.is_scalar() => Some(inner.elem_kind()),
+                _ => None,
+            };
+            let all_scalar_stages = chain.iter().all(|(k, cb)| {
+                if *k == "filter" {
+                    true
+                } else {
+                    matches!(&cb.ty, Type::Function { return_type, .. } if return_type.is_scalar())
+                }
+            });
+            if let Some(elem_kind) = root_elem_kind
+                && all_scalar_stages
+            {
+                let src_obj = self.lower_obj(cur)?;
+                let mut stages = Vec::with_capacity(chain.len() + 1);
+                for (kind, cb_expr) in chain {
+                    let cref = self.resolve_pipeline_callable(cb_expr)?;
+                    if kind == "filter" {
+                        stages.push(PipelineStage::FilterScalar(cref));
+                    } else {
+                        stages.push(PipelineStage::MapScalarToScalar(cref));
+                    }
+                }
+                let red_cref = self.resolve_pipeline_callable(fn_expr)?;
+                stages.push(PipelineStage::ReduceScalar(red_cref));
+
+                let plan_idx = self.mc.add_pipeline_plan(PipelinePlan {
+                    stages: stages.into_boxed_slice(),
+                    elem_kind,
+                })?;
+                let init_s = self.lower_scalar(init_expr)?;
+                let dst_s = self.alloc_temp_s();
+                if init_s != dst_s {
+                    self.ops.push(Op::MoveScalar { dst: dst_s, src: init_s });
+                }
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_PIPELINE_REDUCE,
+                    aux: 0,
+                    a: dst_s,
+                    b: src_obj,
+                    c: plan_idx,
+                });
+                return Ok(dst_s);
+            }
+        }
+
         let list_obj = self.lower_obj(list_expr)?;
         let acc_is_scalar = acc_ty.is_scalar();
         let acc_reg = if acc_is_scalar {
@@ -996,10 +1091,6 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             self.ops.push(Op::ForListObj { list_obj, idx_s, elem_obj: elem_reg, exit_target: 0 });
         }
 
-        let elem_param_is_obj = match &fn_expr.ty {
-            Type::Function { params, .. } => params.get(1).is_some_and(|p| p.is_obj()),
-            _ => !elem_is_scalar,
-        };
         let mut s_regs = Vec::new();
         let mut o_regs = Vec::new();
         if acc_is_scalar {

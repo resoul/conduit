@@ -159,7 +159,7 @@ func main() {
 		}
 	}
 	msPipe := msSince(t0)
-	_ = sum
+	fmt.Printf("CHECK|%d\n", sum)
 
 	fmt.Printf("BENCH|fs_write_text|%.3f\n", msWriteText)
 	fmt.Printf("BENCH|fs_write_lines|%.3f\n", msWriteStream)

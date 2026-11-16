@@ -16,6 +16,7 @@ enum StageKind {
     FilterScalar,
     MapObj,
     FilterObj,
+    ReduceScalar,
 }
 
 #[derive(Clone, Copy)]
@@ -76,6 +77,7 @@ impl Vm {
             PipelineStage::FilterScalar(c) => (StageKind::FilterScalar, c),
             PipelineStage::MapObjToObj(c) => (StageKind::MapObj, c),
             PipelineStage::FilterObj(c) => (StageKind::FilterObj, c),
+            PipelineStage::ReduceScalar(c) => (StageKind::ReduceScalar, c),
         };
         let (func_id, closure_slot) = match cref {
             CallableRef::DirectFunc(fid) => (fid, usize::MAX),
@@ -618,6 +620,192 @@ impl Vm {
                     Obj::List(ListStorage::Obj(Arc::new(out)));
             }
         }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_scalar_slice_reduce<T: Copy>(
+        &mut self,
+        module: &Module,
+        stages: &[ResolvedStage<'_>],
+        src: &[T],
+        mut acc: u64,
+        to_u64: fn(T) -> u64,
+        stage_s_base: usize,
+        stage_o_base: usize,
+    ) -> Result<u64, RuntimeError> {
+        let all_scalar_leaf = stages.iter().all(|st| st.is_scalar_leaf);
+        if all_scalar_leaf {
+            let max_s = stages.iter().map(|s| s.num_scalars as usize).max().unwrap_or(2).max(2);
+            self.ensure_capacity(stage_s_base + max_s, stage_o_base);
+            let leaf_stages = resolve_leaf_stages(stages, &self.objs);
+            let s_ptr = unsafe { self.scalars.as_mut_ptr().add(stage_s_base) };
+            let int_consts = module.int_consts.as_ptr();
+            let float_consts = module.float_consts.as_ptr();
+
+            match leaf_stages.as_slice() {
+                [LeafStage { kind: StageKind::ReduceScalar, ops, closure, .. }] => {
+                    for &item in src {
+                        unsafe {
+                            *s_ptr = acc;
+                            *s_ptr.add(1) = to_u64(item);
+                            acc = exec_scalar_leaf(s_ptr, ops, int_consts, float_consts, *closure)?;
+                        }
+                    }
+                }
+                [
+                    LeafStage { kind: StageKind::FilterScalar, ops: ops_f, closure: cf, .. },
+                    LeafStage { kind: StageKind::MapScalar, ops: ops_m, closure: cm, .. },
+                    LeafStage { kind: StageKind::ReduceScalar, ops: ops_r, closure: cr, .. },
+                ] => {
+                    for &item in src {
+                        unsafe {
+                            let x = to_u64(item);
+                            *s_ptr = x;
+                            if exec_scalar_leaf(s_ptr, ops_f, int_consts, float_consts, *cf)? != 0 {
+                                *s_ptr = x;
+                                let mapped = exec_scalar_leaf(s_ptr, ops_m, int_consts, float_consts, *cm)?;
+                                *s_ptr = acc;
+                                *s_ptr.add(1) = mapped;
+                                acc = exec_scalar_leaf(s_ptr, ops_r, int_consts, float_consts, *cr)?;
+                            }
+                        }
+                    }
+                }
+                [
+                    LeafStage { kind: StageKind::FilterScalar, ops: ops_f, closure: cf, .. },
+                    LeafStage { kind: StageKind::ReduceScalar, ops: ops_r, closure: cr, .. },
+                ] => {
+                    for &item in src {
+                        unsafe {
+                            let x = to_u64(item);
+                            *s_ptr = x;
+                            if exec_scalar_leaf(s_ptr, ops_f, int_consts, float_consts, *cf)? != 0 {
+                                *s_ptr = acc;
+                                *s_ptr.add(1) = x;
+                                acc = exec_scalar_leaf(s_ptr, ops_r, int_consts, float_consts, *cr)?;
+                            }
+                        }
+                    }
+                }
+                [
+                    LeafStage { kind: StageKind::MapScalar, ops: ops_m, closure: cm, .. },
+                    LeafStage { kind: StageKind::ReduceScalar, ops: ops_r, closure: cr, .. },
+                ] => {
+                    for &item in src {
+                        unsafe {
+                            *s_ptr = to_u64(item);
+                            let mapped = exec_scalar_leaf(s_ptr, ops_m, int_consts, float_consts, *cm)?;
+                            *s_ptr = acc;
+                            *s_ptr.add(1) = mapped;
+                            acc = exec_scalar_leaf(s_ptr, ops_r, int_consts, float_consts, *cr)?;
+                        }
+                    }
+                }
+                _ => {
+                    for &item in src {
+                        let mut cur = to_u64(item);
+                        for st in &leaf_stages {
+                            match st.kind {
+                                StageKind::MapScalar => {
+                                    cur = unsafe {
+                                        *s_ptr = cur;
+                                        exec_scalar_leaf(s_ptr, st.ops, int_consts, float_consts, st.closure)?
+                                    };
+                                }
+                                StageKind::FilterScalar => {
+                                    let pass = unsafe {
+                                        *s_ptr = cur;
+                                        exec_scalar_leaf(s_ptr, st.ops, int_consts, float_consts, st.closure)?
+                                    };
+                                    if pass == 0 {
+                                        break;
+                                    }
+                                }
+                                StageKind::ReduceScalar => {
+                                    acc = unsafe {
+                                        *s_ptr = acc;
+                                        *s_ptr.add(1) = cur;
+                                        exec_scalar_leaf(s_ptr, st.ops, int_consts, float_consts, st.closure)?
+                                    };
+                                }
+                                _ => return Err(err_msg("Mismatched stage kind in scalar reduce pipeline")),
+                            }
+                        }
+                    }
+                }
+            }
+            return Ok(acc);
+        }
+
+        for &item in src {
+            let mut cur = to_u64(item);
+            for st in stages {
+                match st.kind {
+                    StageKind::MapScalar => {
+                        self.scalars[stage_s_base] = cur;
+                        let ExecResult::Scalar(v) = self.exec_from(module, st.func_id, stage_s_base, stage_o_base, st.closure_slot)? else {
+                            return Err(err_msg("Expected scalar stage result"));
+                        };
+                        cur = v;
+                    }
+                    StageKind::FilterScalar => {
+                        self.scalars[stage_s_base] = cur;
+                        let ExecResult::Scalar(v) = self.exec_from(module, st.func_id, stage_s_base, stage_o_base, st.closure_slot)? else {
+                            return Err(err_msg("Expected scalar stage result"));
+                        };
+                        if v == 0 {
+                            break;
+                        }
+                    }
+                    StageKind::ReduceScalar => {
+                        self.ensure_capacity(stage_s_base + 2, stage_o_base);
+                        self.scalars[stage_s_base] = acc;
+                        self.scalars[stage_s_base + 1] = cur;
+                        let ExecResult::Scalar(v) = self.exec_from(module, st.func_id, stage_s_base, stage_o_base, st.closure_slot)? else {
+                            return Err(err_msg("Expected scalar reduce result"));
+                        };
+                        acc = v;
+                    }
+                    _ => return Err(err_msg("Mismatched stage kind in scalar reduce pipeline")),
+                }
+            }
+        }
+        Ok(acc)
+    }
+
+    pub(crate) fn run_pipeline_reduce(
+        &mut self,
+        module: &Module,
+        s_base: usize,
+        o_base: usize,
+        dst_s: u16,
+        src_obj: u16,
+        plan_idx: u16,
+    ) -> Result<(), RuntimeError> {
+        let plan = &module.pipelines[plan_idx as usize];
+        let mut stages = Vec::with_capacity(plan.stages.len());
+        for &st in plan.stages.iter() {
+            stages.push(self.resolve_stage(module, o_base, st)?);
+        }
+        let stage_s_base = self.scalars.len();
+        let stage_o_base = self.objs.len();
+        let init_acc = self.scalars[s_base + dst_s as usize];
+
+        let res = match &self.objs[o_base + src_obj as usize] {
+            Obj::List(ListStorage::Int(v)) => {
+                let src = Arc::clone(v);
+                self.run_scalar_slice_reduce(module, &stages, &src, init_acc, |x| x as u64, stage_s_base, stage_o_base)
+            }
+            Obj::List(ListStorage::Float(v)) => {
+                let src = Arc::clone(v);
+                self.run_scalar_slice_reduce(module, &stages, &src, init_acc, f64::to_bits, stage_s_base, stage_o_base)
+            }
+            _ => return Err(err_msg("Expected scalar list in pipeline reduce")),
+        };
+        self.scalars.truncate(stage_s_base);
+        self.objs.truncate(stage_o_base);
+        self.scalars[s_base + dst_s as usize] = res?;
         Ok(())
     }
 }

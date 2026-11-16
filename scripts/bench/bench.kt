@@ -105,6 +105,7 @@ fun main() {
     }
     val msPipe = msSince(t0)
     if (sum < 0 || rt.isEmpty() || rl.isEmpty() || lineTotal < 0) return
+    println("CHECK|$sum")
 
     println("BENCH|fs_write_text|%.3f".format(msWriteText))
     println("BENCH|fs_write_lines|%.3f".format(msWriteStream))

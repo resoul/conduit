@@ -380,6 +380,7 @@ pub fn encode_bundle(module: &Module, main_fid: u32, main_ret_tag: u8) -> Result
                 PipelineStage::FilterScalar(c) => (1, c),
                 PipelineStage::MapObjToObj(c) => (2, c),
                 PipelineStage::FilterObj(c) => (3, c),
+                PipelineStage::ReduceScalar(c) => (4, c),
             };
             w.u8(tag);
             encode_callable_ref(cr, w);
@@ -509,6 +510,7 @@ pub fn decode_bundle(bytes: &[u8]) -> Result<(Module, u32, u8), String> {
                 1 => PipelineStage::FilterScalar(decode_callable_ref(r)?),
                 2 => PipelineStage::MapObjToObj(decode_callable_ref(r)?),
                 3 => PipelineStage::FilterObj(decode_callable_ref(r)?),
+                4 => PipelineStage::ReduceScalar(decode_callable_ref(r)?),
                 tag => return Err(format!("Invalid PipelineStage tag {} in bundle", tag)),
             })
         })?.into_boxed_slice();

@@ -98,6 +98,7 @@ nums = list(range(1000000))
 t0 = time.perf_counter()
 s = sum(x * 3 + 1 for x in nums if x % 2 == 0)
 ms_pipe = (time.perf_counter() - t0) * 1000.0
+print(f"CHECK|{s}")
 
 print(f"BENCH|fs_write_text|{ms_write_text:.3f}")
 print(f"BENCH|fs_write_lines|{ms_write_stream:.3f}")

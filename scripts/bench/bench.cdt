@@ -186,6 +186,7 @@ export func main() -> Void | fs.FsError | process.ProcessError | crypto.CryptoEr
         |> reduce(0, (acc: Int, x: Int) => acc + x)
     ms_pipe := ms_since(t_pl)?
     if sum < 0 { return }
+    print("CHECK|" + sum.to_string())
 
     print("BENCH|fs_write_text|" + ms_write_text.to_string())
     print("BENCH|fs_write_lines|" + ms_write_stream.to_string())

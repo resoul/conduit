@@ -55,6 +55,7 @@ pub enum PipelineStage {
     FilterScalar(CallableRef),
     MapObjToObj(CallableRef),
     FilterObj(CallableRef),
+    ReduceScalar(CallableRef),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -473,7 +474,8 @@ impl Module {
                                 PipelineStage::MapScalarToScalar(c)
                                 | PipelineStage::FilterScalar(c)
                                 | PipelineStage::MapObjToObj(c)
-                                | PipelineStage::FilterObj(c) => c,
+                                | PipelineStage::FilterObj(c)
+                                | PipelineStage::ReduceScalar(c) => c,
                             };
                             match *cref {
                                 CallableRef::DirectFunc(id) => {
@@ -727,6 +729,33 @@ impl Module {
                                         check_s(c, &ctx)?;
                                     }
                                     _ => return Err(format!("{}: invalid crypto sub-op {}", ctx, aux)),
+                                }
+                            }
+                            crate::vm::opcode::EXT_PIPELINE_REDUCE => {
+                                check_s(a, &ctx)?;
+                                check_o(b, &ctx)?;
+                                let plan = self.pipelines.get(c as usize).ok_or_else(|| {
+                                    format!("{}: pipeline plan {} out of bounds", ctx, c)
+                                })?;
+                                for stage in plan.stages.iter() {
+                                    let cref = match stage {
+                                        PipelineStage::MapScalarToScalar(cr)
+                                        | PipelineStage::FilterScalar(cr)
+                                        | PipelineStage::MapObjToObj(cr)
+                                        | PipelineStage::FilterObj(cr)
+                                        | PipelineStage::ReduceScalar(cr) => cr,
+                                    };
+                                    match *cref {
+                                        CallableRef::DirectFunc(id) => {
+                                            if (id as usize) >= self.functions.len() {
+                                                return Err(format!(
+                                                    "{}: pipeline func {} out of bounds",
+                                                    ctx, id
+                                                ));
+                                            }
+                                        }
+                                        CallableRef::RegObj(r) => check_o(r, &ctx)?,
+                                    }
                                 }
                             }
                             _ => return Err(format!("Invalid ExtOp kind {}", kind)),

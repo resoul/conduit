@@ -127,6 +127,7 @@ const sum = nums
   .reduce((acc, x) => acc + x, 0);
 const msPipe = ms(t0);
 if (sum < 0 || decoded.length < 0 || rt.length < 0 || rl.length < 0 || total < 0) process.exit(1);
+console.log(`CHECK|${sum}`);
 
 console.log(`BENCH|fs_write_text|${msWriteText.toFixed(3)}`);
 console.log(`BENCH|fs_write_lines|${msWriteStream.toFixed(3)}`);

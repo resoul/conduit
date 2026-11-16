@@ -162,6 +162,7 @@ let sum = nums.lazy.filter { $0 % 2 == 0 }.map { $0 * 3 + 1 }.reduce(0, +)
 let msPipe = msSince(t0)
 
 if sum < 0 || decoded.isEmpty || rt.isEmpty || rl.isEmpty || lineTotal < 0 { exit(1) }
+print("CHECK|\(sum)")
 
 print(String(format: "BENCH|fs_write_text|%.3f", msWriteText))
 print(String(format: "BENCH|fs_write_lines|%.3f", msWriteStream))

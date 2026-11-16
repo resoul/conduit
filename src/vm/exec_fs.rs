@@ -191,13 +191,19 @@ impl Vm {
                 };
                 let res = match self.fs_writers.get_mut(id).and_then(|s| s.as_mut()) {
                     Some(w) => {
-                        let r = w.write_all(data.as_bytes()).and_then(|()| {
-                            if aux == FS_WRITER_WRITE_LINE {
-                                w.write_all(b"\n")
+                        let bytes = data.as_bytes();
+                        let r = if aux == FS_WRITER_WRITE_LINE {
+                            if bytes.len() <= 4096 {
+                                let mut tmp = [0u8; 4097];
+                                tmp[..bytes.len()].copy_from_slice(bytes);
+                                tmp[bytes.len()] = b'\n';
+                                w.write_all(&tmp[..bytes.len() + 1])
                             } else {
-                                Ok(())
+                                w.write_all(bytes).and_then(|()| w.write_all(b"\n"))
                             }
-                        });
+                        } else {
+                            w.write_all(bytes)
+                        };
                         match r {
                             Ok(()) => Obj::Empty,
                             Err(e) => io_err_obj("<writer>", &e),

@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::Read;
 use std::sync::Arc;
 
 use crate::vm::value::{Obj, SCHEMA_CRYPTO_ERROR, StructData};
@@ -349,7 +349,8 @@ pub fn encode_base64(bytes: &[u8]) -> String {
             b'=',
         ]);
     }
-    String::from_utf8(out).expect("base64 ascii")
+    // SAFETY: `B64_ALPHA` and `'='` are strictly ASCII.
+    unsafe { String::from_utf8_unchecked(out) }
 }
 
 const B64_LUT: [i8; 256] = {
@@ -459,38 +460,76 @@ pub fn decode_base64(s: &str) -> Obj {
 
 // ── OS CSPRNG / UUID v4 ──────────────────────────────────────────────────────
 
+#[cfg(windows)]
+fn os_fill_random(buf: &mut [u8]) -> Result<(), String> {
+    #[link(name = "bcrypt")]
+    unsafe extern "system" {
+        fn BCryptGenRandom(
+            h_algorithm: *mut core::ffi::c_void,
+            pb_buffer: *mut u8,
+            cb_buffer: u32,
+            dw_flags: u32,
+        ) -> i32;
+    }
+    const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
+    for chunk in buf.chunks_mut(u32::MAX as usize) {
+        let status = unsafe {
+            BCryptGenRandom(
+                core::ptr::null_mut(),
+                chunk.as_mut_ptr(),
+                chunk.len() as u32,
+                BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+            )
+        };
+        if status != 0 {
+            return Err(format!("BCryptGenRandom failed with NTSTATUS 0x{:08x}", status));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn os_fill_random(buf: &mut [u8]) -> Result<(), String> {
+    thread_local! {
+        static URANDOM_FILE: RefCell<Option<File>> = const { RefCell::new(None) };
+    }
+    URANDOM_FILE.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        if guard.is_none() {
+            *guard = Some(
+                File::open("/dev/urandom")
+                    .map_err(|e| format!("Failed to open /dev/urandom: {}", e))?,
+            );
+        }
+        guard
+            .as_mut()
+            .unwrap()
+            .read_exact(buf)
+            .map_err(|e| format!("Failed to read /dev/urandom: {}", e))
+    })
+}
+
 thread_local! {
-    static URANDOM_READER: RefCell<Option<BufReader<File>>> = const { RefCell::new(None) };
+    static RNG_BUF: RefCell<([u8; 4096], usize)> = const { RefCell::new(([0u8; 4096], 4096)) };
 }
 
 pub fn fill_random_bytes(buf: &mut [u8]) -> Result<(), String> {
     if buf.is_empty() {
         return Ok(());
     }
-    let ok = URANDOM_READER.with(|cell| {
-        let mut guard = cell.borrow_mut();
-        if guard.is_none()
-            && let Ok(f) = File::open("/dev/urandom")
-        {
-            *guard = Some(BufReader::with_capacity(4096, f));
-        }
-        if let Some(reader) = guard.as_mut() {
-            reader.read_exact(buf).is_ok()
-        } else {
-            false
-        }
-    });
-    if ok {
-        return Ok(());
+    if buf.len() > 256 {
+        return os_fill_random(buf);
     }
-    // Fallback for platforms without /dev/urandom
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
-    for chunk in buf.chunks_mut(8) {
-        let r = RandomState::new().build_hasher().finish().to_ne_bytes();
-        chunk.copy_from_slice(&r[..chunk.len()]);
-    }
-    Ok(())
+    RNG_BUF.with(|cell| {
+        let (pool, pos) = &mut *cell.borrow_mut();
+        if *pos + buf.len() > pool.len() {
+            os_fill_random(pool)?;
+            *pos = 0;
+        }
+        buf.copy_from_slice(&pool[*pos..*pos + buf.len()]);
+        *pos += buf.len();
+        Ok(())
+    })
 }
 
 pub fn uuid_v4() -> Obj {
