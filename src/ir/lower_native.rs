@@ -23,12 +23,13 @@ use crate::native::process::{
     PROC_CWD, PROC_EXIT, PROC_PID, PROC_RUN, PROC_SET_CWD, PROC_STATUS,
 };
 use crate::native::time::TimeOpKind;
+use crate::native::url::{URL_DECODE, URL_DECODE_QUERY, URL_ENCODE, URL_ENCODE_QUERY, URL_PARSE};
 use crate::native::validation::ValOpKind;
 use crate::vm::opcode::{
     EXT_CLI_HELP, EXT_CLI_PARSE, EXT_CLI_PARSE_ARGS, EXT_CRYPTO_OP, EXT_ENV_ARGS, EXT_ENV_GET,
     EXT_ENV_LOAD, EXT_ENV_REQUIRE, EXT_FS_BINARY, EXT_FS_UNARY, EXT_LIST_FIRST, EXT_LIST_LAST,
     EXT_LIST_SORT, EXT_MAP_ENTRIES, EXT_MAP_GET, EXT_MAP_KEYS, EXT_MAP_REMOVE, EXT_MAP_VALUES,
-    EXT_PATH_OP, EXT_PROCESS_OP, EXT_STR_SPLIT, EXT_STR_TO_FLOAT, EXT_STR_TO_INT, Op,
+    EXT_PATH_OP, EXT_PROCESS_OP, EXT_STR_SPLIT, EXT_STR_TO_FLOAT, EXT_STR_TO_INT, EXT_URL_OP, Op,
 };
 use crate::vm::value::{
     SCHEMA_BOXED_BOOL, SCHEMA_BOXED_FLOAT, SCHEMA_BOXED_INT, SCHEMA_CLI_ERROR,
@@ -36,8 +37,8 @@ use crate::vm::value::{
     SCHEMA_FS_WRITER, SCHEMA_INDEX_ERROR, SCHEMA_JSON_DECODE_ERROR, SCHEMA_JSON_ENCODE_ERROR,
     SCHEMA_KEY_ERROR, SCHEMA_LIST_TAG, SCHEMA_MAP_TAG, SCHEMA_PARSE_ERROR, SCHEMA_PROCESS_ERROR,
     SCHEMA_PROCESS_OUTPUT, SCHEMA_STR_TAG, SCHEMA_TIME_DURATION, SCHEMA_TIME_ERROR,
-    SCHEMA_TIME_INSTANT, SCHEMA_TIME_TIMESTAMP, SCHEMA_VALIDATION_ERROR, SCHEMA_VALIDATION_ISSUE,
-    SCHEMA_VALIDATION_VIOLATION,
+    SCHEMA_TIME_INSTANT, SCHEMA_TIME_TIMESTAMP, SCHEMA_URL, SCHEMA_URL_ERROR,
+    SCHEMA_VALIDATION_ERROR, SCHEMA_VALIDATION_ISSUE, SCHEMA_VALIDATION_VIOLATION,
 };
 
 #[inline]
@@ -86,6 +87,8 @@ pub(crate) fn type_tag_for_switch(ty: &Type, checked: &CheckedProgram) -> Result
                 ("cdt.process", "ProcessError") => Ok(SCHEMA_PROCESS_ERROR),
                 ("cdt.process", "Output") => Ok(SCHEMA_PROCESS_OUTPUT),
                 ("cdt.crypto", "CryptoError") => Ok(SCHEMA_CRYPTO_ERROR),
+                ("cdt.url", "UrlError") => Ok(SCHEMA_URL_ERROR),
+                ("cdt.url", "Url") => Ok(SCHEMA_URL),
                 _ => Err(format!("Unsupported native type '{}' in switch pattern", tid)),
             },
             _ => Err(format!("Unsupported type '{}' in switch pattern", tid)),
@@ -694,6 +697,57 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 Ok(a)
             }
             other => Err(format!("Unsupported cdt.crypto symbol '{}'", other)),
+        }
+    }
+
+    pub(crate) fn lower_url_call(
+        &mut self,
+        sym: &str,
+        args: &[Expr],
+        named_args: &[NamedArg],
+    ) -> Result<u16, String> {
+        match sym {
+            "UrlError" => {
+                self.lower_native_record(SCHEMA_URL_ERROR, &["kind", "message"], args, named_args)
+            }
+            "Url" => {
+                let get_expr = |idx: usize, name: &str| -> &Expr {
+                    if !named_args.is_empty() {
+                        &named_args.iter().find(|n| n.name == name).unwrap().value
+                    } else {
+                        &args[idx]
+                    }
+                };
+                let scheme_o = self.lower_obj(get_expr(0, "scheme"))?;
+                let host_o = self.lower_obj(get_expr(1, "host"))?;
+                let port_s = self.lower_scalar(get_expr(2, "port"))?;
+                let path_o = self.lower_obj(get_expr(3, "path"))?;
+                let query_o = self.lower_obj(get_expr(4, "query"))?;
+                let frag_o = self.lower_obj(get_expr(5, "fragment"))?;
+                let desc_idx = self.mc.intern_record_desc(RecordDesc {
+                    schema_id: SCHEMA_URL,
+                    scalar_regs: Box::new([port_s]),
+                    obj_regs: Box::new([scheme_o, host_o, path_o, query_o, frag_o]),
+                })?;
+                let dst_obj = self.alloc_temp_o();
+                self.ops.push(Op::NewRecord { dst_obj, desc_idx });
+                Ok(dst_obj)
+            }
+            "parse" | "encode" | "decode" | "encode_query" | "decode_query" => {
+                let aux = match sym {
+                    "parse" => URL_PARSE,
+                    "encode" => URL_ENCODE,
+                    "decode" => URL_DECODE,
+                    "encode_query" => URL_ENCODE_QUERY,
+                    "decode_query" => URL_DECODE_QUERY,
+                    _ => unreachable!(),
+                };
+                let b = self.lower_obj(&args[0])?;
+                let a = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp { kind: EXT_URL_OP, aux, a, b, c: 0 });
+                Ok(a)
+            }
+            other => Err(format!("Unsupported cdt.url symbol '{}'", other)),
         }
     }
 

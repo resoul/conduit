@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::ir::{CallableRef, ElemKind, Module, PipelineStage};
-use crate::vm::exec_cold::err_msg;
+use crate::vm::exec_cold::{err_div_zero, err_msg, err_overflow};
 use crate::vm::opcode::Op;
 use crate::vm::pipeline_leaf::{
     exec_obj_leaf, exec_scalar_leaf, is_o0_read_only, is_obj_leaf_ops, is_scalar_leaf_ops,
@@ -9,6 +9,807 @@ use crate::vm::pipeline_leaf::{
 };
 use crate::vm::value::{ClosureData, ListStorage, Obj};
 use crate::vm::{ExecResult, RuntimeError, Vm};
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FAST_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[inline]
+fn match_mod_eq_filter(ops: &[Op], int_consts: &[i64]) -> Option<(i64, i64)> {
+    if ops.len() > 8 {
+        return None;
+    }
+    let mut imm = [None; 16];
+    let mut mod_of_x = [None; 16];
+    let mut eq_res = [None; 16];
+    for &op in ops {
+        match op {
+            Op::LoadImmInt { dst, imm: v } if (dst as usize) < 16 => {
+                imm[dst as usize] = Some(i64::from(v));
+            }
+            Op::LoadConstInt { dst, idx } if (dst as usize) < 16 => {
+                imm[dst as usize] = int_consts.get(idx as usize).copied();
+            }
+            Op::NegInt { dst, src } if (dst as usize) < 16 && (src as usize) < 16 => {
+                imm[dst as usize] = imm[src as usize].and_then(i64::checked_neg);
+            }
+            Op::ModIntImm { dst, a, imm: m } if a == 0 && (dst as usize) < 16 => {
+                mod_of_x[dst as usize] = Some(i64::from(m));
+            }
+            Op::ModInt { dst, a, b }
+                if a == 0 && (dst as usize) < 16 && (b as usize) < 16 =>
+            {
+                mod_of_x[dst as usize] = imm[b as usize];
+            }
+            Op::EqIntImm { dst, a, imm: r }
+                if (dst as usize) < 16 && (a as usize) < 16 =>
+            {
+                if let Some(m) = mod_of_x[a as usize] {
+                    eq_res[dst as usize] = Some((m, i64::from(r)));
+                }
+            }
+            Op::EqInt { dst, a, b }
+                if (dst as usize) < 16 && (a as usize) < 16 && (b as usize) < 16 =>
+            {
+                if let (Some(m), Some(r)) = (mod_of_x[a as usize], imm[b as usize]) {
+                    eq_res[dst as usize] = Some((m, r));
+                } else if let (Some(r), Some(m)) = (imm[a as usize], mod_of_x[b as usize]) {
+                    eq_res[dst as usize] = Some((m, r));
+                }
+            }
+            Op::ReturnScalar { src } if (src as usize) < 16 => {
+                return eq_res[src as usize];
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+#[inline]
+fn match_affine_map(ops: &[Op], int_consts: &[i64]) -> Option<(i64, i64)> {
+    if ops.len() > 8 {
+        return None;
+    }
+    let mut imm: [Option<i64>; 16] = [None; 16];
+    let mut aff: [Option<(i64, i64)>; 16] = [None; 16];
+    aff[0] = Some((1, 0));
+    // stage 0: raw x only; stage 1: after at most one x*imm; stage 2: after at most one add/sub.
+    let mut stage: u8 = 0;
+    for &op in ops {
+        match op {
+            Op::LoadImmInt { dst, imm: v } if (dst as usize) < 16 => {
+                imm[dst as usize] = Some(i64::from(v));
+                aff[dst as usize] = None;
+            }
+            Op::LoadConstInt { dst, idx } if (dst as usize) < 16 => {
+                imm[dst as usize] = int_consts.get(idx as usize).copied();
+                aff[dst as usize] = None;
+            }
+            Op::NegInt { dst, src }
+                if (dst as usize) < 16 && (src as usize) < 16 && imm[src as usize].is_some() =>
+            {
+                imm[dst as usize] = imm[src as usize].and_then(i64::checked_neg);
+                aff[dst as usize] = None;
+            }
+            Op::MoveScalar { dst, src }
+                if (dst as usize) < 16 && (src as usize) < 16 =>
+            {
+                imm[dst as usize] = imm[src as usize];
+                aff[dst as usize] = aff[src as usize];
+            }
+            Op::MulInt { dst, a, b }
+                if stage == 0 && (dst as usize) < 16 && (a as usize) < 16 && (b as usize) < 16 =>
+            {
+                let res = match (aff[a as usize], imm[b as usize], imm[a as usize], aff[b as usize]) {
+                    (Some((k, c)), Some(m), _, _) | (_, _, Some(m), Some((k, c))) => {
+                        Some((k.checked_mul(m)?, c.checked_mul(m)?))
+                    }
+                    _ => None,
+                }?;
+                aff[dst as usize] = Some(res);
+                imm[dst as usize] = None;
+                stage = 1;
+            }
+            Op::AddIntImm { dst, a, imm: d }
+                if stage <= 1 && (dst as usize) < 16 && (a as usize) < 16 =>
+            {
+                let (k, c) = aff[a as usize]?;
+                aff[dst as usize] = Some((k, c.checked_add(i64::from(d))?));
+                imm[dst as usize] = None;
+                stage = 2;
+            }
+            Op::AddInt { dst, a, b }
+                if stage <= 1 && (dst as usize) < 16 && (a as usize) < 16 && (b as usize) < 16 =>
+            {
+                let res = match (aff[a as usize], imm[b as usize], imm[a as usize], aff[b as usize]) {
+                    (Some((k, c)), Some(d), _, _) | (_, _, Some(d), Some((k, c))) => {
+                        Some((k, c.checked_add(d)?))
+                    }
+                    _ => None,
+                }?;
+                aff[dst as usize] = Some(res);
+                imm[dst as usize] = None;
+                stage = 2;
+            }
+            Op::SubInt { dst, a, b }
+                if stage <= 1 && (dst as usize) < 16 && (a as usize) < 16 && (b as usize) < 16 =>
+            {
+                let (k, c) = aff[a as usize]?;
+                let d = imm[b as usize]?;
+                aff[dst as usize] = Some((k, c.checked_sub(d)?));
+                imm[dst as usize] = None;
+                stage = 2;
+            }
+            Op::ReturnScalar { src } if (src as usize) < 16 => {
+                return aff[src as usize];
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+#[inline]
+fn match_sum_reduce(ops: &[Op]) -> bool {
+    matches!(
+        ops,
+        [
+            Op::AddInt { dst, a: 0, b: 1 } | Op::AddInt { dst, a: 1, b: 0 },
+            Op::ReturnScalar { src }
+        ] if dst == src
+    )
+}
+
+#[derive(Clone, Copy)]
+enum IntCmp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+#[derive(Clone, Copy)]
+enum IntFilter {
+    ModEq(i64, i64),
+    Cmp(IntCmp, i64),
+}
+
+#[derive(Clone, Copy)]
+enum IntReduceOp {
+    Sum,
+    Min,
+    Max,
+}
+
+#[inline]
+fn flip_int_cmp(c: IntCmp) -> IntCmp {
+    match c {
+        IntCmp::Eq => IntCmp::Eq,
+        IntCmp::Ne => IntCmp::Ne,
+        IntCmp::Lt => IntCmp::Gt,
+        IntCmp::Le => IntCmp::Ge,
+        IntCmp::Gt => IntCmp::Lt,
+        IntCmp::Ge => IntCmp::Le,
+    }
+}
+
+#[inline]
+fn match_cmp_int_filter(ops: &[Op], int_consts: &[i64]) -> Option<(IntCmp, i64)> {
+    if ops.len() > 8 {
+        return None;
+    }
+    let mut imm: [Option<i64>; 16] = [None; 16];
+    let mut is_x = [false; 16];
+    is_x[0] = true;
+    let mut cmp_res: [Option<(IntCmp, i64)>; 16] = [None; 16];
+    for &op in ops {
+        match op {
+            Op::LoadImmInt { dst, imm: v } if (dst as usize) < 16 => {
+                imm[dst as usize] = Some(i64::from(v));
+                is_x[dst as usize] = false;
+            }
+            Op::LoadConstInt { dst, idx } if (dst as usize) < 16 => {
+                imm[dst as usize] = int_consts.get(idx as usize).copied();
+                is_x[dst as usize] = false;
+            }
+            Op::NegInt { dst, src } if (dst as usize) < 16 && (src as usize) < 16 => {
+                imm[dst as usize] = imm[src as usize].and_then(i64::checked_neg);
+                is_x[dst as usize] = false;
+            }
+            Op::MoveScalar { dst, src } if (dst as usize) < 16 && (src as usize) < 16 => {
+                imm[dst as usize] = imm[src as usize];
+                is_x[dst as usize] = is_x[src as usize];
+                cmp_res[dst as usize] = cmp_res[src as usize];
+            }
+            Op::EqIntImm { dst, a, imm: c } if (dst as usize) < 16 && (a as usize) < 16 && is_x[a as usize] => {
+                cmp_res[dst as usize] = Some((IntCmp::Eq, i64::from(c)));
+            }
+            Op::LtIntImm { dst, a, imm: c } if (dst as usize) < 16 && (a as usize) < 16 && is_x[a as usize] => {
+                cmp_res[dst as usize] = Some((IntCmp::Lt, i64::from(c)));
+            }
+            Op::EqInt { dst, a, b }
+            | Op::NeInt { dst, a, b }
+            | Op::LtInt { dst, a, b }
+            | Op::LeInt { dst, a, b }
+            | Op::GtInt { dst, a, b }
+            | Op::GeInt { dst, a, b }
+                if (dst as usize) < 16 && (a as usize) < 16 && (b as usize) < 16 =>
+            {
+                let base = match op {
+                    Op::EqInt { .. } => IntCmp::Eq,
+                    Op::NeInt { .. } => IntCmp::Ne,
+                    Op::LtInt { .. } => IntCmp::Lt,
+                    Op::LeInt { .. } => IntCmp::Le,
+                    Op::GtInt { .. } => IntCmp::Gt,
+                    _ => IntCmp::Ge,
+                };
+                if is_x[a as usize]
+                    && let Some(c) = imm[b as usize]
+                {
+                    cmp_res[dst as usize] = Some((base, c));
+                } else if is_x[b as usize]
+                    && let Some(c) = imm[a as usize]
+                {
+                    cmp_res[dst as usize] = Some((flip_int_cmp(base), c));
+                } else {
+                    return None;
+                }
+            }
+            Op::ReturnScalar { src } if (src as usize) < 16 => {
+                return cmp_res[src as usize];
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+#[inline]
+fn match_int_filter(ops: &[Op], int_consts: &[i64]) -> Option<IntFilter> {
+    if let Some((m, r)) = match_mod_eq_filter(ops, int_consts) {
+        return Some(IntFilter::ModEq(m, r));
+    }
+    match_cmp_int_filter(ops, int_consts).map(|(cmp, c)| IntFilter::Cmp(cmp, c))
+}
+
+#[inline]
+fn extract_if_else_returns(ops: &[Op], cond_reg: u16, target: u32) -> Option<(u16, u16)> {
+    // ops[0] is comparison, ops[1] is JumpIfFalse { cond, target }
+    let t = target as usize;
+    if t >= ops.len() || t < 3 {
+        return None;
+    }
+    match (&ops[2..t], &ops[t..]) {
+        ([Op::ReturnScalar { src: ts }], [Op::ReturnScalar { src: es }])
+            if (*ts == 0 || *ts == 1) && (*es == 0 || *es == 1) && ts != es =>
+        {
+            let _ = cond_reg;
+            Some((*ts, *es))
+        }
+        (
+            [Op::ReturnScalar { src: ts }],
+            [Op::MoveScalar { dst: d, src: es }, Op::ReturnScalar { src: r }],
+        ) if d == r && (*ts == 0 || *ts == 1) && (*es == 0 || *es == 1) && ts != es => {
+            Some((*ts, *es))
+        }
+        (
+            [Op::MoveScalar { dst: d1, src: ts }, Op::Jump { target: j }],
+            [Op::MoveScalar { dst: d2, src: es }, Op::ReturnScalar { src: r }],
+        ) if *j as usize == ops.len() - 1
+            && d1 == r
+            && d2 == r
+            && (*ts == 0 || *ts == 1)
+            && (*es == 0 || *es == 1)
+            && ts != es =>
+        {
+            Some((*ts, *es))
+        }
+        _ => None,
+    }
+}
+
+#[inline]
+fn match_int_reduce(ops: &[Op]) -> Option<IntReduceOp> {
+    if match_sum_reduce(ops) {
+        return Some(IntReduceOp::Sum);
+    }
+    if ops.len() < 4 || ops.len() > 6 {
+        return None;
+    }
+    let (cmp, a, b, cond_reg) = match ops[0] {
+        Op::LtInt { dst, a, b } => (IntCmp::Lt, a, b, dst),
+        Op::LeInt { dst, a, b } => (IntCmp::Le, a, b, dst),
+        Op::GtInt { dst, a, b } => (IntCmp::Gt, a, b, dst),
+        Op::GeInt { dst, a, b } => (IntCmp::Ge, a, b, dst),
+        _ => return None,
+    };
+    if !((a == 0 && b == 1) || (a == 1 && b == 0)) {
+        return None;
+    }
+    let Op::JumpIfFalse { cond, target } = ops[1] else {
+        return None;
+    };
+    if cond != cond_reg {
+        return None;
+    }
+    let (then_s, _else_s) = extract_if_else_returns(ops, cond_reg, target)?;
+    // Normalize so we ask: when `acc <cmp_norm> x` is true, does it return `acc` (0)?
+    let cmp_norm = if a == 0 { cmp } else { flip_int_cmp(cmp) };
+    let returns_acc_when_true = then_s == 0;
+    match (cmp_norm, returns_acc_when_true) {
+        (IntCmp::Lt | IntCmp::Le, true) | (IntCmp::Gt | IntCmp::Ge, false) => Some(IntReduceOp::Min),
+        (IntCmp::Gt | IntCmp::Ge, true) | (IntCmp::Lt | IntCmp::Le, false) => Some(IntReduceOp::Max),
+        _ => None,
+    }
+}
+
+#[inline(always)]
+fn run_int_kernel(
+    src: &[i64],
+    init_acc: u64,
+    filter: impl Fn(i64) -> Result<bool, RuntimeError>,
+    map: impl Fn(i64) -> Result<i64, RuntimeError>,
+    reduce: impl Fn(i64, i64) -> Result<i64, RuntimeError>,
+) -> Result<u64, RuntimeError> {
+    let mut acc = init_acc as i64;
+    for &x in src.iter() {
+        if filter(x)? {
+            let v = map(x)?;
+            acc = reduce(acc, v)?;
+        }
+    }
+    Ok(acc as u64)
+}
+
+#[inline(always)]
+fn dispatch_int_reduce(
+    src: &[i64],
+    init_acc: u64,
+    filter: impl Fn(i64) -> Result<bool, RuntimeError>,
+    map: impl Fn(i64) -> Result<i64, RuntimeError>,
+    red: IntReduceOp,
+) -> Result<u64, RuntimeError> {
+    match red {
+        IntReduceOp::Sum => run_int_kernel(src, init_acc, filter, map, |a, v| {
+            a.checked_add(v).ok_or_else(err_overflow)
+        }),
+        IntReduceOp::Min => run_int_kernel(src, init_acc, filter, map, |a, v| Ok(a.min(v))),
+        IntReduceOp::Max => run_int_kernel(src, init_acc, filter, map, |a, v| Ok(a.max(v))),
+    }
+}
+
+#[inline(always)]
+fn dispatch_int_filter_map_reduce(
+    src: &[i64],
+    init_acc: u64,
+    filter: Option<IntFilter>,
+    map: Option<(i64, i64)>,
+    red: IntReduceOp,
+) -> Result<u64, RuntimeError> {
+    let map_fn = move |x: i64| -> Result<i64, RuntimeError> {
+        match map {
+            Some((mul, add)) => x
+                .checked_mul(mul)
+                .and_then(|v| v.checked_add(add))
+                .ok_or_else(err_overflow),
+            None => Ok(x),
+        }
+    };
+    match filter {
+        None => dispatch_int_reduce(src, init_acc, |_| Ok(true), map_fn, red),
+        Some(IntFilter::ModEq(m, rem)) => {
+            if m == 0 {
+                if src.is_empty() {
+                    return Ok(init_acc);
+                }
+                return Err(err_div_zero());
+            }
+            dispatch_int_reduce(
+                src,
+                init_acc,
+                |x| match x.checked_rem(m) {
+                    Some(r) => Ok(r == rem),
+                    None => Err(err_overflow()),
+                },
+                map_fn,
+                red,
+            )
+        }
+        Some(IntFilter::Cmp(IntCmp::Eq, c)) => {
+            dispatch_int_reduce(src, init_acc, |x| Ok(x == c), map_fn, red)
+        }
+        Some(IntFilter::Cmp(IntCmp::Ne, c)) => {
+            dispatch_int_reduce(src, init_acc, |x| Ok(x != c), map_fn, red)
+        }
+        Some(IntFilter::Cmp(IntCmp::Lt, c)) => {
+            dispatch_int_reduce(src, init_acc, |x| Ok(x < c), map_fn, red)
+        }
+        Some(IntFilter::Cmp(IntCmp::Le, c)) => {
+            dispatch_int_reduce(src, init_acc, |x| Ok(x <= c), map_fn, red)
+        }
+        Some(IntFilter::Cmp(IntCmp::Gt, c)) => {
+            dispatch_int_reduce(src, init_acc, |x| Ok(x > c), map_fn, red)
+        }
+        Some(IntFilter::Cmp(IntCmp::Ge, c)) => {
+            dispatch_int_reduce(src, init_acc, |x| Ok(x >= c), map_fn, red)
+        }
+    }
+}
+
+#[inline]
+fn try_run_int_reduce_fast(
+    src: &[i64],
+    init_acc: u64,
+    stages: &[ResolvedStage<'_>],
+    int_consts: &[i64],
+) -> Option<Result<u64, RuntimeError>> {
+    match stages {
+        [st_f, st_m, st_r]
+            if matches!(st_f.kind, StageKind::FilterScalar)
+                && matches!(st_m.kind, StageKind::MapScalar)
+                && matches!(st_r.kind, StageKind::ReduceScalar)
+                && st_f.closure_slot == usize::MAX
+                && st_m.closure_slot == usize::MAX
+                && st_r.closure_slot == usize::MAX =>
+        {
+            let f = match_int_filter(st_f.ops, int_consts)?;
+            let m = match_affine_map(st_m.ops, int_consts)?;
+            let r = match_int_reduce(st_r.ops)?;
+            #[cfg(test)]
+            FAST_HITS.with(|c| c.set(c.get() + 1));
+            Some(dispatch_int_filter_map_reduce(src, init_acc, Some(f), Some(m), r))
+        }
+        [st_f, st_r]
+            if matches!(st_f.kind, StageKind::FilterScalar)
+                && matches!(st_r.kind, StageKind::ReduceScalar)
+                && st_f.closure_slot == usize::MAX
+                && st_r.closure_slot == usize::MAX =>
+        {
+            let f = match_int_filter(st_f.ops, int_consts)?;
+            let r = match_int_reduce(st_r.ops)?;
+            #[cfg(test)]
+            FAST_HITS.with(|c| c.set(c.get() + 1));
+            Some(dispatch_int_filter_map_reduce(src, init_acc, Some(f), None, r))
+        }
+        [st_m, st_r]
+            if matches!(st_m.kind, StageKind::MapScalar)
+                && matches!(st_r.kind, StageKind::ReduceScalar)
+                && st_m.closure_slot == usize::MAX
+                && st_r.closure_slot == usize::MAX =>
+        {
+            let m = match_affine_map(st_m.ops, int_consts)?;
+            let r = match_int_reduce(st_r.ops)?;
+            #[cfg(test)]
+            FAST_HITS.with(|c| c.set(c.get() + 1));
+            Some(dispatch_int_filter_map_reduce(src, init_acc, None, Some(m), r))
+        }
+        [st_r]
+            if matches!(st_r.kind, StageKind::ReduceScalar)
+                && st_r.closure_slot == usize::MAX =>
+        {
+            let r = match_int_reduce(st_r.ops)?;
+            #[cfg(test)]
+            FAST_HITS.with(|c| c.set(c.get() + 1));
+            Some(dispatch_int_filter_map_reduce(src, init_acc, None, None, r))
+        }
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FloatCmp {
+    Eq,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+#[derive(Clone, Copy)]
+enum FloatReduceOp {
+    Sum,
+    MinLt,
+    MinLe,
+    MaxGt,
+    MaxGe,
+}
+
+#[inline]
+fn flip_float_cmp(c: FloatCmp) -> FloatCmp {
+    match c {
+        FloatCmp::Eq => FloatCmp::Eq,
+        FloatCmp::Lt => FloatCmp::Gt,
+        FloatCmp::Le => FloatCmp::Ge,
+        FloatCmp::Gt => FloatCmp::Lt,
+        FloatCmp::Ge => FloatCmp::Le,
+    }
+}
+
+#[inline]
+fn match_float_filter(ops: &[Op], float_consts: &[f64]) -> Option<(FloatCmp, f64)> {
+    if ops.len() > 8 {
+        return None;
+    }
+    let mut imm: [Option<f64>; 16] = [None; 16];
+    let mut is_x = [false; 16];
+    is_x[0] = true;
+    let mut cmp_res: [Option<(FloatCmp, f64)>; 16] = [None; 16];
+    for &op in ops {
+        match op {
+            Op::LoadConstFloat { dst, idx } if (dst as usize) < 16 => {
+                imm[dst as usize] = float_consts.get(idx as usize).copied();
+                is_x[dst as usize] = false;
+            }
+            Op::MoveScalar { dst, src } if (dst as usize) < 16 && (src as usize) < 16 => {
+                imm[dst as usize] = imm[src as usize];
+                is_x[dst as usize] = is_x[src as usize];
+                cmp_res[dst as usize] = cmp_res[src as usize];
+            }
+            Op::EqFloat { dst, a, b } | Op::LtFloat { dst, a, b } | Op::LeFloat { dst, a, b }
+                if (dst as usize) < 16 && (a as usize) < 16 && (b as usize) < 16 =>
+            {
+                let base = match op {
+                    Op::EqFloat { .. } => FloatCmp::Eq,
+                    Op::LtFloat { .. } => FloatCmp::Lt,
+                    _ => FloatCmp::Le,
+                };
+                if is_x[a as usize]
+                    && let Some(c) = imm[b as usize]
+                {
+                    cmp_res[dst as usize] = Some((base, c));
+                } else if is_x[b as usize]
+                    && let Some(c) = imm[a as usize]
+                {
+                    cmp_res[dst as usize] = Some((flip_float_cmp(base), c));
+                } else {
+                    return None;
+                }
+            }
+            Op::ReturnScalar { src } if (src as usize) < 16 => {
+                return cmp_res[src as usize];
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+#[inline]
+fn match_float_affine_map(ops: &[Op], float_consts: &[f64]) -> Option<(f64, f64)> {
+    if ops.len() > 8 {
+        return None;
+    }
+    let mut imm: [Option<f64>; 16] = [None; 16];
+    let mut aff: [Option<(f64, f64)>; 16] = [None; 16];
+    aff[0] = Some((1.0, 0.0));
+    let mut stage: u8 = 0;
+    for &op in ops {
+        match op {
+            Op::LoadConstFloat { dst, idx } if (dst as usize) < 16 => {
+                imm[dst as usize] = float_consts.get(idx as usize).copied();
+                aff[dst as usize] = None;
+            }
+            Op::MoveScalar { dst, src } if (dst as usize) < 16 && (src as usize) < 16 => {
+                imm[dst as usize] = imm[src as usize];
+                aff[dst as usize] = aff[src as usize];
+            }
+            Op::MulFloat { dst, a, b }
+                if stage == 0 && (dst as usize) < 16 && (a as usize) < 16 && (b as usize) < 16 =>
+            {
+                let res = match (aff[a as usize], imm[b as usize], imm[a as usize], aff[b as usize]) {
+                    (Some((k, c)), Some(m), _, _) | (_, _, Some(m), Some((k, c))) => {
+                        Some((k * m, c * m))
+                    }
+                    _ => None,
+                }?;
+                aff[dst as usize] = Some(res);
+                imm[dst as usize] = None;
+                stage = 1;
+            }
+            Op::AddFloat { dst, a, b }
+                if stage <= 1 && (dst as usize) < 16 && (a as usize) < 16 && (b as usize) < 16 =>
+            {
+                let res = match (aff[a as usize], imm[b as usize], imm[a as usize], aff[b as usize]) {
+                    (Some((k, c)), Some(d), _, _) | (_, _, Some(d), Some((k, c))) => {
+                        Some((k, c + d))
+                    }
+                    _ => None,
+                }?;
+                aff[dst as usize] = Some(res);
+                imm[dst as usize] = None;
+                stage = 2;
+            }
+            Op::SubFloat { dst, a, b }
+                if stage <= 1 && (dst as usize) < 16 && (a as usize) < 16 && (b as usize) < 16 =>
+            {
+                let (k, c) = aff[a as usize]?;
+                let d = imm[b as usize]?;
+                aff[dst as usize] = Some((k, c - d));
+                imm[dst as usize] = None;
+                stage = 2;
+            }
+            Op::ReturnScalar { src } if (src as usize) < 16 => {
+                return aff[src as usize];
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+#[inline]
+fn match_float_reduce(ops: &[Op]) -> Option<FloatReduceOp> {
+    if matches!(
+        ops,
+        [
+            Op::AddFloat { dst, a: 0, b: 1 } | Op::AddFloat { dst, a: 1, b: 0 },
+            Op::ReturnScalar { src }
+        ] if dst == src
+    ) {
+        return Some(FloatReduceOp::Sum);
+    }
+    if ops.len() < 4 || ops.len() > 6 {
+        return None;
+    }
+    let (cmp, a, b, cond_reg) = match ops[0] {
+        Op::LtFloat { dst, a, b } => (FloatCmp::Lt, a, b, dst),
+        Op::LeFloat { dst, a, b } => (FloatCmp::Le, a, b, dst),
+        _ => return None,
+    };
+    if !((a == 0 && b == 1) || (a == 1 && b == 0)) {
+        return None;
+    }
+    let Op::JumpIfFalse { cond, target } = ops[1] else {
+        return None;
+    };
+    if cond != cond_reg {
+        return None;
+    }
+    let (then_s, _else_s) = extract_if_else_returns(ops, cond_reg, target)?;
+    let cmp_norm = if a == 0 { cmp } else { flip_float_cmp(cmp) };
+    let returns_acc_when_true = then_s == 0;
+    match (cmp_norm, returns_acc_when_true) {
+        (FloatCmp::Lt, true) => Some(FloatReduceOp::MinLt),
+        (FloatCmp::Le, true) => Some(FloatReduceOp::MinLe),
+        (FloatCmp::Gt, true) => Some(FloatReduceOp::MaxGt),
+        (FloatCmp::Ge, true) => Some(FloatReduceOp::MaxGe),
+        // Note: when NaN is involved, `if acc < x { x } else { acc }` differs from `if acc > x { acc } else { x }`,
+        // so only match direct `returns_acc_when_true` forms or handle `else` when non-NaN equivalence isn't needed;
+        // actually we can preserve the exact comparison: if `then_s == 1`, `acc` is returned in `else`.
+        _ => None,
+    }
+}
+
+#[inline(always)]
+fn run_float_kernel(
+    src: &[f64],
+    init_acc: u64,
+    filter: impl Fn(f64) -> bool,
+    map: impl Fn(f64) -> f64,
+    reduce: impl Fn(f64, f64) -> f64,
+) -> u64 {
+    let mut acc = f64::from_bits(init_acc);
+    for &x in src.iter() {
+        if filter(x) {
+            let v = map(x);
+            acc = reduce(acc, v);
+        }
+    }
+    acc.to_bits()
+}
+
+#[inline(always)]
+fn dispatch_float_reduce(
+    src: &[f64],
+    init_acc: u64,
+    filter: impl Fn(f64) -> bool,
+    map: impl Fn(f64) -> f64,
+    red: FloatReduceOp,
+) -> u64 {
+    match red {
+        FloatReduceOp::Sum => run_float_kernel(src, init_acc, filter, map, |a, v| a + v),
+        FloatReduceOp::MinLt => {
+            run_float_kernel(src, init_acc, filter, map, |a, v| if a < v { a } else { v })
+        }
+        FloatReduceOp::MinLe => {
+            run_float_kernel(src, init_acc, filter, map, |a, v| if a <= v { a } else { v })
+        }
+        FloatReduceOp::MaxGt => {
+            run_float_kernel(src, init_acc, filter, map, |a, v| if a > v { a } else { v })
+        }
+        FloatReduceOp::MaxGe => {
+            run_float_kernel(src, init_acc, filter, map, |a, v| if a >= v { a } else { v })
+        }
+    }
+}
+
+#[inline(always)]
+fn dispatch_float_filter_map_reduce(
+    src: &[f64],
+    init_acc: u64,
+    filter: Option<(FloatCmp, f64)>,
+    map: Option<(f64, f64)>,
+    red: FloatReduceOp,
+) -> u64 {
+    let map_fn = move |x: f64| -> f64 {
+        match map {
+            Some((mul, add)) => x * mul + add,
+            None => x,
+        }
+    };
+    match filter {
+        None => dispatch_float_reduce(src, init_acc, |_| true, map_fn, red),
+        Some((FloatCmp::Eq, c)) => dispatch_float_reduce(src, init_acc, |x| x == c, map_fn, red),
+        Some((FloatCmp::Lt, c)) => dispatch_float_reduce(src, init_acc, |x| x < c, map_fn, red),
+        Some((FloatCmp::Le, c)) => dispatch_float_reduce(src, init_acc, |x| x <= c, map_fn, red),
+        Some((FloatCmp::Gt, c)) => dispatch_float_reduce(src, init_acc, |x| x > c, map_fn, red),
+        Some((FloatCmp::Ge, c)) => dispatch_float_reduce(src, init_acc, |x| x >= c, map_fn, red),
+    }
+}
+
+#[inline]
+fn try_run_float_reduce_fast(
+    src: &[f64],
+    init_acc: u64,
+    stages: &[ResolvedStage<'_>],
+    float_consts: &[f64],
+) -> Option<u64> {
+    match stages {
+        [st_f, st_m, st_r]
+            if matches!(st_f.kind, StageKind::FilterScalar)
+                && matches!(st_m.kind, StageKind::MapScalar)
+                && matches!(st_r.kind, StageKind::ReduceScalar)
+                && st_f.closure_slot == usize::MAX
+                && st_m.closure_slot == usize::MAX
+                && st_r.closure_slot == usize::MAX =>
+        {
+            let f = match_float_filter(st_f.ops, float_consts)?;
+            let m = match_float_affine_map(st_m.ops, float_consts)?;
+            let r = match_float_reduce(st_r.ops)?;
+            #[cfg(test)]
+            FAST_HITS.with(|c| c.set(c.get() + 1));
+            Some(dispatch_float_filter_map_reduce(src, init_acc, Some(f), Some(m), r))
+        }
+        [st_f, st_r]
+            if matches!(st_f.kind, StageKind::FilterScalar)
+                && matches!(st_r.kind, StageKind::ReduceScalar)
+                && st_f.closure_slot == usize::MAX
+                && st_r.closure_slot == usize::MAX =>
+        {
+            let f = match_float_filter(st_f.ops, float_consts)?;
+            let r = match_float_reduce(st_r.ops)?;
+            #[cfg(test)]
+            FAST_HITS.with(|c| c.set(c.get() + 1));
+            Some(dispatch_float_filter_map_reduce(src, init_acc, Some(f), None, r))
+        }
+        [st_m, st_r]
+            if matches!(st_m.kind, StageKind::MapScalar)
+                && matches!(st_r.kind, StageKind::ReduceScalar)
+                && st_m.closure_slot == usize::MAX
+                && st_r.closure_slot == usize::MAX =>
+        {
+            let m = match_float_affine_map(st_m.ops, float_consts)?;
+            let r = match_float_reduce(st_r.ops)?;
+            #[cfg(test)]
+            FAST_HITS.with(|c| c.set(c.get() + 1));
+            Some(dispatch_float_filter_map_reduce(src, init_acc, None, Some(m), r))
+        }
+        [st_r]
+            if matches!(st_r.kind, StageKind::ReduceScalar)
+                && st_r.closure_slot == usize::MAX =>
+        {
+            let r = match_float_reduce(st_r.ops)?;
+            #[cfg(test)]
+            FAST_HITS.with(|c| c.set(c.get() + 1));
+            Some(dispatch_float_filter_map_reduce(src, init_acc, None, None, r))
+        }
+        _ => None,
+    }
+}
 
 #[derive(Clone, Copy)]
 enum StageKind {
@@ -795,11 +1596,19 @@ impl Vm {
         let res = match &self.objs[o_base + src_obj as usize] {
             Obj::List(ListStorage::Int(v)) => {
                 let src = Arc::clone(v);
-                self.run_scalar_slice_reduce(module, &stages, &src, init_acc, |x| x as u64, stage_s_base, stage_o_base)
+                if let Some(fast_res) = try_run_int_reduce_fast(&src, init_acc, &stages, &module.int_consts) {
+                    fast_res
+                } else {
+                    self.run_scalar_slice_reduce(module, &stages, &src, init_acc, |x| x as u64, stage_s_base, stage_o_base)
+                }
             }
             Obj::List(ListStorage::Float(v)) => {
                 let src = Arc::clone(v);
-                self.run_scalar_slice_reduce(module, &stages, &src, init_acc, f64::to_bits, stage_s_base, stage_o_base)
+                if let Some(fast_val) = try_run_float_reduce_fast(&src, init_acc, &stages, &module.float_consts) {
+                    Ok(fast_val)
+                } else {
+                    self.run_scalar_slice_reduce(module, &stages, &src, init_acc, f64::to_bits, stage_s_base, stage_o_base)
+                }
             }
             _ => return Err(err_msg("Expected scalar list in pipeline reduce")),
         };

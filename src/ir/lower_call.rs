@@ -132,6 +132,9 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 if self.mc.checked.crypto_aliases.contains(alias) {
                     return self.lower_crypto_call(field, args, named_args);
                 }
+                if self.mc.checked.url_aliases.contains(alias) {
+                    return self.lower_url_call(field, args, named_args);
+                }
                 if self.mc.checked.path_aliases.contains(alias) {
                     return self.lower_path_call(field, args);
                 }
@@ -234,6 +237,9 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 if self.mc.checked.crypto_aliases.contains(alias) {
                     return self.lower_crypto_call(field, args, named_args);
                 }
+                if self.mc.checked.url_aliases.contains(alias) {
+                    return self.lower_url_call(field, args, named_args);
+                }
             }
             if let Some(reg) = self.lower_builtin_obj_method(target, field, args)? {
                 return Ok(reg);
@@ -311,6 +317,14 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             if let Some(sym) = self.mc.checked.crypto_direct_types.get(name) {
                 let sym = sym.clone();
                 return self.lower_crypto_call(&sym, args, named_args);
+            }
+            if let Some(sym) = self.mc.checked.url_direct_fns.get(name) {
+                let sym = sym.clone();
+                return self.lower_url_call(&sym, args, named_args);
+            }
+            if let Some(sym) = self.mc.checked.url_direct_types.get(name) {
+                let sym = sym.clone();
+                return self.lower_url_call(&sym, args, named_args);
             }
             if name == "Map" {
                 let dst_obj = self.alloc_temp_o();

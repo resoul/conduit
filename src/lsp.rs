@@ -26,7 +26,7 @@ pub fn run_server_loop(mut reader: impl BufRead, mut writer: impl Write) -> io::
         match method.as_str() {
             "initialize" => {
                 let resp = format!(
-                    r#"{{"jsonrpc":"2.0","id":{},"result":{{"capabilities":{{"textDocumentSync":1,"hoverProvider":true,"completionProvider":{{"triggerCharacters":[".",":"]}}}}}}}}"#,
+                    r#"{{"jsonrpc":"2.0","id":{},"result":{{"capabilities":{{"textDocumentSync":1,"hoverProvider":true,"definitionProvider":true,"completionProvider":{{"triggerCharacters":[".",":"]}}}}}}}}"#,
                     id
                 );
                 send_message(&mut writer, &resp)?;
@@ -54,6 +54,10 @@ pub fn run_server_loop(mut reader: impl BufRead, mut writer: impl Write) -> io::
             }
             "textDocument/hover" => {
                 let resp = handle_hover(&msg, &id, &documents, &checked_cache);
+                send_message(&mut writer, &resp)?;
+            }
+            "textDocument/definition" => {
+                let resp = handle_definition(&msg, &id, &documents);
                 send_message(&mut writer, &resp)?;
             }
             "textDocument/completion" => {
@@ -168,6 +172,145 @@ fn format_diagnostic(uri: &str, line: usize, col: usize, msg: &str) -> String {
         c + 1,
         escape_json(msg)
     )
+}
+
+fn find_decl_span_in_source(source: &str, sym: &str) -> Option<(usize, usize)> {
+    let tokens = crate::frontend::lexer::Lexer::new(source).tokenize_all().ok()?;
+    let prog = crate::frontend::parser::Parser::new(tokens).parse_program().ok()?;
+    for item in &prog.items {
+        let matched = match &item.kind {
+            ItemKind::Func { name, .. }
+            | ItemKind::Struct { name, .. }
+            | ItemKind::TypeAlias { name, .. } => name == sym,
+            _ => false,
+        };
+        if matched {
+            return Some((item.span.line.saturating_sub(1), item.span.col.saturating_sub(1)));
+        }
+    }
+    None
+}
+
+fn resolve_import_path(base_uri: &str, rel: &str) -> Option<std::path::PathBuf> {
+    let base_path = uri_to_path(base_uri);
+    let dir = base_path.parent()?;
+    let cand = dir.join(rel);
+    if cand.is_file() {
+        return Some(cand);
+    }
+    let with_ext = dir.join(format!("{}.cdt", rel));
+    if with_ext.is_file() {
+        return Some(with_ext);
+    }
+    let mod_cdt = cand.join("mod.cdt");
+    if mod_cdt.is_file() {
+        return Some(mod_cdt);
+    }
+    None
+}
+
+fn path_to_uri(path: &std::path::Path) -> String {
+    let norm = path.to_string_lossy().replace('\\', "/");
+    if norm.starts_with('/') {
+        format!("file://{}", norm)
+    } else {
+        format!("file:///{}", norm)
+    }
+}
+
+fn extract_quoted_at(line_str: &str, ch: usize) -> Option<String> {
+    let bytes = line_str.as_bytes();
+    let pos = ch.min(bytes.len());
+    let left = line_str[..pos].rfind('"')?;
+    let right_rel = line_str[pos..].find('"')?;
+    Some(line_str[left + 1..pos + right_rel].to_string())
+}
+
+fn handle_definition(msg: &str, id: &str, documents: &HashMap<String, String>) -> String {
+    let null_resp = format!(r#"{{"jsonrpc":"2.0","id":{},"result":null}}"#, id);
+    let Some(uri) = extract_uri(msg) else {
+        return null_resp;
+    };
+    let Some(doc) = documents.get(&uri) else {
+        return null_resp;
+    };
+    let line = extract_json_num(msg, "line").unwrap_or(0);
+    let ch = extract_json_num(msg, "character").unwrap_or(0);
+
+    // 1. If cursor is inside a relative import string `"./..."`, jump to that file.
+    if let Some(line_str) = doc.lines().nth(line)
+        && line_str.trim_start().starts_with("import")
+        && let Some(rel) = extract_quoted_at(line_str, ch)
+        && rel.starts_with('.')
+        && let Some(target_path) = resolve_import_path(&uri, &rel)
+    {
+        let target_uri = path_to_uri(&target_path);
+        return format!(
+            r#"{{"jsonrpc":"2.0","id":{},"result":{{"uri":"{}","range":{{"start":{{"line":0,"character":0}},"end":{{"line":0,"character":0}}}}}}}}"#,
+            id,
+            escape_json(&target_uri)
+        );
+    }
+
+    let (word, qualified) = get_words_at_position(doc, line, ch);
+    if word.is_empty() {
+        return null_resp;
+    }
+
+    // 2. Declaration in the current file
+    if let Some((dl, dc)) = find_decl_span_in_source(doc, &word) {
+        return format!(
+            r#"{{"jsonrpc":"2.0","id":{},"result":{{"uri":"{}","range":{{"start":{{"line":{},"character":{}}},"end":{{"line":{},"character":{}}}}}}}}}"#,
+            id,
+            escape_json(&uri),
+            dl,
+            dc,
+            dl,
+            dc + word.len()
+        );
+    }
+
+    // 3. Imported symbol from a relative module (`import { foo } from "./bar"` or `import * as bar from "./bar"`)
+    if let Ok(tokens) = crate::frontend::lexer::Lexer::new(doc).tokenize_all()
+        && let Ok(prog) = crate::frontend::parser::Parser::new(tokens).parse_program()
+    {
+        let prefix = qualified.strip_suffix(&format!(".{}", word));
+        for item in &prog.items {
+            if let ItemKind::Import { path, alias, names } = &item.kind
+                && path.starts_with('.')
+                && let Some(target_path) = resolve_import_path(&uri, path)
+            {
+                let target_sym = if let Some(spec) = names.iter().find(|s| s.alias == word) {
+                    Some(spec.name.as_str())
+                } else if prefix == alias.as_deref() && alias.is_some() {
+                    Some(word.as_str())
+                } else {
+                    None
+                };
+                if let Some(sym_name) = target_sym {
+                    let target_uri = path_to_uri(&target_path);
+                    let target_src = documents
+                        .get(&target_uri)
+                        .cloned()
+                        .or_else(|| std::fs::read_to_string(&target_path).ok());
+                    if let Some(tsrc) = target_src {
+                        let (dl, dc) = find_decl_span_in_source(&tsrc, sym_name).unwrap_or((0, 0));
+                        return format!(
+                            r#"{{"jsonrpc":"2.0","id":{},"result":{{"uri":"{}","range":{{"start":{{"line":{},"character":{}}},"end":{{"line":{},"character":{}}}}}}}}}"#,
+                            id,
+                            escape_json(&target_uri),
+                            dl,
+                            dc,
+                            dl,
+                            dc + sym_name.len()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    null_resp
 }
 
 fn find_func_hover(word: &str, prog: &Program, checked: &CheckedProgram, doc: &str) -> Option<String> {
@@ -524,15 +667,20 @@ mod tests {
         let hover_fn = frame(
             r#"{"jsonrpc":"2.0","id":2,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///tmp/test_lsp.cdt"},"position":{"line":4,"character":29}}}"#,
         );
+        let def_fn = frame(
+            r#"{"jsonrpc":"2.0","id":3,"method":"textDocument/definition","params":{"textDocument":{"uri":"file:///tmp/test_lsp.cdt"},"position":{"line":4,"character":29}}}"#,
+        );
         let exit = frame(r#"{"jsonrpc":"2.0","method":"exit"}"#);
 
-        let input = format!("{}{}{}{}", init, open, hover_fn, exit);
+        let input = format!("{}{}{}{}{}", init, open, hover_fn, def_fn, exit);
         let mut out = Vec::new();
         run_server_loop(io::Cursor::new(input.as_bytes()), &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains(r#""hoverProvider":true"#));
+        assert!(text.contains(r#""definitionProvider":true"#));
         assert!(text.contains(r#""diagnostics":[]"#));
         assert!(text.contains("func add(a: Int, b: Int) -> Int"));
         assert!(text.contains("Adds two numbers"));
+        assert!(text.contains(r#""id":3,"result":{"uri":"file:///tmp/test_lsp.cdt","range":{"start":{"line":1,"character":0}"#));
     }
 }

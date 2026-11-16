@@ -741,5 +741,336 @@ func main() -> String {
     let _ = std::fs::remove_file(&out_exe);
 }
 
+#[test]
+fn pipeline_reduce_fast_path_matches_interpreter_on_edge_cases() {
+    let src = r#"
+        export func fast_pipe(xs: [Int], init: Int) -> Int {
+            return xs |> filter((x: Int) => x % 2 == 0) |> map((x: Int) => x * 3 + 1) |> reduce(init, (acc: Int, x: Int) => acc + x)
+        }
+
+        export func slow_pipe(xs: [Int], init: Int) -> Int {
+            zero := 0
+            return xs |> filter((x: Int) => (x % 2) == zero) |> map((x: Int) => x * 3 + 1 + zero) |> reduce(init, (acc: Int, x: Int) => acc + x + zero)
+        }
+
+        export func div_zero_empty() -> Int {
+            xs := [0]
+            xs = []
+            return xs |> filter((x: Int) => x % 0 == 0) |> map((x: Int) => x * 3 + 1) |> reduce(42, (acc: Int, x: Int) => acc + x)
+        }
+
+        export func div_zero_nonempty() -> Int {
+            xs := [10]
+            return xs |> filter((x: Int) => x % 0 == 0) |> map((x: Int) => x * 3 + 1) |> reduce(42, (acc: Int, x: Int) => acc + x)
+        }
+
+        export func rem_min_neg1() -> Int {
+            xs := [-9223372036854775807 - 1]
+            return xs |> filter((x: Int) => x % -1 == 0) |> map((x: Int) => x * 1 + 0) |> reduce(0, (acc: Int, x: Int) => acc + x)
+        }
+
+        export func neg_mod_pipe(xs: [Int]) -> Int {
+            return xs |> filter((x: Int) => x % -3 == -1) |> map((x: Int) => x * -2 + 5) |> reduce(7, (acc: Int, x: Int) => acc + x)
+        }
+
+        export func map_overflow() -> Int {
+            xs := [9223372036854775806]
+            return xs |> filter((x: Int) => x % 2 == 0) |> map((x: Int) => x * 3 + 1) |> reduce(0, (acc: Int, x: Int) => acc + x)
+        }
+    "#;
+
+    let module = crate::frontend::compile_source(src).expect("compile edge cases");
+    let f_fast = module.func_id("fast_pipe").unwrap();
+    let f_slow = module.func_id("slow_pipe").unwrap();
+    let f_dz_empty = module.func_id("div_zero_empty").unwrap();
+    let f_dz_nonempty = module.func_id("div_zero_nonempty").unwrap();
+    let f_rem_min = module.func_id("rem_min_neg1").unwrap();
+    let f_neg_mod = module.func_id("neg_mod_pipe").unwrap();
+    let f_map_ov = module.func_id("map_overflow").unwrap();
+
+    let mut vm = Vm::new();
+
+    for sample in [
+        vec![],
+        vec![0],
+        vec![-10, -3, -2, -1, 0, 1, 2, 3, 10, 99, -100],
+        (0..200).map(|i| i * 17 - 500).collect::<Vec<i64>>(),
+    ] {
+        let list_obj = Obj::List(ListStorage::Int(Arc::new(sample)));
+        crate::vm::pipeline::FAST_HITS.with(|c| c.set(0));
+        let r_fast = vm.call_scalar(&module, f_fast, &[13], std::slice::from_ref(&list_obj)).unwrap();
+        let hits = crate::vm::pipeline::FAST_HITS.with(|c| c.get());
+        assert_eq!(hits, 1);
+        let r_slow = vm.call_scalar(&module, f_slow, &[13], std::slice::from_ref(&list_obj)).unwrap();
+        assert_eq!(r_fast, r_slow);
+    }
+
+    assert_eq!(vm.call_scalar(&module, f_dz_empty, &[], &[]).unwrap(), 42);
+    let dz_err = vm.call_scalar(&module, f_dz_nonempty, &[], &[]).unwrap_err();
+    assert!(dz_err.message.contains("Division by zero"), "got {}", dz_err.message);
+
+    let min_err = vm.call_scalar(&module, f_rem_min, &[], &[]).unwrap_err();
+    assert!(min_err.message.contains("overflow"), "got {}", min_err.message);
+
+    let neg_in = Obj::List(ListStorage::Int(Arc::new(vec![-7, -4, -1, 0, 1, 4, 7])));
+    assert_eq!(
+        vm.call_scalar(&module, f_neg_mod, &[], &[neg_in]).unwrap(),
+        (7i64 + ((-7i64 * -2 + 5) + (-4i64 * -2 + 5) + (-1i64 * -2 + 5))) as u64
+    );
+
+    let ov_err = vm.call_scalar(&module, f_map_ov, &[], &[]).unwrap_err();
+    assert!(ov_err.message.contains("overflow"), "got {}", ov_err.message);
+}
+
+#[test]
+fn pipeline_fast_path_differential_over_grid() {
+    let mut specs: Vec<(String, String, String, String, String, bool)> = Vec::new();
+    for m in [-3i64, -2, -1, 1, 2, 3, 7] {
+        for r in [-2i64, -1, 0, 1, 2] {
+            for a in [-2i64, 0, 1, 3] {
+                for b in [-5i64, 0, 1, 7] {
+                    specs.push((
+                        format!("x % ({m}) == ({r})"),
+                        format!("x % ({m}) == (({r}) + zero)"),
+                        format!("x * ({a}) + ({b})"),
+                        format!("(x * ({a}) + ({b})) + zero"),
+                        format!("m={m} r={r} a={a} b={b}"),
+                        true,
+                    ));
+                }
+            }
+        }
+    }
+    for expr in ["(x + 1) * (-1)", "(x * 2 + 4) * 0", "(x + 1) - 1", "x - 5", "3 * x - 5"] {
+        specs.push((
+            "x % 2 == 0".into(),
+            "x % 2 == (0 + zero)".into(),
+            expr.into(),
+            format!("({expr}) + zero"),
+            format!("expr={expr}"),
+            false,
+        ));
+    }
+
+    let mut src = String::new();
+    for (i, (pf, ps, mf, ms, _, _)) in specs.iter().enumerate() {
+        src += &format!(
+            "export func fast_{i}(xs: [Int], init: Int) -> Int {{\n\
+             return xs |> filter((x: Int) => {pf}) |> map((x: Int) => {mf}) |> reduce(init, (acc: Int, x: Int) => acc + x)\n}}\n"
+        );
+        src += &format!(
+            "export func slow_{i}(xs: [Int], init: Int) -> Int {{\n\
+             zero := 0\n\
+             return xs |> filter((x: Int) => {ps}) |> map((x: Int) => {ms}) |> reduce(init, (acc: Int, x: Int) => acc + x + zero)\n}}\n"
+        );
+    }
+    let module = crate::frontend::compile_source(&src).expect("compile grid");
+
+    let samples: Vec<Vec<i64>> = vec![
+        vec![],
+        vec![0],
+        vec![i64::MIN, i64::MAX, i64::MIN + 1, i64::MAX - 1, -1, 0, 1],
+        (-150..150).map(|i| i * 17 - 500).collect(),
+    ];
+
+    let mut vm = Vm::new();
+    for (i, (_, _, _, _, label, expect_fast)) in specs.iter().enumerate() {
+        let f_fast = module.func_id(&format!("fast_{i}")).unwrap();
+        let f_slow = module.func_id(&format!("slow_{i}")).unwrap();
+        for sample in &samples {
+            let list = Obj::List(ListStorage::Int(Arc::new(sample.clone())));
+            for init in [0i64, 13, -7] {
+                crate::vm::pipeline::FAST_HITS.with(|c| c.set(0));
+                let fast = vm
+                    .call_scalar(&module, f_fast, &[init as u64], std::slice::from_ref(&list))
+                    .map_err(|e| e.message);
+                let hits = crate::vm::pipeline::FAST_HITS.with(|c| c.get());
+                let slow = vm
+                    .call_scalar(&module, f_slow, &[init as u64], std::slice::from_ref(&list))
+                    .map_err(|e| e.message);
+
+                assert_eq!(fast, slow, "{label} sample={sample:?} init={init}");
+                if *expect_fast {
+                    assert_eq!(hits, 1, "fast path did not trigger: {label}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn reduce_sum_overflow_is_error_not_wrap() {
+    let src = r#"
+        export func sum_ov(xs: [Int]) -> Int {
+            return xs |> reduce(0, (acc: Int, x: Int) => acc + x)
+        }
+    "#;
+    let module = crate::frontend::compile_source(src).expect("compile");
+    let id = module.func_id("sum_ov").unwrap();
+    let mut vm = Vm::new();
+    let list = Obj::List(ListStorage::Int(Arc::new(vec![i64::MAX, 1])));
+    let err = vm.call_scalar(&module, id, &[], &[list]).unwrap_err();
+    assert!(err.message.contains("overflow"), "got {}", err.message);
+}
+
+#[test]
+fn pipeline_cmp_minmax_and_float_fast_paths() {
+    let src = r#"
+        export func fast_gt_sum(xs: [Int], init: Int) -> Int {
+            return xs |> filter((x: Int) => x > 5) |> reduce(init, (acc: Int, x: Int) => acc + x)
+        }
+        export func slow_gt_sum(xs: [Int], init: Int) -> Int {
+            zero := 0
+            return xs |> filter((x: Int) => x > 5 + zero) |> reduce(init, (acc: Int, x: Int) => acc + x + zero)
+        }
+
+        export func fast_le_aff_min(xs: [Int], init: Int) -> Int {
+            return xs |> filter((x: Int) => x <= 10) |> map((x: Int) => x * 2 + 1) |> reduce(init, (acc: Int, x: Int) -> Int => {
+                if acc < x {
+                    return acc
+                }
+                return x
+            })
+        }
+        export func slow_le_aff_min(xs: [Int], init: Int) -> Int {
+            zero := 0
+            return xs |> filter((x: Int) => x <= 10 + zero) |> map((x: Int) => x * 2 + 1 + zero) |> reduce(init, (acc: Int, x: Int) -> Int => {
+                if acc < x + zero {
+                    return acc
+                }
+                return x
+            })
+        }
+
+        export func fast_max(xs: [Int], init: Int) -> Int {
+            return xs |> reduce(init, (acc: Int, x: Int) -> Int => {
+                if acc > x {
+                    return acc
+                }
+                return x
+            })
+        }
+        export func slow_max(xs: [Int], init: Int) -> Int {
+            zero := 0
+            return xs |> reduce(init, (acc: Int, x: Int) -> Int => {
+                if acc > x + zero {
+                    return acc
+                }
+                return x
+            })
+        }
+
+        export func fast_f_gt_aff_sum(xs: [Float], init: Float) -> Float {
+            return xs |> filter((x: Float) => x > 1.5) |> map((x: Float) => x * 2.0 - 0.5) |> reduce(init, (acc: Float, x: Float) => acc + x)
+        }
+        export func slow_f_gt_aff_sum(xs: [Float], init: Float) -> Float {
+            zero := 0.0
+            return xs |> filter((x: Float) => x > 1.5 + zero) |> map((x: Float) => x * 2.0 - 0.5 + zero) |> reduce(init, (acc: Float, x: Float) => acc + x + zero)
+        }
+
+        export func fast_f_min(xs: [Float], init: Float) -> Float {
+            return xs |> reduce(init, (acc: Float, x: Float) -> Float => {
+                if acc < x {
+                    return acc
+                }
+                return x
+            })
+        }
+        export func slow_f_min(xs: [Float], init: Float) -> Float {
+            zero := 0.0
+            return xs |> reduce(init, (acc: Float, x: Float) -> Float => {
+                if acc < x + zero {
+                    return acc
+                }
+                return x
+            })
+        }
+
+        export func fast_f_max(xs: [Float], init: Float) -> Float {
+            return xs |> reduce(init, (acc: Float, x: Float) -> Float => {
+                if acc > x {
+                    return acc
+                }
+                return x
+            })
+        }
+        export func slow_f_max(xs: [Float], init: Float) -> Float {
+            zero := 0.0
+            return xs |> reduce(init, (acc: Float, x: Float) -> Float => {
+                if acc > x + zero {
+                    return acc
+                }
+                return x
+            })
+        }
+    "#;
+    let module = crate::frontend::compile_source(src).expect("compile");
+    let mut vm = Vm::new();
+
+    let int_samples = [
+        vec![],
+        vec![0, 5, 6, -3, 10, 11],
+        vec![i64::MIN, -100, 0, 100, i64::MAX / 4],
+    ];
+    for (fast_name, slow_name) in [
+        ("fast_gt_sum", "slow_gt_sum"),
+        ("fast_le_aff_min", "slow_le_aff_min"),
+        ("fast_max", "slow_max"),
+    ] {
+        let f_fast = module.func_id(fast_name).unwrap();
+        let f_slow = module.func_id(slow_name).unwrap();
+        for sample in &int_samples {
+            let list = Obj::List(ListStorage::Int(Arc::new(sample.clone())));
+            for init in [0i64, 7, -20] {
+                crate::vm::pipeline::FAST_HITS.with(|c| c.set(0));
+                let fast = vm
+                    .call_scalar(&module, f_fast, &[init as u64], std::slice::from_ref(&list))
+                    .map_err(|e| e.message);
+                let hits = crate::vm::pipeline::FAST_HITS.with(|c| c.get());
+                let slow = vm
+                    .call_scalar(&module, f_slow, &[init as u64], std::slice::from_ref(&list))
+                    .map_err(|e| e.message);
+                assert_eq!(fast, slow, "{fast_name} sample={sample:?} init={init}");
+                assert_eq!(hits, 1, "fast path did not trigger for {fast_name}");
+            }
+        }
+    }
+
+    let float_samples = [
+        vec![],
+        vec![-2.5, 0.0, 1.5, 2.0, 10.25],
+        vec![-0.0, 0.0, f64::NAN, 3.5],
+    ];
+    for (fast_name, slow_name) in [
+        ("fast_f_gt_aff_sum", "slow_f_gt_aff_sum"),
+        ("fast_f_min", "slow_f_min"),
+        ("fast_f_max", "slow_f_max"),
+    ] {
+        let f_fast = module.func_id(fast_name).unwrap();
+        let f_slow = module.func_id(slow_name).unwrap();
+        for sample in &float_samples {
+            let list = Obj::List(ListStorage::Float(Arc::new(sample.clone())));
+            for init in [0.0f64, 5.5, -1.25] {
+                crate::vm::pipeline::FAST_HITS.with(|c| c.set(0));
+                let fast = vm
+                    .call_scalar(&module, f_fast, &[init.to_bits()], std::slice::from_ref(&list))
+                    .expect("fast float");
+                let hits = crate::vm::pipeline::FAST_HITS.with(|c| c.get());
+                let slow = vm
+                    .call_scalar(&module, f_slow, &[init.to_bits()], std::slice::from_ref(&list))
+                    .expect("slow float");
+                let ff = f64::from_bits(fast);
+                let sf = f64::from_bits(slow);
+                if ff.is_nan() && sf.is_nan() {
+                    // Both NaN
+                } else {
+                    assert_eq!(fast, slow, "{fast_name} sample={sample:?} init={init} ff={ff} sf={sf}");
+                }
+                assert_eq!(hits, 1, "fast path did not trigger for {fast_name}");
+            }
+        }
+    }
+}
+
 #[allow(dead_code)]
 fn _keep_record_desc(_: RecordDesc) {}

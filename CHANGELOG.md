@@ -5,6 +5,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
+## [Unreleased]
+
+### Added
+
+* **`cdt.url` Standard Library Module**:
+  * Added `cdt.url` (`parse`, `encode`, `decode`, `encode_query`, `decode_query`) with `Url { scheme, host, port, path, query, fragment }` and `UrlError { kind, message }` (`src/native/url.rs`, `src/vm/exec_sys.rs`, `EXT_URL_OP`), plus LSP hover/completion docs (`src/lsp_docs.rs`), TextMate highlighting (`editors/textmate/conduit.tmLanguage.json`), library docs (`docs/src/library/url.md`), and end-to-end tests (`cdt_url_e2e`).
+* **LSP Go-to-Definition (`textDocument/definition`)**:
+  * Added `"definitionProvider":true` and `handle_definition` in `src/lsp.rs` supporting jumps to `func`, `struct`, and `type` declarations in the current file, imported symbols (`import { foo } from "./bar"` and `import * as bar from "./bar"`), and relative import file paths.
+* **Starter Example**:
+  * Updated `example/main.cdt` and `example/README.md` with an `inspect` subcommand using `cdt.url`.
+
+### Fixed & Optimized
+
+* **Pipeline Fast-Path Extensions (`Int` & `Float`)**:
+  * Extended `src/vm/pipeline.rs` (`try_run_int_reduce_fast` and new `try_run_float_reduce_fast`) to natively execute `filter` comparisons (`==`, `!=`, `<`, `<=`, `>`, `>=` on `Int`, and `==`, `<`, `<=`, `>`, `>=` on `Float`), `reduce` for `min`/`max` alongside `sum`, `Float` affine `map(a * x + b)`, and `filter |> reduce` / `map |> reduce` combinations while preserving `checked_*` overflow checks and IEEE-754 `NaN`/`-0.0` semantics.
+
 ## [0.2.5] - 2026-11-16
 
 ### Added

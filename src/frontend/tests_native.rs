@@ -957,3 +957,28 @@ fn cdt_path_process_and_crypto_e2e() {
         )
     );
 }
+
+#[test]
+fn cdt_url_e2e() {
+    let src = r#"
+        import * as url from "cdt.url"
+
+        export func test_url() -> String | url.UrlError {
+            u := url.parse("https://api.example.com:8443/v1/search?q=hello+world&tag=rust%2Bcdt#top")?
+            q := url.decode_query(u.query)?
+            enc := url.encode("a b/c")
+            dec := url.decode(enc)?
+            qs := url.encode_query(Map.from([("b", "2"), ("a", "hello world")]))
+            qv := q.get("q") ?? ""
+            tv := q.get("tag") ?? ""
+            return u.scheme + "|" + u.host + "|" + u.port.to_string() + "|" + u.path + "|" + u.fragment + "|" + qv + "|" + tv + "|" + enc + "|" + dec + "|" + qs
+        }
+    "#;
+    let module = crate::frontend::compile_source(src).expect("compile url");
+    let fid = module.func_id("test_url").unwrap();
+    let mut vm = Vm::new();
+    assert_eq!(
+        vm.call_obj(&module, fid, &[], &[]).unwrap(),
+        Obj::str("https|api.example.com|8443|/v1/search|top|hello world|rust+cdt|a%20b%2Fc|a b/c|a=hello%20world&b=2")
+    );
+}

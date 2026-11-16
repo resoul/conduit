@@ -16,6 +16,7 @@ pub(crate) fn is_valid_native_type(mod_name: &str, ty_name: &str) -> bool {
         "cdt.fs" => matches!(ty_name, "FsError" | "Reader" | "Writer"),
         "cdt.process" => matches!(ty_name, "ProcessError" | "Output"),
         "cdt.crypto" => ty_name == "CryptoError",
+        "cdt.url" => matches!(ty_name, "UrlError" | "Url"),
         _ => false,
     }
 }
@@ -209,6 +210,29 @@ pub(crate) fn register_native_imports(
                     }
                 }
             }
+            "cdt.url" => {
+                if let Some(a) = alias {
+                    checked.url_aliases.insert(a.clone());
+                }
+                for spec in names {
+                    match spec.name.as_str() {
+                        "parse" | "encode" | "decode" | "encode_query" | "decode_query" => {
+                            insert_unique(&mut checked.url_direct_fns, &spec.alias, &spec.name)?;
+                        }
+                        "UrlError" | "Url" => {
+                            checked
+                                .url_direct_types
+                                .insert(spec.alias.clone(), spec.name.clone());
+                        }
+                        other => {
+                            return Err(format!(
+                                "Module 'cdt.url' has no exported member '{}'",
+                                other
+                            ));
+                        }
+                    }
+                }
+            }
             other => return Err(format!("Unknown or unlinked module '{}'", other)),
         }
     }
@@ -282,6 +306,10 @@ pub fn resolve_type_expr(te: &TypeExpr, checked: &CheckedProgram) -> Result<Type
                 "cdt.crypto",
                 &checked.crypto_direct_types[name],
             ))),
+            _ if checked.url_direct_types.contains_key(name) => Ok(Type::Custom(TypeId::native(
+                "cdt.url",
+                &checked.url_direct_types[name],
+            ))),
             _ if name.contains('.') => {
                 let mut parts = name.splitn(2, '.');
                 let alias = parts.next().unwrap_or("");
@@ -302,6 +330,8 @@ pub fn resolve_type_expr(te: &TypeExpr, checked: &CheckedProgram) -> Result<Type
                     "cdt.process"
                 } else if checked.crypto_aliases.contains(alias) {
                     "cdt.crypto"
+                } else if checked.url_aliases.contains(alias) {
+                    "cdt.url"
                 } else {
                     return Err(format!("Unknown type '{}'", name));
                 };
@@ -406,6 +436,7 @@ pub(crate) fn is_error_type(ty: &Type, checked: &CheckedProgram) -> bool {
             "cdt.fs" => name == "FsError",
             "cdt.process" => name == "ProcessError",
             "cdt.crypto" => name == "CryptoError",
+            "cdt.url" => name == "UrlError",
             _ => false,
         },
         Type::Custom(TypeId {
@@ -494,6 +525,14 @@ pub(crate) fn native_member_field(tid: &TypeId, field: &str) -> Result<(Type, u1
         ("cdt.process", "Output", "stderr") => Ok((Type::String, 1)),
         ("cdt.crypto", "CryptoError", "kind") => Ok((Type::String, 0)),
         ("cdt.crypto", "CryptoError", "message") => Ok((Type::String, 1)),
+        ("cdt.url", "UrlError", "kind") => Ok((Type::String, 0)),
+        ("cdt.url", "UrlError", "message") => Ok((Type::String, 1)),
+        ("cdt.url", "Url", "port") => Ok((Type::Int, 0)),
+        ("cdt.url", "Url", "scheme") => Ok((Type::String, 0)),
+        ("cdt.url", "Url", "host") => Ok((Type::String, 1)),
+        ("cdt.url", "Url", "path") => Ok((Type::String, 2)),
+        ("cdt.url", "Url", "query") => Ok((Type::String, 3)),
+        ("cdt.url", "Url", "fragment") => Ok((Type::String, 4)),
         _ => Err(format!("Type '{}' has no field '{}'", tid, field)),
     }
 }

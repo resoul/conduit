@@ -29,6 +29,7 @@
 - [cdt.path](library/path.md)
 - [cdt.process](library/process.md)
 - [cdt.crypto](library/crypto.md)
+- [cdt.url](library/url.md)
 
 # Practical Guides
 - [Working with Errors](guides/working-with-errors.md)

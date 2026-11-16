@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 import os
 import platform
 import shutil
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -24,8 +27,9 @@ METRICS = [
 ]
 
 
-def parse_output(text: str) -> dict[str, float]:
+def parse_output(text: str) -> tuple[dict[str, float], str | None]:
     res: dict[str, float] = {}
+    check: str | None = None
     for line in text.splitlines():
         if line.startswith("BENCH|"):
             parts = line.split("|")
@@ -34,14 +38,16 @@ def parse_output(text: str) -> dict[str, float]:
                     res[parts[1]] = float(parts[2])
                 except ValueError:
                     pass
-    return res
+        elif line.startswith("CHECK|"):
+            check = line.split("|", 1)[1].strip()
+    return res, check
 
 
-def run_cmd(cmd: list[str], cwd: str) -> dict[str, float]:
+def run_cmd(cmd: list[str], cwd: str) -> tuple[dict[str, float], str | None]:
     proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
     if proc.returncode != 0:
         print(f"Command failed ({' '.join(cmd)}):\n{proc.stderr}", file=sys.stderr)
-        return {}
+        return {}, None
     return parse_output(proc.stdout)
 
 
@@ -96,15 +102,32 @@ def main() -> None:
     if py:
         runners.append(("Python 3", [py, os.path.join(bench_dir, "bench.py")]))
 
+    runs = int(os.environ.get("BENCH_RUNS", "5"))
     results: dict[str, dict[str, float]] = {}
+    checks: dict[str, str] = {}
     for name, cmd in runners:
-        print(f"Running {name}...", flush=True)
-        results[name] = run_cmd(cmd, bench_dir)
+        print(f"Running {name} ({runs}x median)...", flush=True)
+        samples: dict[str, list[float]] = {}
+        for _ in range(runs):
+            out, chk = run_cmd(cmd, bench_dir)
+            for k, v in out.items():
+                samples.setdefault(k, []).append(v)
+            if chk is not None:
+                if name in checks and checks[name] != chk:
+                    print(f"ERROR: {name} CHECK mismatch across runs: {checks[name]} vs {chk}", file=sys.stderr)
+                    sys.exit(1)
+                checks[name] = chk
+        results[name] = {k: statistics.median(vs) for k, vs in samples.items()}
     for art in temp_artifacts:
         try:
             os.remove(art)
         except OSError:
             pass
+
+    distinct_checks = set(checks.values())
+    if len(distinct_checks) > 1:
+        print(f"ERROR: CHECK mismatch across languages: {checks}", file=sys.stderr)
+        sys.exit(1)
 
     names = [name for name, _ in runners]
     lines = [

@@ -15,6 +15,7 @@ fn is_native_module(path: &str) -> bool {
             | "cdt.path"
             | "cdt.process"
             | "cdt.crypto"
+            | "cdt.url"
     )
 }
 

@@ -15,6 +15,10 @@ use crate::native::process::{
     PROC_CWD, PROC_EXIT, PROC_PID, PROC_RUN, PROC_SET_CWD, PROC_STATUS, make_process_error,
     proc_cwd, proc_run, proc_set_cwd, proc_status,
 };
+use crate::native::url::{
+    URL_DECODE, URL_DECODE_QUERY, URL_ENCODE, URL_ENCODE_QUERY, URL_PARSE, decode_query_str,
+    encode_query_map, percent_decode, percent_encode, url_parse,
+};
 use crate::vm::exec_cold::err_msg;
 use crate::vm::value::{ListStorage, Obj};
 use crate::vm::{RuntimeError, Vm};
@@ -179,6 +183,45 @@ impl Vm {
                 self.objs[o_base + a as usize] = random_int(min, max);
             }
             _ => return Err(err_msg("Unknown crypto sub-op")),
+        }
+        Ok(())
+    }
+
+    pub(crate) fn exec_url_op(
+        &mut self,
+        o_base: usize,
+        aux: u8,
+        a: u16,
+        b: u16,
+    ) -> Result<(), RuntimeError> {
+        match aux {
+            URL_PARSE => {
+                let s = self.sys_str(o_base, b, "url.parse()")?;
+                self.objs[o_base + a as usize] = url_parse(&s);
+            }
+            URL_ENCODE => {
+                let s = self.sys_str(o_base, b, "url.encode()")?;
+                self.objs[o_base + a as usize] = Obj::str(percent_encode(&s));
+            }
+            URL_DECODE => {
+                let s = self.sys_str(o_base, b, "url.decode()")?;
+                self.objs[o_base + a as usize] = match percent_decode(&s, false) {
+                    Ok(decoded) => Obj::str(decoded),
+                    Err(err_obj) => err_obj,
+                };
+            }
+            URL_ENCODE_QUERY => {
+                let Obj::Map(map) = &self.objs[o_base + b as usize] else {
+                    return Err(err_msg("Expected Map<String, String> in url.encode_query()"));
+                };
+                let map_clone = Arc::clone(map);
+                self.objs[o_base + a as usize] = encode_query_map(&map_clone);
+            }
+            URL_DECODE_QUERY => {
+                let s = self.sys_str(o_base, b, "url.decode_query()")?;
+                self.objs[o_base + a as usize] = decode_query_str(&s);
+            }
+            _ => return Err(err_msg("Unknown url sub-op")),
         }
         Ok(())
     }

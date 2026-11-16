@@ -9,6 +9,7 @@ pub(crate) mod json_lexer;
 pub mod path;
 pub mod process;
 pub mod time;
+pub mod url;
 pub mod validation;
 
 use std::collections::{BTreeMap, HashMap};

@@ -241,4 +241,87 @@ impl Checker<'_> {
             other => Err(format!("Unknown cdt.crypto symbol '{}'", other)),
         }
     }
+
+    pub(crate) fn check_url_call(
+        &mut self,
+        sym: &str,
+        type_args: &[TypeExpr],
+        args: &mut [Expr],
+        named_args: &mut [NamedArg],
+    ) -> Result<Type, String> {
+        let url_err = Type::Custom(TypeId::native("cdt.url", "UrlError"));
+        let url_ty = Type::Custom(TypeId::native("cdt.url", "Url"));
+        match sym {
+            "UrlError" => {
+                if !type_args.is_empty() {
+                    return Err("UrlError does not accept type arguments".to_string());
+                }
+                check_fields_ctor(
+                    self,
+                    "UrlError",
+                    &[("kind", Type::String), ("message", Type::String)],
+                    args,
+                    named_args,
+                    url_err,
+                )
+            }
+            "Url" => {
+                if !type_args.is_empty() {
+                    return Err("Url does not accept type arguments".to_string());
+                }
+                check_fields_ctor(
+                    self,
+                    "Url",
+                    &[
+                        ("scheme", Type::String),
+                        ("host", Type::String),
+                        ("port", Type::Int),
+                        ("path", Type::String),
+                        ("query", Type::String),
+                        ("fragment", Type::String),
+                    ],
+                    args,
+                    named_args,
+                    url_ty,
+                )
+            }
+            "parse" | "encode" | "decode" | "decode_query" => {
+                if !type_args.is_empty() || !named_args.is_empty() || args.len() != 1 {
+                    return Err(format!("url.{}(s) expects 1 String argument", sym));
+                }
+                self.check_expr(&mut args[0], Some(&Type::String))?;
+                if args[0].ty != Type::String {
+                    return Err(format!("url.{} expects String, got {}", sym, args[0].ty));
+                }
+                match sym {
+                    "parse" => Ok(Type::union(vec![url_ty, url_err])),
+                    "encode" => Ok(Type::String),
+                    "decode" => Ok(Type::union(vec![Type::String, url_err])),
+                    "decode_query" => Ok(Type::union(vec![
+                        Type::Map(Box::new(Type::String), Box::new(Type::String)),
+                        url_err,
+                    ])),
+                    _ => unreachable!(),
+                }
+            }
+            "encode_query" => {
+                if !type_args.is_empty() || !named_args.is_empty() || args.len() != 1 {
+                    return Err(
+                        "url.encode_query(params) expects 1 Map<String, String> argument"
+                            .to_string(),
+                    );
+                }
+                let expected = Type::Map(Box::new(Type::String), Box::new(Type::String));
+                self.check_expr(&mut args[0], Some(&expected))?;
+                if args[0].ty != expected {
+                    return Err(format!(
+                        "url.encode_query expects Map<String, String>, got {}",
+                        args[0].ty
+                    ));
+                }
+                Ok(Type::String)
+            }
+            other => Err(format!("Unknown cdt.url symbol '{}'", other)),
+        }
+    }
 }

@@ -27,4 +27,5 @@ All standard libraries reside in the reserved `cdt.*` namespace.
 | [cdt.path](path.md) | `cdt.path` | Cross-platform lexical path manipulation (`join`, `dirname`, `basename`, `ext`, `stem`, `normalize`). |
 | [cdt.process](process.md) | `cdt.process` | External command execution (`run`, `status`), working directory (`cwd`, `set_cwd`), `pid`, and `exit`. |
 | [cdt.crypto](crypto.md) | `cdt.crypto` | Hardware-accelerated SHA-256/HMAC, SIMD Base64, Hex, and OS-backed CSPRNG (`uuid_v4`, `random_int`). |
+| [cdt.url](url.md) | `cdt.url` | URL parser (`Url`), RFC 3986 percent-encoding, and query-string encoding/decoding. |
 

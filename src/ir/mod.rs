@@ -758,6 +758,10 @@ impl Module {
                                     }
                                 }
                             }
+                            crate::vm::opcode::EXT_URL_OP => {
+                                check_o(a, &ctx)?;
+                                check_o(b, &ctx)?;
+                            }
                             _ => return Err(format!("Invalid ExtOp kind {}", kind)),
                         }
                     }

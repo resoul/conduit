@@ -11,7 +11,7 @@ use crate::vm::opcode::{
     EXT_MAP_CONTAINS_KEY, EXT_MAP_ENTRIES, EXT_MAP_FROM, EXT_MAP_GET, EXT_MAP_INDEX, EXT_MAP_KEYS,
     EXT_MAP_REMOVE, EXT_MAP_SET, EXT_MAP_VALUES, EXT_PATH_OP, EXT_PIPELINE_REDUCE, EXT_PRINT_OBJ,
     EXT_PRINT_SCALAR, EXT_PROCESS_OP, EXT_STR_IS_EMPTY, EXT_STR_PRED, EXT_STR_SPLIT,
-    EXT_STR_TO_FLOAT, EXT_STR_TO_INT,
+    EXT_STR_TO_FLOAT, EXT_STR_TO_INT, EXT_URL_OP,
 };
 use crate::vm::value::{
     ListStorage, MapKey, MapVal, Obj, OrderedMap, SCHEMA_BOXED_BOOL, SCHEMA_BOXED_FLOAT,
@@ -229,6 +229,9 @@ impl Vm {
             }
             EXT_PIPELINE_REDUCE => {
                 self.run_pipeline_reduce(module, s_base, o_base, a, b, c)?;
+            }
+            EXT_URL_OP => {
+                self.exec_url_op(o_base, aux, a, b)?;
             }
             EXT_STR_TO_INT => {
                 let Obj::Str(s) = &self.objs[o_base + b as usize] else {

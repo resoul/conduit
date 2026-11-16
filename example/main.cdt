@@ -2,6 +2,7 @@ import cli from "cdt.cli"
 import { CliError } from "cdt.cli"
 import { EnvError } from "cdt.env"
 import * as fs from "cdt.fs"
+import * as url from "cdt.url"
 import { ValidationError } from "cdt.validation"
 import { DecodeError, EncodeError } from "cdt.json"
 import { TimeError } from "cdt.time"
@@ -18,9 +19,12 @@ cli Worker "Conduit starter worker" {
     cmd stream "Stream lines from a text file" {
         opt file: String "f" "Path to text file" = "notes.txt"
     }
+    cmd inspect "Parse a URL and its query parameters" {
+        arg raw: String "URL to inspect"
+    }
 }
 
-func run_app() -> String | CliError | EnvError | fs.FsError | ValidationError | DecodeError | EncodeError | TimeError {
+func run_app() -> String | CliError | EnvError | fs.FsError | url.UrlError | ValidationError | DecodeError | EncodeError | TimeError {
     app := cli.parse<Worker>()?
     cfg := load_config()?
 
@@ -52,6 +56,14 @@ func run_app() -> String | CliError | EnvError | fs.FsError | ValidationError | 
             return "streamed {count} line(s) from {s.file}"
     }
 
+    switch app.inspect {
+        case Worker_inspect(u):
+            parsed := url.parse(u.raw)?
+            params := url.decode_query(parsed.query)?
+            qlen := params.len()
+            return "scheme={parsed.scheme} host={parsed.host} port={parsed.port} path={parsed.path} query_keys={qlen}"
+    }
+
     return cli.help<Worker>()
 }
 
@@ -65,6 +77,8 @@ func main() -> Void {
             print("Env error [{e.name}]: {e.message}")
         case fs.FsError(e):
             print("FS error [{e.kind}] {e.path}: {e.message}")
+        case url.UrlError(e):
+            print("URL error [{e.kind}]: {e.message}")
         case ValidationError(e):
             print("Validation error: {e.issues.len()} issue(s)")
         case DecodeError(e):

@@ -43,6 +43,7 @@ fn is_native_mod(path: &str) -> bool {
             | "cdt.path"
             | "cdt.process"
             | "cdt.crypto"
+            | "cdt.url"
     )
 }
 
