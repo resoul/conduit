@@ -762,6 +762,28 @@ impl Module {
                                 check_o(a, &ctx)?;
                                 check_o(b, &ctx)?;
                             }
+                            crate::vm::opcode::EXT_CSV_OP => {
+                                check_o(a, &ctx)?;
+                                check_o(b, &ctx)?;
+                                if aux == 1 || aux == 4 {
+                                    check_o(c, &ctx)?;
+                                }
+                            }
+                            crate::vm::opcode::EXT_MATH_OP => {
+                                check_s(a, &ctx)?;
+                                if aux >= 3 {
+                                    check_s(b, &ctx)?;
+                                }
+                                if aux >= 17 {
+                                    check_s(c, &ctx)?;
+                                }
+                            }
+                            crate::vm::opcode::EXT_LOG_OP => match aux {
+                                0..=4 => check_o(b, &ctx)?,
+                                5 => check_s(b, &ctx)?,
+                                6 => check_o(a, &ctx)?,
+                                _ => return Err(format!("Invalid log aux {}", aux)),
+                            },
                             _ => return Err(format!("Invalid ExtOp kind {}", kind)),
                         }
                     }

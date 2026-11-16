@@ -29,11 +29,12 @@ use crate::vm::opcode::{
     EXT_CLI_HELP, EXT_CLI_PARSE, EXT_CLI_PARSE_ARGS, EXT_CRYPTO_OP, EXT_ENV_ARGS, EXT_ENV_GET,
     EXT_ENV_LOAD, EXT_ENV_REQUIRE, EXT_FS_BINARY, EXT_FS_UNARY, EXT_LIST_FIRST, EXT_LIST_LAST,
     EXT_LIST_SORT, EXT_MAP_ENTRIES, EXT_MAP_GET, EXT_MAP_KEYS, EXT_MAP_REMOVE, EXT_MAP_VALUES,
-    EXT_PATH_OP, EXT_PROCESS_OP, EXT_STR_SPLIT, EXT_STR_TO_FLOAT, EXT_STR_TO_INT, EXT_URL_OP, Op,
+    EXT_PATH_OP, EXT_PROCESS_OP, EXT_STR_SPLIT, EXT_STR_TO_FLOAT, EXT_STR_TO_INT, EXT_URL_OP,
+    EXT_CSV_OP, EXT_MATH_OP, EXT_LOG_OP, Op,
 };
 use crate::vm::value::{
     SCHEMA_BOXED_BOOL, SCHEMA_BOXED_FLOAT, SCHEMA_BOXED_INT, SCHEMA_CLI_ERROR,
-    SCHEMA_CRYPTO_ERROR, SCHEMA_EMPTY_TAG, SCHEMA_ENV_ERROR, SCHEMA_FS_ERROR, SCHEMA_FS_READER,
+    SCHEMA_CRYPTO_ERROR, SCHEMA_CSV_ERROR, SCHEMA_EMPTY_TAG, SCHEMA_ENV_ERROR, SCHEMA_FS_ERROR, SCHEMA_FS_READER,
     SCHEMA_FS_WRITER, SCHEMA_INDEX_ERROR, SCHEMA_JSON_DECODE_ERROR, SCHEMA_JSON_ENCODE_ERROR,
     SCHEMA_KEY_ERROR, SCHEMA_LIST_TAG, SCHEMA_MAP_TAG, SCHEMA_PARSE_ERROR, SCHEMA_PROCESS_ERROR,
     SCHEMA_PROCESS_OUTPUT, SCHEMA_STR_TAG, SCHEMA_TIME_DURATION, SCHEMA_TIME_ERROR,
@@ -89,6 +90,7 @@ pub(crate) fn type_tag_for_switch(ty: &Type, checked: &CheckedProgram) -> Result
                 ("cdt.crypto", "CryptoError") => Ok(SCHEMA_CRYPTO_ERROR),
                 ("cdt.url", "UrlError") => Ok(SCHEMA_URL_ERROR),
                 ("cdt.url", "Url") => Ok(SCHEMA_URL),
+                ("cdt.csv", "CsvError") => Ok(SCHEMA_CSV_ERROR),
                 _ => Err(format!("Unsupported native type '{}' in switch pattern", tid)),
             },
             _ => Err(format!("Unsupported type '{}' in switch pattern", tid)),
@@ -748,6 +750,119 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 Ok(a)
             }
             other => Err(format!("Unsupported cdt.url symbol '{}'", other)),
+        }
+    }
+
+    pub(crate) fn lower_csv_call(
+        &mut self,
+        sym: &str,
+        args: &[Expr],
+        named_args: &[NamedArg],
+    ) -> Result<u16, String> {
+        match sym {
+            "CsvError" => {
+                let get_expr = |idx: usize, name: &str| -> &Expr {
+                    if !named_args.is_empty() {
+                        &named_args.iter().find(|n| n.name == name).unwrap().value
+                    } else {
+                        &args[idx]
+                    }
+                };
+                let kind_o = self.lower_obj(get_expr(0, "kind"))?;
+                let line_s = self.lower_scalar(get_expr(1, "line"))?;
+                let msg_o = self.lower_obj(get_expr(2, "message"))?;
+                let desc_idx = self.mc.intern_record_desc(RecordDesc {
+                    schema_id: SCHEMA_CSV_ERROR,
+                    scalar_regs: Box::new([line_s]),
+                    obj_regs: Box::new([kind_o, msg_o]),
+                })?;
+                let dst_obj = self.alloc_temp_o();
+                self.ops.push(Op::NewRecord { dst_obj, desc_idx });
+                Ok(dst_obj)
+            }
+            "parse" | "parse_records" | "stringify" => {
+                let aux = match sym {
+                    "parse" => 0,
+                    "parse_records" => 2,
+                    "stringify" => 3,
+                    _ => unreachable!(),
+                };
+                let b = self.lower_obj(&args[0])?;
+                let a = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp { kind: EXT_CSV_OP, aux, a, b, c: 0 });
+                Ok(a)
+            }
+            "parse_with" | "stringify_with" => {
+                let aux = if sym == "parse_with" { 1 } else { 4 };
+                let b = self.lower_obj(&args[0])?;
+                let c = self.lower_obj(&args[1])?;
+                let a = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp { kind: EXT_CSV_OP, aux, a, b, c });
+                Ok(a)
+            }
+            other => Err(format!("Unsupported cdt.csv symbol '{}'", other)),
+        }
+    }
+
+    pub(crate) fn lower_math_call(&mut self, sym: &str, args: &[Expr]) -> Result<u16, String> {
+        use crate::native::math::*;
+        let aux = match sym {
+            "pi" => MATH_PI,
+            "e" => MATH_E,
+            "tau" => MATH_TAU,
+            "sqrt" => MATH_SQRT,
+            "sin" => MATH_SIN,
+            "cos" => MATH_COS,
+            "tan" => MATH_TAN,
+            "asin" => MATH_ASIN,
+            "acos" => MATH_ACOS,
+            "atan" => MATH_ATAN,
+            "exp" => MATH_EXP,
+            "ln" => MATH_LN,
+            "log10" => MATH_LOG10,
+            "floor" => MATH_FLOOR,
+            "ceil" => MATH_CEIL,
+            "round" => MATH_ROUND,
+            "trunc" => MATH_TRUNC,
+            "pow" => MATH_POW,
+            "atan2" => MATH_ATAN2,
+            "hypot" => MATH_HYPOT,
+            other => return Err(format!("Unsupported cdt.math symbol '{}'", other)),
+        };
+        let b = if aux >= 3 { self.lower_scalar(&args[0])? } else { 0 };
+        let c = if aux >= 17 { self.lower_scalar(&args[1])? } else { 0 };
+        let a = self.alloc_temp_s();
+        self.ops.push(Op::ExtOp { kind: EXT_MATH_OP, aux, a, b, c });
+        Ok(a)
+    }
+
+    pub(crate) fn lower_log_call(&mut self, sym: &str, args: &[Expr]) -> Result<u16, String> {
+        use crate::native::log::*;
+        match sym {
+            "debug" | "info" | "warn" | "error" | "set_level" => {
+                let aux = match sym {
+                    "debug" => LOG_DEBUG,
+                    "info" => LOG_INFO,
+                    "warn" => LOG_WARN,
+                    "error" => LOG_ERROR,
+                    "set_level" => LOG_SET_LEVEL,
+                    _ => unreachable!(),
+                };
+                let b = self.lower_obj(&args[0])?;
+                self.ops.push(Op::ExtOp { kind: EXT_LOG_OP, aux, a: 0, b, c: 0 });
+                Ok(0)
+            }
+            "set_json" => {
+                let b = self.lower_scalar(&args[0])?;
+                self.ops.push(Op::ExtOp { kind: EXT_LOG_OP, aux: LOG_SET_JSON, a: 0, b, c: 0 });
+                Ok(0)
+            }
+            "get_level" => {
+                let a = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp { kind: EXT_LOG_OP, aux: LOG_GET_LEVEL, a, b: 0, c: 0 });
+                Ok(a)
+            }
+            other => Err(format!("Unsupported cdt.log symbol '{}'", other)),
         }
     }
 

@@ -28,4 +28,7 @@ All standard libraries reside in the reserved `cdt.*` namespace.
 | [cdt.process](process.md) | `cdt.process` | External command execution (`run`, `status`), working directory (`cwd`, `set_cwd`), `pid`, and `exit`. |
 | [cdt.crypto](crypto.md) | `cdt.crypto` | Hardware-accelerated SHA-256/HMAC, SIMD Base64, Hex, and OS-backed CSPRNG (`uuid_v4`, `random_int`). |
 | [cdt.url](url.md) | `cdt.url` | URL parser (`Url`), RFC 3986 percent-encoding, and query-string encoding/decoding. |
+| [cdt.csv](csv.md) | `cdt.csv` | RFC 4180 CSV parsing (`parse`, `parse_with`, `parse_records`) and serialization (`stringify`, `stringify_with`). |
+| [cdt.math](math.md) | `cdt.math` | `Float` math functions (`sqrt`, `pow`, `sin`, `cos`, `ln`, `floor`, `ceil`, `round`, `hypot`) and constants (`pi`, `e`, `tau`). |
+| [cdt.log](log.md) | `cdt.log` | Leveled `stderr` logger (`debug`, `info`, `warn`, `error`, `set_level`, `set_json`). |
 

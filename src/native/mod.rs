@@ -1,11 +1,14 @@
 pub(crate) mod b64_simd;
 pub mod cli;
 pub mod crypto;
+pub mod csv;
 pub mod env;
 pub mod fs;
 pub mod json_decode;
 pub mod json_encode;
 pub(crate) mod json_lexer;
+pub mod log;
+pub mod math;
 pub mod path;
 pub mod process;
 pub mod time;

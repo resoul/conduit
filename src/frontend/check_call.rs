@@ -113,6 +113,15 @@ impl<'a> Checker<'a> {
                 if self.checked.url_aliases.contains(mod_alias) {
                     return self.check_url_call(field, type_args, args, named_args);
                 }
+                if self.checked.csv_aliases.contains(mod_alias) {
+                    return self.check_csv_call(field, type_args, args, named_args);
+                }
+                if self.checked.math_aliases.contains(mod_alias) {
+                    return self.check_math_call(field, type_args, args, named_args);
+                }
+                if self.checked.log_aliases.contains(mod_alias) {
+                    return self.check_log_call(field, type_args, args, named_args);
+                }
             }
             self.check_expr(target, None)?;
             return self.check_method_call(target, field, args, named_args);
@@ -221,6 +230,22 @@ impl<'a> Checker<'a> {
                 _ if self.checked.url_direct_types.contains_key(name) => {
                     let sym = self.checked.url_direct_types[name].clone();
                     return self.check_url_call(&sym, type_args, args, named_args);
+                }
+                _ if self.checked.csv_direct_fns.contains_key(name) => {
+                    let sym = self.checked.csv_direct_fns[name].clone();
+                    return self.check_csv_call(&sym, type_args, args, named_args);
+                }
+                _ if self.checked.csv_direct_types.contains_key(name) => {
+                    let sym = self.checked.csv_direct_types[name].clone();
+                    return self.check_csv_call(&sym, type_args, args, named_args);
+                }
+                _ if self.checked.math_direct_fns.contains_key(name) => {
+                    let sym = self.checked.math_direct_fns[name].clone();
+                    return self.check_math_call(&sym, type_args, args, named_args);
+                }
+                _ if self.checked.log_direct_fns.contains_key(name) => {
+                    let sym = self.checked.log_direct_fns[name].clone();
+                    return self.check_log_call(&sym, type_args, args, named_args);
                 }
                 _ if self.checked.generic_structs.contains_key(name) => {
                     let base = name.clone();

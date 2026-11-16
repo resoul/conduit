@@ -156,6 +156,9 @@ pub const EXT_PROCESS_OP: u8 = 33;
 pub const EXT_CRYPTO_OP: u8 = 34;
 pub const EXT_PIPELINE_REDUCE: u8 = 35;
 pub const EXT_URL_OP: u8 = 36;
+pub const EXT_CSV_OP: u8 = 37;
+pub const EXT_MATH_OP: u8 = 38;
+pub const EXT_LOG_OP: u8 = 39;
 
 #[cfg(test)]
 mod tests {

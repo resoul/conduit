@@ -228,6 +228,7 @@ pub const SCHEMA_FS_ERROR: u32 = 0xFFFF_0037;
 pub const SCHEMA_PROCESS_ERROR: u32 = 0xFFFF_0038;
 pub const SCHEMA_CRYPTO_ERROR: u32 = 0xFFFF_0039;
 pub const SCHEMA_URL_ERROR: u32 = 0xFFFF_003A;
+pub const SCHEMA_CSV_ERROR: u32 = 0xFFFF_003B;
 pub const SCHEMA_FS_READER: u32 = 0xFFFF_0040;
 pub const SCHEMA_FS_WRITER: u32 = 0xFFFF_0041;
 pub const SCHEMA_PROCESS_OUTPUT: u32 = 0xFFFF_0042;
@@ -251,6 +252,7 @@ pub fn is_builtin_error_schema(schema_id: u32) -> bool {
             | SCHEMA_PROCESS_ERROR
             | SCHEMA_CRYPTO_ERROR
             | SCHEMA_URL_ERROR
+            | SCHEMA_CSV_ERROR
     )
 }
 
@@ -642,6 +644,7 @@ impl Obj {
                 | SCHEMA_PROCESS_ERROR
                 | SCHEMA_CRYPTO_ERROR
                 | SCHEMA_URL_ERROR
+                | SCHEMA_CSV_ERROR
                     if rec.inline_objs.len() >= 2 =>
                 {
                     rec.inline_objs[1].format_obj()

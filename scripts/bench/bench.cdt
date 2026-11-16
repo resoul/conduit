@@ -5,6 +5,8 @@ import * as crypto from "cdt.crypto"
 import * as json from "cdt.json"
 import * as env from "cdt.env"
 import * as time from "cdt.time"
+import * as csv from "cdt.csv"
+import * as url from "cdt.url"
 
 struct Item {
     id: Int
@@ -18,7 +20,7 @@ func ms_since(t0: time.Instant) -> Float | time.TimeError {
     return ns.to_float() / 1000000.0
 }
 
-export func main() -> Void | fs.FsError | process.ProcessError | crypto.CryptoError | json.DecodeError | json.EncodeError | time.TimeError {
+export func main() -> Void | fs.FsError | process.ProcessError | crypto.CryptoError | json.DecodeError | json.EncodeError | time.TimeError | csv.CsvError | url.UrlError {
     // ── 1. FS I/O (100k lines / 5.53 MiB) ────────────────────────────────────
     cwd := process.cwd()?
     base := path.join(cwd, "_conduit_bench_tmp")
@@ -188,6 +190,46 @@ export func main() -> Void | fs.FsError | process.ProcessError | crypto.CryptoEr
     if sum < 0 { return }
     print("CHECK|" + sum.to_string())
 
+    fnums := [0.0]
+    fnums = []
+    i = 0
+    while i < 1000000 {
+        fnums.append(i.to_float())
+        i = i + 1
+    }
+    t_fpl := time.monotonic()
+    fsum := fnums
+        |> filter((x: Float) => x > 250000.0)
+        |> map((x: Float) => x * 1.5 + 0.25)
+        |> reduce(0.0, (acc: Float, x: Float) => acc + x)
+    ms_fpipe := ms_since(t_fpl)?
+    if fsum < 0.0 { return }
+
+    csv_lines := ["id,name,note"]
+    i = 0
+    while i < 20000 {
+        csv_lines.append("{i},\"user, #{i}\",\"ok \"\"v1\"\"\"")
+        i = i + 1
+    }
+    csv_raw := csv_lines.join("\n")
+    t_csv := time.monotonic()
+    csv_rows := csv.parse(csv_raw)?
+    ms_csv := ms_since(t_csv)?
+    if csv_rows.len() < 0 { return }
+
+    sample_url := "https://api.example.com:8443/v1/items?tag=prod&limit=50&offset=100#top"
+    t_url := time.monotonic()
+    i = 0
+    url_acc := 0
+    while i < 50000 {
+        u := url.parse(sample_url)?
+        q := url.decode_query(u.query)?
+        url_acc = url_acc + q.len()
+        i = i + 1
+    }
+    ms_url := ms_since(t_url)?
+    if url_acc < 0 { return }
+
     print("BENCH|fs_write_text|" + ms_write_text.to_string())
     print("BENCH|fs_write_lines|" + ms_write_stream.to_string())
     print("BENCH|fs_read_text|" + ms_read_text.to_string())
@@ -203,5 +245,8 @@ export func main() -> Void | fs.FsError | process.ProcessError | crypto.CryptoEr
     print("BENCH|json_encode_10k|" + ms_json_enc.to_string())
     print("BENCH|json_decode_10k|" + ms_json_dec.to_string())
     print("BENCH|pipeline_1m|" + ms_pipe.to_string())
+    print("BENCH|pipeline_float_1m|" + ms_fpipe.to_string())
+    print("BENCH|csv_parse_20k|" + ms_csv.to_string())
+    print("BENCH|url_parse_50k|" + ms_url.to_string())
     return
 }

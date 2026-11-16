@@ -70,20 +70,31 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
         if let ExprKind::Member { target, field } = &callee.kind {
             if let ExprKind::Ident(alias) = &target.kind
                 && self.lookup_local(alias).is_none()
-                && self.mc.checked.process_aliases.contains(alias)
             {
-                let _ = self.lower_process_call(field, args, named_args)?;
-                return Ok(());
+                if self.mc.checked.process_aliases.contains(alias) {
+                    let _ = self.lower_process_call(field, args, named_args)?;
+                    return Ok(());
+                }
+                if self.mc.checked.log_aliases.contains(alias) {
+                    let _ = self.lower_log_call(field, args)?;
+                    return Ok(());
+                }
             }
             return self.lower_void_method(target, field, args);
         }
         if let ExprKind::Ident(name) = &callee.kind
             && self.lookup_local(name).is_none()
-            && let Some(sym) = self.mc.checked.process_direct_fns.get(name)
         {
-            let sym = sym.clone();
-            let _ = self.lower_process_call(&sym, args, named_args)?;
-            return Ok(());
+            if let Some(sym) = self.mc.checked.process_direct_fns.get(name) {
+                let sym = sym.clone();
+                let _ = self.lower_process_call(&sym, args, named_args)?;
+                return Ok(());
+            }
+            if let Some(sym) = self.mc.checked.log_direct_fns.get(name) {
+                let sym = sym.clone();
+                let _ = self.lower_log_call(&sym, args)?;
+                return Ok(());
+            }
         }
         if let ExprKind::Ident(name) = &callee.kind
             && name == "print"
@@ -135,11 +146,17 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 if self.mc.checked.url_aliases.contains(alias) {
                     return self.lower_url_call(field, args, named_args);
                 }
+                if self.mc.checked.csv_aliases.contains(alias) {
+                    return self.lower_csv_call(field, args, named_args);
+                }
                 if self.mc.checked.path_aliases.contains(alias) {
                     return self.lower_path_call(field, args);
                 }
                 if self.mc.checked.process_aliases.contains(alias) {
                     return self.lower_process_call(field, args, named_args);
+                }
+                if self.mc.checked.math_aliases.contains(alias) {
+                    return self.lower_math_call(field, args);
                 }
             }
             return self.lower_scalar_method(target, field, args);
@@ -158,6 +175,10 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             if let Some(sym) = self.mc.checked.process_direct_fns.get(name) {
                 let sym = sym.clone();
                 return self.lower_process_call(&sym, args, named_args);
+            }
+            if let Some(sym) = self.mc.checked.math_direct_fns.get(name) {
+                let sym = sym.clone();
+                return self.lower_math_call(&sym, args);
             }
         }
         if let ExprKind::Ident(fn_name) = &callee.kind
@@ -239,6 +260,12 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 }
                 if self.mc.checked.url_aliases.contains(alias) {
                     return self.lower_url_call(field, args, named_args);
+                }
+                if self.mc.checked.csv_aliases.contains(alias) {
+                    return self.lower_csv_call(field, args, named_args);
+                }
+                if self.mc.checked.log_aliases.contains(alias) {
+                    return self.lower_log_call(field, args);
                 }
             }
             if let Some(reg) = self.lower_builtin_obj_method(target, field, args)? {
@@ -325,6 +352,18 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             if let Some(sym) = self.mc.checked.url_direct_types.get(name) {
                 let sym = sym.clone();
                 return self.lower_url_call(&sym, args, named_args);
+            }
+            if let Some(sym) = self.mc.checked.csv_direct_fns.get(name) {
+                let sym = sym.clone();
+                return self.lower_csv_call(&sym, args, named_args);
+            }
+            if let Some(sym) = self.mc.checked.csv_direct_types.get(name) {
+                let sym = sym.clone();
+                return self.lower_csv_call(&sym, args, named_args);
+            }
+            if let Some(sym) = self.mc.checked.log_direct_fns.get(name) {
+                let sym = sym.clone();
+                return self.lower_log_call(&sym, args);
             }
             if name == "Map" {
                 let dst_obj = self.alloc_temp_o();

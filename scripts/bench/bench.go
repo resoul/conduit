@@ -5,10 +5,12 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -161,6 +163,54 @@ func main() {
 	msPipe := msSince(t0)
 	fmt.Printf("CHECK|%d\n", sum)
 
+	fnums := make([]float64, 1000000)
+	for i := range fnums {
+		fnums[i] = float64(i)
+	}
+	t0 = time.Now()
+	var fsum float64
+	for _, x := range fnums {
+		if x > 250000.0 {
+			fsum += x*1.5 + 0.25
+		}
+	}
+	msFPipe := msSince(t0)
+	if fsum < 0 {
+		return
+	}
+
+	var csvLines []string
+	csvLines = append(csvLines, "id,name,note")
+	for i := 0; i < 20000; i++ {
+		csvLines = append(csvLines, fmt.Sprintf("%d,\"user, #%d\",\"ok \"\"v1\"\"\"", i, i))
+	}
+	csvRaw := strings.Join(csvLines, "\n")
+	t0 = time.Now()
+	csvRows, err := csv.NewReader(strings.NewReader(csvRaw)).ReadAll()
+	if err != nil || len(csvRows) < 0 {
+		return
+	}
+	msCsv := msSince(t0)
+
+	sampleURL := "https://api.example.com:8443/v1/items?tag=prod&limit=50&offset=100#top"
+	t0 = time.Now()
+	urlAcc := 0
+	for i := 0; i < 50000; i++ {
+		u, err := url.Parse(sampleURL)
+		if err != nil {
+			return
+		}
+		q, err := url.ParseQuery(u.RawQuery)
+		if err != nil {
+			return
+		}
+		urlAcc += len(q)
+	}
+	msURL := msSince(t0)
+	if urlAcc < 0 {
+		return
+	}
+
 	fmt.Printf("BENCH|fs_write_text|%.3f\n", msWriteText)
 	fmt.Printf("BENCH|fs_write_lines|%.3f\n", msWriteStream)
 	fmt.Printf("BENCH|fs_read_text|%.3f\n", msReadText)
@@ -176,4 +226,7 @@ func main() {
 	fmt.Printf("BENCH|json_encode_10k|%.3f\n", msJSONEnc)
 	fmt.Printf("BENCH|json_decode_10k|%.3f\n", msJSONDec)
 	fmt.Printf("BENCH|pipeline_1m|%.3f\n", msPipe)
+	fmt.Printf("BENCH|pipeline_float_1m|%.3f\n", msFPipe)
+	fmt.Printf("BENCH|csv_parse_20k|%.3f\n", msCsv)
+	fmt.Printf("BENCH|url_parse_50k|%.3f\n", msURL)
 }

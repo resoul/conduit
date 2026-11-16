@@ -135,6 +135,39 @@ $sum = array_sum($mapped);
 $msPipe = ms_since($t0);
 printf("CHECK|%d\n", $sum);
 
+$fnums = array_map('floatval', range(0, 999999));
+$t0 = hrtime(true);
+$ffiltered = array_filter($fnums, fn($x) => $x > 250000.0);
+$fmapped = array_map(fn($x) => $x * 1.5 + 0.25, $ffiltered);
+$fsum = array_sum($fmapped);
+$msFPipe = ms_since($t0);
+if ($fsum < 0) exit(1);
+
+$csvLines = ["id,name,note"];
+for ($i = 0; $i < 20000; $i++) {
+    $csvLines[] = "$i,\"user, #$i\",\"ok \"\"v1\"\"\"";
+}
+$csvRaw = implode("\n", $csvLines);
+$t0 = hrtime(true);
+$csvRows = [];
+foreach (explode("\n", $csvRaw) as $l) {
+    $csvRows[] = str_getcsv($l, ",", "\"", "");
+}
+$msCsv = ms_since($t0);
+if (count($csvRows) < 0) exit(1);
+
+$sampleUrl = "https://api.example.com:8443/v1/items?tag=prod&limit=50&offset=100#top";
+$t0 = hrtime(true);
+$urlAcc = 0;
+for ($i = 0; $i < 50000; $i++) {
+    $u = parse_url($sampleUrl);
+    $q = [];
+    parse_str($u['query'] ?? '', $q);
+    $urlAcc += count($q);
+}
+$msUrl = ms_since($t0);
+if ($urlAcc < 0) exit(1);
+
 printf("BENCH|fs_write_text|%.3f\n", $msWriteText);
 printf("BENCH|fs_write_lines|%.3f\n", $msWriteStream);
 printf("BENCH|fs_read_text|%.3f\n", $msReadText);
@@ -150,3 +183,6 @@ printf("BENCH|process_run_50x|%.3f\n", $msProc);
 printf("BENCH|json_encode_10k|%.3f\n", $msJsonEnc);
 printf("BENCH|json_decode_10k|%.3f\n", $msJsonDec);
 printf("BENCH|pipeline_1m|%.3f\n", $msPipe);
+printf("BENCH|pipeline_float_1m|%.3f\n", $msFPipe);
+printf("BENCH|csv_parse_20k|%.3f\n", $msCsv);
+printf("BENCH|url_parse_50k|%.3f\n", $msUrl);

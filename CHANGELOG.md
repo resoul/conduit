@@ -11,8 +11,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 * **`cdt.url` Standard Library Module**:
   * Added `cdt.url` (`parse`, `encode`, `decode`, `encode_query`, `decode_query`) with `Url { scheme, host, port, path, query, fragment }` and `UrlError { kind, message }` (`src/native/url.rs`, `src/vm/exec_sys.rs`, `EXT_URL_OP`), plus LSP hover/completion docs (`src/lsp_docs.rs`), TextMate highlighting (`editors/textmate/conduit.tmLanguage.json`), library docs (`docs/src/library/url.md`), and end-to-end tests (`cdt_url_e2e`).
-* **LSP Go-to-Definition (`textDocument/definition`)**:
-  * Added `"definitionProvider":true` and `handle_definition` in `src/lsp.rs` supporting jumps to `func`, `struct`, and `type` declarations in the current file, imported symbols (`import { foo } from "./bar"` and `import * as bar from "./bar"`), and relative import file paths.
+* **`cdt.csv` Standard Library Module**:
+  * Added RFC 4180 `cdt.csv` (`parse`, `parse_with`, `parse_records`, `stringify`, `stringify_with`) with `CsvError { kind, line, message }` (`src/native/csv.rs`, `src/vm/exec_sys.rs`, `EXT_CSV_OP`), LSP hover/completion docs, TextMate highlighting, library docs (`docs/src/library/csv.md`), and end-to-end tests (`cdt_csv_e2e`).
+* **`cdt.math` & `cdt.log` Standard Library Modules**:
+  * Added `cdt.math` (`pi`, `e`, `tau`, `sqrt`, `pow`, `hypot`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `exp`, `ln`, `log10`, `floor`, `ceil`, `round`, `trunc`) (`src/native/math.rs`, `EXT_MATH_OP`) and `cdt.log` (`debug`, `info`, `warn`, `error`, `set_level`, `get_level`, `set_json`) (`src/native/log.rs`, `EXT_LOG_OP`), with LSP docs, library docs (`docs/src/library/{math,log}.md`), and tests (`cdt_math_and_log_e2e`).
+* **LSP Go-to-Definition (`textDocument/definition`) & Document Symbols (`textDocument/documentSymbol`)**:
+  * Added `"definitionProvider":true` (`handle_definition`) and `"documentSymbolProvider":true` (`handle_document_symbol`) in `src/lsp.rs` supporting jumps to `func`/`struct`/`type` declarations, imported symbols, relative import paths, and IDE Outline symbols.
 * **Starter Example**:
   * Updated `example/main.cdt` and `example/README.md` with an `inspect` subcommand using `cdt.url`.
 

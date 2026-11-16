@@ -129,6 +129,27 @@ const msPipe = ms(t0);
 if (sum < 0 || decoded.length < 0 || rt.length < 0 || rl.length < 0 || total < 0) process.exit(1);
 console.log(`CHECK|${sum}`);
 
+const fnums = Array.from({ length: 1000000 }, (_, i) => i * 1.0);
+t0 = process.hrtime.bigint();
+const fsum = fnums
+  .filter((x) => x > 250000.0)
+  .map((x) => x * 1.5 + 0.25)
+  .reduce((acc, x) => acc + x, 0.0);
+const msFPipe = ms(t0);
+if (fsum < 0) process.exit(1);
+
+const sampleUrl = "https://api.example.com:8443/v1/items?tag=prod&limit=50&offset=100#top";
+t0 = process.hrtime.bigint();
+let urlAcc = 0;
+for (let i = 0; i < 50000; i++) {
+  const u = new URL(sampleUrl);
+  let n = 0;
+  for (const _ of u.searchParams) n++;
+  urlAcc += n;
+}
+const msUrl = ms(t0);
+if (urlAcc < 0) process.exit(1);
+
 console.log(`BENCH|fs_write_text|${msWriteText.toFixed(3)}`);
 console.log(`BENCH|fs_write_lines|${msWriteStream.toFixed(3)}`);
 console.log(`BENCH|fs_read_text|${msReadText.toFixed(3)}`);
@@ -144,3 +165,5 @@ console.log(`BENCH|process_run_50x|${msProc.toFixed(3)}`);
 console.log(`BENCH|json_encode_10k|${msJsonEnc.toFixed(3)}`);
 console.log(`BENCH|json_decode_10k|${msJsonDec.toFixed(3)}`);
 console.log(`BENCH|pipeline_1m|${msPipe.toFixed(3)}`);
+console.log(`BENCH|pipeline_float_1m|${msFPipe.toFixed(3)}`);
+console.log(`BENCH|url_parse_50k|${msUrl.toFixed(3)}`);

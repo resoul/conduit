@@ -1,4 +1,4 @@
-import base64, hashlib, json, os, shutil, subprocess, tempfile, time, uuid
+import base64, csv, hashlib, io, json, os, shutil, subprocess, tempfile, time, urllib.parse, uuid
 
 # 1. FS I/O
 base = os.path.join(tempfile.gettempdir(), f"_py_bench_{os.getpid()}")
@@ -100,6 +100,31 @@ s = sum(x * 3 + 1 for x in nums if x % 2 == 0)
 ms_pipe = (time.perf_counter() - t0) * 1000.0
 print(f"CHECK|{s}")
 
+fnums = [float(i) for i in range(1000000)]
+t0 = time.perf_counter()
+fs = sum(x * 1.5 + 0.25 for x in fnums if x > 250000.0)
+ms_fpipe = (time.perf_counter() - t0) * 1000.0
+if fs < 0:
+    raise RuntimeError("unreachable")
+
+csv_raw = "\n".join(["id,name,note"] + [f'{i},"user, #{i}","ok ""v1"""' for i in range(20000)])
+t0 = time.perf_counter()
+csv_rows = list(csv.reader(io.StringIO(csv_raw)))
+ms_csv = (time.perf_counter() - t0) * 1000.0
+if len(csv_rows) < 0:
+    raise RuntimeError("unreachable")
+
+sample_url = "https://api.example.com:8443/v1/items?tag=prod&limit=50&offset=100#top"
+t0 = time.perf_counter()
+url_acc = 0
+for _ in range(50000):
+    u = urllib.parse.urlparse(sample_url)
+    q = urllib.parse.parse_qs(u.query)
+    url_acc += len(q)
+ms_url = (time.perf_counter() - t0) * 1000.0
+if url_acc < 0:
+    raise RuntimeError("unreachable")
+
 print(f"BENCH|fs_write_text|{ms_write_text:.3f}")
 print(f"BENCH|fs_write_lines|{ms_write_stream:.3f}")
 print(f"BENCH|fs_read_text|{ms_read_text:.3f}")
@@ -115,3 +140,6 @@ print(f"BENCH|process_run_50x|{ms_proc:.3f}")
 print(f"BENCH|json_encode_10k|{ms_json_enc:.3f}")
 print(f"BENCH|json_decode_10k|{ms_json_dec:.3f}")
 print(f"BENCH|pipeline_1m|{ms_pipe:.3f}")
+print(f"BENCH|pipeline_float_1m|{ms_fpipe:.3f}")
+print(f"BENCH|csv_parse_20k|{ms_csv:.3f}")
+print(f"BENCH|url_parse_50k|{ms_url:.3f}")

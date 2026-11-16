@@ -164,6 +164,23 @@ let msPipe = msSince(t0)
 if sum < 0 || decoded.isEmpty || rt.isEmpty || rl.isEmpty || lineTotal < 0 { exit(1) }
 print("CHECK|\(sum)")
 
+let fnums = (0..<1_000_000).map { Double($0) }
+t0 = DispatchTime.now().uptimeNanoseconds
+let fsum = fnums.lazy.filter { $0 > 250000.0 }.map { $0 * 1.5 + 0.25 }.reduce(0.0, +)
+let msFPipe = msSince(t0)
+if fsum < 0 { exit(1) }
+
+let sampleUrl = "https://api.example.com:8443/v1/items?tag=prod&limit=50&offset=100#top"
+t0 = DispatchTime.now().uptimeNanoseconds
+var urlAcc = 0
+for _ in 0..<50000 {
+    if let uc = URLComponents(string: sampleUrl) {
+        urlAcc += uc.queryItems?.count ?? 0
+    }
+}
+let msUrl = msSince(t0)
+if urlAcc < 0 { exit(1) }
+
 print(String(format: "BENCH|fs_write_text|%.3f", msWriteText))
 print(String(format: "BENCH|fs_write_lines|%.3f", msWriteStream))
 print(String(format: "BENCH|fs_read_text|%.3f", msReadText))
@@ -181,3 +198,5 @@ print(String(format: "BENCH|process_run_50x|%.3f", msProc))
 print(String(format: "BENCH|json_encode_10k|%.3f", msJsonEnc))
 print(String(format: "BENCH|json_decode_10k|%.3f", msJsonDec))
 print(String(format: "BENCH|pipeline_1m|%.3f", msPipe))
+print(String(format: "BENCH|pipeline_float_1m|%.3f", msFPipe))
+print(String(format: "BENCH|url_parse_50k|%.3f", msUrl))

@@ -45,7 +45,7 @@
     },
     {
       "name": "support.type.conduit",
-      "match": "\\b(Int|Float|String|Bool|Void|Map|IndexError|KeyError|ParseError|CliError|EnvError|FsError|Reader|Writer|ProcessError|Output|CryptoError|UrlError|Url|ValidationError|DecodeError|EncodeError|TimeError|Duration|Instant|Timestamp|Issue)\\b"
+      "match": "\\b(Int|Float|String|Bool|Void|Map|IndexError|KeyError|ParseError|CliError|EnvError|FsError|Reader|Writer|ProcessError|Output|CryptoError|UrlError|Url|CsvError|ValidationError|DecodeError|EncodeError|TimeError|Duration|Instant|Timestamp|Issue)\\b"
     },
     {
       "name": "entity.name.type.conduit",

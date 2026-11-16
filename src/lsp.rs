@@ -26,7 +26,7 @@ pub fn run_server_loop(mut reader: impl BufRead, mut writer: impl Write) -> io::
         match method.as_str() {
             "initialize" => {
                 let resp = format!(
-                    r#"{{"jsonrpc":"2.0","id":{},"result":{{"capabilities":{{"textDocumentSync":1,"hoverProvider":true,"definitionProvider":true,"completionProvider":{{"triggerCharacters":[".",":"]}}}}}}}}"#,
+                    r#"{{"jsonrpc":"2.0","id":{},"result":{{"capabilities":{{"textDocumentSync":1,"hoverProvider":true,"definitionProvider":true,"documentSymbolProvider":true,"completionProvider":{{"triggerCharacters":[".",":"]}}}}}}}}"#,
                     id
                 );
                 send_message(&mut writer, &resp)?;
@@ -58,6 +58,10 @@ pub fn run_server_loop(mut reader: impl BufRead, mut writer: impl Write) -> io::
             }
             "textDocument/definition" => {
                 let resp = handle_definition(&msg, &id, &documents);
+                send_message(&mut writer, &resp)?;
+            }
+            "textDocument/documentSymbol" => {
+                let resp = handle_document_symbol(&msg, &id, &documents);
                 send_message(&mut writer, &resp)?;
             }
             "textDocument/completion" => {
@@ -311,6 +315,48 @@ fn handle_definition(msg: &str, id: &str, documents: &HashMap<String, String>) -
     }
 
     null_resp
+}
+
+fn handle_document_symbol(msg: &str, id: &str, documents: &HashMap<String, String>) -> String {
+    let empty_resp = format!(r#"{{"jsonrpc":"2.0","id":{},"result":[]}}"#, id);
+    let Some(uri) = extract_uri(msg) else {
+        return empty_resp;
+    };
+    let Some(doc) = documents.get(&uri) else {
+        return empty_resp;
+    };
+    let Ok(tokens) = crate::frontend::lexer::Lexer::new(doc).tokenize_all() else {
+        return empty_resp;
+    };
+    let Ok(prog) = crate::frontend::parser::Parser::new(tokens).parse_program() else {
+        return empty_resp;
+    };
+    let mut syms = Vec::new();
+    for item in &prog.items {
+        let (name, kind) = match &item.kind {
+            ItemKind::Func { name, .. } => (name.as_str(), 12u8),
+            ItemKind::Struct { name, .. } => (name.as_str(), 23u8),
+            ItemKind::TypeAlias { name, .. } => (name.as_str(), 5u8),
+            _ => continue,
+        };
+        let line = item.span.line.saturating_sub(1);
+        let col = item.span.col.saturating_sub(1);
+        let end_col = col + name.len();
+        syms.push(format!(
+            r#"{{"name":"{}","kind":{},"range":{{"start":{{"line":{},"character":{}}},"end":{{"line":{},"character":{}}}}},"selectionRange":{{"start":{{"line":{},"character":{}}},"end":{{"line":{},"character":{}}}}}}}"#,
+            escape_json(name),
+            kind,
+            line,
+            col,
+            line,
+            end_col,
+            line,
+            col,
+            line,
+            end_col
+        ));
+    }
+    format!(r#"{{"jsonrpc":"2.0","id":{},"result":[{}]}}"#, id, syms.join(","))
 }
 
 fn find_func_hover(word: &str, prog: &Program, checked: &CheckedProgram, doc: &str) -> Option<String> {
@@ -670,17 +716,22 @@ mod tests {
         let def_fn = frame(
             r#"{"jsonrpc":"2.0","id":3,"method":"textDocument/definition","params":{"textDocument":{"uri":"file:///tmp/test_lsp.cdt"},"position":{"line":4,"character":29}}}"#,
         );
+        let doc_sym = frame(
+            r#"{"jsonrpc":"2.0","id":4,"method":"textDocument/documentSymbol","params":{"textDocument":{"uri":"file:///tmp/test_lsp.cdt"}}}"#,
+        );
         let exit = frame(r#"{"jsonrpc":"2.0","method":"exit"}"#);
 
-        let input = format!("{}{}{}{}{}", init, open, hover_fn, def_fn, exit);
+        let input = format!("{}{}{}{}{}{}", init, open, hover_fn, def_fn, doc_sym, exit);
         let mut out = Vec::new();
         run_server_loop(io::Cursor::new(input.as_bytes()), &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains(r#""hoverProvider":true"#));
         assert!(text.contains(r#""definitionProvider":true"#));
+        assert!(text.contains(r#""documentSymbolProvider":true"#));
         assert!(text.contains(r#""diagnostics":[]"#));
         assert!(text.contains("func add(a: Int, b: Int) -> Int"));
         assert!(text.contains("Adds two numbers"));
         assert!(text.contains(r#""id":3,"result":{"uri":"file:///tmp/test_lsp.cdt","range":{"start":{"line":1,"character":0}"#));
+        assert!(text.contains(r#""id":4,"result":[{"name":"add","kind":12"#));
     }
 }

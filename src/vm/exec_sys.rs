@@ -15,12 +15,19 @@ use crate::native::process::{
     PROC_CWD, PROC_EXIT, PROC_PID, PROC_RUN, PROC_SET_CWD, PROC_STATUS, make_process_error,
     proc_cwd, proc_run, proc_set_cwd, proc_status,
 };
+use crate::native::csv::{CsvError, parse_csv, parse_csv_records, stringify_csv};
+use crate::native::log::{
+    LOG_GET_LEVEL, LOG_SET_JSON, LOG_SET_LEVEL, emit_log, get_log_level, set_log_json,
+    set_log_level,
+};
+use crate::native::math::eval_math_op;
 use crate::native::url::{
     URL_DECODE, URL_DECODE_QUERY, URL_ENCODE, URL_ENCODE_QUERY, URL_PARSE, decode_query_str,
     encode_query_map, percent_decode, percent_encode, url_parse,
 };
 use crate::vm::exec_cold::err_msg;
-use crate::vm::value::{ListStorage, Obj};
+use crate::vm::string::VmString;
+use crate::vm::value::{ListStorage, MapKey, MapVal, Obj, OrderedMap, SCHEMA_CSV_ERROR, StructData};
 use crate::vm::{RuntimeError, Vm};
 
 impl Vm {
@@ -222,6 +229,162 @@ impl Vm {
                 self.objs[o_base + a as usize] = decode_query_str(&s);
             }
             _ => return Err(err_msg("Unknown url sub-op")),
+        }
+        Ok(())
+    }
+
+    pub(crate) fn exec_csv_op(
+        &mut self,
+        o_base: usize,
+        aux: u8,
+        a: u16,
+        b: u16,
+        c: u16,
+    ) -> Result<(), RuntimeError> {
+        let make_csv_err = |e: CsvError| {
+            let mut s = StructData::new(SCHEMA_CSV_ERROR, 1, 2);
+            s.set_scalar(0, e.line as u64);
+            s.set_obj(0, Obj::str(e.kind));
+            s.set_obj(1, Obj::str(e.message));
+            Obj::Record(Arc::new(s))
+        };
+        let rows_to_obj = |rows: Vec<Vec<String>>| {
+            let row_objs: Vec<Obj> = rows
+                .into_iter()
+                .map(|r| Obj::List(ListStorage::Obj(Arc::new(r.into_iter().map(Obj::str).collect()))))
+                .collect();
+            Obj::List(ListStorage::Obj(Arc::new(row_objs)))
+        };
+        let extract_rows = |obj: &Obj| -> Result<Vec<Vec<String>>, RuntimeError> {
+            let Obj::List(ListStorage::Obj(outer)) = obj else {
+                return Err(err_msg("Expected [[String]] in csv.stringify()"));
+            };
+            let mut out = Vec::with_capacity(outer.len());
+            for row_obj in outer.iter() {
+                let Obj::List(ListStorage::Obj(inner)) = row_obj else {
+                    return Err(err_msg("Expected [[String]] in csv.stringify()"));
+                };
+                let mut row = Vec::with_capacity(inner.len());
+                for cell in inner.iter() {
+                    let Obj::Str(s) = cell else {
+                        return Err(err_msg("Expected String cell in csv.stringify()"));
+                    };
+                    row.push(s.as_ref().to_string());
+                }
+                out.push(row);
+            }
+            Ok(out)
+        };
+
+        match aux {
+            0 => {
+                // csv.parse(text)
+                let s = self.sys_str(o_base, b, "csv.parse()")?;
+                self.objs[o_base + a as usize] = match parse_csv(&s, ",") {
+                    Ok(rows) => rows_to_obj(rows),
+                    Err(e) => make_csv_err(e),
+                };
+            }
+            1 => {
+                // csv.parse_with(text, delimiter)
+                let s = self.sys_str(o_base, b, "csv.parse_with()")?;
+                let delim = self.sys_str(o_base, c, "csv.parse_with()")?;
+                self.objs[o_base + a as usize] = match parse_csv(&s, &delim) {
+                    Ok(rows) => rows_to_obj(rows),
+                    Err(e) => make_csv_err(e),
+                };
+            }
+            2 => {
+                // csv.parse_records(text)
+                let s = self.sys_str(o_base, b, "csv.parse_records()")?;
+                self.objs[o_base + a as usize] = match parse_csv_records(&s) {
+                    Ok(records) => {
+                        let maps: Vec<Obj> = records
+                            .into_iter()
+                            .map(|m| {
+                                let mut om = OrderedMap::default();
+                                for (k, v) in m {
+                                    om.set(
+                                        MapKey::Str(Arc::new(VmString::from(k))),
+                                        MapVal::Obj(Obj::str(v)),
+                                    );
+                                }
+                                Obj::Map(Arc::new(om))
+                            })
+                            .collect();
+                        Obj::List(ListStorage::Obj(Arc::new(maps)))
+                    }
+                    Err(e) => make_csv_err(e),
+                };
+            }
+            3 => {
+                // csv.stringify(rows)
+                let rows = extract_rows(&self.objs[o_base + b as usize])?;
+                let out = stringify_csv(&rows, ",").map_err(|e| err_msg(&e.message))?;
+                self.objs[o_base + a as usize] = Obj::str(out);
+            }
+            4 => {
+                // csv.stringify_with(rows, delimiter)
+                let rows = extract_rows(&self.objs[o_base + b as usize])?;
+                let delim = self.sys_str(o_base, c, "csv.stringify_with()")?;
+                self.objs[o_base + a as usize] = match stringify_csv(&rows, &delim) {
+                    Ok(out) => Obj::str(out),
+                    Err(e) => make_csv_err(e),
+                };
+            }
+            _ => return Err(err_msg("Unknown csv sub-op")),
+        }
+        Ok(())
+    }
+
+    pub(crate) fn exec_math_op(
+        &mut self,
+        s_base: usize,
+        aux: u8,
+        a: u16,
+        b: u16,
+        c: u16,
+    ) -> Result<(), RuntimeError> {
+        let x = if aux >= 3 {
+            f64::from_bits(self.scalars[s_base + b as usize])
+        } else {
+            0.0
+        };
+        let y = if aux >= 17 {
+            f64::from_bits(self.scalars[s_base + c as usize])
+        } else {
+            0.0
+        };
+        let res = eval_math_op(aux, x, y).ok_or_else(|| err_msg("Unknown math sub-op"))?;
+        self.scalars[s_base + a as usize] = res.to_bits();
+        Ok(())
+    }
+
+    pub(crate) fn exec_log_op(
+        &mut self,
+        s_base: usize,
+        o_base: usize,
+        aux: u8,
+        a: u16,
+        b: u16,
+    ) -> Result<(), RuntimeError> {
+        match aux {
+            0..=3 => {
+                let msg = self.sys_str(o_base, b, "log()")?;
+                emit_log(aux, &msg);
+            }
+            LOG_SET_LEVEL => {
+                let level = self.sys_str(o_base, b, "log.set_level()")?;
+                set_log_level(&level);
+            }
+            LOG_SET_JSON => {
+                let enabled = self.scalars[s_base + b as usize] != 0;
+                set_log_json(enabled);
+            }
+            LOG_GET_LEVEL => {
+                self.objs[o_base + a as usize] = Obj::str(get_log_level());
+            }
+            _ => return Err(err_msg("Unknown log sub-op")),
         }
         Ok(())
     }

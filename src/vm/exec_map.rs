@@ -11,7 +11,7 @@ use crate::vm::opcode::{
     EXT_MAP_CONTAINS_KEY, EXT_MAP_ENTRIES, EXT_MAP_FROM, EXT_MAP_GET, EXT_MAP_INDEX, EXT_MAP_KEYS,
     EXT_MAP_REMOVE, EXT_MAP_SET, EXT_MAP_VALUES, EXT_PATH_OP, EXT_PIPELINE_REDUCE, EXT_PRINT_OBJ,
     EXT_PRINT_SCALAR, EXT_PROCESS_OP, EXT_STR_IS_EMPTY, EXT_STR_PRED, EXT_STR_SPLIT,
-    EXT_STR_TO_FLOAT, EXT_STR_TO_INT, EXT_URL_OP,
+    EXT_STR_TO_FLOAT, EXT_STR_TO_INT, EXT_URL_OP, EXT_CSV_OP, EXT_MATH_OP, EXT_LOG_OP,
 };
 use crate::vm::value::{
     ListStorage, MapKey, MapVal, Obj, OrderedMap, SCHEMA_BOXED_BOOL, SCHEMA_BOXED_FLOAT,
@@ -232,6 +232,15 @@ impl Vm {
             }
             EXT_URL_OP => {
                 self.exec_url_op(o_base, aux, a, b)?;
+            }
+            EXT_CSV_OP => {
+                self.exec_csv_op(o_base, aux, a, b, c)?;
+            }
+            EXT_MATH_OP => {
+                self.exec_math_op(s_base, aux, a, b, c)?;
+            }
+            EXT_LOG_OP => {
+                self.exec_log_op(s_base, o_base, aux, a, b)?;
             }
             EXT_STR_TO_INT => {
                 let Obj::Str(s) = &self.objs[o_base + b as usize] else {

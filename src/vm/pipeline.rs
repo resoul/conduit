@@ -632,6 +632,24 @@ fn match_float_affine_map(ops: &[Op], float_consts: &[f64]) -> Option<(f64, f64)
                 imm[dst as usize] = None;
                 stage = 2;
             }
+            Op::FmaFloat { dst, a, b, c }
+                if stage == 0
+                    && (dst as usize) < 16
+                    && (a as usize) < 16
+                    && (b as usize) < 16
+                    && (c as usize) < 16 =>
+            {
+                let prod = match (aff[a as usize], imm[b as usize], imm[a as usize], aff[b as usize]) {
+                    (Some((k, c0)), Some(m), _, _) | (_, _, Some(m), Some((k, c0))) => {
+                        Some((k * m, c0 * m))
+                    }
+                    _ => None,
+                }?;
+                let d = imm[c as usize]?;
+                aff[dst as usize] = Some((prod.0, prod.1 + d));
+                imm[dst as usize] = None;
+                stage = 2;
+            }
             Op::ReturnScalar { src } if (src as usize) < 16 => {
                 return aff[src as usize];
             }

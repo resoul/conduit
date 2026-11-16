@@ -17,6 +17,7 @@ pub(crate) fn is_valid_native_type(mod_name: &str, ty_name: &str) -> bool {
         "cdt.process" => matches!(ty_name, "ProcessError" | "Output"),
         "cdt.crypto" => ty_name == "CryptoError",
         "cdt.url" => matches!(ty_name, "UrlError" | "Url"),
+        "cdt.csv" => ty_name == "CsvError",
         _ => false,
     }
 }
@@ -233,6 +234,68 @@ pub(crate) fn register_native_imports(
                     }
                 }
             }
+            "cdt.csv" => {
+                if let Some(a) = alias {
+                    checked.csv_aliases.insert(a.clone());
+                }
+                for spec in names {
+                    match spec.name.as_str() {
+                        "parse" | "parse_with" | "parse_records" | "stringify" | "stringify_with" => {
+                            insert_unique(&mut checked.csv_direct_fns, &spec.alias, &spec.name)?;
+                        }
+                        "CsvError" => {
+                            checked
+                                .csv_direct_types
+                                .insert(spec.alias.clone(), spec.name.clone());
+                        }
+                        other => {
+                            return Err(format!(
+                                "Module 'cdt.csv' has no exported member '{}'",
+                                other
+                            ));
+                        }
+                    }
+                }
+            }
+            "cdt.math" => {
+                if let Some(a) = alias {
+                    checked.math_aliases.insert(a.clone());
+                }
+                for spec in names {
+                    match spec.name.as_str() {
+                        "pi" | "e" | "tau" | "sqrt" | "sin" | "cos" | "tan" | "asin" | "acos"
+                        | "atan" | "exp" | "ln" | "log10" | "floor" | "ceil" | "round" | "trunc"
+                        | "pow" | "atan2" | "hypot" => {
+                            insert_unique(&mut checked.math_direct_fns, &spec.alias, &spec.name)?;
+                        }
+                        other => {
+                            return Err(format!(
+                                "Module 'cdt.math' has no exported member '{}'",
+                                other
+                            ));
+                        }
+                    }
+                }
+            }
+            "cdt.log" => {
+                if let Some(a) = alias {
+                    checked.log_aliases.insert(a.clone());
+                }
+                for spec in names {
+                    match spec.name.as_str() {
+                        "debug" | "info" | "warn" | "error" | "set_level" | "set_json"
+                        | "get_level" => {
+                            insert_unique(&mut checked.log_direct_fns, &spec.alias, &spec.name)?;
+                        }
+                        other => {
+                            return Err(format!(
+                                "Module 'cdt.log' has no exported member '{}'",
+                                other
+                            ));
+                        }
+                    }
+                }
+            }
             other => return Err(format!("Unknown or unlinked module '{}'", other)),
         }
     }
@@ -310,6 +373,10 @@ pub fn resolve_type_expr(te: &TypeExpr, checked: &CheckedProgram) -> Result<Type
                 "cdt.url",
                 &checked.url_direct_types[name],
             ))),
+            _ if checked.csv_direct_types.contains_key(name) => Ok(Type::Custom(TypeId::native(
+                "cdt.csv",
+                &checked.csv_direct_types[name],
+            ))),
             _ if name.contains('.') => {
                 let mut parts = name.splitn(2, '.');
                 let alias = parts.next().unwrap_or("");
@@ -332,6 +399,8 @@ pub fn resolve_type_expr(te: &TypeExpr, checked: &CheckedProgram) -> Result<Type
                     "cdt.crypto"
                 } else if checked.url_aliases.contains(alias) {
                     "cdt.url"
+                } else if checked.csv_aliases.contains(alias) {
+                    "cdt.csv"
                 } else {
                     return Err(format!("Unknown type '{}'", name));
                 };
@@ -437,6 +506,7 @@ pub(crate) fn is_error_type(ty: &Type, checked: &CheckedProgram) -> bool {
             "cdt.process" => name == "ProcessError",
             "cdt.crypto" => name == "CryptoError",
             "cdt.url" => name == "UrlError",
+            "cdt.csv" => name == "CsvError",
             _ => false,
         },
         Type::Custom(TypeId {
@@ -533,6 +603,9 @@ pub(crate) fn native_member_field(tid: &TypeId, field: &str) -> Result<(Type, u1
         ("cdt.url", "Url", "path") => Ok((Type::String, 2)),
         ("cdt.url", "Url", "query") => Ok((Type::String, 3)),
         ("cdt.url", "Url", "fragment") => Ok((Type::String, 4)),
+        ("cdt.csv", "CsvError", "line") => Ok((Type::Int, 0)),
+        ("cdt.csv", "CsvError", "kind") => Ok((Type::String, 0)),
+        ("cdt.csv", "CsvError", "message") => Ok((Type::String, 1)),
         _ => Err(format!("Type '{}' has no field '{}'", tid, field)),
     }
 }

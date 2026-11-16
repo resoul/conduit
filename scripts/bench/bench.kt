@@ -107,6 +107,27 @@ fun main() {
     if (sum < 0 || rt.isEmpty() || rl.isEmpty() || lineTotal < 0) return
     println("CHECK|$sum")
 
+    val fnums = DoubleArray(1_000_000) { it.toDouble() }
+    t0 = System.nanoTime()
+    var fsum = 0.0
+    for (x in fnums) {
+        if (x > 250000.0) fsum += x * 1.5 + 0.25
+    }
+    val msFPipe = msSince(t0)
+    if (fsum < 0.0) return
+
+    val sampleUrl = "https://api.example.com:8443/v1/items?tag=prod&limit=50&offset=100#top"
+    t0 = System.nanoTime()
+    var urlAcc = 0
+    for (i in 0 until 50_000) {
+        val u = java.net.URI(sampleUrl)
+        val q = u.rawQuery ?: ""
+        val pairs = if (q.isEmpty()) 0 else q.split('&').size
+        urlAcc += pairs
+    }
+    val msUrl = msSince(t0)
+    if (urlAcc < 0) return
+
     println("BENCH|fs_write_text|%.3f".format(msWriteText))
     println("BENCH|fs_write_lines|%.3f".format(msWriteStream))
     println("BENCH|fs_read_text|%.3f".format(msReadText))
@@ -120,4 +141,6 @@ fun main() {
     println("BENCH|path_join_norm_100k|%.3f".format(msPath))
     println("BENCH|process_run_50x|%.3f".format(msProc))
     println("BENCH|pipeline_1m|%.3f".format(msPipe))
+    println("BENCH|pipeline_float_1m|%.3f".format(msFPipe))
+    println("BENCH|url_parse_50k|%.3f".format(msUrl))
 }

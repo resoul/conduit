@@ -139,6 +139,9 @@ fn hex_digit(b: u8) -> Option<u8> {
 
 pub fn percent_decode(input: &str, plus_as_space: bool) -> Result<String, Obj> {
     let bytes = input.as_bytes();
+    if !bytes.contains(&b'%') && (!plus_as_space || !bytes.contains(&b'+')) {
+        return Ok(input.to_string());
+    }
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0usize;
     while i < bytes.len() {

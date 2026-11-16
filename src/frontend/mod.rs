@@ -44,6 +44,9 @@ fn is_native_mod(path: &str) -> bool {
             | "cdt.process"
             | "cdt.crypto"
             | "cdt.url"
+            | "cdt.csv"
+            | "cdt.math"
+            | "cdt.log"
     )
 }
 

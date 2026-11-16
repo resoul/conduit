@@ -24,6 +24,9 @@ METRICS = [
     ("json_encode_10k", "json.encode (10k structs)"),
     ("json_decode_10k", "json.decode (10k structs)"),
     ("pipeline_1m", "pipeline filter/map/reduce (1M)"),
+    ("pipeline_float_1m", "pipeline float filter/map/reduce (1M)"),
+    ("csv_parse_20k", "csv.parse (20k rows)"),
+    ("url_parse_50k", "url.parse + query (50k)"),
 ]
 
 

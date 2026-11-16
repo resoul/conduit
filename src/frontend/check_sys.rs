@@ -324,4 +324,192 @@ impl Checker<'_> {
             other => Err(format!("Unknown cdt.url symbol '{}'", other)),
         }
     }
+
+    pub(crate) fn check_csv_call(
+        &mut self,
+        sym: &str,
+        type_args: &[TypeExpr],
+        args: &mut [Expr],
+        named_args: &mut [NamedArg],
+    ) -> Result<Type, String> {
+        let csv_err = Type::Custom(TypeId::native("cdt.csv", "CsvError"));
+        let rows_ty = Type::List(Box::new(Type::List(Box::new(Type::String))));
+        let records_ty = Type::List(Box::new(Type::Map(
+            Box::new(Type::String),
+            Box::new(Type::String),
+        )));
+        match sym {
+            "CsvError" => {
+                if !type_args.is_empty() {
+                    return Err("CsvError does not accept type arguments".to_string());
+                }
+                check_fields_ctor(
+                    self,
+                    "CsvError",
+                    &[
+                        ("kind", Type::String),
+                        ("line", Type::Int),
+                        ("message", Type::String),
+                    ],
+                    args,
+                    named_args,
+                    csv_err,
+                )
+            }
+            "parse" | "parse_records" => {
+                if !type_args.is_empty() || !named_args.is_empty() || args.len() != 1 {
+                    return Err(format!("csv.{}(text) expects 1 String argument", sym));
+                }
+                self.check_expr(&mut args[0], Some(&Type::String))?;
+                if args[0].ty != Type::String {
+                    return Err(format!("csv.{} expects String, got {}", sym, args[0].ty));
+                }
+                if sym == "parse" {
+                    Ok(Type::union(vec![rows_ty, csv_err]))
+                } else {
+                    Ok(Type::union(vec![records_ty, csv_err]))
+                }
+            }
+            "parse_with" => {
+                if !type_args.is_empty() || !named_args.is_empty() || args.len() != 2 {
+                    return Err("csv.parse_with(text, delimiter) expects 2 String arguments".to_string());
+                }
+                for (i, arg) in args.iter_mut().enumerate() {
+                    self.check_expr(arg, Some(&Type::String))?;
+                    if arg.ty != Type::String {
+                        return Err(format!(
+                            "csv.parse_with argument {} expects String, got {}",
+                            i + 1,
+                            arg.ty
+                        ));
+                    }
+                }
+                Ok(Type::union(vec![rows_ty, csv_err]))
+            }
+            "stringify" => {
+                if !type_args.is_empty() || !named_args.is_empty() || args.len() != 1 {
+                    return Err("csv.stringify(rows) expects 1 [[String]] argument".to_string());
+                }
+                self.check_expr(&mut args[0], Some(&rows_ty))?;
+                if args[0].ty != rows_ty {
+                    return Err(format!("csv.stringify expects [[String]], got {}", args[0].ty));
+                }
+                Ok(Type::String)
+            }
+            "stringify_with" => {
+                if !type_args.is_empty() || !named_args.is_empty() || args.len() != 2 {
+                    return Err(
+                        "csv.stringify_with(rows, delimiter) expects [[String]] and String"
+                            .to_string(),
+                    );
+                }
+                self.check_expr(&mut args[0], Some(&rows_ty))?;
+                if args[0].ty != rows_ty {
+                    return Err(format!(
+                        "csv.stringify_with expects [[String]], got {}",
+                        args[0].ty
+                    ));
+                }
+                self.check_expr(&mut args[1], Some(&Type::String))?;
+                if args[1].ty != Type::String {
+                    return Err(format!(
+                        "csv.stringify_with delimiter expects String, got {}",
+                        args[1].ty
+                    ));
+                }
+                Ok(Type::union(vec![Type::String, csv_err]))
+            }
+            other => Err(format!("Unknown cdt.csv symbol '{}'", other)),
+        }
+    }
+
+    pub(crate) fn check_math_call(
+        &mut self,
+        sym: &str,
+        type_args: &[TypeExpr],
+        args: &mut [Expr],
+        named_args: &[NamedArg],
+    ) -> Result<Type, String> {
+        if !type_args.is_empty() || !named_args.is_empty() {
+            return Err(format!("math.{} does not accept type or named arguments", sym));
+        }
+        match sym {
+            "pi" | "e" | "tau" => {
+                if !args.is_empty() {
+                    return Err(format!("math.{}() expects 0 arguments", sym));
+                }
+                Ok(Type::Float)
+            }
+            "sqrt" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "exp" | "ln"
+            | "log10" | "floor" | "ceil" | "round" | "trunc" => {
+                if args.len() != 1 {
+                    return Err(format!("math.{}(x) expects 1 Float argument", sym));
+                }
+                self.check_expr(&mut args[0], Some(&Type::Float))?;
+                if args[0].ty != Type::Float {
+                    return Err(format!("math.{} expects Float, got {}", sym, args[0].ty));
+                }
+                Ok(Type::Float)
+            }
+            "pow" | "atan2" | "hypot" => {
+                if args.len() != 2 {
+                    return Err(format!("math.{}(a, b) expects 2 Float arguments", sym));
+                }
+                for (i, arg) in args.iter_mut().enumerate() {
+                    self.check_expr(arg, Some(&Type::Float))?;
+                    if arg.ty != Type::Float {
+                        return Err(format!(
+                            "math.{} argument {} expects Float, got {}",
+                            sym,
+                            i + 1,
+                            arg.ty
+                        ));
+                    }
+                }
+                Ok(Type::Float)
+            }
+            other => Err(format!("Unknown cdt.math symbol '{}'", other)),
+        }
+    }
+
+    pub(crate) fn check_log_call(
+        &mut self,
+        sym: &str,
+        type_args: &[TypeExpr],
+        args: &mut [Expr],
+        named_args: &[NamedArg],
+    ) -> Result<Type, String> {
+        if !type_args.is_empty() || !named_args.is_empty() {
+            return Err(format!("log.{} does not accept type or named arguments", sym));
+        }
+        match sym {
+            "debug" | "info" | "warn" | "error" | "set_level" => {
+                if args.len() != 1 {
+                    return Err(format!("log.{}(msg) expects 1 String argument", sym));
+                }
+                self.check_expr(&mut args[0], Some(&Type::String))?;
+                if args[0].ty != Type::String {
+                    return Err(format!("log.{} expects String, got {}", sym, args[0].ty));
+                }
+                Ok(Type::Void)
+            }
+            "set_json" => {
+                if args.len() != 1 {
+                    return Err("log.set_json(enabled) expects 1 Bool argument".to_string());
+                }
+                self.check_expr(&mut args[0], Some(&Type::Bool))?;
+                if args[0].ty != Type::Bool {
+                    return Err(format!("log.set_json expects Bool, got {}", args[0].ty));
+                }
+                Ok(Type::Void)
+            }
+            "get_level" => {
+                if !args.is_empty() {
+                    return Err("log.get_level() expects 0 arguments".to_string());
+                }
+                Ok(Type::String)
+            }
+            other => Err(format!("Unknown cdt.log symbol '{}'", other)),
+        }
+    }
 }

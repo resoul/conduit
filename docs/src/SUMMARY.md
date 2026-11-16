@@ -30,6 +30,9 @@
 - [cdt.process](library/process.md)
 - [cdt.crypto](library/crypto.md)
 - [cdt.url](library/url.md)
+- [cdt.csv](library/csv.md)
+- [cdt.math](library/math.md)
+- [cdt.log](library/log.md)
 
 # Practical Guides
 - [Working with Errors](guides/working-with-errors.md)

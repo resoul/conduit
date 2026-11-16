@@ -982,3 +982,74 @@ fn cdt_url_e2e() {
         Obj::str("https|api.example.com|8443|/v1/search|top|hello world|rust+cdt|a%20b%2Fc|a b/c|a=hello%20world&b=2")
     );
 }
+
+#[test]
+fn cdt_csv_e2e() {
+    let src = r#"
+        import * as csv from "cdt.csv"
+
+        export func test_csv() -> String | csv.CsvError | IndexError {
+            raw := "name,note\r\n\"Ada, Lovelace\",\"says \"\"hi\"\"\"\r\nBob,ok\n"
+            rows := csv.parse(raw)?
+            recs := csv.parse_records(raw)?
+            semi := csv.parse_with("a;b\n1;2", ";")?
+            out := csv.stringify(rows)
+            out_semi := csv.stringify_with(semi, ";")?
+            rec0 := recs[0]?
+            row1 := rows[1]?
+            semi1 := semi[1]?
+            ada_note := rec0.get("note") ?? ""
+            return rows.len().to_string() + "|" + row1[0]? + "|" + ada_note + "|" + semi1[1]? + "|" + out_semi + "|" + out
+        }
+
+        export func test_csv_err() -> String {
+            switch csv.parse("\"unclosed") {
+                case csv.CsvError(e):
+                    return e.kind + ":" + e.line.to_string()
+                case _:
+                    return "ok"
+            }
+        }
+    "#;
+    let module = crate::frontend::compile_source(src).expect("compile csv");
+    let fid = module.func_id("test_csv").unwrap();
+    let ferr = module.func_id("test_csv_err").unwrap();
+    let mut vm = Vm::new();
+    assert_eq!(
+        vm.call_obj(&module, fid, &[], &[]).unwrap(),
+        Obj::str("3|Ada, Lovelace|says \"hi\"|2|a;b\n1;2|name,note\n\"Ada, Lovelace\",\"says \"\"hi\"\"\"\nBob,ok")
+    );
+    assert_eq!(
+        vm.call_obj(&module, ferr, &[], &[]).unwrap(),
+        Obj::str("InvalidCsv:1")
+    );
+}
+
+#[test]
+fn cdt_math_and_log_e2e() {
+    let src = r#"
+        import * as math from "cdt.math"
+        import * as log from "cdt.log"
+
+        export func test_math_log() -> String {
+            log.set_level("warn")
+            log.set_json(true)
+            log.debug("suppressed")
+            log.warn("active")
+            lvl := log.get_level()
+            log.set_level("info")
+            log.set_json(false)
+            h := math.hypot(3.0, 4.0)
+            p := math.pow(2.0, 3.0)
+            r := math.round(math.pi())
+            return h.to_string() + "|" + p.to_string() + "|" + r.to_string() + "|" + lvl
+        }
+    "#;
+    let module = crate::frontend::compile_source(src).expect("compile math/log");
+    let fid = module.func_id("test_math_log").unwrap();
+    let mut vm = Vm::new();
+    assert_eq!(
+        vm.call_obj(&module, fid, &[], &[]).unwrap(),
+        Obj::str("5|8|3|warn")
+    );
+}
