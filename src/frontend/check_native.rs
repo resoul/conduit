@@ -14,6 +14,8 @@ pub(crate) fn is_valid_native_type(mod_name: &str, ty_name: &str) -> bool {
         "cdt.env" => ty_name == "EnvError",
         "cdt.cli" => ty_name == "CliError",
         "cdt.fs" => matches!(ty_name, "FsError" | "Reader" | "Writer"),
+        "cdt.process" => matches!(ty_name, "ProcessError" | "Output"),
+        "cdt.crypto" => ty_name == "CryptoError",
         _ => false,
     }
 }
@@ -143,6 +145,70 @@ pub(crate) fn register_native_imports(
                     }
                 }
             }
+            "cdt.path" => {
+                if let Some(a) = alias {
+                    checked.path_aliases.insert(a.clone());
+                }
+                for spec in names {
+                    match spec.name.as_str() {
+                        "join" | "join_all" | "dirname" | "basename" | "ext" | "stem"
+                        | "normalize" | "is_abs" | "with_ext" => {
+                            insert_unique(&mut checked.path_direct_fns, &spec.alias, &spec.name)?;
+                        }
+                        other => {
+                            return Err(format!("Module 'cdt.path' has no exported member '{}'", other));
+                        }
+                    }
+                }
+            }
+            "cdt.process" => {
+                if let Some(a) = alias {
+                    checked.process_aliases.insert(a.clone());
+                }
+                for spec in names {
+                    match spec.name.as_str() {
+                        "run" | "status" | "cwd" | "set_cwd" | "pid" | "exit" => {
+                            insert_unique(&mut checked.process_direct_fns, &spec.alias, &spec.name)?;
+                        }
+                        "ProcessError" | "Output" => {
+                            checked
+                                .process_direct_types
+                                .insert(spec.alias.clone(), spec.name.clone());
+                        }
+                        other => {
+                            return Err(format!(
+                                "Module 'cdt.process' has no exported member '{}'",
+                                other
+                            ));
+                        }
+                    }
+                }
+            }
+            "cdt.crypto" => {
+                if let Some(a) = alias {
+                    checked.crypto_aliases.insert(a.clone());
+                }
+                for spec in names {
+                    match spec.name.as_str() {
+                        "sha256" | "hmac_sha256" | "base64_encode" | "base64_decode"
+                        | "hex_encode" | "hex_decode" | "uuid_v4" | "random_bytes_hex"
+                        | "random_int" => {
+                            insert_unique(&mut checked.crypto_direct_fns, &spec.alias, &spec.name)?;
+                        }
+                        "CryptoError" => {
+                            checked
+                                .crypto_direct_types
+                                .insert(spec.alias.clone(), spec.name.clone());
+                        }
+                        other => {
+                            return Err(format!(
+                                "Module 'cdt.crypto' has no exported member '{}'",
+                                other
+                            ));
+                        }
+                    }
+                }
+            }
             other => return Err(format!("Unknown or unlinked module '{}'", other)),
         }
     }
@@ -208,6 +274,14 @@ pub fn resolve_type_expr(te: &TypeExpr, checked: &CheckedProgram) -> Result<Type
                 "cdt.fs",
                 &checked.fs_direct_types[name],
             ))),
+            _ if checked.process_direct_types.contains_key(name) => Ok(Type::Custom(TypeId::native(
+                "cdt.process",
+                &checked.process_direct_types[name],
+            ))),
+            _ if checked.crypto_direct_types.contains_key(name) => Ok(Type::Custom(TypeId::native(
+                "cdt.crypto",
+                &checked.crypto_direct_types[name],
+            ))),
             _ if name.contains('.') => {
                 let mut parts = name.splitn(2, '.');
                 let alias = parts.next().unwrap_or("");
@@ -224,6 +298,10 @@ pub fn resolve_type_expr(te: &TypeExpr, checked: &CheckedProgram) -> Result<Type
                     "cdt.cli"
                 } else if checked.fs_aliases.contains(alias) {
                     "cdt.fs"
+                } else if checked.process_aliases.contains(alias) {
+                    "cdt.process"
+                } else if checked.crypto_aliases.contains(alias) {
+                    "cdt.crypto"
                 } else {
                     return Err(format!("Unknown type '{}'", name));
                 };
@@ -326,6 +404,8 @@ pub(crate) fn is_error_type(ty: &Type, checked: &CheckedProgram) -> bool {
             "cdt.env" => name == "EnvError",
             "cdt.cli" => name == "CliError",
             "cdt.fs" => name == "FsError",
+            "cdt.process" => name == "ProcessError",
+            "cdt.crypto" => name == "CryptoError",
             _ => false,
         },
         Type::Custom(TypeId {
@@ -407,6 +487,13 @@ pub(crate) fn native_member_field(tid: &TypeId, field: &str) -> Result<(Type, u1
         ("cdt.fs", "FsError", "kind") => Ok((Type::String, 0)),
         ("cdt.fs", "FsError", "path") => Ok((Type::String, 1)),
         ("cdt.fs", "FsError", "message") => Ok((Type::String, 2)),
+        ("cdt.process", "ProcessError", "kind") => Ok((Type::String, 0)),
+        ("cdt.process", "ProcessError", "message") => Ok((Type::String, 1)),
+        ("cdt.process", "Output", "code") => Ok((Type::Int, 0)),
+        ("cdt.process", "Output", "stdout") => Ok((Type::String, 0)),
+        ("cdt.process", "Output", "stderr") => Ok((Type::String, 1)),
+        ("cdt.crypto", "CryptoError", "kind") => Ok((Type::String, 0)),
+        ("cdt.crypto", "CryptoError", "message") => Ok((Type::String, 1)),
         _ => Err(format!("Type '{}' has no field '{}'", tid, field)),
     }
 }

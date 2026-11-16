@@ -4,6 +4,10 @@ use crate::frontend::check_native::{native_member_field, scalar_kind};
 use crate::frontend::types::{ModuleId, Type, TypeId};
 use crate::ir::lower::FnLowerer;
 use crate::ir::{FunctionProto, RecordDesc};
+use crate::native::crypto::{
+    CRYPTO_B64_DEC, CRYPTO_B64_ENC, CRYPTO_HEX_DEC, CRYPTO_HEX_ENC, CRYPTO_HMAC_SHA256,
+    CRYPTO_RAND_HEX, CRYPTO_RAND_INT, CRYPTO_SHA256, CRYPTO_UUID_V4,
+};
 use crate::native::fs::{
     FS_APPEND_TEXT, FS_COPY, FS_EACH_LINE, FS_EXISTS, FS_IS_DIR, FS_IS_FILE, FS_LIST_DIR,
     FS_MKDIR_ALL, FS_OPEN_APPEND, FS_OPEN_READ, FS_OPEN_WRITE, FS_READ_LINES, FS_READ_TEXT,
@@ -11,19 +15,27 @@ use crate::native::fs::{
     FS_WRITE_ATOMIC, FS_WRITE_TEXT, FS_WRITER_CLOSE, FS_WRITER_FLUSH, FS_WRITER_WRITE,
     FS_WRITER_WRITE_LINE, FS_WRITER_WRITE_LINES,
 };
+use crate::native::path::{
+    PATH_BASENAME, PATH_DIRNAME, PATH_EXT, PATH_IS_ABS, PATH_JOIN, PATH_JOIN_ALL, PATH_NORMALIZE,
+    PATH_STEM, PATH_WITH_EXT,
+};
+use crate::native::process::{
+    PROC_CWD, PROC_EXIT, PROC_PID, PROC_RUN, PROC_SET_CWD, PROC_STATUS,
+};
 use crate::native::time::TimeOpKind;
 use crate::native::validation::ValOpKind;
 use crate::vm::opcode::{
-    EXT_CLI_HELP, EXT_CLI_PARSE, EXT_CLI_PARSE_ARGS, EXT_ENV_ARGS, EXT_ENV_GET, EXT_ENV_LOAD,
-    EXT_ENV_REQUIRE, EXT_FS_BINARY, EXT_FS_UNARY, EXT_LIST_FIRST, EXT_LIST_LAST, EXT_LIST_SORT,
-    EXT_MAP_ENTRIES, EXT_MAP_GET, EXT_MAP_KEYS, EXT_MAP_REMOVE, EXT_MAP_VALUES, EXT_STR_SPLIT,
-    EXT_STR_TO_FLOAT, EXT_STR_TO_INT, Op,
+    EXT_CLI_HELP, EXT_CLI_PARSE, EXT_CLI_PARSE_ARGS, EXT_CRYPTO_OP, EXT_ENV_ARGS, EXT_ENV_GET,
+    EXT_ENV_LOAD, EXT_ENV_REQUIRE, EXT_FS_BINARY, EXT_FS_UNARY, EXT_LIST_FIRST, EXT_LIST_LAST,
+    EXT_LIST_SORT, EXT_MAP_ENTRIES, EXT_MAP_GET, EXT_MAP_KEYS, EXT_MAP_REMOVE, EXT_MAP_VALUES,
+    EXT_PATH_OP, EXT_PROCESS_OP, EXT_STR_SPLIT, EXT_STR_TO_FLOAT, EXT_STR_TO_INT, Op,
 };
 use crate::vm::value::{
-    SCHEMA_BOXED_BOOL, SCHEMA_BOXED_FLOAT, SCHEMA_BOXED_INT, SCHEMA_CLI_ERROR, SCHEMA_EMPTY_TAG,
-    SCHEMA_ENV_ERROR, SCHEMA_FS_ERROR, SCHEMA_FS_READER, SCHEMA_FS_WRITER, SCHEMA_INDEX_ERROR,
-    SCHEMA_JSON_DECODE_ERROR, SCHEMA_JSON_ENCODE_ERROR, SCHEMA_KEY_ERROR, SCHEMA_LIST_TAG,
-    SCHEMA_MAP_TAG, SCHEMA_PARSE_ERROR, SCHEMA_STR_TAG, SCHEMA_TIME_DURATION, SCHEMA_TIME_ERROR,
+    SCHEMA_BOXED_BOOL, SCHEMA_BOXED_FLOAT, SCHEMA_BOXED_INT, SCHEMA_CLI_ERROR,
+    SCHEMA_CRYPTO_ERROR, SCHEMA_EMPTY_TAG, SCHEMA_ENV_ERROR, SCHEMA_FS_ERROR, SCHEMA_FS_READER,
+    SCHEMA_FS_WRITER, SCHEMA_INDEX_ERROR, SCHEMA_JSON_DECODE_ERROR, SCHEMA_JSON_ENCODE_ERROR,
+    SCHEMA_KEY_ERROR, SCHEMA_LIST_TAG, SCHEMA_MAP_TAG, SCHEMA_PARSE_ERROR, SCHEMA_PROCESS_ERROR,
+    SCHEMA_PROCESS_OUTPUT, SCHEMA_STR_TAG, SCHEMA_TIME_DURATION, SCHEMA_TIME_ERROR,
     SCHEMA_TIME_INSTANT, SCHEMA_TIME_TIMESTAMP, SCHEMA_VALIDATION_ERROR, SCHEMA_VALIDATION_ISSUE,
     SCHEMA_VALIDATION_VIOLATION,
 };
@@ -71,6 +83,9 @@ pub(crate) fn type_tag_for_switch(ty: &Type, checked: &CheckedProgram) -> Result
                 ("cdt.fs", "FsError") => Ok(SCHEMA_FS_ERROR),
                 ("cdt.fs", "Reader") => Ok(SCHEMA_FS_READER),
                 ("cdt.fs", "Writer") => Ok(SCHEMA_FS_WRITER),
+                ("cdt.process", "ProcessError") => Ok(SCHEMA_PROCESS_ERROR),
+                ("cdt.process", "Output") => Ok(SCHEMA_PROCESS_OUTPUT),
+                ("cdt.crypto", "CryptoError") => Ok(SCHEMA_CRYPTO_ERROR),
                 _ => Err(format!("Unsupported native type '{}' in switch pattern", tid)),
             },
             _ => Err(format!("Unsupported type '{}' in switch pattern", tid)),
@@ -510,6 +525,176 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             _ => return Err(format!("Unsupported cdt.fs method '{}.{}()'", type_name, method)),
         }
         Ok(dst_o)
+    }
+
+    pub(crate) fn lower_path_call(&mut self, sym: &str, args: &[Expr]) -> Result<u16, String> {
+        match sym {
+            "join" | "with_ext" => {
+                let aux = if sym == "join" { PATH_JOIN } else { PATH_WITH_EXT };
+                let b = self.lower_obj(&args[0])?;
+                let c = self.lower_obj(&args[1])?;
+                let a = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp { kind: EXT_PATH_OP, aux, a, b, c });
+                Ok(a)
+            }
+            "is_abs" => {
+                let b = self.lower_obj(&args[0])?;
+                let a = self.alloc_temp_s();
+                self.ops.push(Op::ExtOp { kind: EXT_PATH_OP, aux: PATH_IS_ABS, a, b, c: 0 });
+                Ok(a)
+            }
+            "join_all" | "dirname" | "basename" | "ext" | "stem" | "normalize" => {
+                let aux = match sym {
+                    "join_all" => PATH_JOIN_ALL,
+                    "dirname" => PATH_DIRNAME,
+                    "basename" => PATH_BASENAME,
+                    "ext" => PATH_EXT,
+                    "stem" => PATH_STEM,
+                    "normalize" => PATH_NORMALIZE,
+                    _ => unreachable!(),
+                };
+                let b = self.lower_obj(&args[0])?;
+                let a = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp { kind: EXT_PATH_OP, aux, a, b, c: 0 });
+                Ok(a)
+            }
+            other => Err(format!("Unsupported cdt.path symbol '{}'", other)),
+        }
+    }
+
+    pub(crate) fn lower_process_call(
+        &mut self,
+        sym: &str,
+        args: &[Expr],
+        named_args: &[NamedArg],
+    ) -> Result<u16, String> {
+        match sym {
+            "ProcessError" => {
+                self.lower_native_record(SCHEMA_PROCESS_ERROR, &["kind", "message"], args, named_args)
+            }
+            "Output" => {
+                let (code_expr, out_expr, err_expr) = if !named_args.is_empty() {
+                    let c = &named_args.iter().find(|n| n.name == "code").unwrap().value;
+                    let o = &named_args.iter().find(|n| n.name == "stdout").unwrap().value;
+                    let e = &named_args.iter().find(|n| n.name == "stderr").unwrap().value;
+                    (c, o, e)
+                } else {
+                    (&args[0], &args[1], &args[2])
+                };
+                let code_s = self.lower_scalar(code_expr)?;
+                let out_o = self.lower_obj(out_expr)?;
+                let err_o = self.lower_obj(err_expr)?;
+                let desc_idx = self.mc.intern_record_desc(RecordDesc {
+                    schema_id: SCHEMA_PROCESS_OUTPUT,
+                    scalar_regs: Box::new([code_s]),
+                    obj_regs: Box::new([out_o, err_o]),
+                })?;
+                let dst_obj = self.alloc_temp_o();
+                self.ops.push(Op::NewRecord { dst_obj, desc_idx });
+                Ok(dst_obj)
+            }
+            "run" | "status" => {
+                let aux = if sym == "run" { PROC_RUN } else { PROC_STATUS };
+                let b = self.lower_obj(&args[0])?;
+                let c = self.lower_obj(&args[1])?;
+                let a = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp { kind: EXT_PROCESS_OP, aux, a, b, c });
+                Ok(a)
+            }
+            "cwd" => {
+                let a = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp { kind: EXT_PROCESS_OP, aux: PROC_CWD, a, b: 0, c: 0 });
+                Ok(a)
+            }
+            "set_cwd" => {
+                let b = self.lower_obj(&args[0])?;
+                let a = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp { kind: EXT_PROCESS_OP, aux: PROC_SET_CWD, a, b, c: 0 });
+                Ok(a)
+            }
+            "pid" => {
+                let a = self.alloc_temp_s();
+                self.ops.push(Op::ExtOp { kind: EXT_PROCESS_OP, aux: PROC_PID, a, b: 0, c: 0 });
+                Ok(a)
+            }
+            "exit" => {
+                let a = self.lower_scalar(&args[0])?;
+                self.ops.push(Op::ExtOp { kind: EXT_PROCESS_OP, aux: PROC_EXIT, a, b: 0, c: 0 });
+                Ok(a)
+            }
+            other => Err(format!("Unsupported cdt.process symbol '{}'", other)),
+        }
+    }
+
+    pub(crate) fn lower_crypto_call(
+        &mut self,
+        sym: &str,
+        args: &[Expr],
+        named_args: &[NamedArg],
+    ) -> Result<u16, String> {
+        match sym {
+            "CryptoError" => {
+                self.lower_native_record(SCHEMA_CRYPTO_ERROR, &["kind", "message"], args, named_args)
+            }
+            "sha256" | "base64_encode" | "base64_decode" | "hex_encode" | "hex_decode" => {
+                let aux = match sym {
+                    "sha256" => CRYPTO_SHA256,
+                    "base64_encode" => CRYPTO_B64_ENC,
+                    "base64_decode" => CRYPTO_B64_DEC,
+                    "hex_encode" => CRYPTO_HEX_ENC,
+                    "hex_decode" => CRYPTO_HEX_DEC,
+                    _ => unreachable!(),
+                };
+                let b = self.lower_obj(&args[0])?;
+                let a = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp { kind: EXT_CRYPTO_OP, aux, a, b, c: 0 });
+                Ok(a)
+            }
+            "hmac_sha256" => {
+                let b = self.lower_obj(&args[0])?;
+                let c = self.lower_obj(&args[1])?;
+                let a = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_CRYPTO_OP,
+                    aux: CRYPTO_HMAC_SHA256,
+                    a,
+                    b,
+                    c,
+                });
+                Ok(a)
+            }
+            "uuid_v4" => {
+                let a = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp { kind: EXT_CRYPTO_OP, aux: CRYPTO_UUID_V4, a, b: 0, c: 0 });
+                Ok(a)
+            }
+            "random_bytes_hex" => {
+                let b = self.lower_scalar(&args[0])?;
+                let a = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_CRYPTO_OP,
+                    aux: CRYPTO_RAND_HEX,
+                    a,
+                    b,
+                    c: 0,
+                });
+                Ok(a)
+            }
+            "random_int" => {
+                let b = self.lower_scalar(&args[0])?;
+                let c = self.lower_scalar(&args[1])?;
+                let a = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_CRYPTO_OP,
+                    aux: CRYPTO_RAND_INT,
+                    a,
+                    b,
+                    c,
+                });
+                Ok(a)
+            }
+            other => Err(format!("Unsupported cdt.crypto symbol '{}'", other)),
+        }
     }
 
     pub(crate) fn lower_native_method_obj(

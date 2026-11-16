@@ -1,9 +1,12 @@
 pub mod cli;
+pub mod crypto;
 pub mod env;
 pub mod fs;
 pub mod json_decode;
 pub mod json_encode;
 pub(crate) mod json_lexer;
+pub mod path;
+pub mod process;
 pub mod time;
 pub mod validation;
 

@@ -1,0 +1,206 @@
+import * as fs from "cdt.fs"
+import * as path from "cdt.path"
+import * as process from "cdt.process"
+import * as crypto from "cdt.crypto"
+import * as json from "cdt.json"
+import * as env from "cdt.env"
+import * as time from "cdt.time"
+
+struct Item {
+    id: Int
+    user: String
+    score: Int
+}
+
+func ms_since(t0: time.Instant) -> Float | time.TimeError {
+    el := time.elapsed(t0)?
+    ns := el.nanoseconds()?
+    return ns.to_float() / 1000000.0
+}
+
+export func main() -> Void | fs.FsError | process.ProcessError | crypto.CryptoError | json.DecodeError | json.EncodeError | time.TimeError {
+    // ── 1. FS I/O (100k lines / 5.53 MiB) ────────────────────────────────────
+    cwd := process.cwd()?
+    base := path.join(cwd, "_conduit_bench_tmp")
+    fs.mkdir_all(base)?
+    p := path.join(base, "data.txt")
+    p_bulk := path.join(base, "bulk.txt")
+
+    t_ws := time.monotonic()
+    w := fs.open_write(p)?
+    i := 0
+    while i < 100000 {
+        w.write_line("line payload number 0123456789 abcdefghijklmnopqrstuvwxyz")?
+        i = i + 1
+    }
+    w.flush()?
+    w.close()
+    ms_write_stream := ms_since(t_ws)?
+
+    data := fs.read_text(p)?
+    // Warmup
+    _w_r := fs.read_text(p)?
+
+    t_wt := time.monotonic()
+    fs.write_text(p_bulk, data)?
+    ms_write_text := ms_since(t_wt)?
+
+    t_rt := time.monotonic()
+    rt := fs.read_text(p)?
+    if rt.len() < 0 { return }
+    ms_read_text := ms_since(t_rt)?
+
+    t_rl := time.monotonic()
+    rl := fs.read_lines(p)?
+    if rl.len() < 0 { return }
+    ms_read_lines := ms_since(t_rl)?
+
+    t_el := time.monotonic()
+    n_el := fs.each_line(p, (ln: String) => {
+        if ln.len() < 0 { x := 0 }
+    })?
+    if n_el < 0 { return }
+    ms_each_line := ms_since(t_el)?
+
+    t_rc := time.monotonic()
+    rc := fs.open_read(p)?
+    while true {
+        ch := rc.read_chunk(65536)
+        switch ch {
+            case nil:
+                break
+            case fs.FsError(e):
+                rc.close()
+                return e
+            case String(s):
+                if s.len() < 0 { break }
+        }
+    }
+    rc.close()
+    ms_read_chunk := ms_since(t_rc)?
+    fs.remove(base)?
+
+    // ── 2. Crypto, Path, Process ─────────────────────────────────────────────
+    chunk := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    big := chunk
+    i = 0
+    while i < 14 {
+        big = big + big
+        i = i + 1
+    }
+    _w_sha := crypto.sha256(big)
+    _w_b64 := crypto.base64_encode(big)
+
+    t_sha := time.monotonic()
+    i = 0
+    while i < 50 {
+        _h := crypto.sha256(big)
+        i = i + 1
+    }
+    ms_sha := ms_since(t_sha)?
+
+    t_be := time.monotonic()
+    b64_s := ""
+    i = 0
+    while i < 50 {
+        b64_s = crypto.base64_encode(big)
+        i = i + 1
+    }
+    ms_b64e := ms_since(t_be)?
+
+    t_bd := time.monotonic()
+    i = 0
+    while i < 50 {
+        _d := crypto.base64_decode(b64_s)?
+        i = i + 1
+    }
+    ms_b64d := ms_since(t_bd)?
+
+    t_uu := time.monotonic()
+    i = 0
+    while i < 10000 {
+        _u := crypto.uuid_v4()
+        i = i + 1
+    }
+    ms_uuid := ms_since(t_uu)?
+
+    t_pa := time.monotonic()
+    i = 0
+    while i < 100000 {
+        _np := path.normalize(path.join("/var/log", "app/../service/output.log"))
+        i = i + 1
+    }
+    ms_path := ms_since(t_pa)?
+
+    is_win := false
+    switch env.get("OS") {
+        case String(os_val):
+            if os_val == "Windows_NT" { is_win = true }
+        case nil:
+            is_win = false
+    }
+    proc_cmd := "true"
+    proc_args := [""]
+    proc_args = []
+    if is_win {
+        proc_cmd = "cmd"
+        proc_args = ["/c", "exit", "0"]
+    }
+    t_pr := time.monotonic()
+    i = 0
+    while i < 50 {
+        _po := process.run(proc_cmd, proc_args)?
+        i = i + 1
+    }
+    ms_proc := ms_since(t_pr)?
+
+    // ── 3. JSON + Pipeline (map / filter / reduce) ───────────────────────────
+    items := [Item(id: 0, user: "u0", score: 0)]
+    items = []
+    i = 0
+    while i < 10000 {
+        items.append(Item(id: i, user: "alice_" + (i % 10).to_string(), score: i % 100))
+        i = i + 1
+    }
+
+    t_je := time.monotonic()
+    raw_json := json.encode(items)?
+    ms_json_enc := ms_since(t_je)?
+
+    t_jd := time.monotonic()
+    decoded := json.decode<[Item]>(raw_json)?
+    if decoded.len() < 0 { return }
+    ms_json_dec := ms_since(t_jd)?
+
+    nums := [0]
+    nums = []
+    i = 0
+    while i < 1000000 {
+        nums.append(i)
+        i = i + 1
+    }
+    t_pl := time.monotonic()
+    sum := nums
+        |> filter((x: Int) => x % 2 == 0)
+        |> map((x: Int) => x * 3 + 1)
+        |> reduce(0, (acc: Int, x: Int) => acc + x)
+    ms_pipe := ms_since(t_pl)?
+    if sum < 0 { return }
+
+    print("BENCH|fs_write_text|" + ms_write_text.to_string())
+    print("BENCH|fs_write_lines|" + ms_write_stream.to_string())
+    print("BENCH|fs_read_text|" + ms_read_text.to_string())
+    print("BENCH|fs_read_lines|" + ms_read_lines.to_string())
+    print("BENCH|fs_each_line|" + ms_each_line.to_string())
+    print("BENCH|fs_read_chunk64k|" + ms_read_chunk.to_string())
+    print("BENCH|crypto_sha256_50m|" + ms_sha.to_string())
+    print("BENCH|crypto_b64_enc_50m|" + ms_b64e.to_string())
+    print("BENCH|crypto_b64_dec_50m|" + ms_b64d.to_string())
+    print("BENCH|crypto_uuid_10k|" + ms_uuid.to_string())
+    print("BENCH|path_join_norm_100k|" + ms_path.to_string())
+    print("BENCH|process_run_50x|" + ms_proc.to_string())
+    print("BENCH|json_encode_10k|" + ms_json_enc.to_string())
+    print("BENCH|json_decode_10k|" + ms_json_dec.to_string())
+    print("BENCH|pipeline_1m|" + ms_pipe.to_string())
+    return
+}

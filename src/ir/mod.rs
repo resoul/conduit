@@ -685,6 +685,50 @@ impl Module {
                                     check_o(c, &ctx)?;
                                 }
                             }
+                            crate::vm::opcode::EXT_PATH_OP => {
+                                if aux == 7 {
+                                    check_s(a, &ctx)?;
+                                } else {
+                                    check_o(a, &ctx)?;
+                                }
+                                check_o(b, &ctx)?;
+                                if matches!(aux, 0 | 8) {
+                                    check_o(c, &ctx)?;
+                                }
+                            }
+                            crate::vm::opcode::EXT_PROCESS_OP => {
+                                match aux {
+                                    0 | 1 => {
+                                        check_o(a, &ctx)?;
+                                        check_o(b, &ctx)?;
+                                        check_o(c, &ctx)?;
+                                    }
+                                    2 => check_o(a, &ctx)?,
+                                    3 => {
+                                        check_o(a, &ctx)?;
+                                        check_o(b, &ctx)?;
+                                    }
+                                    4 | 5 => check_s(a, &ctx)?,
+                                    _ => return Err(format!("{}: invalid process sub-op {}", ctx, aux)),
+                                }
+                            }
+                            crate::vm::opcode::EXT_CRYPTO_OP => {
+                                check_o(a, &ctx)?;
+                                match aux {
+                                    0 | 2..=5 => check_o(b, &ctx)?,
+                                    1 => {
+                                        check_o(b, &ctx)?;
+                                        check_o(c, &ctx)?;
+                                    }
+                                    6 => {}
+                                    7 => check_s(b, &ctx)?,
+                                    8 => {
+                                        check_s(b, &ctx)?;
+                                        check_s(c, &ctx)?;
+                                    }
+                                    _ => return Err(format!("{}: invalid crypto sub-op {}", ctx, aux)),
+                                }
+                            }
                             _ => return Err(format!("Invalid ExtOp kind {}", kind)),
                         }
                     }

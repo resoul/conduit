@@ -68,7 +68,22 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             return Err("Unexpected named arguments in void call".to_string());
         }
         if let ExprKind::Member { target, field } = &callee.kind {
+            if let ExprKind::Ident(alias) = &target.kind
+                && self.lookup_local(alias).is_none()
+                && self.mc.checked.process_aliases.contains(alias)
+            {
+                let _ = self.lower_process_call(field, args, named_args)?;
+                return Ok(());
+            }
             return self.lower_void_method(target, field, args);
+        }
+        if let ExprKind::Ident(name) = &callee.kind
+            && self.lookup_local(name).is_none()
+            && let Some(sym) = self.mc.checked.process_direct_fns.get(name)
+        {
+            let sym = sym.clone();
+            let _ = self.lower_process_call(&sym, args, named_args)?;
+            return Ok(());
         }
         if let ExprKind::Ident(name) = &callee.kind
             && name == "print"
@@ -104,18 +119,43 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
         if let ExprKind::Member { target, field } = &callee.kind {
             if let ExprKind::Ident(alias) = &target.kind
                 && self.lookup_local(alias).is_none()
-                && self.mc.checked.fs_aliases.contains(alias)
             {
-                return self.lower_fs_call(field, args, named_args);
+                if self.mc.checked.fs_aliases.contains(alias) {
+                    return self.lower_fs_call(field, args, named_args);
+                }
+                if self.mc.checked.path_aliases.contains(alias) {
+                    return self.lower_path_call(field, args);
+                }
+                if self.mc.checked.process_aliases.contains(alias) {
+                    return self.lower_process_call(field, args, named_args);
+                }
+                if self.mc.checked.crypto_aliases.contains(alias) {
+                    return self.lower_crypto_call(field, args, named_args);
+                }
+                if self.mc.checked.path_aliases.contains(alias) {
+                    return self.lower_path_call(field, args);
+                }
+                if self.mc.checked.process_aliases.contains(alias) {
+                    return self.lower_process_call(field, args, named_args);
+                }
             }
             return self.lower_scalar_method(target, field, args);
         }
         if let ExprKind::Ident(name) = &callee.kind
             && self.lookup_local(name).is_none()
-            && let Some(sym) = self.mc.checked.fs_direct_fns.get(name)
         {
-            let sym = sym.clone();
-            return self.lower_fs_call(&sym, args, named_args);
+            if let Some(sym) = self.mc.checked.fs_direct_fns.get(name) {
+                let sym = sym.clone();
+                return self.lower_fs_call(&sym, args, named_args);
+            }
+            if let Some(sym) = self.mc.checked.path_direct_fns.get(name) {
+                let sym = sym.clone();
+                return self.lower_path_call(&sym, args);
+            }
+            if let Some(sym) = self.mc.checked.process_direct_fns.get(name) {
+                let sym = sym.clone();
+                return self.lower_process_call(&sym, args, named_args);
+            }
         }
         if let ExprKind::Ident(fn_name) = &callee.kind
             && self.lookup_local(fn_name).is_none()
@@ -185,6 +225,15 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 if self.mc.checked.fs_aliases.contains(alias) {
                     return self.lower_fs_call(field, args, named_args);
                 }
+                if self.mc.checked.path_aliases.contains(alias) {
+                    return self.lower_path_call(field, args);
+                }
+                if self.mc.checked.process_aliases.contains(alias) {
+                    return self.lower_process_call(field, args, named_args);
+                }
+                if self.mc.checked.crypto_aliases.contains(alias) {
+                    return self.lower_crypto_call(field, args, named_args);
+                }
             }
             if let Some(reg) = self.lower_builtin_obj_method(target, field, args)? {
                 return Ok(reg);
@@ -242,6 +291,26 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             if let Some(sym) = self.mc.checked.fs_direct_types.get(name) {
                 let sym = sym.clone();
                 return self.lower_fs_call(&sym, args, named_args);
+            }
+            if let Some(sym) = self.mc.checked.path_direct_fns.get(name) {
+                let sym = sym.clone();
+                return self.lower_path_call(&sym, args);
+            }
+            if let Some(sym) = self.mc.checked.process_direct_fns.get(name) {
+                let sym = sym.clone();
+                return self.lower_process_call(&sym, args, named_args);
+            }
+            if let Some(sym) = self.mc.checked.process_direct_types.get(name) {
+                let sym = sym.clone();
+                return self.lower_process_call(&sym, args, named_args);
+            }
+            if let Some(sym) = self.mc.checked.crypto_direct_fns.get(name) {
+                let sym = sym.clone();
+                return self.lower_crypto_call(&sym, args, named_args);
+            }
+            if let Some(sym) = self.mc.checked.crypto_direct_types.get(name) {
+                let sym = sym.clone();
+                return self.lower_crypto_call(&sym, args, named_args);
             }
             if name == "Map" {
                 let dst_obj = self.alloc_temp_o();

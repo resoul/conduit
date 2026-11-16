@@ -5,13 +5,13 @@ use crate::native::cli::{exec_cli_parse, format_cli_help};
 use crate::native::env::{exec_env_load, make_env_error};
 use crate::vm::exec_union::list_get_or_index;
 use crate::vm::opcode::{
-    EXT_CLI_HELP, EXT_CLI_PARSE, EXT_CLI_PARSE_ARGS, EXT_ENV_ARGS, EXT_ENV_GET, EXT_ENV_LOAD,
-    EXT_ENV_REQUIRE, EXT_FLOAT_CEIL, EXT_FLOAT_MATH, EXT_FS_BINARY, EXT_FS_UNARY, EXT_INT_MATH,
-    EXT_LIST_FIRST,
-    EXT_LIST_IS_EMPTY, EXT_LIST_LAST, EXT_LIST_SORT, EXT_MAP_CONTAINS_KEY, EXT_MAP_ENTRIES,
-    EXT_MAP_FROM, EXT_MAP_GET, EXT_MAP_INDEX, EXT_MAP_KEYS, EXT_MAP_REMOVE, EXT_MAP_SET,
-    EXT_MAP_VALUES, EXT_PRINT_OBJ, EXT_PRINT_SCALAR, EXT_STR_IS_EMPTY, EXT_STR_PRED, EXT_STR_SPLIT,
-    EXT_STR_TO_FLOAT, EXT_STR_TO_INT,
+    EXT_CLI_HELP, EXT_CLI_PARSE, EXT_CLI_PARSE_ARGS, EXT_CRYPTO_OP, EXT_ENV_ARGS, EXT_ENV_GET,
+    EXT_ENV_LOAD, EXT_ENV_REQUIRE, EXT_FLOAT_CEIL, EXT_FLOAT_MATH, EXT_FS_BINARY, EXT_FS_UNARY,
+    EXT_INT_MATH, EXT_LIST_FIRST, EXT_LIST_IS_EMPTY, EXT_LIST_LAST, EXT_LIST_SORT,
+    EXT_MAP_CONTAINS_KEY, EXT_MAP_ENTRIES, EXT_MAP_FROM, EXT_MAP_GET, EXT_MAP_INDEX, EXT_MAP_KEYS,
+    EXT_MAP_REMOVE, EXT_MAP_SET, EXT_MAP_VALUES, EXT_PATH_OP, EXT_PRINT_OBJ, EXT_PRINT_SCALAR,
+    EXT_PROCESS_OP, EXT_STR_IS_EMPTY, EXT_STR_PRED, EXT_STR_SPLIT, EXT_STR_TO_FLOAT,
+    EXT_STR_TO_INT,
 };
 use crate::vm::value::{
     ListStorage, MapKey, MapVal, Obj, OrderedMap, SCHEMA_BOXED_BOOL, SCHEMA_BOXED_FLOAT,
@@ -217,6 +217,15 @@ impl Vm {
             }
             EXT_FS_BINARY => {
                 self.exec_fs_binary(module, s_base, o_base, aux, a, b, c)?;
+            }
+            EXT_PATH_OP => {
+                self.exec_path_op(s_base, o_base, aux, a, b, c)?;
+            }
+            EXT_PROCESS_OP => {
+                self.exec_process_op(s_base, o_base, aux, a, b, c)?;
+            }
+            EXT_CRYPTO_OP => {
+                self.exec_crypto_op(s_base, o_base, aux, a, b, c)?;
             }
             EXT_STR_TO_INT => {
                 let Obj::Str(s) = &self.objs[o_base + b as usize] else {

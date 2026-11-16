@@ -101,6 +101,15 @@ impl<'a> Checker<'a> {
                 if self.checked.fs_aliases.contains(mod_alias) {
                     return self.check_fs_call(field, type_args, args, named_args);
                 }
+                if self.checked.path_aliases.contains(mod_alias) {
+                    return self.check_path_call(field, type_args, args, named_args);
+                }
+                if self.checked.process_aliases.contains(mod_alias) {
+                    return self.check_process_call(field, type_args, args, named_args);
+                }
+                if self.checked.crypto_aliases.contains(mod_alias) {
+                    return self.check_crypto_call(field, type_args, args, named_args);
+                }
             }
             self.check_expr(target, None)?;
             return self.check_method_call(target, field, args, named_args);
@@ -181,6 +190,26 @@ impl<'a> Checker<'a> {
                 _ if self.checked.fs_direct_types.contains_key(name) => {
                     let sym = self.checked.fs_direct_types[name].clone();
                     return self.check_fs_call(&sym, type_args, args, named_args);
+                }
+                _ if self.checked.path_direct_fns.contains_key(name) => {
+                    let sym = self.checked.path_direct_fns[name].clone();
+                    return self.check_path_call(&sym, type_args, args, named_args);
+                }
+                _ if self.checked.process_direct_fns.contains_key(name) => {
+                    let sym = self.checked.process_direct_fns[name].clone();
+                    return self.check_process_call(&sym, type_args, args, named_args);
+                }
+                _ if self.checked.process_direct_types.contains_key(name) => {
+                    let sym = self.checked.process_direct_types[name].clone();
+                    return self.check_process_call(&sym, type_args, args, named_args);
+                }
+                _ if self.checked.crypto_direct_fns.contains_key(name) => {
+                    let sym = self.checked.crypto_direct_fns[name].clone();
+                    return self.check_crypto_call(&sym, type_args, args, named_args);
+                }
+                _ if self.checked.crypto_direct_types.contains_key(name) => {
+                    let sym = self.checked.crypto_direct_types[name].clone();
+                    return self.check_crypto_call(&sym, type_args, args, named_args);
                 }
                 _ if self.checked.generic_structs.contains_key(name) => {
                     let base = name.clone();

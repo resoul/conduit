@@ -151,6 +151,9 @@ pub const EXT_CLI_PARSE_ARGS: u8 = 28;
 pub const EXT_CLI_HELP: u8 = 29;
 pub const EXT_FS_UNARY: u8 = 30;
 pub const EXT_FS_BINARY: u8 = 31;
+pub const EXT_PATH_OP: u8 = 32;
+pub const EXT_PROCESS_OP: u8 = 33;
+pub const EXT_CRYPTO_OP: u8 = 34;
 
 #[cfg(test)]
 mod tests {

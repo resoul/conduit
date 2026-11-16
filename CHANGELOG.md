@@ -13,10 +13,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   * Added basic file and directory operations: `read_text`, `write_text`, `append_text`, `write_atomic` (temp-file + rename), `read_lines`, `exists`, `is_file`, `is_dir`, `size`, `list_dir`, `mkdir_all`, `remove`, `copy`, and `rename`, returning `FsError { kind, path, message }` on I/O failures.
   * Added high-throughput streaming operations backed by 64 KB `BufReader`/`BufWriter` VM handles: `open_read` -> `Reader` (`read_line`, `read_chunk`, `close`), `open_write` / `open_append` -> `Writer` (`write`, `write_line`, `flush`, `close`), and `each_line(path, cb)` for zero-list-allocation line streaming.
   * Added `cdt.fs` type-checking (`src/frontend/check_fs.rs`), IR lowering (`EXT_FS_UNARY`, `EXT_FS_BINARY`), VM execution (`src/native/fs.rs`, `src/vm/exec_fs.rs`), LSP hover/completion docs (`src/lsp_docs.rs`), and end-to-end tests (`cdt_fs_basic_and_streaming`).
+* **`cdt.path`, `cdt.process`, and `cdt.crypto` Standard Library Modules**:
+  * Added `cdt.path` (`join`, `join_all`, `dirname`, `basename`, `ext`, `stem`, `normalize`, `is_abs`, `with_ext`) for cross-platform lexical path handling (`EXT_PATH_OP`).
+  * Added `cdt.process` (`run`, `status`, `cwd`, `set_cwd`, `pid`, `exit`, `Output`, `ProcessError`) for spawning external processes (`EXT_PROCESS_OP`).
+  * Added zero-dependency `cdt.crypto` (`sha256`, `hmac_sha256`, `base64_encode`, `base64_decode`, `hex_encode`, `hex_decode`, `uuid_v4`, `random_bytes_hex`, `random_int`, `CryptoError`) (`EXT_CRYPTO_OP`), with LSP hover/completion, TextMate highlighting, and library docs (`docs/src/library/{path,process,crypto}.md`).
 
 ### Fixed & Optimized
 
-* **Streaming Performance & UTF-8 Safety (`cdt.fs`)**:
+* **Crypto & Streaming Performance (`cdt.crypto`, `cdt.fs`)**:
+  * Cached `/dev/urandom` in a thread-local `BufReader`, eliminated `format!`/`Vec` allocations in `crypto.uuid_v4` and `crypto.base64_decode` (lookup-table fast-path), and added zero-allocation padding + ARM64 `sha2` hardware acceleration (`std::arch::aarch64`) for `crypto.sha256`/`hmac_sha256`.
   * Reused `Arc<String>` line buffers across `fs.each_line` iterations when not retained by the callback, and pre-sized `Vec` capacity in `fs.read_lines`.
   * Implemented zero-zeroing `BufRead::fill_buf()` fast-paths in `Reader.read_line` and `Reader.read_chunk`, with safe multi-byte UTF-8 boundary handling so chunks never fail mid-character.
   * Added `sync_frame_ptrs!()` after `Op::ExtOp` in the VM dispatch loop (`src/vm/exec.rs`) to keep cached frame pointers valid when native callbacks grow the VM stack.

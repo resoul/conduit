@@ -2,6 +2,7 @@ pub mod exec;
 pub(crate) mod exec_cold;
 pub(crate) mod exec_fs;
 pub(crate) mod exec_map;
+pub(crate) mod exec_sys;
 pub(crate) mod exec_union;
 pub mod opcode;
 pub mod pipeline;

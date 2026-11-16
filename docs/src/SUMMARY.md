@@ -26,6 +26,9 @@
 - [cdt.env](library/env.md)
 - [cdt.cli](library/cli.md)
 - [cdt.fs: reading and buffered writing](library/fs.md)
+- [cdt.path](library/path.md)
+- [cdt.process](library/process.md)
+- [cdt.crypto](library/crypto.md)
 
 # Practical Guides
 - [Working with Errors](guides/working-with-errors.md)

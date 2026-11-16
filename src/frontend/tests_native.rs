@@ -868,3 +868,67 @@ fn cdt_fs_shared_lines_string_map_json_and_bundle_interop() {
     let (decoded, entry, _) = crate::ir::bundle::decode_bundle(&encoded).unwrap();
     assert_eq!(vm.call_obj(&decoded, entry, &[], &[]).unwrap(), Obj::str("beta"));
 }
+
+#[test]
+fn cdt_path_process_and_crypto_e2e() {
+    let src = r#"
+        import * as path from "cdt.path"
+        import * as process from "cdt.process"
+        import * as crypto from "cdt.crypto"
+
+        export func test_path() -> String {
+            p := path.join("/var/log", "app/server.tar.gz")
+            p2 := path.join_all(["a", "b", "..", "c.txt"])
+            norm := path.normalize(p2)
+            dn := path.dirname(p)
+            bn := path.basename(p)
+            ex := path.ext(p)
+            st := path.stem(p)
+            we := path.with_ext("/tmp/data.txt", "json")
+            abs1 := path.is_abs("/tmp/x")
+            abs2 := path.is_abs("rel/x")
+            return norm + "|" + dn + "|" + bn + "|" + ex + "|" + st + "|" + we + "|" + abs1.to_string() + "|" + abs2.to_string()
+        }
+
+        export func test_process() -> String | process.ProcessError {
+            pid := process.pid()
+            cwd := process.cwd()?
+            out := process.run("echo", ["hello-proc"])?
+            return (pid > 0).to_string() + ":" + (cwd.len() > 0).to_string() + ":" + out.code.to_string() + ":" + out.stdout.trim()
+        }
+
+        export func test_crypto() -> String | crypto.CryptoError {
+            h := crypto.sha256("abc")
+            hm := crypto.hmac_sha256("key", "The quick brown fox jumps over the lazy dog")
+            b64 := crypto.base64_encode("Hello, Conduit!")
+            b64d := crypto.base64_decode(b64)?
+            hx := crypto.hex_encode("AZ")
+            hxd := crypto.hex_decode(hx)?
+            u := crypto.uuid_v4()
+            rh := crypto.random_bytes_hex(8)?
+            ri := crypto.random_int(10, 20)?
+            return h + "|" + hm + "|" + b64 + "|" + b64d + "|" + hx + "|" + hxd + "|" + u.len().to_string() + "|" + rh.len().to_string() + "|" + (ri >= 10 && ri < 20).to_string()
+        }
+    "#;
+
+    let module = crate::frontend::compile_source(src).expect("compile path/process/crypto");
+    let f_path = module.func_id("test_path").unwrap();
+    let f_proc = module.func_id("test_process").unwrap();
+    let f_cryp = module.func_id("test_crypto").unwrap();
+
+    let mut vm = Vm::new();
+    assert_eq!(
+        vm.call_obj(&module, f_path, &[], &[]).unwrap(),
+        Obj::str("a/c.txt|/var/log/app|server.tar.gz|gz|server.tar|/tmp/data.json|true|false")
+    );
+    assert_eq!(
+        vm.call_obj(&module, f_proc, &[], &[]).unwrap(),
+        Obj::str("true:true:0:hello-proc")
+    );
+    assert_eq!(
+        vm.call_obj(&module, f_cryp, &[], &[]).unwrap(),
+        Obj::str(
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad|f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8|SGVsbG8sIENvbmR1aXQh|Hello, Conduit!|415a|AZ|36|16|true"
+        )
+    );
+}
