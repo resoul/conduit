@@ -20,7 +20,7 @@ METRICS = [
     ("process_run_50x", "process.run (50x)"),
     ("json_encode_10k", "json.encode (10k structs)"),
     ("json_decode_10k", "json.decode (10k structs)"),
-    ("pipeline_1m", "pipeline filter|>map|>reduce (1M)"),
+    ("pipeline_1m", "pipeline filter/map/reduce (1M)"),
 ]
 
 
