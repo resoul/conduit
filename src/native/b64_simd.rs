@@ -213,7 +213,7 @@ pub(crate) unsafe fn encode_prefix(src: &[u8], dst: &mut Vec<u8>) -> usize {
 
             let mut lut_idx = _mm256_subs_epu8(indices, c51);
             let less26 = _mm256_cmpgt_epi8(c26, indices);
-            lut_idx = _mm256_sub_epi8(lut_idx, _mm256_and_si256(less26, c13));
+            lut_idx = _mm256_add_epi8(lut_idx, _mm256_and_si256(less26, c13));
             let shifts = _mm256_shuffle_epi8(shift_lut, lut_idx);
             let encoded = _mm256_add_epi8(indices, shifts);
             _mm256_storeu_si256(out_ptr as *mut __m256i, encoded);
