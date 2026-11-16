@@ -23,4 +23,8 @@ All standard libraries reside in the reserved `cdt.*` namespace.
 | [cdt.validation](validation.md) | `cdt.validation` | Schema validation, field rule annotations, issue aggregation, and standard rules (`min`, `max`, `email`). |
 | [cdt.env](env.md) | `cdt.env` | Typed environment configuration (`@env`, `load<T>`), `get`/`require`, and CLI `args()`. |
 | [cdt.cli](cli.md) | `cdt.cli` | Typed CLI parser (`cli { ... }` DSL and `@cli.*` annotations), subcommands, and `--help`. |
+| [cdt.fs](fs.md) | `cdt.fs` | Fast basic and buffered streaming file I/O (`read_text`, `write_atomic`, `each_line`, `Reader`, `Writer`). |
+| [cdt.path](path.md) | `cdt.path` | Cross-platform lexical path manipulation (`join`, `dirname`, `basename`, `ext`, `stem`, `normalize`). |
+| [cdt.process](process.md) | `cdt.process` | External command execution (`run`, `status`), working directory (`cwd`, `set_cwd`), `pid`, and `exit`. |
+| [cdt.crypto](crypto.md) | `cdt.crypto` | Hardware-accelerated SHA-256/HMAC, SIMD Base64, Hex, and OS-backed CSPRNG (`uuid_v4`, `random_int`). |
 

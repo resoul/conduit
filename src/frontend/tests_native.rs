@@ -885,15 +885,19 @@ fn cdt_path_process_and_crypto_e2e() {
             ex := path.ext(p)
             st := path.stem(p)
             we := path.with_ext("/tmp/data.txt", "json")
-            abs1 := path.is_abs("/tmp/x")
+            abs_pos := path.is_abs(if_abs_sample())
             abs2 := path.is_abs("rel/x")
-            return norm + "|" + dn + "|" + bn + "|" + ex + "|" + st + "|" + we + "|" + abs1.to_string() + "|" + abs2.to_string()
+            return norm + "|" + dn + "|" + bn + "|" + ex + "|" + st + "|" + we + "|" + abs_pos.to_string() + "|" + abs2.to_string()
+        }
+
+        func if_abs_sample() -> String {
+            return "__ABS_SAMPLE__"
         }
 
         export func test_process() -> String | process.ProcessError {
             pid := process.pid()
             cwd := process.cwd()?
-            out := process.run("echo", ["hello-proc"])?
+            out := process.run("__PROC_CMD__", __PROC_ARGS__)?
             return (pid > 0).to_string() + ":" + (cwd.len() > 0).to_string() + ":" + out.code.to_string() + ":" + out.stdout.trim()
         }
 
@@ -911,15 +915,36 @@ fn cdt_path_process_and_crypto_e2e() {
         }
     "#;
 
-    let module = crate::frontend::compile_source(src).expect("compile path/process/crypto");
+    let src = src
+        .replace(
+            "__ABS_SAMPLE__",
+            if cfg!(windows) { r"C:\\tmp\\x" } else { "/tmp/x" },
+        )
+        .replace("__PROC_CMD__", if cfg!(windows) { "cmd" } else { "echo" })
+        .replace(
+            "__PROC_ARGS__",
+            if cfg!(windows) {
+                r#"["/c", "echo", "hello-proc"]"#
+            } else {
+                r#"["hello-proc"]"#
+            },
+        );
+
+    let module = crate::frontend::compile_source(&src).expect("compile path/process/crypto");
     let f_path = module.func_id("test_path").unwrap();
     let f_proc = module.func_id("test_process").unwrap();
     let f_cryp = module.func_id("test_crypto").unwrap();
 
+    let expected_path = if cfg!(windows) {
+        r"a\c.txt|/var/log\app|server.tar.gz|gz|server.tar|/tmp/data.json|true|false"
+    } else {
+        "a/c.txt|/var/log/app|server.tar.gz|gz|server.tar|/tmp/data.json|true|false"
+    };
+
     let mut vm = Vm::new();
     assert_eq!(
         vm.call_obj(&module, f_path, &[], &[]).unwrap(),
-        Obj::str("a/c.txt|/var/log/app|server.tar.gz|gz|server.tar|/tmp/data.json|true|false")
+        Obj::str(expected_path)
     );
     assert_eq!(
         vm.call_obj(&module, f_proc, &[], &[]).unwrap(),

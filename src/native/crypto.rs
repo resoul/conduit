@@ -1,8 +1,11 @@
 use std::cell::RefCell;
+#[cfg(not(windows))]
 use std::fs::File;
+#[cfg(not(windows))]
 use std::io::Read;
 use std::sync::Arc;
 
+use crate::native::b64_simd;
 use crate::vm::value::{Obj, SCHEMA_CRYPTO_ERROR, StructData};
 
 pub const CRYPTO_SHA256: u8 = 0;
@@ -328,7 +331,12 @@ const B64_ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvw
 
 pub fn encode_base64(bytes: &[u8]) -> String {
     let mut out = Vec::with_capacity(bytes.len().div_ceil(3) * 4);
-    let (chunks, rem) = bytes.as_chunks::<3>();
+    let mut consumed = 0usize;
+    if bytes.len() >= 28 && b64_simd::available() {
+        // SAFETY: CPU feature verified by `b64_simd::available()`.
+        consumed = unsafe { b64_simd::encode_prefix(bytes, &mut out) };
+    }
+    let (chunks, rem) = bytes[consumed..].as_chunks::<3>();
     for &[b0, b1, b2] in chunks {
         let n = ((b0 as u32) << 16) | ((b1 as u32) << 8) | (b2 as u32);
         out.extend_from_slice(&[
@@ -374,8 +382,13 @@ fn decode_base64_slice(clean: &[u8]) -> Result<Obj, bool> {
             "Base64 length must be a multiple of 4",
         ));
     }
-    let mut out = Vec::with_capacity((clean.len() / 4) * 3);
-    let chunks = clean.as_chunks::<4>().0;
+    let mut out = Vec::with_capacity((clean.len() / 4) * 3 + 8);
+    let mut simd_chars = 0usize;
+    if clean.len() >= 68 && b64_simd::available() {
+        // SAFETY: CPU feature verified by `b64_simd::available()`.
+        simd_chars = unsafe { b64_simd::decode_prefix(&clean[..clean.len() - 4], &mut out) };
+    }
+    let chunks = clean[simd_chars..].as_chunks::<4>().0;
     if let Some((last, head)) = chunks.split_last() {
         for &[c0, c1, c2, c3] in head {
             let a = B64_LUT[c0 as usize];

@@ -1,3 +1,4 @@
+pub(crate) mod b64_simd;
 pub mod cli;
 pub mod crypto;
 pub mod env;

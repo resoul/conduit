@@ -194,10 +194,14 @@ impl Vm {
                         let bytes = data.as_bytes();
                         let r = if aux == FS_WRITER_WRITE_LINE {
                             if bytes.len() <= 4096 {
-                                let mut tmp = [0u8; 4097];
-                                tmp[..bytes.len()].copy_from_slice(bytes);
-                                tmp[bytes.len()] = b'\n';
-                                w.write_all(&tmp[..bytes.len() + 1])
+                                let mut tmp = [const { std::mem::MaybeUninit::<u8>::uninit() }; 4097];
+                                // SAFETY: `bytes.len() <= 4096`, so `bytes.len() + 1 <= 4097` bytes are initialized before reading.
+                                unsafe {
+                                    let dst = tmp.as_mut_ptr().cast::<u8>();
+                                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
+                                    *dst.add(bytes.len()) = b'\n';
+                                    w.write_all(std::slice::from_raw_parts(dst, bytes.len() + 1))
+                                }
                             } else {
                                 w.write_all(bytes).and_then(|()| w.write_all(b"\n"))
                             }
