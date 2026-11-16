@@ -57,31 +57,41 @@ def main() -> None:
     temp_artifacts: list[str] = []
     if os.path.exists(conduit_bin):
         runners.append(("Conduit", [conduit_bin, "run", os.path.join(bench_dir, "bench.cdt")]))
-    if shutil.which("go"):
-        runners.append(("Go", ["go", "run", os.path.join(bench_dir, "bench.go")]))
-    if shutil.which("swiftc"):
+    go_bin = shutil.which("go")
+    if go_bin:
+        runners.append(("Go", [go_bin, "run", os.path.join(bench_dir, "bench.go")]))
+    swiftc_bin = shutil.which("swiftc")
+    if swiftc_bin:
         swift_bin = os.path.join(tempfile.gettempdir(), "conduit_bench_swift" + (".exe" if os.name == "nt" else ""))
         swift_cache = os.path.join(tempfile.gettempdir(), "swift_mod_cache")
-        comp = subprocess.run(["swiftc", "-O", "-module-cache-path", swift_cache, os.path.join(bench_dir, "bench.swift"), "-o", swift_bin], capture_output=True, text=True)
+        comp = subprocess.run([swiftc_bin, "-O", "-module-cache-path", swift_cache, os.path.join(bench_dir, "bench.swift"), "-o", swift_bin], capture_output=True, text=True)
         if comp.returncode == 0:
             runners.append(("Swift", [swift_bin]))
             temp_artifacts.append(swift_bin)
         else:
             print(f"Swift compile skipped: {comp.stderr}", file=sys.stderr)
-    if shutil.which("kotlinc") and shutil.which("java"):
+    kotlinc_bin = shutil.which("kotlinc")
+    java_bin = shutil.which("java")
+    if kotlinc_bin and java_bin:
         kt_jar = os.path.join(tempfile.gettempdir(), "conduit_bench_kt.jar")
-        comp = subprocess.run(["kotlinc", os.path.join(bench_dir, "bench.kt"), "-include-runtime", "-d", kt_jar], capture_output=True, text=True)
+        kt_cmd = [kotlinc_bin, os.path.join(bench_dir, "bench.kt"), "-include-runtime", "-d", kt_jar]
+        if os.name == "nt" and kotlinc_bin.lower().endswith((".bat", ".cmd")):
+            kt_cmd = ["cmd", "/c", *kt_cmd]
+        comp = subprocess.run(kt_cmd, capture_output=True, text=True)
         if comp.returncode == 0:
-            runners.append(("Kotlin", ["java", "-Xmx1g", "-jar", kt_jar]))
+            runners.append(("Kotlin", [java_bin, "-Xmx1g", "-jar", kt_jar]))
             temp_artifacts.append(kt_jar)
         else:
             print(f"Kotlin compile skipped: {comp.stderr}", file=sys.stderr)
-    if shutil.which("bun"):
-        runners.append(("Bun", ["bun", os.path.join(bench_dir, "bench.mjs")]))
-    if shutil.which("node"):
-        runners.append(("Node.js", ["node", os.path.join(bench_dir, "bench.mjs")]))
-    if shutil.which("php"):
-        runners.append(("PHP", ["php", os.path.join(bench_dir, "bench.php")]))
+    bun_bin = shutil.which("bun")
+    if bun_bin:
+        runners.append(("Bun", [bun_bin, os.path.join(bench_dir, "bench.mjs")]))
+    node_bin = shutil.which("node")
+    if node_bin:
+        runners.append(("Node.js", [node_bin, os.path.join(bench_dir, "bench.mjs")]))
+    php_bin = shutil.which("php")
+    if php_bin:
+        runners.append(("PHP", [php_bin, os.path.join(bench_dir, "bench.php")]))
     py = sys.executable or shutil.which("python3") or shutil.which("python")
     if py:
         runners.append(("Python 3", [py, os.path.join(bench_dir, "bench.py")]))

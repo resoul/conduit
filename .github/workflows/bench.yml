@@ -2,12 +2,6 @@ name: Cross-OS Benchmarks
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - 'src/**'
-      - 'scripts/bench/**'
-      - '.github/workflows/bench.yml'
 
 jobs:
   benchmark:
