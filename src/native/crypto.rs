@@ -134,6 +134,78 @@ unsafe fn sha256_compress_aarch64(h: &mut [u32; 8], blocks: &[[u8; 64]]) {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sha,sse4.1,ssse3")]
+unsafe fn sha256_compress_x86_64(h: &mut [u32; 8], blocks: &[[u8; 64]]) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let mut state0 = _mm_set_epi32(h[0] as i32, h[1] as i32, h[4] as i32, h[5] as i32);
+        let mut state1 = _mm_set_epi32(h[2] as i32, h[3] as i32, h[6] as i32, h[7] as i32);
+        let shuf_mask = _mm_set_epi64x(0x0c0d_0e0f_0809_0a0b, 0x0405_0607_0001_0203);
+
+        for block in blocks {
+            let state0_orig = state0;
+            let state1_orig = state1;
+
+            let p = block.as_ptr() as *const __m128i;
+            let mut w0 = _mm_shuffle_epi8(_mm_loadu_si128(p), shuf_mask);
+            let mut w1 = _mm_shuffle_epi8(_mm_loadu_si128(p.add(1)), shuf_mask);
+            let mut w2 = _mm_shuffle_epi8(_mm_loadu_si128(p.add(2)), shuf_mask);
+            let mut w3 = _mm_shuffle_epi8(_mm_loadu_si128(p.add(3)), shuf_mask);
+
+            macro_rules! x86_round4 {
+                ($w:expr, $k_off:expr) => {
+                    let mut msg = _mm_add_epi32(
+                        $w,
+                        _mm_loadu_si128(K256.as_ptr().add($k_off) as *const __m128i),
+                    );
+                    state1 = _mm_sha256rnds2_epu32(state1, state0, msg);
+                    msg = _mm_shuffle_epi32(msg, 0x0E);
+                    state0 = _mm_sha256rnds2_epu32(state0, state1, msg);
+                };
+            }
+
+            macro_rules! x86_sched {
+                ($w0:expr, $w1:expr, $w2:expr, $w3:expr) => {
+                    let tmp = _mm_alignr_epi8($w3, $w2, 4);
+                    $w0 = _mm_add_epi32(_mm_sha256msg1_epu32($w0, $w1), tmp);
+                    $w0 = _mm_sha256msg2_epu32($w0, $w3);
+                };
+            }
+
+            x86_round4!(w0, 0);
+            x86_round4!(w1, 4);
+            x86_round4!(w2, 8);
+            x86_round4!(w3, 12);
+
+            let mut k_off = 16usize;
+            while k_off < 64 {
+                x86_sched!(w0, w1, w2, w3);
+                x86_round4!(w0, k_off);
+                x86_sched!(w1, w2, w3, w0);
+                x86_round4!(w1, k_off + 4);
+                x86_sched!(w2, w3, w0, w1);
+                x86_round4!(w2, k_off + 8);
+                x86_sched!(w3, w0, w1, w2);
+                x86_round4!(w3, k_off + 12);
+                k_off += 16;
+            }
+
+            state0 = _mm_add_epi32(state0, state0_orig);
+            state1 = _mm_add_epi32(state1, state1_orig);
+        }
+
+        h[0] = _mm_extract_epi32::<3>(state0) as u32;
+        h[1] = _mm_extract_epi32::<2>(state0) as u32;
+        h[2] = _mm_extract_epi32::<3>(state1) as u32;
+        h[3] = _mm_extract_epi32::<2>(state1) as u32;
+        h[4] = _mm_extract_epi32::<1>(state0) as u32;
+        h[5] = _mm_extract_epi32::<0>(state0) as u32;
+        h[6] = _mm_extract_epi32::<1>(state1) as u32;
+        h[7] = _mm_extract_epi32::<0>(state1) as u32;
+    }
+}
+
 #[inline]
 fn sha256_compress(h: &mut [u32; 8], blocks: &[[u8; 64]]) {
     if blocks.is_empty() {
@@ -143,6 +215,15 @@ fn sha256_compress(h: &mut [u32; 8], blocks: &[[u8; 64]]) {
     if std::arch::is_aarch64_feature_detected!("sha2") {
         // SAFETY: sha2 feature verified at runtime.
         unsafe { sha256_compress_aarch64(h, blocks) };
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("sha")
+        && std::arch::is_x86_feature_detected!("ssse3")
+        && std::arch::is_x86_feature_detected!("sse4.1")
+    {
+        // SAFETY: sha + ssse3 + sse4.1 features verified at runtime.
+        unsafe { sha256_compress_x86_64(h, blocks) };
         return;
     }
     sha256_compress_scalar(h, blocks);

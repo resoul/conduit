@@ -610,7 +610,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             obj_regs: o_regs.into_boxed_slice(),
         })?;
         let dst_obj = self.alloc_temp_o();
-        self.ops.push(Op::NewRecordMove { dst_obj, desc_idx });
+        self.ops.push(Op::NewRecord { dst_obj, desc_idx });
         Ok(dst_obj)
     }
 
