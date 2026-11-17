@@ -802,7 +802,8 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 let st = match (cur_elem_scalar, out_scalar) {
                     (true, true) => PipelineStage::MapScalarToScalar(cref),
                     (false, false) => PipelineStage::MapObjToObj(cref),
-                    _ => return Err("Cross scalar<->obj pipeline map is not supported".to_string()),
+                    (false, true) => PipelineStage::MapObjToScalar(cref),
+                    (true, false) => PipelineStage::MapScalarToObj(cref),
                 };
                 cur_elem_scalar = out_scalar;
                 st
@@ -810,9 +811,15 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             stages.push(stage);
         }
 
+        let out_elem_kind = match &expr.ty {
+            Type::List(inner) if matches!(inner.as_ref(), Type::Float) => ElemKind::Float,
+            Type::List(inner) if inner.is_scalar() => ElemKind::Int,
+            _ => ElemKind::Obj,
+        };
         let plan_idx = self.mc.add_pipeline_plan(PipelinePlan {
             stages: stages.into_boxed_slice(),
             elem_kind,
+            out_elem_kind,
         })?;
         let dst_obj = self.alloc_temp_o();
         self.ops.push(Op::RunPipeline { dst_obj, src_obj, plan_idx });
@@ -1103,6 +1110,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 let plan_idx = self.mc.add_pipeline_plan(PipelinePlan {
                     stages: stages.into_boxed_slice(),
                     elem_kind,
+                    out_elem_kind: elem_kind,
                 })?;
                 let init_s = self.lower_scalar(init_expr)?;
                 let dst_s = self.alloc_temp_s();

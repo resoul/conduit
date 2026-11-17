@@ -48,14 +48,9 @@ export func process_events(raw_json: String, env_name: String, tag: String, min_
     started := time.monotonic()
     events := json.decode<[Event]>(raw_json)?
 
-    kept := events
+    scores := events
     |> filter((e: Event) => e.score >= min_score)
-
-    scores := [0]
-    scores = []
-    for e in kept {
-        scores.append(e.score)
-    }
+    |> map((e: Event) => e.score)
 
     total := scores.sum()
     peak := scores.max() ?? 0

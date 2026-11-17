@@ -5,7 +5,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
-## [Unreleased]
+## [0.2.7] - 2026-11-18
 
 ### Added
 
@@ -15,8 +15,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   * Added `"renameProvider":true` (`textDocument/rename` via `handle_rename`), `"documentFormattingProvider":true` (`textDocument/formatting`), `const` and `enum` hover/completion (`Enum.` variants), and `enum` support in `textDocument/definition` and `textDocument/documentSymbol` (`src/lsp.rs`), plus updated `docs/src/getting-started/editors.md`.
 * **`conduit fmt` Formatter**:
   * Added `conduit fmt <file_or_dir> [--check]` (`src/fmt.rs`, `src/main.rs`) for 4-space indentation and `switch`/`case` formatting while preserving comments and strings, plus docs in `docs/src/getting-started/cli.md`.
-* **`List` Aggregate Methods (`.sum()`, `.min()`, `.max()`)**:
+* **`List` Aggregate Methods & Cross `Obj <-> Scalar` Pipeline `map`**:
   * Added native `.sum() -> Int | Float`, `.min() -> T?`, and `.max() -> T?` on `[Int]` and `[Float]` (`EXT_LIST_AGG`, `list_sum_min_max_methods`), plus docs in `docs/src/language/collections.md` and `enum` docs in `docs/src/language/types.md`.
+  * Added `PipelineStage::MapObjToScalar` and `PipelineStage::MapScalarToObj` (`run_mixed_pipeline` in `src/vm/pipeline.rs`, `src/ir/lower_call.rs`, `src/ir/bundle.rs`), enabling pipelines like `[Event] |> filter(...) |> map(e => e.score)` and `[Int] |> map(x => "n={x}")` (`cross_scalar_obj_pipeline_map`).
 
 ### Fixed
 

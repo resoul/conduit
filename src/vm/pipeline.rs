@@ -877,6 +877,8 @@ enum StageKind {
     MapObj,
     FilterObj,
     ReduceScalar,
+    MapObjToScalar,
+    MapScalarToObj,
 }
 
 #[derive(Clone, Copy)]
@@ -938,6 +940,8 @@ impl Vm {
             PipelineStage::MapObjToObj(c) => (StageKind::MapObj, c),
             PipelineStage::FilterObj(c) => (StageKind::FilterObj, c),
             PipelineStage::ReduceScalar(c) => (StageKind::ReduceScalar, c),
+            PipelineStage::MapObjToScalar(c) => (StageKind::MapObjToScalar, c),
+            PipelineStage::MapScalarToObj(c) => (StageKind::MapScalarToObj, c),
         };
         let (func_id, closure_slot) = match cref {
             CallableRef::DirectFunc(fid) => (fid, usize::MAX),
@@ -1162,6 +1166,24 @@ impl Vm {
 
         let dst_slot = caller_o_base + dst_obj as usize;
         let clear_dst = !stages.iter().any(|s| s.closure_slot == dst_slot);
+
+        if stages
+            .iter()
+            .any(|s| matches!(s.kind, StageKind::MapObjToScalar | StageKind::MapScalarToObj))
+        {
+            return self.run_mixed_pipeline(
+                module,
+                plan.elem_kind,
+                plan.out_elem_kind,
+                &stages,
+                caller_o_base,
+                src_obj,
+                dst_obj,
+                stage_s_base,
+                stage_o_base,
+                clear_dst,
+            );
+        }
 
         match plan.elem_kind {
             ElemKind::Int => {
@@ -1674,6 +1696,133 @@ impl Vm {
         self.scalars.truncate(stage_s_base);
         self.objs.truncate(stage_o_base);
         self.scalars[s_base + dst_s as usize] = res?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_mixed_pipeline(
+        &mut self,
+        module: &Module,
+        in_kind: ElemKind,
+        out_kind: ElemKind,
+        stages: &[ResolvedStage<'_>],
+        caller_o_base: usize,
+        src_obj: u16,
+        dst_obj: u16,
+        stage_s_base: usize,
+        stage_o_base: usize,
+        clear_dst: bool,
+    ) -> Result<(), RuntimeError> {
+        enum Cur {
+            Scalar(u64),
+            Obj(Obj),
+        }
+
+        let src_clone = self.objs[caller_o_base + src_obj as usize].clone();
+        if clear_dst {
+            self.objs[caller_o_base + dst_obj as usize] = Obj::Empty;
+        }
+        let mut out_ints: Vec<i64> = Vec::new();
+        let mut out_floats: Vec<f64> = Vec::new();
+        let mut out_objs: Vec<Obj> = Vec::new();
+
+        let len = match (&src_clone, in_kind) {
+            (Obj::List(ListStorage::Int(v)), ElemKind::Int) => v.len(),
+            (Obj::List(ListStorage::Float(v)), ElemKind::Float) => v.len(),
+            (Obj::List(ListStorage::Obj(v)), ElemKind::Obj) => v.len(),
+            _ => return Err(err_msg("Mismatched list element type in mixed pipeline")),
+        };
+
+        for idx in 0..len {
+            let mut cur = match &src_clone {
+                Obj::List(ListStorage::Int(v)) => Cur::Scalar(v[idx] as u64),
+                Obj::List(ListStorage::Float(v)) => Cur::Scalar(v[idx].to_bits()),
+                Obj::List(ListStorage::Obj(v)) => Cur::Obj(v[idx].clone()),
+                _ => unreachable!(),
+            };
+            let mut keep = true;
+            for st in stages {
+                match (st.kind, &cur) {
+                    (StageKind::MapScalar | StageKind::MapScalarToObj, Cur::Scalar(val)) => {
+                        self.scalars[stage_s_base] = *val;
+                        let res = self.exec_from(
+                            module,
+                            st.func_id,
+                            stage_s_base,
+                            stage_o_base,
+                            st.closure_slot,
+                        )?;
+                        cur = match (st.kind, res) {
+                            (StageKind::MapScalar, ExecResult::Scalar(v)) => Cur::Scalar(v),
+                            (StageKind::MapScalarToObj, ExecResult::Obj(o)) => Cur::Obj(o),
+                            _ => return Err(err_msg("Mismatched stage result in mixed pipeline")),
+                        };
+                    }
+                    (StageKind::FilterScalar, Cur::Scalar(val)) => {
+                        self.scalars[stage_s_base] = *val;
+                        let ExecResult::Scalar(b) = self.exec_from(
+                            module,
+                            st.func_id,
+                            stage_s_base,
+                            stage_o_base,
+                            st.closure_slot,
+                        )? else {
+                            return Err(err_msg("Expected scalar bool from filter"));
+                        };
+                        if b == 0 {
+                            keep = false;
+                            break;
+                        }
+                    }
+                    (StageKind::MapObj | StageKind::MapObjToScalar, Cur::Obj(o)) => {
+                        self.objs[stage_o_base] = o.clone();
+                        let res = self.exec_from(
+                            module,
+                            st.func_id,
+                            stage_s_base,
+                            stage_o_base,
+                            st.closure_slot,
+                        )?;
+                        cur = match (st.kind, res) {
+                            (StageKind::MapObj, ExecResult::Obj(next)) => Cur::Obj(next),
+                            (StageKind::MapObjToScalar, ExecResult::Scalar(v)) => Cur::Scalar(v),
+                            _ => return Err(err_msg("Mismatched stage result in mixed pipeline")),
+                        };
+                    }
+                    (StageKind::FilterObj, Cur::Obj(o)) => {
+                        self.objs[stage_o_base] = o.clone();
+                        let ExecResult::Scalar(b) = self.exec_from(
+                            module,
+                            st.func_id,
+                            stage_s_base,
+                            stage_o_base,
+                            st.closure_slot,
+                        )? else {
+                            return Err(err_msg("Expected scalar bool from filter"));
+                        };
+                        if b == 0 {
+                            keep = false;
+                            break;
+                        }
+                    }
+                    _ => return Err(err_msg("Mismatched stage kind in mixed pipeline")),
+                }
+            }
+            if keep {
+                match (out_kind, cur) {
+                    (ElemKind::Int, Cur::Scalar(v)) => out_ints.push(v as i64),
+                    (ElemKind::Float, Cur::Scalar(v)) => out_floats.push(f64::from_bits(v)),
+                    (ElemKind::Obj, Cur::Obj(o)) => out_objs.push(o),
+                    _ => return Err(err_msg("Mismatched final element kind in mixed pipeline")),
+                }
+            }
+        }
+
+        self.objs[caller_o_base + dst_obj as usize] = match out_kind {
+            ElemKind::Int => Obj::List(ListStorage::Int(Arc::new(out_ints))),
+            ElemKind::Float => Obj::List(ListStorage::Float(Arc::new(out_floats))),
+            ElemKind::Obj => Obj::List(ListStorage::Obj(Arc::new(out_objs))),
+        };
         Ok(())
     }
 }

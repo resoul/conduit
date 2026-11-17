@@ -374,6 +374,7 @@ pub fn encode_bundle(module: &Module, main_fid: u32, main_ret_tag: u8) -> Result
     })?;
     w.list(&module.pipelines, |w, p| {
         w.u8(match p.elem_kind { ElemKind::Int => 0, ElemKind::Float => 1, ElemKind::Obj => 2 });
+        w.u8(match p.out_elem_kind { ElemKind::Int => 0, ElemKind::Float => 1, ElemKind::Obj => 2 });
         w.list(&p.stages, |w, &st| {
             let (tag, cr) = match st {
                 PipelineStage::MapScalarToScalar(c) => (0, c),
@@ -381,6 +382,8 @@ pub fn encode_bundle(module: &Module, main_fid: u32, main_ret_tag: u8) -> Result
                 PipelineStage::MapObjToObj(c) => (2, c),
                 PipelineStage::FilterObj(c) => (3, c),
                 PipelineStage::ReduceScalar(c) => (4, c),
+                PipelineStage::MapObjToScalar(c) => (5, c),
+                PipelineStage::MapScalarToObj(c) => (6, c),
             };
             w.u8(tag);
             encode_callable_ref(cr, w);
@@ -504,6 +507,12 @@ pub fn decode_bundle(bytes: &[u8]) -> Result<(Module, u32, u8), String> {
             2 => ElemKind::Obj,
             tag => return Err(format!("Invalid ElemKind tag {} in bundle", tag)),
         };
+        let out_elem_kind = match r.u8()? {
+            0 => ElemKind::Int,
+            1 => ElemKind::Float,
+            2 => ElemKind::Obj,
+            tag => return Err(format!("Invalid out ElemKind tag {} in bundle", tag)),
+        };
         let stages = r.vec(|r| {
             Ok(match r.u8()? {
                 0 => PipelineStage::MapScalarToScalar(decode_callable_ref(r)?),
@@ -511,10 +520,12 @@ pub fn decode_bundle(bytes: &[u8]) -> Result<(Module, u32, u8), String> {
                 2 => PipelineStage::MapObjToObj(decode_callable_ref(r)?),
                 3 => PipelineStage::FilterObj(decode_callable_ref(r)?),
                 4 => PipelineStage::ReduceScalar(decode_callable_ref(r)?),
+                5 => PipelineStage::MapObjToScalar(decode_callable_ref(r)?),
+                6 => PipelineStage::MapScalarToObj(decode_callable_ref(r)?),
                 tag => return Err(format!("Invalid PipelineStage tag {} in bundle", tag)),
             })
         })?.into_boxed_slice();
-        Ok(PipelinePlan { stages, elem_kind })
+        Ok(PipelinePlan { stages, elem_kind, out_elem_kind })
     })?;
     module.struct_schemas = r.vec(|r| {
         let schema_id = r.u32()?;

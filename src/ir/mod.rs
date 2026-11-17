@@ -56,6 +56,8 @@ pub enum PipelineStage {
     MapObjToObj(CallableRef),
     FilterObj(CallableRef),
     ReduceScalar(CallableRef),
+    MapObjToScalar(CallableRef),
+    MapScalarToObj(CallableRef),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +71,7 @@ pub enum ElemKind {
 pub struct PipelinePlan {
     pub stages: Box<[PipelineStage]>,
     pub elem_kind: ElemKind,
+    pub out_elem_kind: ElemKind,
 }
 
 #[derive(Debug, Default)]
@@ -475,7 +478,9 @@ impl Module {
                                 | PipelineStage::FilterScalar(c)
                                 | PipelineStage::MapObjToObj(c)
                                 | PipelineStage::FilterObj(c)
-                                | PipelineStage::ReduceScalar(c) => c,
+                                | PipelineStage::ReduceScalar(c)
+                                | PipelineStage::MapObjToScalar(c)
+                                | PipelineStage::MapScalarToObj(c) => c,
                             };
                             match *cref {
                                 CallableRef::DirectFunc(id) => {
@@ -743,7 +748,9 @@ impl Module {
                                         | PipelineStage::FilterScalar(cr)
                                         | PipelineStage::MapObjToObj(cr)
                                         | PipelineStage::FilterObj(cr)
-                                        | PipelineStage::ReduceScalar(cr) => cr,
+                                        | PipelineStage::ReduceScalar(cr)
+                                        | PipelineStage::MapObjToScalar(cr)
+                                        | PipelineStage::MapScalarToObj(cr) => cr,
                                     };
                                     match *cref {
                                         CallableRef::DirectFunc(id) => {

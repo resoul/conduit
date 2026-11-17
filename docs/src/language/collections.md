@@ -155,6 +155,8 @@ Lists also provide `.is_empty() -> Bool`, `.first() -> T?`, `.last() -> T?`, `.s
 
 ```conduit
 total := [3, 1, 2].sort() |> reduce(0, (acc, n) => acc + n) // 6
+lengths := ["hi", "conduit"] |> map((s: String) => s.len()) // [2, 7]
+labels := [1, 2] |> map((n: Int) => "n={n}")               // ["n=1", "n=2"]
 ```
 
 ---

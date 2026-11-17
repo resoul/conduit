@@ -304,6 +304,7 @@ fn non_leaf_and_float_pipelines() {
             PipelineStage::FilterScalar(CallableRef::DirectFunc(filt_id)),
         ]),
         elem_kind: ElemKind::Float,
+        out_elem_kind: ElemKind::Float,
     });
 
     let mut runner = FnBuilder::new("run_fp", 0, 1, true);
@@ -1095,6 +1096,33 @@ fn list_sum_min_max_methods() {
     let fid = module.func_id("test_agg").unwrap();
     let res = Vm::new().call_obj(&module, fid, &[], &[]).unwrap();
     assert_eq!(res, Obj::str("36|-3|25|-999|0|3|-2.5|4|-999|0"));
+}
+
+#[test]
+fn cross_scalar_obj_pipeline_map() {
+    let src = r#"
+        struct Item {
+            name: String
+            score: Int
+        }
+
+        export func test_cross() -> String {
+            items := [Item(name: "a", score: 10), Item(name: "b", score: 25), Item(name: "c", score: 5)]
+            scores := items
+                |> filter((it: Item) => it.score >= 10)
+                |> map((it: Item) => it.score)
+                |> map((s: Int) => s * 2)
+            total := scores.sum()
+            labels := [1, 2, 3]
+                |> filter((n: Int) => n != 2)
+                |> map((n: Int) => "n={n}")
+            return total.to_string() + "|" + labels.join(",")
+        }
+    "#;
+    let module = crate::frontend::compile_source(src).expect("compile cross");
+    let fid = module.func_id("test_cross").unwrap();
+    let res = Vm::new().call_obj(&module, fid, &[], &[]).unwrap();
+    assert_eq!(res, Obj::str("70|n=1,n=3"));
 }
 
 #[allow(dead_code)]
