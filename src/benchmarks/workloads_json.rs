@@ -256,6 +256,54 @@ fn setup_json_etl(count: usize, expected_raw_bytes: usize) -> WorkloadState {
     }
 }
 
+fn string_decode_workload(name: &'static str, byte_len: usize, escaped: bool) -> Workload {
+    const COUNT: usize = 1_000;
+    Workload {
+        name,
+        category: "json",
+        size: COUNT,
+        target_us: None,
+        old_conduit_us: None,
+        php_us: None,
+        go_us: None,
+        rust_us: None,
+        setup: Box::new(move |_| {
+            let prefix = "a".repeat(byte_len - 1);
+            let (suffix, wire_suffix) = if escaped { ('\n', r"\n") } else { ('z', "z") };
+            let value = format!("{prefix}{suffix}");
+            let quoted = format!(r#""{prefix}{wire_suffix}""#);
+            let raw = format!("[{}]", vec![quoted.as_str(); COUNT].join(","));
+            let plan = JsonDecodePlan::compile(&JsonType::List(Box::new(JsonType::String)), &[]);
+            let Obj::List(ListStorage::Obj(items)) = decode_json_with_plan(&raw, &plan).unwrap()
+            else {
+                panic!("expected list of strings");
+            };
+            assert_eq!(items.len(), COUNT);
+            assert!(items.iter().all(|v| matches!(v, Obj::Str(s) if s.as_str() == value)));
+            let (module, func) = compile_json_module(
+                "func bench(iterations: Int, raw: String) -> Int {
+                    var total = 0
+                    for _ in 0..iterations {
+                        items := decode<[String]>(raw)?
+                        total = total + items.len()
+                    }
+                    return total
+                }",
+                "bench",
+            );
+            WorkloadState {
+                module,
+                bench_func: func,
+                verify_func: func,
+                scalar_args: vec![],
+                obj_args: vec![Obj::str(raw)],
+                expected_per_op: COUNT as i64,
+                after_check: None,
+            }
+        }),
+    }
+}
+
 pub fn json_workloads() -> Vec<Workload> {
     vec![
         Workload {
@@ -313,5 +361,11 @@ pub fn json_workloads() -> Vec<Workload> {
             rust_us: None,
             setup: Box::new(|_| setup_json_etl(1000, 210_862)),
         },
+        string_decode_workload("json.strings_plain_8", 8, false),
+        string_decode_workload("json.strings_plain_22", 22, false),
+        string_decode_workload("json.strings_plain_23", 23, false),
+        string_decode_workload("json.strings_plain_256", 256, false),
+        string_decode_workload("json.strings_escaped_8", 8, true),
+        string_decode_workload("json.strings_escaped_256", 256, true),
     ]
 }

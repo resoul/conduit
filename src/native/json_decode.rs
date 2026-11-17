@@ -57,10 +57,7 @@ impl<'a> JsonDecoder<'a> {
     ) -> Result<Obj, JsonError> {
         match &plan.nodes[index] {
             PlanNode::Pending => unreachable!("decode plan compilation left an unfinished node"),
-            PlanNode::String => {
-                let s = self.parse_string_owned("String", depth)?;
-                Ok(Obj::str(s))
-            }
+            PlanNode::String => self.parse_string_obj(depth),
             PlanNode::Optional(inner) => {
                 self.skip_ws();
                 if self.bytes[self.pos..].starts_with(b"null") {
@@ -186,9 +183,9 @@ impl<'a> JsonDecoder<'a> {
         loop {
             let idx = items.len();
             let val = self
-                .parse_string_owned("String", depth + 1)
+                .parse_string_obj(depth + 1)
                 .map_err(|e| err_at_index(idx, e))?;
-            items.push(Obj::str(val));
+            items.push(val);
             self.skip_ws();
             match self.peek() {
                 Some(b',') => {
@@ -376,8 +373,8 @@ impl<'a> JsonDecoder<'a> {
                         rec.set_scalar(slot as usize, v as u64);
                     }),
                     FieldDecodeKind::Str(slot) => {
-                        self.parse_string_owned("String", depth + 1).map(|s| {
-                            rec.set_obj(slot as usize, Obj::str(s));
+                        self.parse_string_obj(depth + 1).map(|s| {
+                            rec.set_obj(slot as usize, s);
                         })
                     }
                     FieldDecodeKind::OptStr(slot) => {
@@ -387,8 +384,8 @@ impl<'a> JsonDecoder<'a> {
                             rec.set_obj(slot as usize, Obj::Empty);
                             Ok(())
                         } else {
-                            self.parse_string_owned("String", depth + 1).map(|s| {
-                                rec.set_obj(slot as usize, Obj::str(s));
+                            self.parse_string_obj(depth + 1).map(|s| {
+                                rec.set_obj(slot as usize, s);
                             })
                         }
                     }

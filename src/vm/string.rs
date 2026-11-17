@@ -11,9 +11,15 @@ pub struct VmString {
     storage: Storage,
 }
 
+const INLINE_CAPACITY: usize = 22;
+
 #[derive(Clone)]
 enum Storage {
     Owned(String),
+    Inline {
+        bytes: [u8; INLINE_CAPACITY],
+        len: u8,
+    },
     Shared {
         text: Arc<String>,
         range: Range<usize>,
@@ -54,7 +60,7 @@ impl VmString {
                     range: (range.start + sub.start)..(range.start + sub.end),
                 },
             },
-            Storage::Owned(_) => Self {
+            Storage::Inline { .. } | Storage::Owned(_) => Self {
                 storage: Storage::Slice {
                     base: Arc::clone(base),
                     range: sub,
@@ -67,6 +73,10 @@ impl VmString {
     pub fn as_str(&self) -> &str {
         match &self.storage {
             Storage::Owned(text) => text,
+            Storage::Inline { bytes, len } => {
+                // SAFETY: From<&str> copies a complete UTF-8 string into this prefix.
+                unsafe { std::str::from_utf8_unchecked(&bytes[..*len as usize]) }
+            }
             Storage::Shared { text, range } => {
                 // SAFETY: shared() checks bounds and UTF-8 boundaries. Storage
                 // is private, and the Arc keeps this String immutable and alive.
@@ -75,7 +85,7 @@ impl VmString {
             }
             Storage::Slice { base, range } => {
                 // SAFETY: slice_arc() checks bounds and UTF-8 boundaries against
-                // an immutable Owned VmString kept alive by Arc.
+                // an immutable base VmString kept alive by Arc.
                 unsafe { base.as_str().get_unchecked(range.clone()) }
             }
         }
@@ -91,6 +101,7 @@ impl VmString {
             Storage::Slice { base, range } => {
                 self.storage = Storage::Owned(base.as_str()[range.clone()].to_owned());
             }
+            Storage::Inline { .. } => self.storage = Storage::Owned(self.as_str().to_owned()),
             Storage::Owned(_) => {}
         }
         let Storage::Owned(text) = &mut self.storage else {
@@ -110,7 +121,17 @@ impl From<String> for VmString {
 
 impl From<&str> for VmString {
     fn from(text: &str) -> Self {
-        Self::from(text.to_owned())
+        if text.len() > INLINE_CAPACITY {
+            return Self::from(text.to_owned());
+        }
+        let mut bytes = [0; INLINE_CAPACITY];
+        bytes[..text.len()].copy_from_slice(text.as_bytes());
+        Self {
+            storage: Storage::Inline {
+                bytes,
+                len: text.len() as u8,
+            },
+        }
     }
 }
 
@@ -182,7 +203,7 @@ mod tests {
     fn shared_strings_use_content_for_equality_hash_and_order() {
         let text = Arc::new("prefix:Привет:tail".to_owned());
         let shared = VmString::shared(Arc::clone(&text), 7..19);
-        let owned = VmString::from("Привет");
+        let owned = VmString::from("Привет".to_owned());
         let other = VmString::shared(Arc::new("Привет!".to_owned()), 0..12);
         assert_eq!(shared.as_ptr(), text[7..].as_ptr());
         assert_eq!(shared, owned);
@@ -206,6 +227,26 @@ mod tests {
             strings.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
             ["a", "z", "Привет"]
         );
+    }
+
+    #[test]
+    fn short_strings_store_complete_utf8_and_support_slicing_and_mutation() {
+        let text = "é".repeat(INLINE_CAPACITY / 2);
+        let base = Arc::new(VmString::from(text.as_str()));
+        assert!(matches!(base.storage, Storage::Inline { .. }));
+        assert_eq!(base.as_str(), text);
+        let mut slice = VmString::slice_arc(&base, 2..4);
+        slice.make_owned_mut().push('!');
+        assert_eq!(slice.as_str(), "é!");
+        assert_eq!(base.as_str(), text);
+
+        let longer = format!("{text}x");
+        let long = VmString::from(longer.as_str());
+        assert!(matches!(long.storage, Storage::Owned(_)));
+        assert_eq!(long.as_str(), longer);
+        let mut empty = VmString::from("");
+        empty.make_owned_mut().push('x');
+        assert_eq!(empty.as_str(), "x");
     }
 
     #[test]

@@ -1,4 +1,7 @@
 use std::borrow::Cow;
+use std::sync::Arc;
+
+use crate::vm::value::Obj;
 
 use crate::native::json_decode::JsonDecoder;
 use crate::native::{
@@ -11,16 +14,15 @@ static POW10: [f64; 11] = [
 
 impl<'a> JsonDecoder<'a> {
     #[inline]
-    pub(crate) fn parse_string_owned(
-        &mut self,
-        expected: &str,
-        depth: usize,
-    ) -> Result<String, JsonError> {
+    pub(crate) fn parse_string_obj(&mut self, depth: usize) -> Result<Obj, JsonError> {
         self.skip_ws();
         if self.peek() != Some(b'"') {
-            return Err(self.wrong_kind(expected, depth));
+            return Err(self.wrong_kind("String", depth));
         }
-        self.parse_string_cow().map(Cow::into_owned)
+        Ok(match self.parse_string_cow()? {
+            Cow::Borrowed(s) => Obj::Str(Arc::new(s.into())),
+            Cow::Owned(s) => Obj::str(s),
+        })
     }
 
     #[inline]
