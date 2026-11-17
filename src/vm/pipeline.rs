@@ -721,6 +721,24 @@ fn run_float_kernel(
 }
 
 #[inline(always)]
+fn run_float_sum_kernel(
+    src: &[f64],
+    init_acc: u64,
+    filter: impl Fn(f64) -> bool,
+    map: impl Fn(f64) -> f64,
+) -> u64 {
+    // `acc + (-0.0) == acc` bit-for-bit for every non-signaling `acc` (incl. ±0.0, ±inf, NaN),
+    // so adding `-0.0` for rejected elements matches the interpreter's conditional add exactly
+    // while keeping the select off the `acc` dependency chain (one fadd latency per element).
+    let mut acc = f64::from_bits(init_acc);
+    for &x in src.iter() {
+        let v = if filter(x) { map(x) } else { -0.0 };
+        acc += v;
+    }
+    acc.to_bits()
+}
+
+#[inline(always)]
 fn dispatch_float_reduce(
     src: &[f64],
     init_acc: u64,
@@ -729,7 +747,7 @@ fn dispatch_float_reduce(
     red: FloatReduceOp,
 ) -> u64 {
     match red {
-        FloatReduceOp::Sum => run_float_kernel(src, init_acc, filter, map, |a, v| a + v),
+        FloatReduceOp::Sum => run_float_sum_kernel(src, init_acc, filter, map),
         FloatReduceOp::MinLt => {
             run_float_kernel(src, init_acc, filter, map, |a, v| if a < v { a } else { v })
         }
