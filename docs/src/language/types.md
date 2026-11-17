@@ -179,6 +179,35 @@ struct Point {
     y: Int
 }
 
+---
+
+## Enums (`enum`)
+
+Enums define nominal scalar types with a fixed set of named variants (`export enum` makes them importable from other modules):
+
+```conduit
+enum Role {
+    Admin,
+    User,
+    Guest
+}
+
+func label(r: Role) -> String {
+    switch r {
+        case Role.Admin:
+            return "admin"
+        case Role.User:
+            return "user"
+        case _:
+            return "guest"
+    }
+}
+```
+
+Enums support `==`, `!=`, `switch` matching, lists (`[Role]`), and maps (`Map<Role, String>`) with zero heap allocation.
+
+---
+
 func main() -> Void {
     var score: Int? = nil
     print(score ?? 100)

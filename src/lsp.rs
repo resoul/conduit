@@ -26,7 +26,7 @@ pub fn run_server_loop(mut reader: impl BufRead, mut writer: impl Write) -> io::
         match method.as_str() {
             "initialize" => {
                 let resp = format!(
-                    r#"{{"jsonrpc":"2.0","id":{},"result":{{"capabilities":{{"textDocumentSync":1,"hoverProvider":true,"definitionProvider":true,"documentSymbolProvider":true,"completionProvider":{{"triggerCharacters":[".",":"]}}}}}}}}"#,
+                    r#"{{"jsonrpc":"2.0","id":{},"result":{{"capabilities":{{"textDocumentSync":1,"hoverProvider":true,"definitionProvider":true,"documentSymbolProvider":true,"documentFormattingProvider":true,"renameProvider":true,"completionProvider":{{"triggerCharacters":[".",":"]}}}}}}}}"#,
                     id
                 );
                 send_message(&mut writer, &resp)?;
@@ -66,6 +66,14 @@ pub fn run_server_loop(mut reader: impl BufRead, mut writer: impl Write) -> io::
             }
             "textDocument/completion" => {
                 let resp = handle_completion(&msg, &id, &documents, &checked_cache);
+                send_message(&mut writer, &resp)?;
+            }
+            "textDocument/rename" => {
+                let resp = handle_rename(&msg, &id, &documents);
+                send_message(&mut writer, &resp)?;
+            }
+            "textDocument/formatting" => {
+                let resp = handle_formatting(&msg, &id, &documents);
                 send_message(&mut writer, &resp)?;
             }
             "shutdown" => {
@@ -186,7 +194,8 @@ fn find_decl_span_in_source(source: &str, sym: &str) -> Option<(usize, usize)> {
             ItemKind::Func { name, .. }
             | ItemKind::Struct { name, .. }
             | ItemKind::TypeAlias { name, .. }
-            | ItemKind::Const { name, .. } => name == sym,
+            | ItemKind::Const { name, .. }
+            | ItemKind::Enum { name, .. } => name == sym,
             _ => false,
         };
         if matched {
@@ -339,6 +348,7 @@ fn handle_document_symbol(msg: &str, id: &str, documents: &HashMap<String, Strin
             ItemKind::Struct { name, .. } => (name.as_str(), 23u8),
             ItemKind::TypeAlias { name, .. } => (name.as_str(), 5u8),
             ItemKind::Const { name, .. } => (name.as_str(), 14u8),
+            ItemKind::Enum { name, .. } => (name.as_str(), 10u8),
             _ => continue,
         };
         let line = item.span.line.saturating_sub(1);
@@ -475,6 +485,8 @@ fn handle_hover(
     } else if let Some((prog, checked)) = cache.get(&uri) {
         find_func_hover(&word, prog, checked, doc)
             .or_else(|| find_struct_hover(&word, checked))
+            .or_else(|| find_const_hover(&word, prog, checked, doc))
+            .or_else(|| find_enum_hover(&word, prog, checked, doc))
             .or_else(|| lookup_builtin_hover(&word).map(str::to_string))
     } else {
         lookup_builtin_hover(&word).map(str::to_string)
@@ -520,6 +532,22 @@ fn handle_completion(
         .collect();
 
     if let Some((_, checked)) = cache.get(&uri) {
+        if let Some(prefix) = get_dot_prefix_alias(doc, line, character)
+            && let Some(variants) = checked.enums.get(&prefix)
+        {
+            let vitems: Vec<String> = variants
+                .iter()
+                .map(|v| {
+                    format!(
+                        r#"{{"label":"{}","kind":20,"detail":"{}.{}"}}"#,
+                        escape_json(v),
+                        escape_json(&prefix),
+                        escape_json(v)
+                    )
+                })
+                .collect();
+            return format!(r#"{{"jsonrpc":"2.0","id":{},"result":[{}]}}"#, id, vitems.join(","));
+        }
         for f in &checked.funcs {
             if !f.name.contains("__") {
                 let params = f.params.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", ");
@@ -540,9 +568,163 @@ fn handle_completion(
                 ));
             }
         }
+        for (cname, (cty, _)) in &checked.consts {
+            if !cname.contains("__") {
+                items.push(format!(
+                    r#"{{"label":"{}","kind":21,"detail":"const {}: {}"}}"#,
+                    escape_json(cname),
+                    escape_json(cname),
+                    escape_json(&cty.to_string())
+                ));
+            }
+        }
+        for ename in checked.enums.keys() {
+            if !ename.contains("__") {
+                items.push(format!(
+                    r#"{{"label":"{}","kind":10,"detail":"enum {}"}}"#,
+                    escape_json(ename),
+                    escape_json(ename)
+                ));
+            }
+        }
     }
 
     format!(r#"{{"jsonrpc":"2.0","id":{},"result":[{}]}}"#, id, items.join(","))
+}
+
+fn find_const_hover(
+    word: &str,
+    prog: &Program,
+    checked: &CheckedProgram,
+    doc: &str,
+) -> Option<String> {
+    let (ty, val) = checked.consts.get(word).or_else(|| {
+        let suffix = format!("__{}", word);
+        checked
+            .consts
+            .iter()
+            .find(|(k, _)| k.ends_with(&suffix))
+            .map(|(_, v)| v)
+    })?;
+    let val_str = match val {
+        crate::frontend::check::ConstVal::Int(n) => n.to_string(),
+        crate::frontend::check::ConstVal::Float(f) => f.to_string(),
+        crate::frontend::check::ConstVal::Bool(b) => b.to_string(),
+        crate::frontend::check::ConstVal::String(s) => format!("{:?}", s),
+    };
+    let mut out = format!("```conduit\nconst {}: {} = {}\n```", word, ty, val_str);
+    if let Some(item) = prog
+        .items
+        .iter()
+        .find(|i| matches!(&i.kind, ItemKind::Const { name, .. } if name == word))
+        && let Some(comment) = extract_leading_doc(doc, item.span.line)
+    {
+        out.push_str("\n\n");
+        out.push_str(&comment);
+    }
+    Some(out)
+}
+
+fn find_enum_hover(
+    word: &str,
+    prog: &Program,
+    checked: &CheckedProgram,
+    doc: &str,
+) -> Option<String> {
+    let variants = checked.enums.get(word).or_else(|| {
+        let suffix = format!("__{}", word);
+        checked
+            .enums
+            .iter()
+            .find(|(k, _)| k.ends_with(&suffix))
+            .map(|(_, v)| v)
+    })?;
+    let mut out = format!(
+        "```conduit\nenum {} {{ {} }}\n```",
+        word,
+        variants.join(", ")
+    );
+    if let Some(item) = prog
+        .items
+        .iter()
+        .find(|i| matches!(&i.kind, ItemKind::Enum { name, .. } if name == word))
+        && let Some(comment) = extract_leading_doc(doc, item.span.line)
+    {
+        out.push_str("\n\n");
+        out.push_str(&comment);
+    }
+    Some(out)
+}
+
+fn handle_rename(msg: &str, id: &str, documents: &HashMap<String, String>) -> String {
+    let null_resp = format!(r#"{{"jsonrpc":"2.0","id":{},"result":null}}"#, id);
+    let Some(uri) = extract_uri(msg) else {
+        return null_resp;
+    };
+    let Some(doc) = documents.get(&uri) else {
+        return null_resp;
+    };
+    let Some(new_name) = extract_json_string(msg, "newName") else {
+        return null_resp;
+    };
+    let line = extract_json_num(msg, "line").unwrap_or(0);
+    let ch = extract_json_num(msg, "character").unwrap_or(0);
+    let (word, _) = get_words_at_position(doc, line, ch);
+    if word.is_empty() {
+        return null_resp;
+    }
+    let mut edits = Vec::new();
+    let is_ident_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    for (line_idx, line_str) in doc.lines().enumerate() {
+        let bytes = line_str.as_bytes();
+        let mut search_from = 0usize;
+        while let Some(rel) = line_str[search_from..].find(&word) {
+            let start = search_from + rel;
+            let end = start + word.len();
+            let left_ok = start == 0 || !is_ident_byte(bytes[start - 1]);
+            let right_ok = end == bytes.len() || !is_ident_byte(bytes[end]);
+            if left_ok && right_ok {
+                let char_start = line_str[..start].chars().count();
+                let char_end = char_start + word.chars().count();
+                edits.push(format!(
+                    r#"{{"range":{{"start":{{"line":{},"character":{}}},"end":{{"line":{},"character":{}}}}},"newText":"{}"}}"#,
+                    line_idx,
+                    char_start,
+                    line_idx,
+                    char_end,
+                    escape_json(&new_name)
+                ));
+            }
+            search_from = end;
+        }
+    }
+    format!(
+        r#"{{"jsonrpc":"2.0","id":{},"result":{{"changes":{{"{}":[{}]}}}}}}"#,
+        id,
+        escape_json(&uri),
+        edits.join(",")
+    )
+}
+
+fn handle_formatting(msg: &str, id: &str, documents: &HashMap<String, String>) -> String {
+    let empty_resp = format!(r#"{{"jsonrpc":"2.0","id":{},"result":[]}}"#, id);
+    let Some(uri) = extract_uri(msg) else {
+        return empty_resp;
+    };
+    let Some(doc) = documents.get(&uri) else {
+        return empty_resp;
+    };
+    let formatted = crate::fmt::format_source(doc);
+    if &formatted == doc {
+        return empty_resp;
+    }
+    let line_count = doc.lines().count() + usize::from(doc.ends_with('\n'));
+    format!(
+        r#"{{"jsonrpc":"2.0","id":{},"result":[{{"range":{{"start":{{"line":0,"character":0}},"end":{{"line":{},"character":0}}}},"newText":"{}"}}]}}"#,
+        id,
+        line_count,
+        escape_json(&formatted)
+    )
 }
 
 fn get_dot_prefix_alias(text: &str, line_idx: usize, char_idx: usize) -> Option<String> {
@@ -721,19 +903,25 @@ mod tests {
         let doc_sym = frame(
             r#"{"jsonrpc":"2.0","id":4,"method":"textDocument/documentSymbol","params":{"textDocument":{"uri":"file:///tmp/test_lsp.cdt"}}}"#,
         );
+        let rename_fn = frame(
+            r#"{"jsonrpc":"2.0","id":5,"method":"textDocument/rename","params":{"textDocument":{"uri":"file:///tmp/test_lsp.cdt"},"position":{"line":4,"character":29},"newName":"sum2"}}"#,
+        );
         let exit = frame(r#"{"jsonrpc":"2.0","method":"exit"}"#);
 
-        let input = format!("{}{}{}{}{}{}", init, open, hover_fn, def_fn, doc_sym, exit);
+        let input = format!("{}{}{}{}{}{}{}", init, open, hover_fn, def_fn, doc_sym, rename_fn, exit);
         let mut out = Vec::new();
         run_server_loop(io::Cursor::new(input.as_bytes()), &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains(r#""hoverProvider":true"#));
         assert!(text.contains(r#""definitionProvider":true"#));
         assert!(text.contains(r#""documentSymbolProvider":true"#));
+        assert!(text.contains(r#""renameProvider":true"#));
         assert!(text.contains(r#""diagnostics":[]"#));
         assert!(text.contains("func add(a: Int, b: Int) -> Int"));
         assert!(text.contains("Adds two numbers"));
         assert!(text.contains(r#""id":3,"result":{"uri":"file:///tmp/test_lsp.cdt","range":{"start":{"line":1,"character":0}"#));
         assert!(text.contains(r#""id":4,"result":[{"name":"add","kind":12"#));
+        assert!(text.contains(r#""id":5,"result":{"changes":{"file:///tmp/test_lsp.cdt":[{"range":"#));
+        assert!(text.contains(r#""newText":"sum2""#));
     }
 }

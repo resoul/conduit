@@ -5,6 +5,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
+## [Unreleased]
+
+### Added
+
+* **Enums (`enum` / `export enum`)**:
+  * Added scalar-backed nominal `enum` declarations (`enum Role { Admin, User, Guest }` and `export enum ...`) with `Role.Admin` expressions, `==`/`!=`, `switch` variant matching (`case Role.Admin:`), cross-module linking, TextMate highlighting, and `enum_and_const_interp_cross_module` tests.
+* **LSP Rename, Formatting & `const`/`enum` Hover/Completion**:
+  * Added `"renameProvider":true` (`textDocument/rename` via `handle_rename`), `"documentFormattingProvider":true` (`textDocument/formatting`), `const` and `enum` hover/completion (`Enum.` variants), and `enum` support in `textDocument/definition` and `textDocument/documentSymbol` (`src/lsp.rs`), plus updated `docs/src/getting-started/editors.md`.
+* **`conduit fmt` Formatter**:
+  * Added `conduit fmt <file_or_dir> [--check]` (`src/fmt.rs`, `src/main.rs`) for 4-space indentation and `switch`/`case` formatting while preserving comments and strings, plus docs in `docs/src/getting-started/cli.md`.
+* **`List` Aggregate Methods (`.sum()`, `.min()`, `.max()`)**:
+  * Added native `.sum() -> Int | Float`, `.min() -> T?`, and `.max() -> T?` on `[Int]` and `[Float]` (`EXT_LIST_AGG`, `list_sum_min_max_methods`), plus docs in `docs/src/language/collections.md` and `enum` docs in `docs/src/language/types.md`.
+
+### Fixed
+
+* **Linker String Interpolation Rewriting**:
+  * Added `rewrite_interp_string` in `src/frontend/linker.rs` so colliding `const` / namespace-imported identifiers inside `{...}` string interpolation are safely rewritten across modules.
+
 ## [0.2.6] - 2026-11-17
 
 ### Added

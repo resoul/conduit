@@ -40,7 +40,7 @@ pub(crate) fn flush_stdout() {
     });
 }
 
-use crate::vm::exec_cold::err_msg;
+use crate::vm::exec_cold::{err_msg, err_overflow};
 use crate::native::cli::{exec_cli_parse, format_cli_help};
 use crate::native::env::{exec_env_load, make_env_error};
 use crate::vm::exec_union::list_get_or_index;
@@ -52,6 +52,7 @@ use crate::vm::opcode::{
     EXT_MAP_REMOVE, EXT_MAP_SET, EXT_MAP_VALUES, EXT_PATH_OP, EXT_PIPELINE_REDUCE, EXT_PRINT_OBJ,
     EXT_PRINT_SCALAR, EXT_PROCESS_OP, EXT_STR_IS_EMPTY, EXT_STR_PRED, EXT_STR_SPLIT,
     EXT_STR_TO_FLOAT, EXT_STR_TO_INT, EXT_URL_OP, EXT_CSV_OP, EXT_MATH_OP, EXT_LOG_OP,
+    EXT_LIST_AGG,
 };
 use crate::vm::value::{
     ListStorage, MapKey, MapVal, Obj, OrderedMap, SCHEMA_BOXED_BOOL, SCHEMA_BOXED_FLOAT,
@@ -285,6 +286,72 @@ impl Vm {
             }
             EXT_LOG_OP => {
                 self.exec_log_op(s_base, o_base, aux, a, b)?;
+            }
+            EXT_LIST_AGG => {
+                let Obj::List(storage) = &self.objs[o_base + b as usize] else {
+                    return Err(err_msg("Expected List in aggregate method"));
+                };
+                match (storage, aux) {
+                    (ListStorage::Int(v), 0) => {
+                        let mut acc: i64 = 0;
+                        let mut ov = false;
+                        for &x in v.iter() {
+                            let (next, o) = acc.overflowing_add(x);
+                            acc = next;
+                            ov |= o;
+                        }
+                        if ov {
+                            return Err(err_overflow());
+                        }
+                        self.scalars[s_base + a as usize] = acc as u64;
+                    }
+                    (ListStorage::Float(v), 0) => {
+                        let mut acc = 0.0f64;
+                        for &x in v.iter() {
+                            acc += x;
+                        }
+                        self.scalars[s_base + a as usize] = acc.to_bits();
+                    }
+                    (ListStorage::Int(v), 1) => {
+                        self.objs[o_base + a as usize] = match v.iter().copied().min() {
+                            Some(m) => Obj::boxed_int(m),
+                            None => Obj::Empty,
+                        };
+                    }
+                    (ListStorage::Int(v), 2) => {
+                        self.objs[o_base + a as usize] = match v.iter().copied().max() {
+                            Some(m) => Obj::boxed_int(m),
+                            None => Obj::Empty,
+                        };
+                    }
+                    (ListStorage::Float(v), 1) => {
+                        self.objs[o_base + a as usize] = if v.is_empty() {
+                            Obj::Empty
+                        } else {
+                            let mut m = v[0];
+                            for &x in &v[1..] {
+                                if x < m {
+                                    m = x;
+                                }
+                            }
+                            Obj::boxed_float(m.to_bits())
+                        };
+                    }
+                    (ListStorage::Float(v), 2) => {
+                        self.objs[o_base + a as usize] = if v.is_empty() {
+                            Obj::Empty
+                        } else {
+                            let mut m = v[0];
+                            for &x in &v[1..] {
+                                if x > m {
+                                    m = x;
+                                }
+                            }
+                            Obj::boxed_float(m.to_bits())
+                        };
+                    }
+                    _ => return Err(err_msg("List aggregate only supports [Int] and [Float]")),
+                }
             }
             EXT_STR_TO_INT => {
                 let Obj::Str(s) = &self.objs[o_base + b as usize] else {

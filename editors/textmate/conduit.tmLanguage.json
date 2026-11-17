@@ -33,7 +33,7 @@
     },
     {
       "name": "keyword.control.conduit",
-      "match": "\\b(func|return|if|else|guard|while|for|in|break|continue|switch|case|var|const|struct|type|error|export|import|from|as|cli|group|cmd|flag|opt|arg|rest)\\b"
+      "match": "\\b(func|return|if|else|guard|while|for|in|break|continue|switch|case|var|const|enum|struct|type|error|export|import|from|as|cli|group|cmd|flag|opt|arg|rest)\\b"
     },
     {
       "name": "constant.language.boolean.conduit",

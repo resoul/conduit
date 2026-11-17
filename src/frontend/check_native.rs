@@ -337,6 +337,7 @@ pub fn resolve_type_expr(te: &TypeExpr, checked: &CheckedProgram) -> Result<Type
             _ if checked.struct_by_name.contains_key(name) => {
                 Ok(Type::Custom(TypeId::program(name)))
             }
+            _ if checked.enums.contains_key(name) => Ok(Type::Enum(name.clone())),
             _ if checked.json_direct_types.contains_key(name) => Ok(Type::Custom(TypeId::native(
                 "cdt.json",
                 &checked.json_direct_types[name],

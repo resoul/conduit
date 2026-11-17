@@ -78,6 +78,7 @@ pub struct CheckedProgram {
     pub mono_struct_args: HashMap<String, (String, Vec<Type>)>,
     pub pending_mono_items: Vec<Item>,
     pub consts: HashMap<String, (Type, ConstVal)>,
+    pub enums: HashMap<String, Vec<String>>,
 }
 
 impl CheckedProgram {
@@ -152,6 +153,7 @@ pub fn check_program_with_roots(
         mono_struct_args: HashMap::new(),
         pending_mono_items: Vec::new(),
         consts: HashMap::new(),
+        enums: HashMap::new(),
     };
 
     register_native_imports(program, &mut checked)?;
@@ -491,6 +493,24 @@ impl<'a> Checker<'a> {
     }
 
     fn bind_switch_pattern(&mut self, pat: &Pattern, scrutinee_ty: &Type) -> Result<(), String> {
+        if let PatternKind::Ident(pat_name) = &pat.kind
+            && let Type::Enum(ename) = scrutinee_ty
+            && let Some((lhs, rhs)) = pat_name.split_once('.')
+        {
+            if lhs != ename {
+                return Err(format!(
+                    "Enum pattern '{}' does not match enum type '{}'",
+                    pat_name, ename
+                ));
+            }
+            let variants = self.checked.enums.get(ename).ok_or_else(|| {
+                format!("Unknown enum '{}'", ename)
+            })?;
+            if !variants.iter().any(|v| v == rhs) {
+                return Err(format!("Enum '{}' has no variant '{}'", ename, rhs));
+            }
+            return Ok(());
+        }
         if let PatternKind::Type { name, binding } = &pat.kind {
             let resolved = resolve_switch_pattern_type(name, scrutinee_ty, self.checked)?;
             if binding != "_" {
@@ -608,7 +628,17 @@ impl<'a> Checker<'a> {
                 }
             }
             ExprKind::Member { target, field } => {
-                if let ExprKind::Ident(alias) = &target.kind
+                if let ExprKind::Ident(ename) = &target.kind
+                    && self.lookup(ename).is_none()
+                    && let Some(variants) = self.checked.enums.get(ename)
+                {
+                    let idx = variants
+                        .iter()
+                        .position(|v| v == field)
+                        .ok_or_else(|| format!("Enum '{}' has no variant '{}'", ename, field))?;
+                    const_inline = Some(ExprKind::Int(idx as i64));
+                    Type::Enum(ename.clone())
+                } else if let ExprKind::Ident(alias) = &target.kind
                     && self.lookup(alias).is_none()
                     && self.checked.val_aliases.contains(alias)
                     && field == "email"

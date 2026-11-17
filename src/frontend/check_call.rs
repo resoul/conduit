@@ -415,6 +415,30 @@ impl<'a> Checker<'a> {
                 }
                 Ok(Type::List(elem.clone()))
             }
+            (Type::List(elem), "sum") => {
+                if !args.is_empty() {
+                    return Err(".sum() takes 0 arguments".to_string());
+                }
+                if !matches!(**elem, Type::Int | Type::Float) {
+                    return Err(format!(
+                        "Cannot call .sum() on {}; .sum() supports [Int] and [Float]",
+                        target.ty
+                    ));
+                }
+                Ok((**elem).clone())
+            }
+            (Type::List(elem), "min" | "max") => {
+                if !args.is_empty() {
+                    return Err(format!(".{}() takes 0 arguments", method));
+                }
+                if !matches!(**elem, Type::Int | Type::Float) {
+                    return Err(format!(
+                        "Cannot call .{}() on {}; .{}() supports [Int] and [Float]",
+                        method, target.ty, method
+                    ));
+                }
+                Ok(Type::Optional(elem.clone()))
+            }
             (Type::List(elem), "find" | "any" | "all") => {
                 if args.len() != 1 {
                     return Err(format!(".{}(pred) expects 1 argument", method));

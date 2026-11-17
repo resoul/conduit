@@ -74,6 +74,21 @@ pub(crate) fn register_program_types(
             {
                 return Err(format!("Duplicate type alias '{}'", name));
             }
+            ItemKind::Enum { name, variants } => {
+                if checked.enums.contains_key(name)
+                    || checked.struct_by_name.contains_key(name)
+                    || checked.generic_structs.contains_key(name)
+                {
+                    return Err(format!("Duplicate type '{}'", name));
+                }
+                let mut seen = HashSet::new();
+                for v in variants {
+                    if !seen.insert(v.clone()) {
+                        return Err(format!("Duplicate variant '{}' in enum '{}'", v, name));
+                    }
+                }
+                checked.enums.insert(name.clone(), variants.clone());
+            }
             _ => {}
         }
     }

@@ -173,6 +173,7 @@ impl Parser {
             TokenKind::KwStruct => self.parse_struct_item(is_exported),
             TokenKind::KwType => self.parse_type_alias_item(is_exported),
             TokenKind::KwConst => self.parse_const_item(is_exported),
+            TokenKind::KwEnum => self.parse_enum_item(is_exported),
             TokenKind::KwError => self.parse_error_item(is_exported),
             TokenKind::Ident(kw) if kw == "cli" => self.parse_cli_item(is_exported),
             TokenKind::KwImport => {
@@ -591,6 +592,30 @@ impl Parser {
         let value = self.parse_expr()?;
         Ok(Item::new_exported(
             ItemKind::Const { name, ty, value },
+            start_span,
+            is_exported,
+        ))
+    }
+
+    fn parse_enum_item(&mut self, is_exported: bool) -> Result<Item, ParserError> {
+        let start_span = self.expect(&TokenKind::KwEnum)?.span;
+        let (name, _) = self.expect_ident()?;
+        self.expect(&TokenKind::LBrace)?;
+        let mut variants = Vec::new();
+        while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
+            let (v, _) = self.expect_ident()?;
+            variants.push(v);
+            self.match_token(&TokenKind::Comma);
+        }
+        self.expect(&TokenKind::RBrace)?;
+        if variants.is_empty() {
+            return Err(ParserError {
+                message: format!("Enum '{}' must have at least one variant", name),
+                span: start_span,
+            });
+        }
+        Ok(Item::new_exported(
+            ItemKind::Enum { name, variants },
             start_span,
             is_exported,
         ))

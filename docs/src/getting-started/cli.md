@@ -11,7 +11,8 @@ The `conduit` CLI provides tools for checking, compiling, executing, disassembli
 | `conduit build` | `<file.cdt> [-o <output>]` | Compiles and bundles the program (including relative imports) into a standalone executable. |
 | `conduit run` | `<file.cdt>` | Type-checks, compiles to bytecode, and executes `main()` in the VM. |
 | `conduit watch` | `<file.cdt> [args...]` | Watches `.cdt` files and automatically recompiles and restarts on changes. |
-| `conduit lsp` | None | Starts the stdio Language Server (diagnostics, hover, completion) for IDEs. |
+| `conduit lsp` | None | Starts the stdio Language Server (diagnostics, hover, definition, symbols, rename, formatting, completion) for IDEs. |
+| `conduit fmt` | `<file_or_dir> [--check]` | Formats `.cdt` source files (or checks formatting with `--check`). |
 | `conduit check` | `<file.cdt>` | Performs static semantic analysis and type checking without running code. |
 | `conduit disasm` | `<file.cdt>` | Compiles the program and prints the disassembled register bytecode. |
 | `conduit bench` | `[--filter <pat>] [--strict]` | Runs the built-in VM benchmark suite and checks target performance gates. |

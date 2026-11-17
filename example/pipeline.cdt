@@ -7,11 +7,40 @@ export struct Event {
     score: Int
 }
 
+export enum ScoreTier {
+    Low,
+    Mid,
+    High,
+}
+
+func classify_tier(total: Int) -> ScoreTier {
+    if total >= 200 {
+        return ScoreTier.High
+    }
+    if total >= 100 {
+        return ScoreTier.Mid
+    }
+    return ScoreTier.Low
+}
+
+func tier_label(t: ScoreTier) -> String {
+    switch t {
+        case ScoreTier.High:
+            return "high"
+        case ScoreTier.Mid:
+            return "mid"
+        case _:
+            return "low"
+    }
+}
+
 export struct Report {
     env: String
     tag: String
     kept: Int
     total_score: Int
+    max_score: Int
+    tier: String
     elapsed_us: Int
 }
 
@@ -20,18 +49,28 @@ export func process_events(raw_json: String, env_name: String, tag: String, min_
     events := json.decode<[Event]>(raw_json)?
 
     kept := events
-        |> filter((e: Event) => e.score >= min_score)
+    |> filter((e: Event) => e.score >= min_score)
 
-    total := reduce(kept, 0, (acc: Int, e: Event) => acc + e.score)
+    scores := [0]
+    scores = []
+    for e in kept {
+        scores.append(e.score)
+    }
+
+    total := scores.sum()
+    peak := scores.max() ?? 0
+    tier := tier_label(classify_tier(total))
     elapsed := time.elapsed(started)?
     elapsed_us := elapsed.nanoseconds()? / 1000
 
     report := Report(
-        env: env_name,
-        tag: tag,
-        kept: kept.len(),
-        total_score: total,
-        elapsed_us: elapsed_us,
+    env: env_name,
+    tag: tag,
+    kept: scores.len(),
+    total_score: total,
+    max_score: peak,
+    tier: tier,
+    elapsed_us: elapsed_us,
     )
     return json.encode(report)?
 }

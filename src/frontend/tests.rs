@@ -385,3 +385,45 @@ fn module_consts_and_cross_module_exports() {
     let bad_nonconst = "func g() -> Int { return 1 }\nconst X = g()\nexport func f() -> Int { return X }";
     assert!(compile_source(bad_nonconst).is_err());
 }
+
+#[test]
+fn enum_and_const_interp_cross_module() {
+    let mod_a = r#"
+        export enum Role {
+            Admin,
+            User,
+            Guest
+        }
+        export const TAG = "mod_a"
+    "#;
+    let main_src = r#"
+        import { Role } from "./a"
+        import * as a from "./a"
+
+        const TAG = "local"
+
+        func describe(r: Role) -> String {
+            switch r {
+                case Role.Admin:
+                    return "admin"
+                case Role.User:
+                    return "user"
+                case _:
+                    return "guest"
+            }
+        }
+
+        export func run() -> String {
+            r := Role.Admin
+            eq := r == Role.Admin && r != Role.Guest
+            roles := [Role.Admin, Role.User]
+            return "{TAG}:{a.TAG}:" + describe(roles.get(1) ?? Role.Guest) + ":" + eq.to_string()
+        }
+    "#;
+    let mut modules = HashMap::new();
+    modules.insert("./a", mod_a);
+    let module = compile_with_modules(main_src, &modules).expect("compile enum");
+    let fid = module.func_id("run").unwrap();
+    let res = Vm::new().call_obj(&module, fid, &[], &[]).unwrap();
+    assert_eq!(res, Obj::str("local:mod_a:user:true"));
+}

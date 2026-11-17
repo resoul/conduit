@@ -471,6 +471,18 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 });
                 Ok(dst_s)
             }
+            (Type::List(_), "sum") => {
+                let list_obj = self.lower_obj(target)?;
+                let dst_s = self.alloc_temp_s();
+                self.ops.push(Op::ExtOp {
+                    kind: crate::vm::opcode::EXT_LIST_AGG,
+                    aux: 0,
+                    a: dst_s,
+                    b: list_obj,
+                    c: 0,
+                });
+                Ok(dst_s)
+            }
             (Type::List(_), "any") => self.lower_list_pred_loop(target, &args[0], 0),
             (Type::List(_), "all") => self.lower_list_pred_loop(target, &args[0], 1),
             (Type::List(elem), "contains") => {

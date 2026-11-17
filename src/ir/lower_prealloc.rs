@@ -96,6 +96,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
         let pkey = pat as *const Pattern as usize;
         match (&pat.kind, ty) {
             (PatternKind::Wildcard | PatternKind::Nil, _) => {}
+            (PatternKind::Ident(name), Type::Enum(_)) if name.contains('.') => {}
             (PatternKind::Ident(name), _) => {
                 let slot = self.prealloc_slot_for_ty(ty);
                 self.pat_slots.insert((pkey, name.clone()), slot);

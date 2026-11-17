@@ -133,7 +133,7 @@ pub(crate) fn type_to_type_expr(ty: &Type) -> TypeExpr {
         Type::Nil => TypeExpr::Named("Nil".into()),
         Type::Void => TypeExpr::Named("Void".into()),
         Type::Any => TypeExpr::Named("Any".into()),
-        Type::TypeParam(n) => TypeExpr::Named(n.clone()),
+        Type::TypeParam(n) | Type::Enum(n) => TypeExpr::Named(n.clone()),
         Type::List(t) => TypeExpr::List(Box::new(type_to_type_expr(t))),
         Type::Optional(t) => TypeExpr::Optional(Box::new(type_to_type_expr(t))),
         Type::Map(k, v) => TypeExpr::Generic {

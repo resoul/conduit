@@ -45,7 +45,7 @@ use crate::vm::value::{
 #[inline]
 pub(crate) fn elem_tag_for(ty: &Type) -> u8 {
     match ty {
-        Type::Int => 1,
+        Type::Int | Type::Enum(_) => 1,
         Type::Float => 2,
         Type::Bool => 3,
         _ => 0,
@@ -55,7 +55,7 @@ pub(crate) fn elem_tag_for(ty: &Type) -> u8 {
 pub(crate) fn type_tag_for_switch(ty: &Type, checked: &CheckedProgram) -> Result<u32, String> {
     match ty {
         Type::Void | Type::Nil => Ok(SCHEMA_EMPTY_TAG),
-        Type::Int => Ok(SCHEMA_BOXED_INT),
+        Type::Int | Type::Enum(_) => Ok(SCHEMA_BOXED_INT),
         Type::Float => Ok(SCHEMA_BOXED_FLOAT),
         Type::Bool => Ok(SCHEMA_BOXED_BOOL),
         Type::String => Ok(SCHEMA_STR_TAG),
@@ -1080,6 +1080,19 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 };
                 self.ops.push(Op::ExtOp {
                     kind: EXT_LIST_SORT,
+                    aux,
+                    a: dst_obj,
+                    b: list_obj,
+                    c: 0,
+                });
+                Ok(Some(dst_obj))
+            }
+            (Type::List(_), "min" | "max") => {
+                let list_obj = self.lower_obj(target)?;
+                let dst_obj = self.alloc_temp_o();
+                let aux = if method == "min" { 1 } else { 2 };
+                self.ops.push(Op::ExtOp {
+                    kind: crate::vm::opcode::EXT_LIST_AGG,
                     aux,
                     a: dst_obj,
                     b: list_obj,

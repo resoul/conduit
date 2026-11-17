@@ -64,6 +64,7 @@ fn collect_local_defs(items: &[Item]) -> HashSet<String> {
             | ItemKind::Struct { name, .. }
             | ItemKind::TypeAlias { name, .. }
             | ItemKind::Const { name, .. }
+            | ItemKind::Enum { name, .. }
             | ItemKind::Error { name, .. } => {
                 defs.insert(name.clone());
             }
@@ -79,6 +80,7 @@ fn rename_item_decl(item: &mut Item, rename: &HashMap<String, String>) {
         | ItemKind::Struct { name, .. }
         | ItemKind::TypeAlias { name, .. }
         | ItemKind::Const { name, .. }
+        | ItemKind::Enum { name, .. }
         | ItemKind::Error { name, .. } => {
             if let Some(new_name) = rename.get(name) {
                 *name = new_name.clone();
@@ -243,6 +245,7 @@ fn load_module(
                 | ItemKind::Struct { name, .. }
                 | ItemKind::TypeAlias { name, .. }
                 | ItemKind::Const { name, .. }
+                | ItemKind::Enum { name, .. }
                 | ItemKind::Error { name, .. } => {
                     exports.insert(name.clone(), local_to_global[name].clone());
                 }
@@ -388,7 +391,7 @@ fn rewrite_items(items: &mut [Item], env: &RewriteEnv) -> Result<(), String> {
                     }
                 }
             }
-            ItemKind::Import { .. } => {}
+            ItemKind::Enum { .. } | ItemKind::Import { .. } => {}
         }
     }
     Ok(())
@@ -535,6 +538,22 @@ fn rewrite_block_stmts(
             StmtKind::Switch { expr, cases } => {
                 rewrite_expr(expr, env, scopes)?;
                 for case in cases {
+                    if let PatternKind::Ident(name) = &mut case.pattern.kind
+                        && let Some(dot) = name.find('.')
+                    {
+                        let first = &name[..dot];
+                        let rest = &name[dot + 1..];
+                        if let Some(exports) = env.ns_map.get(first)
+                            && let Some(dot2) = rest.find('.')
+                        {
+                            let (ename, vname) = (&rest[..dot2], &rest[dot2 + 1..]);
+                            if let Some(resolved) = exports.get(ename) {
+                                *name = format!("{}.{}", resolved, vname);
+                            }
+                        } else if let Some(resolved) = env.sym_map.get(first) {
+                            *name = format!("{}.{}", resolved, rest);
+                        }
+                    }
                     if let PatternKind::Type { name, .. } = &mut case.pattern.kind {
                         if let Some(dot) = name.find('.') {
                             let (ns, member) = (&name[..dot], &name[dot + 1..]);
@@ -651,11 +670,93 @@ fn rewrite_expr(
             rewrite_block_stmts(body, env, scopes)?;
             scopes.pop();
         }
+        ExprKind::String(s) => {
+            if s.contains('{') {
+                *s = rewrite_interp_string(s, env, scopes);
+            }
+        }
         ExprKind::Int(_)
         | ExprKind::Float(_)
-        | ExprKind::String(_)
         | ExprKind::Bool(_)
         | ExprKind::Nil => {}
     }
     Ok(())
+}
+
+fn is_interp_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn rewrite_interp_string(
+    raw: &str,
+    env: &RewriteEnv,
+    scopes: &[HashSet<String>],
+) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            out.push(ch);
+            if let Some(next) = chars.next() {
+                out.push(next);
+            }
+            continue;
+        }
+        if ch != '{' {
+            out.push(ch);
+            continue;
+        }
+        let mut seg = String::new();
+        let mut closed = false;
+        for inner in chars.by_ref() {
+            if inner == '}' {
+                closed = true;
+                break;
+            }
+            seg.push(inner);
+        }
+        if !closed {
+            out.push('{');
+            out.push_str(&seg);
+            break;
+        }
+        let seg_parts: Vec<&str> = seg.split('.').collect();
+        if !seg.is_empty()
+            && seg_parts.iter().all(|p| is_interp_ident(p))
+            && !is_shadowed(scopes, seg_parts[0])
+        {
+            if seg_parts.len() >= 2
+                && let Some(ns_exports) = env.ns_map.get(seg_parts[0])
+                && let Some(mapped) = ns_exports.get(seg_parts[1])
+            {
+                out.push('{');
+                out.push_str(mapped);
+                for rest in &seg_parts[2..] {
+                    out.push('.');
+                    out.push_str(rest);
+                }
+                out.push('}');
+                continue;
+            }
+            if let Some(mapped) = env.sym_map.get(seg_parts[0]) {
+                out.push('{');
+                out.push_str(mapped);
+                for rest in &seg_parts[1..] {
+                    out.push('.');
+                    out.push_str(rest);
+                }
+                out.push('}');
+                continue;
+            }
+        }
+        out.push('{');
+        out.push_str(&seg);
+        out.push('}');
+    }
+    out
 }

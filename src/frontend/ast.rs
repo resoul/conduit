@@ -259,6 +259,10 @@ pub enum ItemKind {
         ty: Option<TypeExpr>,
         value: Expr,
     },
+    Enum {
+        name: String,
+        variants: Vec<String>,
+    },
     Error {
         name: String,
         fields: Vec<FieldDef>,

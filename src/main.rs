@@ -105,6 +105,7 @@ fn main() {
         Some("disasm") => run_disasm_cmd(args.get(1)),
         Some("run") => run_exec_cmd(&args[1..]),
         Some("watch") => watch::run_watch_cmd(&args[1..]),
+        Some("fmt") => run_fmt_cmd(&args[1..]),
         Some("lsp") => {
             if let Err(e) = conduit::lsp::run_lsp_server() {
                 eprintln!("LSP error: {}", e);
@@ -116,13 +117,38 @@ fn main() {
         }
         Some("--help" | "-h" | "help") => {
             println!(
-                "Conduit v{}\n\nUsage:\n  conduit bench [--filter <pat>] [--strict]\n  conduit build <file.cdt> [-o <output>]\n  conduit check <file.cdt>\n  conduit disasm <file.cdt>\n  conduit run <file.cdt> [-- args...]\n  conduit watch <file.cdt> [-- args...]\n  conduit lsp\n  conduit --version, -V\n  conduit --help, -h",
+                "Conduit v{}\n\nUsage:\n  conduit bench [--filter <pat>] [--strict]\n  conduit build <file.cdt> [-o <output>]\n  conduit check <file.cdt>\n  conduit disasm <file.cdt>\n  conduit fmt <file_or_dir> [--check]\n  conduit run <file.cdt> [-- args...]\n  conduit watch <file.cdt> [-- args...]\n  conduit lsp\n  conduit --version, -V\n  conduit --help, -h",
                 env!("CARGO_PKG_VERSION")
             );
         }
         Some(cmd) => {
-            eprintln!("Unknown command '{}'. Usage: conduit <bench|build|check|disasm|run|watch|lsp> ...", cmd);
+            eprintln!("Unknown command '{}'. Usage: conduit <bench|build|check|disasm|fmt|run|watch|lsp> ...", cmd);
             process::exit(2);
+        }
+    }
+}
+
+fn run_fmt_cmd(args: &[String]) {
+    let mut check_only = false;
+    let mut target: Option<&String> = None;
+    for arg in args {
+        if arg == "--check" {
+            check_only = true;
+        } else if target.is_none() {
+            target = Some(arg);
+        }
+    }
+    let path = target.map(|s| Path::new(s.as_str())).unwrap_or_else(|| Path::new("."));
+    match conduit::fmt::format_path(path, check_only) {
+        Ok(changed) => {
+            if check_only && changed > 0 {
+                eprintln!("{} file(s) need formatting", changed);
+                process::exit(1);
+            }
+        }
+        Err(e) => {
+            eprintln!("Format error: {}", e);
+            process::exit(1);
         }
     }
 }

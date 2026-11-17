@@ -361,6 +361,7 @@ pub(crate) fn expand_program_aliases(
             }
             ItemKind::TypeAlias { .. }
             | ItemKind::Const { .. }
+            | ItemKind::Enum { .. }
             | ItemKind::Import { .. }
             | ItemKind::ExportList { .. } => {}
         }

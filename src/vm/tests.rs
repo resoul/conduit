@@ -1072,5 +1072,30 @@ fn pipeline_cmp_minmax_and_float_fast_paths() {
     }
 }
 
+#[test]
+fn list_sum_min_max_methods() {
+    let src = r#"
+        export func test_agg() -> String {
+            ints := [10, -3, 25, 4]
+            empty_i := [0]
+            empty_i = []
+            floats := [1.5, -2.5, 4.0]
+            empty_f := [0.0]
+            empty_f = []
+            imin := ints.min() ?? -999
+            imax := ints.max() ?? -999
+            emin := empty_i.min() ?? -999
+            fmin := floats.min() ?? -999.0
+            fmax := floats.max() ?? -999.0
+            efmax := empty_f.max() ?? -999.0
+            return ints.sum().to_string() + "|" + imin.to_string() + "|" + imax.to_string() + "|" + emin.to_string() + "|" + empty_i.sum().to_string() + "|" + floats.sum().to_string() + "|" + fmin.to_string() + "|" + fmax.to_string() + "|" + efmax.to_string() + "|" + empty_f.sum().to_string()
+        }
+    "#;
+    let module = crate::frontend::compile_source(src).expect("compile agg");
+    let fid = module.func_id("test_agg").unwrap();
+    let res = Vm::new().call_obj(&module, fid, &[], &[]).unwrap();
+    assert_eq!(res, Obj::str("36|-3|25|-999|0|3|-2.5|4|-999|0"));
+}
+
 #[allow(dead_code)]
 fn _keep_record_desc(_: RecordDesc) {}

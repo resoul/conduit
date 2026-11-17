@@ -344,6 +344,28 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                     self.patch_here(jf);
                 }
                 PatternKind::Ident(name) => {
+                    if let Type::Enum(ename) = &expr.ty
+                        && let Some((_, vname)) = name.split_once('.')
+                    {
+                        let tag = self.mc.checked.enums[ename]
+                            .iter()
+                            .position(|v| v == vname)
+                            .ok_or_else(|| format!("Unknown variant '{}.{}'", ename, vname))?;
+                        let eq_s = self.alloc_temp_s();
+                        self.ops.push(Op::EqIntImm {
+                            dst: eq_s,
+                            a: scr_reg,
+                            imm: tag as i16,
+                        });
+                        let jf = self.ops.len();
+                        self.ops.push(Op::JumpIfFalse { cond: eq_s, target: 0 });
+                        self.lower_block_stmts(&case.body.stmts)?;
+                        let je = self.ops.len();
+                        self.ops.push(Op::Jump { target: 0 });
+                        end_jumps.push(je);
+                        self.patch_here(jf);
+                        continue;
+                    }
                     let pkey = &case.pattern as *const Pattern as usize;
                     let slot = self.pat_slots[&(pkey, name.clone())];
                     if slot.is_scalar && scr_is_scalar {

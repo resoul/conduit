@@ -58,6 +58,7 @@ pub enum Type {
     List(Box<Type>),
     Map(Box<Type>, Box<Type>),
     Optional(Box<Type>),
+    Enum(String),
     Custom(TypeId),
     Generic {
         type_id: TypeId,
@@ -76,7 +77,7 @@ pub enum Type {
 impl Type {
     #[inline]
     pub fn is_scalar(&self) -> bool {
-        matches!(self, Type::Int | Type::Float | Type::Bool)
+        matches!(self, Type::Int | Type::Float | Type::Bool | Type::Enum(_))
     }
 
     #[inline]
@@ -234,6 +235,7 @@ impl std::fmt::Display for Type {
             Type::List(inner) => write!(f, "[{}]", inner),
             Type::Map(key, val) => write!(f, "Map<{}, {}>", key, val),
             Type::Optional(inner) => write!(f, "{}?", inner),
+            Type::Enum(name) => write!(f, "{}", name),
             Type::Custom(name) => write!(f, "{}", name),
             Type::Generic { type_id, type_args } => {
                 let s = type_args

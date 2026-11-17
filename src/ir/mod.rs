@@ -784,6 +784,14 @@ impl Module {
                                 6 => check_o(a, &ctx)?,
                                 _ => return Err(format!("Invalid log aux {}", aux)),
                             },
+                            crate::vm::opcode::EXT_LIST_AGG => {
+                                check_o(b, &ctx)?;
+                                match aux {
+                                    0 => check_s(a, &ctx)?,
+                                    1 | 2 => check_o(a, &ctx)?,
+                                    _ => return Err(format!("Invalid list agg aux {}", aux)),
+                                }
+                            }
                             _ => return Err(format!("Invalid ExtOp kind {}", kind)),
                         }
                     }

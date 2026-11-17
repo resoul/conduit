@@ -1,11 +1,12 @@
 # Conduit Starter Example
 
-A minimal multi-file Conduit project combining `const`, `cdt.cli`, `cdt.env`, `cdt.fs`, `cdt.log`, `cdt.url`, `cdt.validation`, `cdt.json`, `cdt.time`, and `|>` pipelines, packaged for both `conduit watch` in development and `FROM scratch` (~2–3 MB) in production.
+A minimal multi-file Conduit project combining `const`, `enum`, `cdt.cli`, `cdt.env`, `cdt.fs`, `cdt.log`, `cdt.url`, `cdt.validation`, `cdt.json`, `cdt.time`, list aggregates (`.sum()`, `.max()`), and `|>` pipelines, packaged for both `conduit watch` in development and `FROM scratch` (~2–3 MB) in production.
 
 ## Local Usage
 
 ```bash
-# Type-check
+# Format & type-check
+conduit fmt .
 conduit check main.cdt
 
 # Run CLI commands

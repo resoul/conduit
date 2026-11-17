@@ -1,4 +1,5 @@
 pub mod benchmarks;
+pub mod fmt;
 pub mod frontend;
 pub mod ir;
 pub mod lsp;
