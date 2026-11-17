@@ -18,26 +18,19 @@ pub fn make_url_error(kind: &str, message: impl Into<String>) -> Obj {
 }
 
 #[inline]
-pub fn make_url_obj(
-    scheme: &str,
-    host: &str,
-    port: i64,
-    path: &str,
-    query: &str,
-    fragment: &str,
-) -> Obj {
-    let mut s = StructData::new(SCHEMA_URL, 1, 5);
-    s.set_scalar(0, port as u64);
-    s.set_obj(0, Obj::str(scheme));
-    s.set_obj(1, Obj::str(host));
-    s.set_obj(2, Obj::str(path));
-    s.set_obj(3, Obj::str(query));
-    s.set_obj(4, Obj::str(fragment));
-    Obj::Record(Arc::new(s))
+fn sub_range(full: &str, part: &str) -> std::ops::Range<usize> {
+    let start = (part.as_ptr() as usize) - (full.as_ptr() as usize);
+    start..(start + part.len())
 }
 
-pub fn url_parse(raw: &str) -> Obj {
-    let s = raw.trim();
+#[inline]
+fn slice_obj(base: &Arc<VmString>, full: &str, part: &str) -> Obj {
+    Obj::Str(Arc::new(VmString::slice_arc(base, sub_range(full, part))))
+}
+
+pub fn url_parse(raw: &Arc<VmString>) -> Obj {
+    let full = raw.as_str();
+    let s = full.trim();
     let Some(scheme_end) = s.find("://") else {
         return make_url_error("invalid_url", "URL must contain '://'");
     };
@@ -101,14 +94,19 @@ pub fn url_parse(raw: &str) -> Obj {
         return make_url_error("invalid_url", "URL host cannot be empty");
     }
 
-    make_url_obj(
-        &scheme.to_ascii_lowercase(),
-        host,
-        port,
-        path,
-        query,
-        fragment,
-    )
+    let scheme_obj = if scheme.bytes().any(|b| b.is_ascii_uppercase()) {
+        Obj::str(scheme.to_ascii_lowercase())
+    } else {
+        slice_obj(raw, full, scheme)
+    };
+    let mut rec = StructData::new(SCHEMA_URL, 1, 5);
+    rec.set_scalar(0, port as u64);
+    rec.set_obj(0, scheme_obj);
+    rec.set_obj(1, slice_obj(raw, full, host));
+    rec.set_obj(2, if path.is_empty() { Obj::Str(Arc::new(VmString::slice_arc(raw, 0..0))) } else { slice_obj(raw, full, path) });
+    rec.set_obj(3, if query.is_empty() { Obj::Str(Arc::new(VmString::slice_arc(raw, 0..0))) } else { slice_obj(raw, full, query) });
+    rec.set_obj(4, if fragment.is_empty() { Obj::Str(Arc::new(VmString::slice_arc(raw, 0..0))) } else { slice_obj(raw, full, fragment) });
+    Obj::Record(Arc::new(rec))
 }
 
 const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
@@ -189,12 +187,21 @@ pub fn encode_query_map(map: &OrderedMap) -> Obj {
     Obj::str(out)
 }
 
-pub fn decode_query_str(q: &str) -> Obj {
-    let trimmed = q.strip_prefix('?').unwrap_or(q);
+pub fn decode_query_str(q_arc: &Arc<VmString>) -> Obj {
+    let full = q_arc.as_str();
+    let trimmed = full.strip_prefix('?').unwrap_or(full);
     let mut map = OrderedMap::default();
     if trimmed.is_empty() {
         return Obj::Map(Arc::new(map));
     }
+    let slice_vm = |part: &str| -> Result<VmString, Obj> {
+        let bytes = part.as_bytes();
+        if !bytes.contains(&b'%') && !bytes.contains(&b'+') {
+            Ok(VmString::slice_arc(q_arc, sub_range(full, part)))
+        } else {
+            percent_decode(part, true).map(VmString::from)
+        }
+    };
     for part in trimmed.split('&') {
         if part.is_empty() {
             continue;
@@ -203,15 +210,15 @@ pub fn decode_query_str(q: &str) -> Obj {
             Some((k, v)) => (k, v),
             None => (part, ""),
         };
-        let k = match percent_decode(raw_k, true) {
+        let k = match slice_vm(raw_k) {
             Ok(s) => s,
             Err(e) => return e,
         };
-        let v = match percent_decode(raw_v, true) {
+        let v = match slice_vm(raw_v) {
             Ok(s) => s,
             Err(e) => return e,
         };
-        map.set(MapKey::Str(Arc::new(VmString::from(k))), MapVal::Obj(Obj::str(v)));
+        map.set(MapKey::Str(Arc::new(k)), MapVal::Obj(Obj::Str(Arc::new(v))));
     }
     Obj::Map(Arc::new(map))
 }

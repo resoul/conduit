@@ -254,6 +254,43 @@ pub fn reader_read_chunk(reader: &mut BufReader<File>, max_bytes: usize) -> Obj 
     if max_bytes == 0 {
         return Obj::str(String::new());
     }
+    if reader.buffer().is_empty() && max_bytes >= FS_BUF_CAP {
+        let mut out = vec![0u8; max_bytes];
+        let mut filled = 0usize;
+        let file = reader.get_mut();
+        while filled < max_bytes {
+            match file.read(&mut out[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return io_err_obj("<reader>", &e),
+            }
+        }
+        if filled == 0 {
+            return Obj::Empty;
+        }
+        out.truncate(filled);
+        if let Err(e) = std::str::from_utf8(&out)
+            && e.error_len().is_none()
+        {
+            for _ in 0..3 {
+                let mut b = [0u8; 1];
+                match file.read(&mut b) {
+                    Ok(1) => {
+                        out.push(b[0]);
+                        if std::str::from_utf8(&out).is_ok() {
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+        }
+        return match String::from_utf8(out) {
+            Ok(s) => Obj::str(s),
+            Err(e) => make_fs_error("invalid_input", "<reader>", e.to_string()),
+        };
+    }
     match reader.fill_buf() {
         Ok([]) => Obj::Empty,
         Ok(buf) if max_bytes <= buf.len() || buf.len() < FS_BUF_CAP => {

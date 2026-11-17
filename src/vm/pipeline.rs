@@ -348,37 +348,50 @@ fn match_int_reduce(ops: &[Op]) -> Option<IntReduceOp> {
 }
 
 #[inline(always)]
+fn mod_eq_const<const M: i64>(x: i64, rem: i64) -> (bool, bool) {
+    let (r, ov) = x.overflowing_rem(M);
+    (r == rem, ov)
+}
+
+#[inline(always)]
 fn run_int_kernel(
     src: &[i64],
     init_acc: u64,
-    filter: impl Fn(i64) -> Result<bool, RuntimeError>,
-    map: impl Fn(i64) -> Result<i64, RuntimeError>,
-    reduce: impl Fn(i64, i64) -> Result<i64, RuntimeError>,
+    filter: impl Fn(i64) -> (bool, bool),
+    map: impl Fn(i64) -> (i64, bool),
+    reduce: impl Fn(i64, i64) -> (i64, bool),
 ) -> Result<u64, RuntimeError> {
     let mut acc = init_acc as i64;
+    let mut ov = false;
     for &x in src.iter() {
-        if filter(x)? {
-            let v = map(x)?;
-            acc = reduce(acc, v)?;
+        let (keep, o1) = filter(x);
+        ov |= o1;
+        if keep {
+            let (v, o2) = map(x);
+            let (next, o3) = reduce(acc, v);
+            acc = next;
+            ov |= o2 | o3;
         }
     }
-    Ok(acc as u64)
+    if ov {
+        Err(err_overflow())
+    } else {
+        Ok(acc as u64)
+    }
 }
 
 #[inline(always)]
 fn dispatch_int_reduce(
     src: &[i64],
     init_acc: u64,
-    filter: impl Fn(i64) -> Result<bool, RuntimeError>,
-    map: impl Fn(i64) -> Result<i64, RuntimeError>,
+    filter: impl Fn(i64) -> (bool, bool),
+    map: impl Fn(i64) -> (i64, bool),
     red: IntReduceOp,
 ) -> Result<u64, RuntimeError> {
     match red {
-        IntReduceOp::Sum => run_int_kernel(src, init_acc, filter, map, |a, v| {
-            a.checked_add(v).ok_or_else(err_overflow)
-        }),
-        IntReduceOp::Min => run_int_kernel(src, init_acc, filter, map, |a, v| Ok(a.min(v))),
-        IntReduceOp::Max => run_int_kernel(src, init_acc, filter, map, |a, v| Ok(a.max(v))),
+        IntReduceOp::Sum => run_int_kernel(src, init_acc, filter, map, i64::overflowing_add),
+        IntReduceOp::Min => run_int_kernel(src, init_acc, filter, map, |a, v| (a.min(v), false)),
+        IntReduceOp::Max => run_int_kernel(src, init_acc, filter, map, |a, v| (a.max(v), false)),
     }
 }
 
@@ -390,17 +403,18 @@ fn dispatch_int_filter_map_reduce(
     map: Option<(i64, i64)>,
     red: IntReduceOp,
 ) -> Result<u64, RuntimeError> {
-    let map_fn = move |x: i64| -> Result<i64, RuntimeError> {
+    let map_fn = move |x: i64| -> (i64, bool) {
         match map {
-            Some((mul, add)) => x
-                .checked_mul(mul)
-                .and_then(|v| v.checked_add(add))
-                .ok_or_else(err_overflow),
-            None => Ok(x),
+            Some((mul, add)) => {
+                let (v, o1) = x.overflowing_mul(mul);
+                let (res, o2) = v.overflowing_add(add);
+                (res, o1 | o2)
+            }
+            None => (x, false),
         }
     };
     match filter {
-        None => dispatch_int_reduce(src, init_acc, |_| Ok(true), map_fn, red),
+        None => dispatch_int_reduce(src, init_acc, |_| (true, false), map_fn, red),
         Some(IntFilter::ModEq(m, rem)) => {
             if m == 0 {
                 if src.is_empty() {
@@ -408,34 +422,43 @@ fn dispatch_int_filter_map_reduce(
                 }
                 return Err(err_div_zero());
             }
-            dispatch_int_reduce(
-                src,
-                init_acc,
-                |x| match x.checked_rem(m) {
-                    Some(r) => Ok(r == rem),
-                    None => Err(err_overflow()),
-                },
-                map_fn,
-                red,
-            )
+            match m {
+                2 => dispatch_int_reduce(src, init_acc, |x| mod_eq_const::<2>(x, rem), map_fn, red),
+                3 => dispatch_int_reduce(src, init_acc, |x| mod_eq_const::<3>(x, rem), map_fn, red),
+                4 => dispatch_int_reduce(src, init_acc, |x| mod_eq_const::<4>(x, rem), map_fn, red),
+                5 => dispatch_int_reduce(src, init_acc, |x| mod_eq_const::<5>(x, rem), map_fn, red),
+                8 => dispatch_int_reduce(src, init_acc, |x| mod_eq_const::<8>(x, rem), map_fn, red),
+                10 => dispatch_int_reduce(src, init_acc, |x| mod_eq_const::<10>(x, rem), map_fn, red),
+                16 => dispatch_int_reduce(src, init_acc, |x| mod_eq_const::<16>(x, rem), map_fn, red),
+                _ => dispatch_int_reduce(
+                    src,
+                    init_acc,
+                    |x| {
+                        let (r, ov) = x.overflowing_rem(m);
+                        (r == rem, ov)
+                    },
+                    map_fn,
+                    red,
+                ),
+            }
         }
         Some(IntFilter::Cmp(IntCmp::Eq, c)) => {
-            dispatch_int_reduce(src, init_acc, |x| Ok(x == c), map_fn, red)
+            dispatch_int_reduce(src, init_acc, |x| (x == c, false), map_fn, red)
         }
         Some(IntFilter::Cmp(IntCmp::Ne, c)) => {
-            dispatch_int_reduce(src, init_acc, |x| Ok(x != c), map_fn, red)
+            dispatch_int_reduce(src, init_acc, |x| (x != c, false), map_fn, red)
         }
         Some(IntFilter::Cmp(IntCmp::Lt, c)) => {
-            dispatch_int_reduce(src, init_acc, |x| Ok(x < c), map_fn, red)
+            dispatch_int_reduce(src, init_acc, |x| (x < c, false), map_fn, red)
         }
         Some(IntFilter::Cmp(IntCmp::Le, c)) => {
-            dispatch_int_reduce(src, init_acc, |x| Ok(x <= c), map_fn, red)
+            dispatch_int_reduce(src, init_acc, |x| (x <= c, false), map_fn, red)
         }
         Some(IntFilter::Cmp(IntCmp::Gt, c)) => {
-            dispatch_int_reduce(src, init_acc, |x| Ok(x > c), map_fn, red)
+            dispatch_int_reduce(src, init_acc, |x| (x > c, false), map_fn, red)
         }
         Some(IntFilter::Cmp(IntCmp::Ge, c)) => {
-            dispatch_int_reduce(src, init_acc, |x| Ok(x >= c), map_fn, red)
+            dispatch_int_reduce(src, init_acc, |x| (x >= c, false), map_fn, red)
         }
     }
 }

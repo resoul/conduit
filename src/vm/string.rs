@@ -18,6 +18,10 @@ enum Storage {
         text: Arc<String>,
         range: Range<usize>,
     },
+    Slice {
+        base: Arc<VmString>,
+        range: Range<usize>,
+    },
 }
 
 impl VmString {
@@ -32,6 +36,34 @@ impl VmString {
     }
 
     #[inline]
+    pub(crate) fn slice_arc(base: &Arc<VmString>, sub: Range<usize>) -> Self {
+        assert!(
+            base.as_str().get(sub.clone()).is_some(),
+            "invalid UTF-8 string range"
+        );
+        match &base.storage {
+            Storage::Shared { text, range } => Self {
+                storage: Storage::Shared {
+                    text: Arc::clone(text),
+                    range: (range.start + sub.start)..(range.start + sub.end),
+                },
+            },
+            Storage::Slice { base: inner, range } => Self {
+                storage: Storage::Slice {
+                    base: Arc::clone(inner),
+                    range: (range.start + sub.start)..(range.start + sub.end),
+                },
+            },
+            Storage::Owned(_) => Self {
+                storage: Storage::Slice {
+                    base: Arc::clone(base),
+                    range: sub,
+                },
+            },
+        }
+    }
+
+    #[inline]
     pub fn as_str(&self) -> &str {
         match &self.storage {
             Storage::Owned(text) => text,
@@ -41,14 +73,25 @@ impl VmString {
                 // make_owned_mut() replaces a shared view before any mutation.
                 unsafe { text.get_unchecked(range.clone()) }
             }
+            Storage::Slice { base, range } => {
+                // SAFETY: slice_arc() checks bounds and UTF-8 boundaries against
+                // an immutable Owned VmString kept alive by Arc.
+                unsafe { base.as_str().get_unchecked(range.clone()) }
+            }
         }
     }
 
     /// Used by each_line to reuse a uniquely owned string buffer. Shared views
     /// must become owned before mutation, preserving every other string's value.
     pub(crate) fn make_owned_mut(&mut self) -> &mut String {
-        if let Storage::Shared { text, range } = &self.storage {
-            self.storage = Storage::Owned(text[range.clone()].to_owned());
+        match &self.storage {
+            Storage::Shared { text, range } => {
+                self.storage = Storage::Owned(text[range.clone()].to_owned());
+            }
+            Storage::Slice { base, range } => {
+                self.storage = Storage::Owned(base.as_str()[range.clone()].to_owned());
+            }
+            Storage::Owned(_) => {}
         }
         let Storage::Owned(text) = &mut self.storage else {
             unreachable!()

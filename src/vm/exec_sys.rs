@@ -15,7 +15,7 @@ use crate::native::process::{
     PROC_CWD, PROC_EXIT, PROC_PID, PROC_RUN, PROC_SET_CWD, PROC_STATUS, make_process_error,
     proc_cwd, proc_run, proc_set_cwd, proc_status,
 };
-use crate::native::csv::{CsvError, parse_csv, parse_csv_records, stringify_csv};
+use crate::native::csv::{CsvError, parse_csv_objs, parse_csv_records_objs, stringify_csv};
 use crate::native::log::{
     LOG_GET_LEVEL, LOG_SET_JSON, LOG_SET_LEVEL, emit_log, get_log_level, set_log_json,
     set_log_level,
@@ -26,8 +26,7 @@ use crate::native::url::{
     encode_query_map, percent_decode, percent_encode, url_parse,
 };
 use crate::vm::exec_cold::err_msg;
-use crate::vm::string::VmString;
-use crate::vm::value::{ListStorage, MapKey, MapVal, Obj, OrderedMap, SCHEMA_CSV_ERROR, StructData};
+use crate::vm::value::{ListStorage, Obj, SCHEMA_CSV_ERROR, StructData};
 use crate::vm::{RuntimeError, Vm};
 
 impl Vm {
@@ -248,13 +247,6 @@ impl Vm {
             s.set_obj(1, Obj::str(e.message));
             Obj::Record(Arc::new(s))
         };
-        let rows_to_obj = |rows: Vec<Vec<String>>| {
-            let row_objs: Vec<Obj> = rows
-                .into_iter()
-                .map(|r| Obj::List(ListStorage::Obj(Arc::new(r.into_iter().map(Obj::str).collect()))))
-                .collect();
-            Obj::List(ListStorage::Obj(Arc::new(row_objs)))
-        };
         let extract_rows = |obj: &Obj| -> Result<Vec<Vec<String>>, RuntimeError> {
             let Obj::List(ListStorage::Obj(outer)) = obj else {
                 return Err(err_msg("Expected [[String]] in csv.stringify()"));
@@ -280,8 +272,8 @@ impl Vm {
             0 => {
                 // csv.parse(text)
                 let s = self.sys_str(o_base, b, "csv.parse()")?;
-                self.objs[o_base + a as usize] = match parse_csv(&s, ",") {
-                    Ok(rows) => rows_to_obj(rows),
+                self.objs[o_base + a as usize] = match parse_csv_objs(&s, ",") {
+                    Ok(obj) => obj,
                     Err(e) => make_csv_err(e),
                 };
             }
@@ -289,31 +281,16 @@ impl Vm {
                 // csv.parse_with(text, delimiter)
                 let s = self.sys_str(o_base, b, "csv.parse_with()")?;
                 let delim = self.sys_str(o_base, c, "csv.parse_with()")?;
-                self.objs[o_base + a as usize] = match parse_csv(&s, &delim) {
-                    Ok(rows) => rows_to_obj(rows),
+                self.objs[o_base + a as usize] = match parse_csv_objs(&s, &delim) {
+                    Ok(obj) => obj,
                     Err(e) => make_csv_err(e),
                 };
             }
             2 => {
                 // csv.parse_records(text)
                 let s = self.sys_str(o_base, b, "csv.parse_records()")?;
-                self.objs[o_base + a as usize] = match parse_csv_records(&s) {
-                    Ok(records) => {
-                        let maps: Vec<Obj> = records
-                            .into_iter()
-                            .map(|m| {
-                                let mut om = OrderedMap::default();
-                                for (k, v) in m {
-                                    om.set(
-                                        MapKey::Str(Arc::new(VmString::from(k))),
-                                        MapVal::Obj(Obj::str(v)),
-                                    );
-                                }
-                                Obj::Map(Arc::new(om))
-                            })
-                            .collect();
-                        Obj::List(ListStorage::Obj(Arc::new(maps)))
-                    }
+                self.objs[o_base + a as usize] = match parse_csv_records_objs(&s) {
+                    Ok(obj) => obj,
                     Err(e) => make_csv_err(e),
                 };
             }
