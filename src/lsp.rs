@@ -185,7 +185,8 @@ fn find_decl_span_in_source(source: &str, sym: &str) -> Option<(usize, usize)> {
         let matched = match &item.kind {
             ItemKind::Func { name, .. }
             | ItemKind::Struct { name, .. }
-            | ItemKind::TypeAlias { name, .. } => name == sym,
+            | ItemKind::TypeAlias { name, .. }
+            | ItemKind::Const { name, .. } => name == sym,
             _ => false,
         };
         if matched {
@@ -337,6 +338,7 @@ fn handle_document_symbol(msg: &str, id: &str, documents: &HashMap<String, Strin
             ItemKind::Func { name, .. } => (name.as_str(), 12u8),
             ItemKind::Struct { name, .. } => (name.as_str(), 23u8),
             ItemKind::TypeAlias { name, .. } => (name.as_str(), 5u8),
+            ItemKind::Const { name, .. } => (name.as_str(), 14u8),
             _ => continue,
         };
         let line = item.span.line.saturating_sub(1);

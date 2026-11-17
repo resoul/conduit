@@ -342,3 +342,46 @@ fn multi_module_ts_imports_and_tree_shaking() {
                   export func run() -> Int { return math.private_step(1) }";
     assert!(compile_with_modules(bad_ns, &modules).is_err());
 }
+
+#[test]
+fn module_consts_and_cross_module_exports() {
+    let cfg_src = r#"
+        const BASE_PORT = 8000
+        export const PORT: Int = BASE_PORT + 80
+        export const NEG_OFFSET = -5
+        export const RATIO: Float = 1.5
+        export const PREFIX = "/v1"
+        export const ENABLED = true
+    "#;
+    let main_src = r#"
+        import * as cfg from "./cfg"
+        import { PREFIX, NEG_OFFSET } from "./cfg"
+
+        const LOCAL_STEP = 2
+
+        func with_default(p: Int = cfg.PORT) -> Int {
+            return p + NEG_OFFSET + LOCAL_STEP
+        }
+
+        export func run() -> String {
+            if cfg.ENABLED {
+                v := with_default()
+                return PREFIX + ":" + v.to_string() + ":" + cfg.RATIO.to_string()
+            }
+            return ""
+        }
+    "#;
+    let mut modules = HashMap::new();
+    modules.insert("./cfg", cfg_src);
+    let module = compile_with_modules(main_src, &modules).expect("compile consts");
+    let fid = module.func_id("run").unwrap();
+    let res = Vm::new().call_obj(&module, fid, &[], &[]).unwrap();
+    assert_eq!(res, Obj::str("/v1:8077:1.5"));
+
+    let bad_assign = "const X = 1\nexport func f() -> Int { X = 2\n return X }";
+    let err = compile_source(bad_assign).unwrap_err();
+    assert!(err.contains("Cannot assign to constant"), "got {err}");
+
+    let bad_nonconst = "func g() -> Int { return 1 }\nconst X = g()\nexport func f() -> Int { return X }";
+    assert!(compile_source(bad_nonconst).is_err());
+}

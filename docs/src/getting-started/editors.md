@@ -14,8 +14,10 @@ conduit lsp
 
 Supported capabilities:
 - **Real-time diagnostics**: Type-checks open and unsaved `.cdt` buffers (including multi-file relative imports) on open/change.
-- **Hover**: Shows signatures, parameter names/types, return unions, and leading `//` comments for user-defined `func` and `struct` declarations, all `cdt.*` modules (`cdt.cli`, `cdt.env`, `cdt.json`, `cdt.time`, `cdt.validation`), and built-in methods/keywords.
-- **Completion**: Dot-completion for `cli.`, `env.`, `json.`, `time.`, and `validation.`, plus user-defined functions, structs, and keywords.
+- **Hover**: Shows signatures, parameter names/types, return unions, and leading `//` comments for user-defined `func` and `struct` declarations, all `cdt.*` modules (`cli`, `env`, `fs`, `path`, `process`, `crypto`, `url`, `csv`, `math`, `log`, `json`, `time`, `validation`), and built-in methods/keywords.
+- **Go to Definition (`textDocument/definition`)**: Jump (`Cmd+Click` / `F12`) to `func`, `struct`, `type`, and `const` declarations in the current file, imported symbols, and relative `import "./..."` file paths.
+- **Document Symbols (`textDocument/documentSymbol`)**: Populates the editor Outline with `func`, `struct`, `type`, and `const` declarations.
+- **Completion**: Dot-completion for `cdt.*` modules, plus user-defined functions, structs, and keywords.
 
 ---
 

@@ -2,12 +2,15 @@ import cli from "cdt.cli"
 import { CliError } from "cdt.cli"
 import { EnvError } from "cdt.env"
 import * as fs from "cdt.fs"
+import * as log from "cdt.log"
 import * as url from "cdt.url"
 import { ValidationError } from "cdt.validation"
 import { DecodeError, EncodeError } from "cdt.json"
 import { TimeError } from "cdt.time"
-import { load_config, AppConfig } from "./config"
+import { load_config, AppConfig, DEFAULT_MIN_SCORE } from "./config"
 import { process_events } from "./pipeline"
+
+const APP_BANNER = "[worker]"
 
 cli Worker "Conduit starter worker" {
     flag verbose "v" "Print detailed status"
@@ -30,7 +33,7 @@ func run_app() -> String | CliError | EnvError | fs.FsError | url.UrlError | Val
 
     switch app.check {
         case Worker_check(_):
-            return "config ok: env={cfg.app_env}, min_score={cfg.min_score}, tag={cfg.tag}"
+            return "config ok: env={cfg.app_env}, min_score={cfg.min_score} (default={DEFAULT_MIN_SCORE}), tag={cfg.tag}"
     }
 
     switch app.run {
@@ -40,7 +43,7 @@ func run_app() -> String | CliError | EnvError | fs.FsError | url.UrlError | Val
                 threshold = r.min_score
             }
             if app.verbose {
-                print("[worker] env={cfg.app_env} threshold={threshold} file={r.file}")
+                log.info("{APP_BANNER} env={cfg.app_env} threshold={threshold} file={r.file}")
             }
             raw_json := fs.read_text(r.file)?
             return process_events(raw_json, cfg.app_env, cfg.tag, threshold)?

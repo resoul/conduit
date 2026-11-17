@@ -63,6 +63,7 @@ fn collect_local_defs(items: &[Item]) -> HashSet<String> {
             ItemKind::Func { name, .. }
             | ItemKind::Struct { name, .. }
             | ItemKind::TypeAlias { name, .. }
+            | ItemKind::Const { name, .. }
             | ItemKind::Error { name, .. } => {
                 defs.insert(name.clone());
             }
@@ -77,6 +78,7 @@ fn rename_item_decl(item: &mut Item, rename: &HashMap<String, String>) {
         ItemKind::Func { name, .. }
         | ItemKind::Struct { name, .. }
         | ItemKind::TypeAlias { name, .. }
+        | ItemKind::Const { name, .. }
         | ItemKind::Error { name, .. } => {
             if let Some(new_name) = rename.get(name) {
                 *name = new_name.clone();
@@ -240,6 +242,7 @@ fn load_module(
                 ItemKind::Func { name, .. }
                 | ItemKind::Struct { name, .. }
                 | ItemKind::TypeAlias { name, .. }
+                | ItemKind::Const { name, .. }
                 | ItemKind::Error { name, .. } => {
                     exports.insert(name.clone(), local_to_global[name].clone());
                 }
@@ -314,6 +317,10 @@ fn rewrite_items(items: &mut [Item], env: &RewriteEnv) -> Result<(), String> {
             } => {
                 for p in params.iter_mut() {
                     rewrite_type_expr(&mut p.ty, env)?;
+                    if let Some(def) = &mut p.default {
+                        let mut scopes = Vec::new();
+                        rewrite_expr(def, env, &mut scopes)?;
+                    }
                 }
                 if let Some(rt) = return_type {
                     rewrite_type_expr(rt, env)?;
@@ -324,6 +331,10 @@ fn rewrite_items(items: &mut [Item], env: &RewriteEnv) -> Result<(), String> {
             ItemKind::Struct { fields, .. } | ItemKind::Error { fields, .. } => {
                 for f in fields {
                     rewrite_type_expr(&mut f.ty, env)?;
+                    if let Some(def) = &mut f.default {
+                        let mut scopes = Vec::new();
+                        rewrite_expr(def, env, &mut scopes)?;
+                    }
                     for ann in &mut f.annotations {
                         let mut empty_scopes = Vec::new();
                         for a in &mut ann.args {
@@ -362,6 +373,13 @@ fn rewrite_items(items: &mut [Item], env: &RewriteEnv) -> Result<(), String> {
             }
             ItemKind::TypeAlias { target, .. } => {
                 rewrite_type_expr(target, env)?;
+            }
+            ItemKind::Const { ty, value, .. } => {
+                if let Some(t) = ty {
+                    rewrite_type_expr(t, env)?;
+                }
+                let mut scopes = Vec::new();
+                rewrite_expr(value, env, &mut scopes)?;
             }
             ItemKind::ExportList { names } => {
                 for spec in names {

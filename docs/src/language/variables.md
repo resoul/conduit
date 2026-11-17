@@ -84,6 +84,20 @@ print(x)     // Prints 10
 
 ---
 
+## Module Constants (`const`)
+
+Top-level constants can be declared at the module level with `const` (and exported across modules with `export const`). Constant initializers are evaluated at compile time and cannot be reassigned:
+
+```conduit
+const MAX_RETRIES = 3
+export const DEFAULT_PORT: Int = 8080
+export const API_PREFIX = "/v1"
+```
+
+Supported constant types are `Int`, `Float`, `Bool`, and `String` (including arithmetic, boolean logic, and references to earlier constants).
+
+---
+
 ## Common Errors & Diagnostics
 
 ### Reassigning an Incompatible Type

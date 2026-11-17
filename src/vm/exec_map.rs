@@ -1,4 +1,44 @@
-use std::sync::Arc;
+use std::cell::RefCell;
+use std::io::{BufWriter, IsTerminal, Write};
+use std::sync::{Arc, OnceLock};
+
+const STDOUT_BUF_CAP: usize = 64 * 1024;
+
+thread_local! {
+    static STDOUT_BUF: RefCell<Option<BufWriter<std::io::Stdout>>> = const { RefCell::new(None) };
+}
+
+#[inline]
+fn stdout_is_tty() -> bool {
+    static IS_TTY: OnceLock<bool> = OnceLock::new();
+    *IS_TTY.get_or_init(|| std::io::stdout().is_terminal())
+}
+
+#[inline]
+pub(crate) fn print_stdout_line(s: &str) {
+    if cfg!(test) || stdout_is_tty() {
+        println!("{}", s);
+        return;
+    }
+    STDOUT_BUF.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let bw = slot
+            .get_or_insert_with(|| BufWriter::with_capacity(STDOUT_BUF_CAP, std::io::stdout()));
+        let _ = bw.write_all(s.as_bytes());
+        let _ = bw.write_all(b"\n");
+    });
+}
+
+pub(crate) fn flush_stdout() {
+    if cfg!(test) || stdout_is_tty() {
+        return;
+    }
+    STDOUT_BUF.with(|cell| {
+        if let Some(bw) = cell.borrow_mut().as_mut() {
+            let _ = bw.flush();
+        }
+    });
+}
 
 use crate::vm::exec_cold::err_msg;
 use crate::native::cli::{exec_cli_parse, format_cli_help};
@@ -43,10 +83,14 @@ impl Vm {
                     3 => (raw != 0).to_string(),
                     _ => (raw as i64).to_string(),
                 };
-                println!("{}", text);
+                print_stdout_line(&text);
             }
             EXT_PRINT_OBJ => {
-                println!("{}", self.objs[o_base + a as usize].format_obj());
+                if let Obj::Str(s) = &self.objs[o_base + a as usize] {
+                    print_stdout_line(s.as_str());
+                } else {
+                    print_stdout_line(&self.objs[o_base + a as usize].format_obj());
+                }
             }
             EXT_FLOAT_CEIL => {
                 let v = f64::from_bits(self.scalars[s_base + b as usize]).ceil();

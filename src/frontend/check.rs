@@ -17,6 +17,14 @@ use crate::native::validation::ValidationStructPlan;
 use crate::native::StructSchema;
 
 #[derive(Debug, Clone)]
+pub enum ConstVal {
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    String(String),
+}
+
+#[derive(Debug)]
 pub struct CheckedProgram {
     pub structs: Vec<ResolvedStruct>,
     pub struct_by_name: HashMap<String, usize>,
@@ -69,6 +77,7 @@ pub struct CheckedProgram {
     pub generic_funcs: HashMap<String, GenericFuncTemplate>,
     pub mono_struct_args: HashMap<String, (String, Vec<Type>)>,
     pub pending_mono_items: Vec<Item>,
+    pub consts: HashMap<String, (Type, ConstVal)>,
 }
 
 impl CheckedProgram {
@@ -142,10 +151,12 @@ pub fn check_program_with_roots(
         generic_funcs: HashMap::new(),
         mono_struct_args: HashMap::new(),
         pending_mono_items: Vec::new(),
+        consts: HashMap::new(),
     };
 
     register_native_imports(program, &mut checked)?;
     register_program_types(program, &mut checked)?;
+    register_program_consts(program, &mut checked)?;
     check_validator_contracts(program, &mut checked)?;
     check_default_exprs(program, &mut checked)?;
 
@@ -350,6 +361,12 @@ impl<'a> Checker<'a> {
                 if matches!(target.kind, ExprKind::Index { .. }) {
                     return Err("Index assignment is not supported".to_string());
                 }
+                if let ExprKind::Ident(name) = &target.kind
+                    && self.lookup(name).is_none()
+                    && self.checked.consts.contains_key(name)
+                {
+                    return Err(format!("Cannot assign to constant '{}'", name));
+                }
                 self.check_expr(target, None)?;
                 self.check_expr(value, Some(&target.ty))?;
                 if !value.ty.is_assignable_to(&target.ty) {
@@ -486,6 +503,7 @@ impl<'a> Checker<'a> {
     }
 
     pub(crate) fn check_expr(&mut self, expr: &mut Expr, expected: Option<&Type>) -> Result<(), String> {
+        let mut const_inline: Option<ExprKind> = None;
         let ty = match &mut expr.kind {
             ExprKind::Int(_) => Type::Int,
             ExprKind::Float(_) => Type::Float,
@@ -502,6 +520,14 @@ impl<'a> Checker<'a> {
             ExprKind::Ident(name) => {
                 if let Some(ty) = self.lookup(name) {
                     ty
+                } else if let Some((cty, cval)) = self.checked.consts.get(name) {
+                    const_inline = Some(match cval {
+                        ConstVal::Int(n) => ExprKind::Int(*n),
+                        ConstVal::Float(f) => ExprKind::Float(*f),
+                        ConstVal::Bool(b) => ExprKind::Bool(*b),
+                        ConstVal::String(s) => ExprKind::String(s.clone()),
+                    });
+                    cty.clone()
                 } else if self.checked.generic_funcs.contains_key(name) {
                     return Err(format!(
                         "Generic function '{}' cannot be used as a first-class value",
@@ -692,6 +718,9 @@ impl<'a> Checker<'a> {
                 named_args,
             } => self.check_call(callee, type_args, args, named_args)?,
         };
+        if let Some(kind) = const_inline {
+            expr.kind = kind;
+        }
         expr.ty = ty;
         Ok(())
     }
@@ -765,4 +794,129 @@ impl<'a> Checker<'a> {
         }
         Ok(Type::Custom(TypeId { module: ModuleId::Builtin, name: name.to_string() }))
     }
+}
+
+fn eval_const_expr(
+    expr: &Expr,
+    consts: &HashMap<String, (Type, ConstVal)>,
+) -> Result<(Type, ConstVal), String> {
+    match &expr.kind {
+        ExprKind::Int(n) => Ok((Type::Int, ConstVal::Int(*n))),
+        ExprKind::Float(f) => Ok((Type::Float, ConstVal::Float(*f))),
+        ExprKind::Bool(b) => Ok((Type::Bool, ConstVal::Bool(*b))),
+        ExprKind::String(s) => {
+            if s.contains('{') || s.contains("\\{") {
+                return Err("Constant string cannot contain interpolation".to_string());
+            }
+            Ok((Type::String, ConstVal::String(s.clone())))
+        }
+        ExprKind::Ident(name) => consts
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("Unknown or non-constant identifier '{}' in const initializer", name)),
+        ExprKind::Unary { op, expr: inner } => {
+            let (ty, val) = eval_const_expr(inner, consts)?;
+            match (op, val) {
+                (UnaryOp::Neg, ConstVal::Int(n)) => n
+                    .checked_neg()
+                    .map(|v| (Type::Int, ConstVal::Int(v)))
+                    .ok_or_else(|| "Integer overflow in const negation".to_string()),
+                (UnaryOp::Neg, ConstVal::Float(f)) => Ok((Type::Float, ConstVal::Float(-f))),
+                (UnaryOp::Not, ConstVal::Bool(b)) => Ok((Type::Bool, ConstVal::Bool(!b))),
+                _ => Err(format!("Invalid unary {:?} in const expression for {}", op, ty)),
+            }
+        }
+        ExprKind::Binary { op, left, right } => {
+            let (_, lv) = eval_const_expr(left, consts)?;
+            let (_, rv) = eval_const_expr(right, consts)?;
+            match (op, lv, rv) {
+                (BinaryOp::Add, ConstVal::Int(a), ConstVal::Int(b)) => a
+                    .checked_add(b)
+                    .map(|v| (Type::Int, ConstVal::Int(v)))
+                    .ok_or_else(|| "Integer overflow in const '+'".to_string()),
+                (BinaryOp::Sub, ConstVal::Int(a), ConstVal::Int(b)) => a
+                    .checked_sub(b)
+                    .map(|v| (Type::Int, ConstVal::Int(v)))
+                    .ok_or_else(|| "Integer overflow in const '-'".to_string()),
+                (BinaryOp::Mul, ConstVal::Int(a), ConstVal::Int(b)) => a
+                    .checked_mul(b)
+                    .map(|v| (Type::Int, ConstVal::Int(v)))
+                    .ok_or_else(|| "Integer overflow in const '*'".to_string()),
+                (BinaryOp::Div, ConstVal::Int(a), ConstVal::Int(b)) => {
+                    if b == 0 {
+                        Err("Division by zero in const '/'".to_string())
+                    } else {
+                        a.checked_div(b)
+                            .map(|v| (Type::Int, ConstVal::Int(v)))
+                            .ok_or_else(|| "Integer overflow in const '/'".to_string())
+                    }
+                }
+                (BinaryOp::Mod, ConstVal::Int(a), ConstVal::Int(b)) => {
+                    if b == 0 {
+                        Err("Division by zero in const '%'".to_string())
+                    } else {
+                        a.checked_rem(b)
+                            .map(|v| (Type::Int, ConstVal::Int(v)))
+                            .ok_or_else(|| "Integer overflow in const '%'".to_string())
+                    }
+                }
+                (BinaryOp::Add, ConstVal::Float(a), ConstVal::Float(b)) => {
+                    Ok((Type::Float, ConstVal::Float(a + b)))
+                }
+                (BinaryOp::Sub, ConstVal::Float(a), ConstVal::Float(b)) => {
+                    Ok((Type::Float, ConstVal::Float(a - b)))
+                }
+                (BinaryOp::Mul, ConstVal::Float(a), ConstVal::Float(b)) => {
+                    Ok((Type::Float, ConstVal::Float(a * b)))
+                }
+                (BinaryOp::Div, ConstVal::Float(a), ConstVal::Float(b)) => {
+                    Ok((Type::Float, ConstVal::Float(a / b)))
+                }
+                (BinaryOp::Add, ConstVal::String(a), ConstVal::String(b)) => {
+                    Ok((Type::String, ConstVal::String(format!("{}{}", a, b))))
+                }
+                (BinaryOp::Eq, ConstVal::Int(a), ConstVal::Int(b)) => Ok((Type::Bool, ConstVal::Bool(a == b))),
+                (BinaryOp::NotEq, ConstVal::Int(a), ConstVal::Int(b)) => Ok((Type::Bool, ConstVal::Bool(a != b))),
+                (BinaryOp::Lt, ConstVal::Int(a), ConstVal::Int(b)) => Ok((Type::Bool, ConstVal::Bool(a < b))),
+                (BinaryOp::LtEq, ConstVal::Int(a), ConstVal::Int(b)) => Ok((Type::Bool, ConstVal::Bool(a <= b))),
+                (BinaryOp::Gt, ConstVal::Int(a), ConstVal::Int(b)) => Ok((Type::Bool, ConstVal::Bool(a > b))),
+                (BinaryOp::GtEq, ConstVal::Int(a), ConstVal::Int(b)) => Ok((Type::Bool, ConstVal::Bool(a >= b))),
+                (BinaryOp::And, ConstVal::Bool(a), ConstVal::Bool(b)) => Ok((Type::Bool, ConstVal::Bool(a && b))),
+                (BinaryOp::Or, ConstVal::Bool(a), ConstVal::Bool(b)) => Ok((Type::Bool, ConstVal::Bool(a || b))),
+                _ => Err("Unsupported binary expression in const initializer".to_string()),
+            }
+        }
+        _ => Err("Const initializer must be a compile-time constant (Int, Float, Bool, String, or arithmetic on constants)".to_string()),
+    }
+}
+
+fn register_program_consts(
+    program: &Program,
+    checked: &mut CheckedProgram,
+) -> Result<(), String> {
+    for item in &program.items {
+        if let ItemKind::Const { name, ty, value } = &item.kind {
+            if checked.consts.contains_key(name)
+                || checked.func_by_name.contains_key(name)
+                || checked.struct_by_name.contains_key(name)
+            {
+                return Err(format!("Duplicate top-level symbol '{}'", name));
+            }
+            let (val_ty, val) = eval_const_expr(value, &checked.consts)?;
+            let final_ty = if let Some(te) = ty {
+                let decl_ty = checked.resolve_type(te)?;
+                if !val_ty.is_assignable_to(&decl_ty) {
+                    return Err(format!(
+                        "Const '{}' type mismatch: expected {}, got {}",
+                        name, decl_ty, val_ty
+                    ));
+                }
+                decl_ty
+            } else {
+                val_ty
+            };
+            checked.consts.insert(name.clone(), (final_ty, val));
+        }
+    }
+    Ok(())
 }

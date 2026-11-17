@@ -5,7 +5,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
-## [Unreleased]
+## [0.2.6] - 2026-11-17
 
 ### Added
 
@@ -15,15 +15,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   * Added RFC 4180 `cdt.csv` (`parse`, `parse_with`, `parse_records`, `stringify`, `stringify_with`) with `CsvError { kind, line, message }` (`src/native/csv.rs`, `src/vm/exec_sys.rs`, `EXT_CSV_OP`), LSP hover/completion docs, TextMate highlighting, library docs (`docs/src/library/csv.md`), and end-to-end tests (`cdt_csv_e2e`).
 * **`cdt.math` & `cdt.log` Standard Library Modules**:
   * Added `cdt.math` (`pi`, `e`, `tau`, `sqrt`, `pow`, `hypot`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `exp`, `ln`, `log10`, `floor`, `ceil`, `round`, `trunc`) (`src/native/math.rs`, `EXT_MATH_OP`) and `cdt.log` (`debug`, `info`, `warn`, `error`, `set_level`, `get_level`, `set_json`) (`src/native/log.rs`, `EXT_LOG_OP`), with LSP docs, library docs (`docs/src/library/{math,log}.md`), and tests (`cdt_math_and_log_e2e`).
+* **Module-Level Constants (`const` / `export const`)**:
+  * Added compile-time evaluated module constants (`const NAME [: Type] = expr` and `export const ...`) for `Int`, `Float`, `Bool`, and `String` (arithmetic/boolean constant folding, cross-module `import`, default parameter/field values, string interpolation `{CONST}`, TextMate highlighting, and docs in `docs/src/language/variables.md`).
 * **LSP Go-to-Definition (`textDocument/definition`) & Document Symbols (`textDocument/documentSymbol`)**:
-  * Added `"definitionProvider":true` (`handle_definition`) and `"documentSymbolProvider":true` (`handle_document_symbol`) in `src/lsp.rs` supporting jumps to `func`/`struct`/`type` declarations, imported symbols, relative import paths, and IDE Outline symbols.
-* **Starter Example**:
-  * Updated `example/main.cdt` and `example/README.md` with an `inspect` subcommand using `cdt.url`.
+  * Added `"definitionProvider":true` (`handle_definition`) and `"documentSymbolProvider":true` (`handle_document_symbol`) in `src/lsp.rs` supporting jumps to `func`/`struct`/`type`/`const` declarations, imported symbols, relative import paths, and IDE Outline symbols, plus updated `docs/src/getting-started/editors.md`.
+* **Starter Example & Benchmarks**:
+  * Updated `example/` (`config.cdt`, `main.cdt`, `README.md`) to showcase `const` / `export const`, `cdt.log`, and `cdt.url` (`inspect` subcommand).
+  * Added `pipeline_float_1m`, `csv_parse_20k`, and `url_parse_50k` to `scripts/bench/` (`run_all.py` and language benchmark scripts).
 
 ### Fixed & Optimized
 
-* **Pipeline Fast-Path Extensions (`Int` & `Float`)**:
-  * Extended `src/vm/pipeline.rs` (`try_run_int_reduce_fast` and new `try_run_float_reduce_fast`) to natively execute `filter` comparisons (`==`, `!=`, `<`, `<=`, `>`, `>=` on `Int`, and `==`, `<`, `<=`, `>`, `>=` on `Float`), `reduce` for `min`/`max` alongside `sum`, `Float` affine `map(a * x + b)`, and `filter |> reduce` / `map |> reduce` combinations while preserving `checked_*` overflow checks and IEEE-754 `NaN`/`-0.0` semantics.
+* **Zero-Copy Slicing, Pipeline Kernels & Buffered `print`**:
+  * Added `Storage::Slice` / `VmString::slice_arc` in `src/vm/string.rs` for zero-copy substring views over `Owned` strings, byte-scanning + zero-copy `csv.parse` (`src/native/csv.rs`), zero-copy `url.parse` / `decode_query` (`src/native/url.rs`), direct `BufReader`-bypassing `Reader.read_chunk` (`src/native/fs.rs`), and 64 KiB buffered `print` when `stdout` is not a TTY (`src/vm/exec_map.rs`) with automatic flushing in `Vm::call`, `process.*`, and `log.*`.
+  * Extended `src/vm/pipeline.rs` (`try_run_int_reduce_fast` and new `try_run_float_reduce_fast`) to natively execute `filter` comparisons (`==`, `!=`, `<`, `<=`, `>`, `>=` on `Int`, and `==`, `<`, `<=`, `>`, `>=` on `Float`), `reduce` for `min`/`max` alongside `sum`, `Float` affine `map(a * x + b)` (including `Op::FmaFloat`), `filter |> reduce` / `map |> reduce` combinations, `const M` divisor specialization + `overflowing_*` overflow-flag loops for `Int`, and branchless `-0.0` accumulation for `Float` sum while preserving exact overflow and IEEE-754 `NaN`/`-0.0` semantics.
 
 ## [0.2.5] - 2026-11-16
 

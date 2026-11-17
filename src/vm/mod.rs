@@ -170,7 +170,9 @@ impl Vm {
         for (idx, obj) in obj_args.iter().enumerate() {
             self.objs[idx] = obj.clone();
         }
-        self.exec_from(module, func_id, 0, 0, usize::MAX)
+        let res = self.exec_from(module, func_id, 0, 0, usize::MAX);
+        exec_map::flush_stdout();
+        res
     }
 }
 

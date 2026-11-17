@@ -360,6 +360,7 @@ pub(crate) fn expand_program_aliases(
                 expand_block_aliases(body, aliases)?;
             }
             ItemKind::TypeAlias { .. }
+            | ItemKind::Const { .. }
             | ItemKind::Import { .. }
             | ItemKind::ExportList { .. } => {}
         }

@@ -808,7 +808,9 @@ impl<'a> Checker<'a> {
                 if closed && !seg.is_empty() && seg_parts.iter().all(|p| is_interp_ident(p)) {
                     has_hole = true;
                     flush_lit(&mut lit, &mut parts);
-                    if self.lookup(seg_parts[0]).is_none() {
+                    if self.lookup(seg_parts[0]).is_none()
+                        && !self.checked.consts.contains_key(seg_parts[0])
+                    {
                         return Err(format!(
                             "Unknown variable '{}' in string interpolation",
                             seg_parts[0]

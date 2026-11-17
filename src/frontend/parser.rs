@@ -172,6 +172,7 @@ impl Parser {
             TokenKind::KwFunc => self.parse_func_item(is_exported, is_validator),
             TokenKind::KwStruct => self.parse_struct_item(is_exported),
             TokenKind::KwType => self.parse_type_alias_item(is_exported),
+            TokenKind::KwConst => self.parse_const_item(is_exported),
             TokenKind::KwError => self.parse_error_item(is_exported),
             TokenKind::Ident(kw) if kw == "cli" => self.parse_cli_item(is_exported),
             TokenKind::KwImport => {
@@ -573,6 +574,23 @@ impl Parser {
         let target = self.parse_type_expr()?;
         Ok(Item::new_exported(
             ItemKind::TypeAlias { name, target },
+            start_span,
+            is_exported,
+        ))
+    }
+
+    fn parse_const_item(&mut self, is_exported: bool) -> Result<Item, ParserError> {
+        let start_span = self.expect(&TokenKind::KwConst)?.span;
+        let (name, _) = self.expect_ident()?;
+        let ty = if self.match_token(&TokenKind::Colon) {
+            Some(self.parse_type_expr()?)
+        } else {
+            None
+        };
+        self.expect(&TokenKind::Assign)?;
+        let value = self.parse_expr()?;
+        Ok(Item::new_exported(
+            ItemKind::Const { name, ty, value },
             start_span,
             is_exported,
         ))

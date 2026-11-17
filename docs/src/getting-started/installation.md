@@ -90,6 +90,6 @@ conduit --version
 Expected output:
 
 ```text
-Conduit v0.2.5
+Conduit v0.2.6
 ```
 

@@ -108,6 +108,7 @@ impl Vm {
     ) -> Result<(), RuntimeError> {
         match aux {
             PROC_RUN | PROC_STATUS => {
+                crate::vm::exec_map::flush_stdout();
                 let cmd = self.sys_str(o_base, b, "process")?;
                 let res = match &self.objs[o_base + c as usize] {
                     Obj::List(ListStorage::Obj(items)) => {
@@ -132,6 +133,7 @@ impl Vm {
                 self.scalars[s_base + a as usize] = i64::from(std::process::id()) as u64;
             }
             PROC_EXIT => {
+                crate::vm::exec_map::flush_stdout();
                 let code = self.scalars[s_base + a as usize] as i64 as i32;
                 std::process::exit(code);
             }
@@ -347,6 +349,7 @@ impl Vm {
     ) -> Result<(), RuntimeError> {
         match aux {
             0..=3 => {
+                crate::vm::exec_map::flush_stdout();
                 let msg = self.sys_str(o_base, b, "log()")?;
                 emit_log(aux, &msg);
             }

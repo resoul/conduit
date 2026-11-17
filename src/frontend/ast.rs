@@ -254,6 +254,11 @@ pub enum ItemKind {
         name: String,
         target: TypeExpr,
     },
+    Const {
+        name: String,
+        ty: Option<TypeExpr>,
+        value: Expr,
+    },
     Error {
         name: String,
         fields: Vec<FieldDef>,

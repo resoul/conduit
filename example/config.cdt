@@ -1,10 +1,13 @@
 import * as env from "cdt.env"
 import * as validation from "cdt.validation"
 
+export const DEFAULT_MIN_SCORE: Int = 50
+export const DEFAULT_TAG = "starter"
+
 export struct AppConfig {
     app_env: String @env("APP_ENV") = "dev"
-    min_score: Int @env("MIN_SCORE") @validation.min(0) = 50
-    tag: String @env("APP_TAG") = "starter"
+    min_score: Int @env("MIN_SCORE") @validation.min(0) = DEFAULT_MIN_SCORE
+    tag: String @env("APP_TAG") = DEFAULT_TAG
 }
 
 export func load_config() -> AppConfig | env.EnvError | validation.ValidationError {
