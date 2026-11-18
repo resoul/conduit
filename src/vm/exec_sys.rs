@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
 use crate::native::crypto::{
-    CRYPTO_B64_DEC, CRYPTO_B64_ENC, CRYPTO_HEX_DEC, CRYPTO_HEX_ENC, CRYPTO_HMAC_SHA256,
-    CRYPTO_RAND_HEX, CRYPTO_RAND_INT, CRYPTO_SHA256, CRYPTO_UUID_V4, decode_base64, decode_hex,
-    encode_base64, encode_hex, hmac_sha256_bytes, random_bytes_hex, random_int, sha256_bytes,
-    uuid_v4,
+    CRYPTO_B64_DEC, CRYPTO_B64_ENC, CRYPTO_CONST_TIME_EQ, CRYPTO_HASH_PASSWORD, CRYPTO_HEX_DEC,
+    CRYPTO_HEX_ENC, CRYPTO_HMAC_SHA256, CRYPTO_RAND_HEX, CRYPTO_RAND_INT, CRYPTO_SHA256,
+    CRYPTO_UUID_V4, CRYPTO_VERIFY_PASSWORD, constant_time_eq, decode_base64, decode_hex,
+    encode_base64, encode_hex, hash_password, hmac_sha256_bytes, random_bytes_hex, random_int,
+    sha256_bytes, uuid_v4, verify_password,
 };
 use crate::native::path::{
     PATH_BASENAME, PATH_DIRNAME, PATH_EXT, PATH_IS_ABS, PATH_JOIN, PATH_JOIN_ALL, PATH_NORMALIZE,
@@ -189,6 +190,21 @@ impl Vm {
                 let min = self.scalars[s_base + b as usize] as i64;
                 let max = self.scalars[s_base + c as usize] as i64;
                 self.objs[o_base + a as usize] = random_int(min, max);
+            }
+            CRYPTO_HASH_PASSWORD => {
+                let pw = self.sys_str(o_base, b, "crypto.hash_password()")?;
+                self.objs[o_base + a as usize] = hash_password(&pw);
+            }
+            CRYPTO_VERIFY_PASSWORD => {
+                let pw = self.sys_str(o_base, b, "crypto.verify_password()")?;
+                let stored = self.sys_str(o_base, c, "crypto.verify_password()")?;
+                self.scalars[s_base + a as usize] = u64::from(verify_password(&pw, &stored));
+            }
+            CRYPTO_CONST_TIME_EQ => {
+                let s1 = self.sys_str(o_base, b, "crypto.constant_time_eq()")?;
+                let s2 = self.sys_str(o_base, c, "crypto.constant_time_eq()")?;
+                self.scalars[s_base + a as usize] =
+                    u64::from(constant_time_eq(s1.as_bytes(), s2.as_bytes()));
             }
             _ => return Err(err_msg("Unknown crypto sub-op")),
         }

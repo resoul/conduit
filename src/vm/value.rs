@@ -230,6 +230,7 @@ pub const SCHEMA_CRYPTO_ERROR: u32 = 0xFFFF_0039;
 pub const SCHEMA_URL_ERROR: u32 = 0xFFFF_003A;
 pub const SCHEMA_CSV_ERROR: u32 = 0xFFFF_003B;
 pub const SCHEMA_HTTP_ERROR: u32 = 0xFFFF_003C;
+pub const SCHEMA_DB_ERROR: u32 = 0xFFFF_003D;
 pub const SCHEMA_FS_READER: u32 = 0xFFFF_0040;
 pub const SCHEMA_FS_WRITER: u32 = 0xFFFF_0041;
 pub const SCHEMA_PROCESS_OUTPUT: u32 = 0xFFFF_0042;
@@ -238,6 +239,8 @@ pub const SCHEMA_HTTP_REQUEST: u32 = 0xFFFF_0045;
 pub const SCHEMA_HTTP_RESPONSE: u32 = 0xFFFF_0046;
 pub const SCHEMA_HTTP_ROUTER: u32 = 0xFFFF_0047;
 pub const SCHEMA_HTTP_BINARY_RESPONSE: u32 = 0xFFFF_0048;
+pub const SCHEMA_DB_CONN: u32 = 0xFFFF_0049;
+pub const SCHEMA_DB_PARAM: u32 = 0xFFFF_004A;
 
 #[inline]
 pub fn is_builtin_error_schema(schema_id: u32) -> bool {
@@ -259,6 +262,7 @@ pub fn is_builtin_error_schema(schema_id: u32) -> bool {
             | SCHEMA_URL_ERROR
             | SCHEMA_CSV_ERROR
             | SCHEMA_HTTP_ERROR
+            | SCHEMA_DB_ERROR
     )
 }
 
@@ -707,6 +711,7 @@ impl Obj {
                 | SCHEMA_URL_ERROR
                 | SCHEMA_CSV_ERROR
                 | SCHEMA_HTTP_ERROR
+                | SCHEMA_DB_ERROR
                     if rec.inline_objs.len() >= 2 =>
                 {
                     rec.inline_objs[1].format_obj()

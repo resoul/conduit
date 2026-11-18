@@ -4,8 +4,8 @@ use std::path::Path;
 use std::process::Command;
 
 use crate::ir::{
-    CallableRef, ClosureProto, ElemKind, FunctionProto, Module, PipelinePlan, PipelineStage,
-    RecordDesc,
+    CallableRef, ClosureProto, ElemKind, FunctionProto, MigrationPlan, Module, PipelinePlan,
+    PipelineStage, RecordDesc,
 };
 use crate::native::cli::{CliDefault, CliFieldPlan, CliKind, CliNodePlan, CliPlan, CliValKind};
 use crate::native::env::{EnvDefault, EnvFieldKind, EnvFieldPlan, EnvLoadPlan};
@@ -463,6 +463,13 @@ pub fn encode_bundle(module: &Module, main_fid: u32, main_ret_tag: u8) -> Result
             })
         })
     })?;
+    w.list(&module.migrations, |w, m| {
+        w.i64(m.version);
+        w.str(&m.name);
+        w.u32(m.up_func_id);
+        w.u32(m.down_func_id);
+        Ok(())
+    })?;
 
     Ok(w.0)
 }
@@ -603,6 +610,18 @@ pub fn decode_bundle(bytes: &[u8]) -> Result<(Module, u32, u8), String> {
             Ok(CliNodePlan { name, about, schema_id, scalar_len, obj_len, fields })
         })?.into_boxed_slice();
         Ok(CliPlan { nodes })
+    })?;
+    module.migrations = r.vec(|r| {
+        let version = r.i64()?;
+        let name = r.str()?;
+        let up_func_id = r.u32()?;
+        let down_func_id = r.u32()?;
+        Ok(MigrationPlan {
+            version,
+            name,
+            up_func_id,
+            down_func_id,
+        })
     })?;
 
     module.validate()?;

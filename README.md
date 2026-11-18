@@ -14,7 +14,7 @@ Conduit is designed with explicit control flow, strict types, and composable sta
 - **Errors as Values**: Functions return explicit union types (`T | Error`), inspected via exhaustive `switch` or propagated via `?`—zero exceptions.
 - **Strict Numbers (`Int` & `Float`)**: 64-bit integers (`Int`) and IEEE 754 floats (`Float`) never mix implicitly; conversions (`.to_float()`, `.floor()`, `.ceil()`, `.round()`, `.to_string()`) are always explicit.
 - **Explicit Schema Validation**: Mark validators with `[#validator]`, attach `@rule` / `@module.rule(...)` annotations to fields, and execute recursive checks explicitly via `validation.check()`.
-- **Standard Library (`cdt.*`)**: Built-in host-native modules for HTTP (`cdt.http`), JSON (`cdt.json`), schema validation (`cdt.validation`), time (`cdt.time`), environment config (`cdt.env`), CLI parsing & dispatch (`cdt.cli`), filesystem (`cdt.fs`), paths (`cdt.path`), processes (`cdt.process`), crypto (`cdt.crypto`), URLs (`cdt.url`), CSV (`cdt.csv`), math (`cdt.math`), and logging (`cdt.log`).
+- **Standard Library (`cdt.*`)**: Built-in host-native modules for HTTP (`cdt.http`), SQL databases (`cdt.db`), JSON (`cdt.json`), schema validation (`cdt.validation`), time (`cdt.time`), environment config (`cdt.env`), CLI parsing & dispatch (`cdt.cli`), filesystem (`cdt.fs`), paths (`cdt.path`), processes (`cdt.process`), crypto (`cdt.crypto`), URLs (`cdt.url`), CSV (`cdt.csv`), math (`cdt.math`), and logging (`cdt.log`).
 
 ## Standard Library
 
@@ -28,12 +28,13 @@ Conduit is designed with explicit control flow, strict types, and composable sta
 | `cdt.fs` | Basic & buffered streaming file I/O (`read_text`, `write_atomic`, `each_line`, `Reader`, `Writer`) | [cdt.fs](docs/src/library/fs.md) |
 | `cdt.path` | Cross-platform path manipulation (`join`, `dirname`, `basename`, `ext`, `stem`, `normalize`) | [cdt.path](docs/src/library/path.md) |
 | `cdt.process` | Subprocess execution (`run`, `status`), working directory, `pid`, and `exit` | [cdt.process](docs/src/library/process.md) |
-| `cdt.crypto` | SHA-256, HMAC-SHA256, SIMD Base64, Hex, `uuid_v4`, and OS-backed CSPRNG | [cdt.crypto](docs/src/library/crypto.md) |
+| `cdt.crypto` | SHA-256, HMAC-SHA256, PBKDF2-SHA256 password hashing, SIMD Base64, Hex, `uuid_v4`, and OS-backed CSPRNG | [cdt.crypto](docs/src/library/crypto.md) |
 | `cdt.url` | URL parser (`Url`), RFC 3986 percent-encoding, and query string encoding/decoding | [cdt.url](docs/src/library/url.md) |
 | `cdt.csv` | RFC 4180 CSV parser and serializer (`parse`, `parse_records`, `stringify`) | [cdt.csv](docs/src/library/csv.md) |
 | `cdt.math` | Floating-point math functions (`sqrt`, `pow`, `sin`, `cos`, `ln`, `floor`, `ceil`, `round`, `hypot`) and constants | [cdt.math](docs/src/library/math.md) |
 | `cdt.log` | Leveled `stderr` logger with optional structured JSON lines | [cdt.log](docs/src/library/log.md) |
 | `cdt.http` | Zero-dependency HTTP/1.1 client (`http.get`, `post`, `request_timeout`, `get_bytes`, `https://` via `curl`), declarative `router { ... }`, multi-threaded `Router`, middleware, and graceful shutdown | [cdt.http](docs/src/library/http.md) |
+| `cdt.db` | Zero-dependency PostgreSQL and MySQL wire-protocol drivers (`connect`, `exec`, `query<T>`, transactions) and declarative `migration`s | [cdt.db](docs/src/library/db.md) |
 
 ## Installation
 
@@ -72,6 +73,9 @@ conduit disasm main.cdt
 
 # Run built-in VM performance benchmarks
 conduit bench --strict
+
+# Manage database migrations (status, migrate, rollback)
+conduit db status main.cdt --url postgres://conduit:secret@127.0.0.1:5432/app
 ```
 
 ## Documentation

@@ -22,6 +22,7 @@ pub(crate) fn is_valid_native_type(mod_name: &str, ty_name: &str) -> bool {
             ty_name,
             "HttpError" | "Request" | "Response" | "BinaryResponse" | "Router"
         ),
+        "cdt.db" => matches!(ty_name, "Connection" | "Param" | "DbError"),
         _ => false,
     }
 }
@@ -198,7 +199,8 @@ pub(crate) fn register_native_imports(
                     match spec.name.as_str() {
                         "sha256" | "hmac_sha256" | "base64_encode" | "base64_decode"
                         | "hex_encode" | "hex_decode" | "uuid_v4" | "random_bytes_hex"
-                        | "random_int" => {
+                        | "random_int" | "hash_password" | "verify_password"
+                        | "constant_time_eq" => {
                             insert_unique(&mut checked.crypto_direct_fns, &spec.alias, &spec.name)?;
                         }
                         "CryptoError" => {
@@ -325,6 +327,29 @@ pub(crate) fn register_native_imports(
                     }
                 }
             }
+            "cdt.db" => {
+                if let Some(a) = alias {
+                    checked.db_aliases.insert(a.clone());
+                }
+                for spec in names {
+                    match spec.name.as_str() {
+                        "connect" | "int" | "float" | "bool" | "text" | "null" => {
+                            insert_unique(&mut checked.db_direct_fns, &spec.alias, &spec.name)?;
+                        }
+                        "Connection" | "Param" | "DbError" => {
+                            checked
+                                .db_direct_types
+                                .insert(spec.alias.clone(), spec.name.clone());
+                        }
+                        other => {
+                            return Err(format!(
+                                "Module 'cdt.db' has no exported member '{}'",
+                                other
+                            ));
+                        }
+                    }
+                }
+            }
             other => return Err(format!("Unknown or unlinked module '{}'", other)),
         }
     }
@@ -411,6 +436,10 @@ pub fn resolve_type_expr(te: &TypeExpr, checked: &CheckedProgram) -> Result<Type
                 "cdt.http",
                 &checked.http_direct_types[name],
             ))),
+            _ if checked.db_direct_types.contains_key(name) => Ok(Type::Custom(TypeId::native(
+                "cdt.db",
+                &checked.db_direct_types[name],
+            ))),
             _ if name.contains('.') => {
                 let mut parts = name.splitn(2, '.');
                 let alias = parts.next().unwrap_or("");
@@ -437,6 +466,8 @@ pub fn resolve_type_expr(te: &TypeExpr, checked: &CheckedProgram) -> Result<Type
                     "cdt.csv"
                 } else if checked.http_aliases.contains(alias) {
                     "cdt.http"
+                } else if checked.db_aliases.contains(alias) {
+                    "cdt.db"
                 } else {
                     return Err(format!("Unknown type '{}'", name));
                 };
@@ -544,6 +575,7 @@ pub(crate) fn is_error_type(ty: &Type, checked: &CheckedProgram) -> bool {
             "cdt.url" => name == "UrlError",
             "cdt.csv" => name == "CsvError",
             "cdt.http" => name == "HttpError",
+            "cdt.db" => name == "DbError",
             _ => false,
         },
         Type::Custom(TypeId {
@@ -672,6 +704,9 @@ pub(crate) fn native_member_field(tid: &TypeId, field: &str) -> Result<(Type, u1
             Type::Map(Box::new(Type::String), Box::new(Type::String)),
             1,
         )),
+        ("cdt.db", "DbError", "kind") => Ok((Type::String, 0)),
+        ("cdt.db", "DbError", "message") => Ok((Type::String, 1)),
+        ("cdt.db", "DbError", "code") => Ok((Type::String, 2)),
         _ => Err(format!("Type '{}' has no field '{}'", tid, field)),
     }
 }
@@ -959,15 +994,25 @@ impl<'a> Checker<'a> {
         &mut self,
         tid: &TypeId,
         method: &str,
+        type_args: &[TypeExpr],
         args: &mut [Expr],
     ) -> Result<Type, String> {
         let terr = Type::Custom(TypeId::native("cdt.time", "TimeError"));
         match (tid.module.clone(), tid.name.as_str(), method) {
             (ModuleId::Native(ref m), _, _) if m == "cdt.fs" => {
+                if !type_args.is_empty() {
+                    return Err(format!("Method '.{}()' does not accept type arguments", method));
+                }
                 self.check_fs_method(&tid.name, method, args)
             }
             (ModuleId::Native(ref m), _, _) if m == "cdt.http" => {
+                if !type_args.is_empty() {
+                    return Err(format!("Method '.{}()' does not accept type arguments", method));
+                }
                 self.check_http_method(&tid.name, method, args)
+            }
+            (ModuleId::Native(ref m), _, _) if m == "cdt.db" => {
+                self.check_db_method(&tid.name, method, type_args, args)
             }
             (ModuleId::Native(ref m), "Timestamp", "unix_seconds" | "unix_milliseconds")
                 if m == "cdt.time" =>

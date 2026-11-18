@@ -34,6 +34,7 @@
 - [cdt.math](library/math.md)
 - [cdt.log](library/log.md)
 - [cdt.http](library/http.md)
+- [cdt.db](library/db.md)
 
 # Practical Guides
 - [Working with Errors](guides/working-with-errors.md)

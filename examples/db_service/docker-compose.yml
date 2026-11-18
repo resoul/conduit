@@ -1,0 +1,29 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: conduit
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: conduit_demo
+    ports:
+      - "15432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U conduit -d conduit_demo"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+
+  mysql:
+    image: mariadb:11.8.2
+    environment:
+      MARIADB_ROOT_PASSWORD: secret
+      MARIADB_USER: conduit
+      MARIADB_PASSWORD: secret
+      MARIADB_DATABASE: conduit_demo
+    ports:
+      - "13306:3306"
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 3s
+      timeout: 3s
+      retries: 15

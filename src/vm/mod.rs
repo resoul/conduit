@@ -1,5 +1,6 @@
 pub mod exec;
 pub(crate) mod exec_cold;
+pub mod exec_db;
 pub(crate) mod exec_fs;
 pub(crate) mod exec_http;
 pub(crate) mod exec_map;
@@ -78,6 +79,7 @@ pub struct Vm {
     pub(crate) fs_readers: Vec<Option<std::io::BufReader<std::fs::File>>>,
     pub(crate) fs_writers: Vec<Option<std::io::BufWriter<std::fs::File>>>,
     pub(crate) routers: Vec<crate::native::http::RouterState>,
+    pub(crate) db_conns: Vec<Option<crate::native::db::SqlConn>>,
     pub(crate) cached_http_req: Option<(Arc<StructData>, Arc<StructData>)>,
 }
 
@@ -91,6 +93,7 @@ impl Vm {
             fs_readers: Vec::new(),
             fs_writers: Vec::new(),
             routers: Vec::new(),
+            db_conns: Vec::new(),
             cached_http_req: None,
         }
     }
@@ -128,6 +131,13 @@ impl Vm {
                 }
             }
         }
+    }
+
+    pub fn open_db(&mut self, url: &str) -> Result<usize, crate::native::db::DbErr> {
+        let conn = crate::native::db::SqlConn::open(url)?;
+        let id = self.db_conns.len();
+        self.db_conns.push(Some(conn));
+        Ok(id)
     }
 
     pub fn call_scalar(

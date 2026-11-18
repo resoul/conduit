@@ -161,6 +161,7 @@ pub const EXT_MATH_OP: u8 = 38;
 pub const EXT_LOG_OP: u8 = 39;
 pub const EXT_LIST_AGG: u8 = 40;
 pub const EXT_HTTP_OP: u8 = 41;
+pub const EXT_DB_OP: u8 = 42;
 
 #[cfg(test)]
 mod tests {

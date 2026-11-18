@@ -125,9 +125,12 @@ impl<'a> Checker<'a> {
                 if self.checked.http_aliases.contains(mod_alias) {
                     return self.check_http_call(field, type_args, args, named_args);
                 }
+                if self.checked.db_aliases.contains(mod_alias) {
+                    return self.check_db_call(field, type_args, args, named_args);
+                }
             }
             self.check_expr(target, None)?;
-            return self.check_method_call(target, field, args, named_args);
+            return self.check_method_call(target, field, type_args, args, named_args);
         }
 
         if let ExprKind::Ident(name) = &callee.kind
@@ -258,6 +261,14 @@ impl<'a> Checker<'a> {
                     let sym = self.checked.http_direct_types[name].clone();
                     return self.check_http_call(&sym, type_args, args, named_args);
                 }
+                _ if self.checked.db_direct_fns.contains_key(name) => {
+                    let sym = self.checked.db_direct_fns[name].clone();
+                    return self.check_db_call(&sym, type_args, args, named_args);
+                }
+                _ if self.checked.db_direct_types.contains_key(name) => {
+                    let sym = self.checked.db_direct_types[name].clone();
+                    return self.check_db_call(&sym, type_args, args, named_args);
+                }
                 _ if self.checked.generic_structs.contains_key(name) => {
                     let base = name.clone();
                     let mono = crate::frontend::monomorph::check_generic_struct_ctor(
@@ -382,6 +393,7 @@ impl<'a> Checker<'a> {
         &mut self,
         target: &Expr,
         method: &str,
+        type_args: &[TypeExpr],
         args: &mut [Expr],
         named_args: &[NamedArg],
     ) -> Result<Type, String> {
@@ -390,6 +402,11 @@ impl<'a> Checker<'a> {
                 "Method '{}' does not accept named arguments",
                 method
             ));
+        }
+        if !type_args.is_empty()
+            && !matches!(&target.ty, Type::Custom(tid) if matches!(tid.module, ModuleId::Native(_)))
+        {
+            return Err(format!("Method '.{}()' does not accept type arguments", method));
         }
         match (&target.ty, method) {
             (Type::List(_), "len") | (Type::String, "len") | (Type::Map(_, _), "len") => {
@@ -700,7 +717,7 @@ impl<'a> Checker<'a> {
                 Ok(expected)
             }
             (Type::Custom(tid), m) if matches!(tid.module, ModuleId::Native(_)) => {
-                self.check_native_method(tid, m, args)
+                self.check_native_method(tid, m, type_args, args)
             }
             (ty, m) => Err(format!("Type {} has no method '.{}()'", ty, m)),
         }

@@ -67,3 +67,13 @@ conduit watch main.cdt
 ```
 
 Polls `.cdt` files in the project directory and automatically stops, recompiles, and restarts `conduit run` whenever any file changes.
+
+### Managing Database Migrations (`conduit db`)
+
+```bash
+conduit db status main.cdt --url postgres://conduit:secret@127.0.0.1:5432/app
+conduit db migrate main.cdt --url postgres://conduit:secret@127.0.0.1:5432/app [--dry-run]
+conduit db rollback main.cdt --url postgres://conduit:secret@127.0.0.1:5432/app [--steps 1] [--dry-run]
+```
+
+Inspects, applies, or rolls back declarative `migration <version> "<name>"` blocks against PostgreSQL or MySQL, tracking applied versions in `schema_migrations`.

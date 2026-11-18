@@ -48,6 +48,7 @@ fn is_native_mod(path: &str) -> bool {
             | "cdt.math"
             | "cdt.log"
             | "cdt.http"
+            | "cdt.db"
     )
 }
 

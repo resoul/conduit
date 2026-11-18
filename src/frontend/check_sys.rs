@@ -175,7 +175,8 @@ impl Checker<'_> {
                     crypto_err,
                 )
             }
-            "sha256" | "base64_encode" | "base64_decode" | "hex_encode" | "hex_decode" => {
+            "sha256" | "base64_encode" | "base64_decode" | "hex_encode" | "hex_decode"
+            | "hash_password" => {
                 if !type_args.is_empty() || !named_args.is_empty() || args.len() != 1 {
                     return Err(format!("crypto.{}(data) expects 1 String argument", sym));
                 }
@@ -183,11 +184,28 @@ impl Checker<'_> {
                 if args[0].ty != Type::String {
                     return Err(format!("crypto.{} expects String, got {}", sym, args[0].ty));
                 }
-                if matches!(sym, "base64_decode" | "hex_decode") {
+                if matches!(sym, "base64_decode" | "hex_decode" | "hash_password") {
                     Ok(Type::union(vec![Type::String, crypto_err]))
                 } else {
                     Ok(Type::String)
                 }
+            }
+            "verify_password" | "constant_time_eq" => {
+                if !type_args.is_empty() || !named_args.is_empty() || args.len() != 2 {
+                    return Err(format!("crypto.{}(a, b) expects 2 String arguments", sym));
+                }
+                for (i, arg) in args.iter_mut().enumerate() {
+                    self.check_expr(arg, Some(&Type::String))?;
+                    if arg.ty != Type::String {
+                        return Err(format!(
+                            "crypto.{} argument {} expects String, got {}",
+                            sym,
+                            i + 1,
+                            arg.ty
+                        ));
+                    }
+                }
+                Ok(Type::Bool)
             }
             "hmac_sha256" => {
                 if !type_args.is_empty() || !named_args.is_empty() || args.len() != 2 {
@@ -1024,4 +1042,182 @@ fn ensure_http_router_plan(
     }
     checked.http_router_plans.push((router_name.to_string(), entries));
     Ok(())
+}
+
+impl Checker<'_> {
+    pub(crate) fn check_db_call(
+        &mut self,
+        sym: &str,
+        type_args: &[TypeExpr],
+        args: &mut [Expr],
+        named_args: &mut [NamedArg],
+    ) -> Result<Type, String> {
+        let db_err = Type::Custom(TypeId::native("cdt.db", "DbError"));
+        let db_conn = Type::Custom(TypeId::native("cdt.db", "Connection"));
+        let db_param = Type::Custom(TypeId::native("cdt.db", "Param"));
+        match sym {
+            "DbError" => {
+                if !type_args.is_empty() {
+                    return Err("DbError does not accept type arguments".to_string());
+                }
+                check_fields_ctor(
+                    self,
+                    "DbError",
+                    &[
+                        ("kind", Type::String),
+                        ("message", Type::String),
+                        ("code", Type::String),
+                    ],
+                    args,
+                    named_args,
+                    db_err,
+                )
+            }
+            "connect" => {
+                if !type_args.is_empty() || !named_args.is_empty() || args.len() != 1 {
+                    return Err("db.connect(url) expects 1 String argument".to_string());
+                }
+                self.check_expr(&mut args[0], Some(&Type::String))?;
+                if args[0].ty != Type::String {
+                    return Err(format!("db.connect expects String, got {}", args[0].ty));
+                }
+                Ok(Type::union(vec![db_conn, db_err]))
+            }
+            "null" => {
+                if !type_args.is_empty() || !named_args.is_empty() || !args.is_empty() {
+                    return Err("db.null() takes 0 arguments".to_string());
+                }
+                Ok(db_param)
+            }
+            "int" | "float" | "bool" | "text" => {
+                if !type_args.is_empty() || !named_args.is_empty() || args.len() != 1 {
+                    return Err(format!("db.{}(val) expects 1 argument", sym));
+                }
+                let expected = match sym {
+                    "int" => Type::Int,
+                    "float" => Type::Float,
+                    "bool" => Type::Bool,
+                    _ => Type::String,
+                };
+                self.check_expr(&mut args[0], Some(&expected))?;
+                if args[0].ty != expected {
+                    return Err(format!("db.{} expects {}, got {}", sym, expected, args[0].ty));
+                }
+                Ok(db_param)
+            }
+            other => Err(format!("Unknown cdt.db symbol '{}'", other)),
+        }
+    }
+
+    fn check_sql_and_opt_params(
+        &mut self,
+        method: &str,
+        args: &mut [Expr],
+    ) -> Result<(), String> {
+        if !(1..=2).contains(&args.len()) {
+            return Err(format!(
+                "Connection.{}(sql, params?) expects 1 or 2 arguments",
+                method
+            ));
+        }
+        self.check_expr(&mut args[0], Some(&Type::String))?;
+        if args[0].ty != Type::String {
+            return Err(format!(
+                "Connection.{} sql expects String, got {}",
+                method, args[0].ty
+            ));
+        }
+        if args.len() == 2 {
+            let expected = Type::List(Box::new(Type::Custom(TypeId::native("cdt.db", "Param"))));
+            self.check_expr(&mut args[1], Some(&expected))?;
+            if args[1].ty != expected {
+                return Err(format!(
+                    "Connection.{} params expects [db.Param], got {}",
+                    method, args[1].ty
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn check_db_method(
+        &mut self,
+        type_name: &str,
+        method: &str,
+        type_args: &[TypeExpr],
+        args: &mut [Expr],
+    ) -> Result<Type, String> {
+        if type_name != "Connection" {
+            return Err(format!("Type 'db.{}' has no method '.{}()'", type_name, method));
+        }
+        let db_err = Type::Custom(TypeId::native("cdt.db", "DbError"));
+        match method {
+            "exec" => {
+                if !type_args.is_empty() {
+                    return Err("Connection.exec() does not accept type arguments".to_string());
+                }
+                self.check_sql_and_opt_params("exec", args)?;
+                Ok(Type::union(vec![Type::Int, db_err]))
+            }
+            "query" => {
+                if type_args.len() != 1 {
+                    return Err("Connection.query<T>(sql, params?) expects 1 type argument".to_string());
+                }
+                let target_ty = self.checked.resolve_type_mut(&type_args[0])?;
+                let Type::Custom(tid) = &target_ty else {
+                    return Err(format!(
+                        "Connection.query<T>() requires a struct type, got {}",
+                        target_ty
+                    ));
+                };
+                if tid.module != ModuleId::Program || !self.checked.struct_by_name.contains_key(&tid.name) {
+                    return Err(format!(
+                        "Connection.query<T>() requires a program struct type, got {}",
+                        target_ty
+                    ));
+                }
+                self.check_sql_and_opt_params("query", args)?;
+                Ok(Type::union(vec![Type::List(Box::new(target_ty)), db_err]))
+            }
+            "query_rows" => {
+                if !type_args.is_empty() {
+                    return Err("Connection.query_rows() does not accept type arguments".to_string());
+                }
+                self.check_sql_and_opt_params("query_rows", args)?;
+                let row_map = Type::Map(Box::new(Type::String), Box::new(Type::String));
+                Ok(Type::union(vec![Type::List(Box::new(row_map)), db_err]))
+            }
+            "begin" | "commit" | "rollback" => {
+                if !type_args.is_empty() || !args.is_empty() {
+                    return Err(format!("Connection.{}() takes 0 arguments", method));
+                }
+                Ok(Type::union(vec![Type::Void, db_err]))
+            }
+            "migrate" => {
+                if !type_args.is_empty() || !args.is_empty() {
+                    return Err("Connection.migrate() takes 0 arguments".to_string());
+                }
+                Ok(Type::union(vec![Type::Int, db_err]))
+            }
+            "dialect" => {
+                if !type_args.is_empty() || !args.is_empty() {
+                    return Err("Connection.dialect() takes 0 arguments".to_string());
+                }
+                Ok(Type::String)
+            }
+            "last_insert_id" => {
+                if !type_args.is_empty() || !args.is_empty() {
+                    return Err("Connection.last_insert_id() takes 0 arguments".to_string());
+                }
+                Ok(Type::Int)
+            }
+            "close" => {
+                if !type_args.is_empty() || !args.is_empty() {
+                    return Err("Connection.close() takes 0 arguments".to_string());
+                }
+                Ok(Type::Void)
+            }
+            other => Err(format!("db.Connection has no method '.{}()'", other)),
+        }
+    }
 }

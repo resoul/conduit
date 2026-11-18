@@ -177,6 +177,7 @@ impl Parser {
             TokenKind::KwError => self.parse_error_item(is_exported),
             TokenKind::Ident(kw) if kw == "cli" => self.parse_cli_item(is_exported),
             TokenKind::Ident(kw) if kw == "router" => self.parse_router_item(is_exported),
+            TokenKind::Ident(kw) if kw == "migration" => self.parse_migration_item(),
             TokenKind::KwImport => {
                 if is_exported {
                     return Err(ParserError {
@@ -194,6 +195,131 @@ impl Parser {
                 span: tok.span,
             }),
         }
+    }
+
+    fn parse_migration_item(&mut self) -> Result<Item, ParserError> {
+        let start_span = self.bump().span; // consume 'migration'
+        let ver_tok = self.peek().clone();
+        let version = match ver_tok.kind {
+            TokenKind::Int(v) if v >= 1 => {
+                self.bump();
+                v
+            }
+            _ => {
+                return Err(ParserError {
+                    message: "Expected positive integer migration version after 'migration'"
+                        .to_string(),
+                    span: ver_tok.span,
+                });
+            }
+        };
+        let name_tok = self.peek().clone();
+        let name = match name_tok.kind {
+            TokenKind::String(s) => {
+                self.bump();
+                s
+            }
+            _ => {
+                return Err(ParserError {
+                    message: "Expected migration name string after version".to_string(),
+                    span: name_tok.span,
+                });
+            }
+        };
+        self.expect(&TokenKind::LBrace)?;
+        let mut up_block: Option<Block> = None;
+        let mut down_block: Option<Block> = None;
+        while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
+            let kw_tok = self.peek().clone();
+            let TokenKind::Ident(kw) = &kw_tok.kind else {
+                return Err(ParserError {
+                    message: "Expected 'up' or 'down' inside migration block".to_string(),
+                    span: kw_tok.span,
+                });
+            };
+            let is_up = match kw.as_str() {
+                "up" => true,
+                "down" => false,
+                other => {
+                    return Err(ParserError {
+                        message: format!(
+                            "Expected 'up' or 'down' in migration block, got '{}'",
+                            other
+                        ),
+                        span: kw_tok.span,
+                    });
+                }
+            };
+            self.bump();
+            let block = if let TokenKind::String(sql) = &self.peek().kind {
+                let sql_str = sql.clone();
+                let sp = self.bump().span;
+                // Desugar `up "SQL"` -> `{ db.exec("SQL")? }`
+                let call = Expr::new(
+                    ExprKind::Call {
+                        callee: Box::new(Expr::new(
+                            ExprKind::Member {
+                                target: Box::new(Expr::new(
+                                    ExprKind::Ident("db".to_string()),
+                                    sp,
+                                )),
+                                field: "exec".to_string(),
+                            },
+                            sp,
+                        )),
+                        type_args: Vec::new(),
+                        args: vec![Expr::new(ExprKind::String(sql_str), sp)],
+                        named_args: Vec::new(),
+                    },
+                    sp,
+                );
+                Block {
+                    stmts: vec![Stmt::new(
+                        StmtKind::Expr(Expr::new(ExprKind::Try(Box::new(call)), sp)),
+                        sp,
+                    )],
+                    span: sp,
+                }
+            } else {
+                self.parse_block()?
+            };
+            if is_up {
+                if up_block.is_some() {
+                    return Err(ParserError {
+                        message: "Duplicate 'up' block in migration".to_string(),
+                        span: kw_tok.span,
+                    });
+                }
+                up_block = Some(block);
+            } else {
+                if down_block.is_some() {
+                    return Err(ParserError {
+                        message: "Duplicate 'down' block in migration".to_string(),
+                        span: kw_tok.span,
+                    });
+                }
+                down_block = Some(block);
+            }
+        }
+        self.expect(&TokenKind::RBrace)?;
+        let up = up_block.ok_or_else(|| ParserError {
+            message: "Migration block must define 'up'".to_string(),
+            span: start_span,
+        })?;
+        let down = down_block.unwrap_or(Block {
+            stmts: Vec::new(),
+            span: start_span,
+        });
+        Ok(Item::new_exported(
+            ItemKind::Migration {
+                version,
+                name,
+                up,
+                down,
+            },
+            start_span,
+            false,
+        ))
     }
 
     fn expect_from_keyword(&mut self) -> Result<(), ParserError> {

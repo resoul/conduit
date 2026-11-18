@@ -275,6 +275,12 @@ pub enum ItemKind {
     ExportList {
         names: Vec<ImportSpecifier>,
     },
+    Migration {
+        version: i64,
+        name: String,
+        up: Block,
+        down: Block,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

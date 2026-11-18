@@ -17,6 +17,12 @@ pub const CRYPTO_HEX_DEC: u8 = 5;
 pub const CRYPTO_UUID_V4: u8 = 6;
 pub const CRYPTO_RAND_HEX: u8 = 7;
 pub const CRYPTO_RAND_INT: u8 = 8;
+pub const CRYPTO_HASH_PASSWORD: u8 = 9;
+pub const CRYPTO_VERIFY_PASSWORD: u8 = 10;
+pub const CRYPTO_CONST_TIME_EQ: u8 = 11;
+
+pub const MAX_PBKDF2_ITERATIONS: u32 = 10_000_000;
+const DEFAULT_PBKDF2_ITERATIONS: u32 = 600_000;
 
 #[inline]
 pub fn make_crypto_error(kind: &str, message: impl Into<String>) -> Obj {
@@ -590,4 +596,175 @@ pub fn random_int(min: i64, max: i64) -> Obj {
     let v = u64::from_le_bytes(b) as u128;
     let offset = (v % span) as i128;
     Obj::boxed_int((min as i128 + offset) as i64)
+}
+
+#[inline]
+fn sha256_init_state() -> [u32; 8] {
+    [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    ]
+}
+
+#[inline]
+fn sha256_finish_with_prefix(mut h: [u32; 8], prefix_bytes: u64, data: &[u8]) -> [u8; 32] {
+    let (full_blocks, rem) = data.as_chunks::<64>();
+    sha256_compress(&mut h, full_blocks);
+
+    let mut tail = [0u8; 128];
+    tail[..rem.len()].copy_from_slice(rem);
+    tail[rem.len()] = 0x80;
+    let total_tail = if rem.len() < 56 { 64 } else { 128 };
+    let bit_len = prefix_bytes.wrapping_add(data.len() as u64).wrapping_mul(8);
+    tail[total_tail - 8..total_tail].copy_from_slice(&bit_len.to_be_bytes());
+    let tail_blocks = tail[..total_tail].as_chunks::<64>().0;
+    sha256_compress(&mut h, tail_blocks);
+
+    let mut out = [0u8; 32];
+    for (i, word) in h.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+pub fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32, out: &mut [u8]) {
+    let mut k_block = [0u8; 64];
+    if password.len() > 64 {
+        let hashed = sha256_bytes(password);
+        k_block[..32].copy_from_slice(&hashed);
+    } else {
+        k_block[..password.len()].copy_from_slice(password);
+    }
+    let mut ipad = [0x36u8; 64];
+    let mut opad = [0x5cu8; 64];
+    for i in 0..64 {
+        ipad[i] ^= k_block[i];
+        opad[i] ^= k_block[i];
+    }
+    let mut h_inner = sha256_init_state();
+    sha256_compress(&mut h_inner, std::slice::from_ref(&ipad));
+    let mut h_outer = sha256_init_state();
+    sha256_compress(&mut h_outer, std::slice::from_ref(&opad));
+
+    let iters = iterations.max(1);
+    for (index, chunk) in out.chunks_mut(32).enumerate() {
+        let mut salted = Vec::with_capacity(salt.len() + 4);
+        salted.extend_from_slice(salt);
+        salted.extend_from_slice(&(index as u32 + 1).to_be_bytes());
+
+        let inner_h = sha256_finish_with_prefix(h_inner, 64, &salted);
+        let mut u = sha256_finish_with_prefix(h_outer, 64, &inner_h);
+        let mut t = u;
+        for _ in 1..iters {
+            let ih = sha256_finish_with_prefix(h_inner, 64, &u);
+            u = sha256_finish_with_prefix(h_outer, 64, &ih);
+            for (a, b) in t.iter_mut().zip(u) {
+                *a ^= b;
+            }
+        }
+        chunk.copy_from_slice(&t[..chunk.len()]);
+    }
+}
+
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    std::hint::black_box(diff) == 0
+}
+
+pub fn hash_password(password: &str) -> Obj {
+    let mut salt = [0u8; 16];
+    if let Err(e) = fill_random_bytes(&mut salt) {
+        return make_crypto_error("rng_failed", e);
+    }
+    let mut dk = [0u8; 32];
+    pbkdf2_sha256(password.as_bytes(), &salt, DEFAULT_PBKDF2_ITERATIONS, &mut dk);
+    Obj::str(format!(
+        "pbkdf2-sha256${}${}${}",
+        DEFAULT_PBKDF2_ITERATIONS,
+        encode_hex(&salt),
+        encode_hex(&dk)
+    ))
+}
+
+pub fn verify_password(password: &str, stored: &str) -> bool {
+    let mut parts = stored.split('$');
+    let valid_parts = match (parts.next(), parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some("pbkdf2-sha256"), Some(iter_s), Some(salt_hex), Some(hash_hex), None) => {
+            if let Ok(iters) = iter_s.parse::<u32>()
+                && (1..=MAX_PBKDF2_ITERATIONS).contains(&iters)
+                && let (Some(salt), Some(expected)) = (decode_hex_bytes(salt_hex), decode_hex_bytes(hash_hex))
+                && expected.len() == 32
+            {
+                Some((iters, salt, expected))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    if let Some((iters, salt, expected)) = valid_parts {
+        let mut dk = [0u8; 32];
+        pbkdf2_sha256(password.as_bytes(), &salt, iters, &mut dk);
+        constant_time_eq(&dk, &expected)
+    } else {
+        // Burn constant-ish work even on malformed input to avoid timing leaks.
+        let mut dk = [0u8; 32];
+        pbkdf2_sha256(password.as_bytes(), &[0u8; 16], 1, &mut dk);
+        false
+    }
+}
+
+fn decode_hex_bytes(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.as_chunks::<2>().0 {
+        let hi = match pair[0] {
+            b'0'..=b'9' => pair[0] - b'0',
+            b'a'..=b'f' => pair[0] - b'a' + 10,
+            b'A'..=b'F' => pair[0] - b'A' + 10,
+            _ => return None,
+        };
+        let lo = match pair[1] {
+            b'0'..=b'9' => pair[1] - b'0',
+            b'a'..=b'f' => pair[1] - b'a' + 10,
+            b'A'..=b'F' => pair[1] - b'A' + 10,
+            _ => return None,
+        };
+        out.push((hi << 4) | lo);
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pbkdf2_rfc6070_vector() {
+        let mut out = [0u8; 32];
+        pbkdf2_sha256(b"password", b"salt", 4096, &mut out);
+        assert_eq!(
+            encode_hex(&out),
+            "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a"
+        );
+    }
+
+    #[test]
+    fn password_hash_and_verify_roundtrip() {
+        let Obj::Str(h) = hash_password("s3cr3t!") else {
+            panic!("expected hashed string");
+        };
+        assert!(verify_password("s3cr3t!", h.as_str()));
+        assert!(!verify_password("wrong", h.as_str()));
+        assert!(!verify_password("s3cr3t!", "bad$format"));
+    }
 }

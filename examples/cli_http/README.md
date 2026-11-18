@@ -5,7 +5,7 @@ A full-featured, zero-dependency HTTP/1.1 CLI client, router server, and Conduit
 ## Local Usage
 
 ```bash
-cd examples/http_client
+cd examples/cli_http
 
 # Format & type-check
 conduit fmt .
@@ -33,7 +33,7 @@ conduit run main.cdt -- post http://127.0.0.1:8080/shutdown
 ## Docker Compose
 
 ```bash
-cd examples/http_client
+cd examples/cli_http
 
 # Development with auto-reload (conduit watch)
 docker compose up dev

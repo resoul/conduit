@@ -1407,3 +1407,64 @@ fn cdt_http_server_graceful_shutdown_e2e() {
     let srv_ret = srv_handle.join().unwrap();
     assert_eq!(srv_ret, Obj::Empty);
 }
+
+#[test]
+fn cdt_db_migrations_bundle_and_crypto_passwords_e2e() {
+    use crate::ir::bundle::{decode_bundle, encode_bundle};
+
+    let src = r#"
+    import * as db from "cdt.db"
+    import * as crypto from "cdt.crypto"
+
+    migration 1 "init" {
+        up {
+            db.exec("CREATE TABLE items (id SERIAL PRIMARY KEY, label TEXT NOT NULL)")?
+        }
+        down {
+            db.exec("DROP TABLE items")?
+        }
+    }
+
+    migration 2 "seed" {
+        up "INSERT INTO items (id, label) VALUES (1, 'first')"
+        down "DELETE FROM items WHERE id = 1"
+    }
+
+    export func main() -> String | crypto.CryptoError {
+        pw_hash := crypto.hash_password("hunter2")?
+        ok1 := crypto.verify_password("hunter2", pw_hash)
+        ok2 := crypto.verify_password("wrong", pw_hash)
+        eq := crypto.constant_time_eq("abc", "abc")
+        return "{ok1}:{ok2}:{eq}"
+    }
+
+    export func bad_url() -> String | db.DbError {
+        _conn := db.connect("sqlite::memory:")?
+        return "unreachable"
+    }
+    "#;
+    let (mut prog, checked) = crate::frontend::check_source(src).unwrap();
+    let module = crate::ir::lower::compile_program(&prog, &checked).unwrap();
+    module.validate().unwrap();
+    let main_fid = checked.func_by_name["main"];
+    let bytes = encode_bundle(&module, main_fid, 1).unwrap();
+    let (decoded_mod, _, _) = decode_bundle(&bytes).unwrap();
+    assert_eq!(decoded_mod.migrations.len(), 2);
+    assert_eq!(decoded_mod.migrations[0].version, 1);
+    assert_eq!(decoded_mod.migrations[1].version, 2);
+
+    let mut vm = Vm::new();
+    let out = vm
+        .call_obj(&decoded_mod, decoded_mod.func_id("main").unwrap(), &[], &[])
+        .unwrap();
+    assert_eq!(out, Obj::str("true:false:true"));
+
+    let bad = vm
+        .call_obj(&decoded_mod, decoded_mod.func_id("bad_url").unwrap(), &[], &[])
+        .unwrap();
+    let Obj::Record(rec) = bad else {
+        panic!("expected DbError record, got {bad:?}");
+    };
+    assert_eq!(rec.schema_id, crate::vm::value::SCHEMA_DB_ERROR);
+    let _ = &mut prog;
+}

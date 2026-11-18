@@ -20,6 +20,7 @@ fn is_native_module(path: &str) -> bool {
             | "cdt.math"
             | "cdt.log"
             | "cdt.http"
+            | "cdt.db"
     )
 }
 
@@ -69,7 +70,7 @@ fn collect_local_defs(items: &[Item]) -> HashSet<String> {
             | ItemKind::Error { name, .. } => {
                 defs.insert(name.clone());
             }
-            ItemKind::Import { .. } | ItemKind::ExportList { .. } => {}
+            ItemKind::Import { .. } | ItemKind::ExportList { .. } | ItemKind::Migration { .. } => {}
         }
     }
     defs
@@ -87,7 +88,7 @@ fn rename_item_decl(item: &mut Item, rename: &HashMap<String, String>) {
                 *name = new_name.clone();
             }
         }
-        ItemKind::Import { .. } | ItemKind::ExportList { .. } => {}
+        ItemKind::Import { .. } | ItemKind::ExportList { .. } | ItemKind::Migration { .. } => {}
     }
 }
 
@@ -264,7 +265,7 @@ fn load_module(
                         exports.insert(spec.alias.clone(), resolved.clone());
                     }
                 }
-                ItemKind::Import { .. } => {}
+                ItemKind::Import { .. } | ItemKind::Migration { .. } => {}
             }
         }
     }
@@ -391,6 +392,12 @@ fn rewrite_items(items: &mut [Item], env: &RewriteEnv) -> Result<(), String> {
                         spec.name = mapped.clone();
                     }
                 }
+            }
+            ItemKind::Migration { up, down, .. } => {
+                let mut up_scopes = vec![HashSet::from(["db".to_string()])];
+                rewrite_block_stmts(up, env, &mut up_scopes)?;
+                let mut down_scopes = vec![HashSet::from(["db".to_string()])];
+                rewrite_block_stmts(down, env, &mut down_scopes)?;
             }
             ItemKind::Enum { .. } | ItemKind::Import { .. } => {}
         }

@@ -106,6 +106,7 @@ fn main() {
         Some("run") => run_exec_cmd(&args[1..]),
         Some("watch") => watch::run_watch_cmd(&args[1..]),
         Some("fmt") => run_fmt_cmd(&args[1..]),
+        Some("db") => run_db_cmd(&args[1..]),
         Some("lsp") => {
             if let Err(e) = conduit::lsp::run_lsp_server() {
                 eprintln!("LSP error: {}", e);
@@ -117,12 +118,12 @@ fn main() {
         }
         Some("--help" | "-h" | "help") => {
             println!(
-                "Conduit v{}\n\nUsage:\n  conduit bench [--filter <pat>] [--strict]\n  conduit build <file.cdt> [-o <output>]\n  conduit check <file.cdt>\n  conduit disasm <file.cdt>\n  conduit fmt <file_or_dir> [--check]\n  conduit run <file.cdt> [-- args...]\n  conduit watch <file.cdt> [-- args...]\n  conduit lsp\n  conduit --version, -V\n  conduit --help, -h",
+                "Conduit v{}\n\nUsage:\n  conduit bench [--filter <pat>] [--strict]\n  conduit build <file.cdt> [-o <output>]\n  conduit check <file.cdt>\n  conduit db <migrate|rollback|status> <file.cdt> [--url <dsn>] [--steps <n>] [--dry-run]\n  conduit disasm <file.cdt>\n  conduit fmt <file_or_dir> [--check]\n  conduit run <file.cdt> [-- args...]\n  conduit watch <file.cdt> [-- args...]\n  conduit lsp\n  conduit --version, -V\n  conduit --help, -h",
                 env!("CARGO_PKG_VERSION")
             );
         }
         Some(cmd) => {
-            eprintln!("Unknown command '{}'. Usage: conduit <bench|build|check|disasm|fmt|run|watch|lsp> ...", cmd);
+            eprintln!("Unknown command '{}'. Usage: conduit <bench|build|check|db|disasm|fmt|run|watch|lsp> ...", cmd);
             process::exit(2);
         }
     }
@@ -150,6 +151,149 @@ fn run_fmt_cmd(args: &[String]) {
             eprintln!("Format error: {}", e);
             process::exit(1);
         }
+    }
+}
+
+fn run_db_cmd(args: &[String]) {
+    use conduit::vm::exec_db::{
+        EitherMigErr, db_migration_status_at, rollback_db_migrations_at, run_db_migrations_at,
+    };
+    let Some(sub) = args.first().map(|s| s.as_str()) else {
+        eprintln!("Usage: conduit db <migrate|rollback|status> <file.cdt> [--url <dsn>] [--steps <n>] [--dry-run]");
+        process::exit(2);
+    };
+    if !matches!(sub, "migrate" | "rollback" | "status") {
+        eprintln!("Unknown db subcommand '{}'. Expected: migrate, rollback, or status", sub);
+        process::exit(2);
+    }
+    let mut file: Option<String> = None;
+    let mut url: Option<String> = None;
+    let mut steps: usize = 1;
+    let mut dry_run = false;
+    let mut i = 1usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--url" => {
+                i += 1;
+                if i < args.len() {
+                    url = Some(args[i].clone());
+                } else {
+                    eprintln!("Missing DSN after --url");
+                    process::exit(2);
+                }
+            }
+            "--steps" => {
+                i += 1;
+                if i < args.len() {
+                    steps = args[i].parse().unwrap_or_else(|_| {
+                        eprintln!("Invalid --steps '{}'", args[i]);
+                        process::exit(2);
+                    });
+                } else {
+                    eprintln!("Missing number after --steps");
+                    process::exit(2);
+                }
+            }
+            "--dry-run" => dry_run = true,
+            arg if !arg.starts_with('-') && file.is_none() => file = Some(arg.to_string()),
+            other => {
+                eprintln!("Unknown argument '{}' in conduit db {}", other, sub);
+                process::exit(2);
+            }
+        }
+        i += 1;
+    }
+    let Some(file_str) = file else {
+        eprintln!("Usage: conduit db {} <file.cdt> [--url <dsn>] [--steps <n>] [--dry-run]", sub);
+        process::exit(2);
+    };
+    let dsn = url.or_else(|| env::var("DATABASE_URL").ok()).unwrap_or_else(|| {
+        eprintln!("Missing database URL: pass --url <dsn> or set DATABASE_URL");
+        process::exit(2);
+    });
+    let (program, checked) = match frontend::check_file(Path::new(&file_str)) {
+        Ok(res) => res,
+        Err(e) => {
+            eprintln!("Check error: {}", e);
+            process::exit(1);
+        }
+    };
+    let module = match compile_program(&program, &checked) {
+        Ok(m) => {
+            if let Err(e) = m.validate() {
+                eprintln!("Validation error: {}", e);
+                process::exit(1);
+            }
+            m
+        }
+        Err(e) => {
+            eprintln!("Compile error: {}", e);
+            process::exit(1);
+        }
+    };
+    let mut vm = Vm::new();
+    let cid = match vm.open_db(&dsn) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("Database connection error: {}", e.message);
+            process::exit(1);
+        }
+    };
+    let format_mig_err = |e: EitherMigErr| -> String {
+        match e {
+            EitherMigErr::Db(d) => d.message,
+            EitherMigErr::Vm(v) => v.message,
+        }
+    };
+    match sub {
+        "migrate" => match run_db_migrations_at(&mut vm, &module, cid, 0, 0, dry_run) {
+            Ok(list) if list.is_empty() => println!("No pending migrations."),
+            Ok(list) => {
+                for (ver, name) in &list {
+                    if dry_run {
+                        println!("[dry-run] would apply {} '{}'", ver, name);
+                    } else {
+                        println!("Applied {} '{}'", ver, name);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Migration error: {}", format_mig_err(e));
+                process::exit(1);
+            }
+        },
+        "rollback" => match rollback_db_migrations_at(&mut vm, &module, cid, steps, dry_run) {
+            Ok(list) if list.is_empty() => println!("No applied migrations to rollback."),
+            Ok(list) => {
+                for (ver, name) in &list {
+                    if dry_run {
+                        println!("[dry-run] would rollback {} '{}'", ver, name);
+                    } else {
+                        println!("Rolled back {} '{}'", ver, name);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Rollback error: {}", format_mig_err(e));
+                process::exit(1);
+            }
+        },
+        "status" => match db_migration_status_at(&vm, &module, cid) {
+            Ok(rows) if rows.is_empty() => println!("No migrations defined."),
+            Ok(rows) => {
+                for (ver, name, applied_at) in rows {
+                    match applied_at {
+                        Some(ts) => println!("[applied @ {}] {} '{}'", ts, ver, name),
+                        None => println!("[pending] {} '{}'", ver, name),
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Status error: {}", e.message);
+                process::exit(1);
+            }
+        },
+        _ => unreachable!(),
     }
 }
 

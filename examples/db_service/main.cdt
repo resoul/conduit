@@ -1,0 +1,72 @@
+import * as db from "cdt.db"
+import { text, bool } from "cdt.db"
+import * as crypto from "cdt.crypto"
+import * as env from "cdt.env"
+
+struct User {
+    id: Int
+    email: String
+    pw_hash: String
+    active: Bool
+    bio: String?
+}
+
+migration 1 "create_users" {
+    up {
+        d := db.dialect()
+        if d == "mysql" {
+            db.exec("CREATE TABLE IF NOT EXISTS users (id BIGINT AUTO_INCREMENT PRIMARY KEY, email VARCHAR(255) NOT NULL UNIQUE, pw_hash TEXT NOT NULL, active BOOLEAN NOT NULL, bio TEXT)")?
+        } else {
+            db.exec("CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, email TEXT NOT NULL UNIQUE, pw_hash TEXT NOT NULL, active BOOLEAN NOT NULL, bio TEXT)")?
+        }
+    }
+    down {
+        db.exec("DROP TABLE IF EXISTS users")?
+    }
+}
+
+migration 2 "seed_admin" {
+    up {
+        db.exec(
+            "INSERT INTO users (email, pw_hash, active, bio) VALUES (?, ?, ?, ?)",
+            [text("admin@example.com"), text("seeded"), bool(true), text("System administrator")],
+        )?
+    }
+    down {
+        db.exec("DELETE FROM users WHERE email = ?", [text("admin@example.com")])?
+    }
+}
+
+export func main() -> Void | db.DbError | crypto.CryptoError | env.EnvError {
+    dsn := env.require("DATABASE_URL")?
+    conn := db.connect(dsn)?
+    applied := conn.migrate()?
+
+    d := conn.dialect()
+    print("Connected to {d}, applied {applied} migration(s)")
+
+    pw_hash := crypto.hash_password("hunter2")?
+    conn.exec(
+        "INSERT INTO users (email, pw_hash, active, bio) VALUES (?, ?, ?, ?)",
+        [db.text("alice@example.com"), db.text(pw_hash), db.bool(true), db.null()],
+    )?
+
+    // Demonstrate transaction rollback
+    conn.begin()?
+    conn.exec(
+        "INSERT INTO users (email, pw_hash, active) VALUES (?, ?, ?)",
+        [db.text("temp@example.com"), db.text("x"), db.bool(false)],
+    )?
+    conn.rollback()?
+
+    users := conn.query<User>("SELECT id, email, pw_hash, active, bio FROM users ORDER BY id")?
+    for u in users {
+        uid := u.id
+        uemail := u.email
+        uactive := u.active
+        ok := crypto.verify_password("hunter2", u.pw_hash)
+        print("user[{uid}] email={uemail} active={uactive} pw_match={ok}")
+    }
+
+    conn.close()
+}

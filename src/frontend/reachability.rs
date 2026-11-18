@@ -96,6 +96,20 @@ pub fn shake_unreachable_funcs(
             }
         }
     }
+    for item in &program.items {
+        if let ItemKind::Migration { up, down, .. } = &item.kind {
+            let mut up_scopes = vec![HashSet::from(["db".to_string()])];
+            let mut refs = Vec::new();
+            collect_block_refs(up, checked, &struct_fields, &mut up_scopes, &mut refs);
+            let mut down_scopes = vec![HashSet::from(["db".to_string()])];
+            collect_block_refs(down, checked, &struct_fields, &mut down_scopes, &mut refs);
+            for target in refs {
+                if reachable.insert(target.clone()) {
+                    queue.push_back(target);
+                }
+            }
+        }
+    }
 
     while let Some(fname) = queue.pop_front() {
         let Some(&(params, body)) = func_bodies.get(fname.as_str()) else {
@@ -377,7 +391,8 @@ pub(crate) fn expand_program_aliases(
             | ItemKind::Const { .. }
             | ItemKind::Enum { .. }
             | ItemKind::Import { .. }
-            | ItemKind::ExportList { .. } => {}
+            | ItemKind::ExportList { .. }
+            | ItemKind::Migration { .. } => {}
         }
     }
     Ok(())

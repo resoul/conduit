@@ -103,6 +103,59 @@ impl<'a> ModuleCompiler<'a> {
                 fn_idx += 1;
             }
         }
+
+        let db_conn_ty =
+            Type::Custom(crate::frontend::types::TypeId::native("cdt.db", "Connection"));
+        let db_err_ty =
+            Type::Custom(crate::frontend::types::TypeId::native("cdt.db", "DbError"));
+        let mig_ret_ty = Type::union(vec![Type::Void, db_err_ty]);
+        let db_param = Param {
+            name: "db".to_string(),
+            ty: TypeExpr::Named("Connection".to_string()),
+            default: None,
+            span: crate::frontend::lexer::Span::new(0, 0),
+        };
+        for item in &program.items {
+            if let ItemKind::Migration {
+                version,
+                name,
+                up,
+                down,
+            } = &item.kind
+            {
+                let up_proto = self.lower_function(
+                    &format!("__cdt_mig_{}_up", version),
+                    std::slice::from_ref(&db_param),
+                    std::slice::from_ref(&db_conn_ty),
+                    &mig_ret_ty,
+                    up,
+                    &[],
+                    &[],
+                )?;
+                let up_func_id = self.module.functions.len() as u32;
+                self.module.functions.push(up_proto);
+
+                let down_proto = self.lower_function(
+                    &format!("__cdt_mig_{}_down", version),
+                    std::slice::from_ref(&db_param),
+                    std::slice::from_ref(&db_conn_ty),
+                    &mig_ret_ty,
+                    down,
+                    &[],
+                    &[],
+                )?;
+                let down_func_id = self.module.functions.len() as u32;
+                self.module.functions.push(down_proto);
+
+                self.module.migrations.push(crate::ir::MigrationPlan {
+                    version: *version,
+                    name: name.clone(),
+                    up_func_id,
+                    down_func_id,
+                });
+            }
+        }
+        self.module.migrations.sort_by_key(|m| m.version);
         Ok(())
     }
 
@@ -128,6 +181,7 @@ impl<'a> ModuleCompiler<'a> {
         lowerer.prealloc_block(body);
         lowerer.finalize_prealloc();
         lowerer.emit_upvalue_prologue(scalar_upvalues, obj_upvalues);
+        lowerer.flush_hoisted_constants_if_outer()?;
         lowerer.lower_block_stmts(&body.stmts)?;
         lowerer.ensure_trailing_return(return_ty);
 

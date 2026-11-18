@@ -74,6 +74,14 @@ pub struct PipelinePlan {
     pub out_elem_kind: ElemKind,
 }
 
+#[derive(Debug, Clone)]
+pub struct MigrationPlan {
+    pub version: i64,
+    pub name: String,
+    pub up_func_id: u32,
+    pub down_func_id: u32,
+}
+
 #[derive(Debug, Default)]
 pub struct Module {
     pub functions: Vec<FunctionProto>,
@@ -88,6 +96,7 @@ pub struct Module {
     pub validation_plans: Vec<crate::native::validation::ValidationStructPlan>,
     pub env_plans: Vec<crate::native::env::EnvLoadPlan>,
     pub cli_plans: Vec<crate::native::cli::CliPlan>,
+    pub migrations: Vec<MigrationPlan>,
 }
 
 impl Module {
@@ -719,23 +728,33 @@ impl Module {
                                     _ => return Err(format!("{}: invalid process sub-op {}", ctx, aux)),
                                 }
                             }
-                            crate::vm::opcode::EXT_CRYPTO_OP => {
-                                check_o(a, &ctx)?;
-                                match aux {
-                                    0 | 2..=5 => check_o(b, &ctx)?,
-                                    1 => {
-                                        check_o(b, &ctx)?;
-                                        check_o(c, &ctx)?;
-                                    }
-                                    6 => {}
-                                    7 => check_s(b, &ctx)?,
-                                    8 => {
-                                        check_s(b, &ctx)?;
-                                        check_s(c, &ctx)?;
-                                    }
-                                    _ => return Err(format!("{}: invalid crypto sub-op {}", ctx, aux)),
+                            crate::vm::opcode::EXT_CRYPTO_OP => match aux {
+                                0 | 2..=5 | 9 => {
+                                    check_o(a, &ctx)?;
+                                    check_o(b, &ctx)?;
                                 }
-                            }
+                                1 => {
+                                    check_o(a, &ctx)?;
+                                    check_o(b, &ctx)?;
+                                    check_o(c, &ctx)?;
+                                }
+                                6 => check_o(a, &ctx)?,
+                                7 => {
+                                    check_o(a, &ctx)?;
+                                    check_s(b, &ctx)?;
+                                }
+                                8 => {
+                                    check_o(a, &ctx)?;
+                                    check_s(b, &ctx)?;
+                                    check_s(c, &ctx)?;
+                                }
+                                10 | 11 => {
+                                    check_s(a, &ctx)?;
+                                    check_o(b, &ctx)?;
+                                    check_o(c, &ctx)?;
+                                }
+                                _ => return Err(format!("{}: invalid crypto sub-op {}", ctx, aux)),
+                            },
                             crate::vm::opcode::EXT_PIPELINE_REDUCE => {
                                 check_s(a, &ctx)?;
                                 check_o(b, &ctx)?;
@@ -822,10 +841,38 @@ impl Module {
                                 }
                                 _ => return Err(format!("Invalid http aux {}", aux)),
                             },
+                            crate::vm::opcode::EXT_DB_OP => match aux {
+                                0 | 5 | 6 | 9..=12 | 14 => {
+                                    check_o(a, &ctx)?;
+                                    check_o(b, &ctx)?;
+                                }
+                                1 => check_o(a, &ctx)?,
+                                2..=4 => {
+                                    check_o(a, &ctx)?;
+                                    check_s(b, &ctx)?;
+                                }
+                                7 | 8 | 15 => {
+                                    check_o(a, &ctx)?;
+                                    check_o(b, &ctx)?;
+                                    check_o(c, &ctx)?;
+                                }
+                                13 => {
+                                    check_s(a, &ctx)?;
+                                    check_o(b, &ctx)?;
+                                }
+                                _ => return Err(format!("Invalid db aux {}", aux)),
+                            },
                             _ => return Err(format!("Invalid ExtOp kind {}", kind)),
                         }
                     }
                 }
+            }
+        }
+        for mig in &self.migrations {
+            if (mig.up_func_id as usize) >= self.functions.len()
+                || (mig.down_func_id as usize) >= self.functions.len()
+            {
+                return Err(format!("Migration {} '{}' func_id out of bounds", mig.version, mig.name));
             }
         }
         Ok(())

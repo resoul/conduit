@@ -5,8 +5,9 @@ use crate::frontend::types::{ModuleId, Type, TypeId};
 use crate::ir::lower::FnLowerer;
 use crate::ir::{FunctionProto, RecordDesc};
 use crate::native::crypto::{
-    CRYPTO_B64_DEC, CRYPTO_B64_ENC, CRYPTO_HEX_DEC, CRYPTO_HEX_ENC, CRYPTO_HMAC_SHA256,
-    CRYPTO_RAND_HEX, CRYPTO_RAND_INT, CRYPTO_SHA256, CRYPTO_UUID_V4,
+    CRYPTO_B64_DEC, CRYPTO_B64_ENC, CRYPTO_CONST_TIME_EQ, CRYPTO_HASH_PASSWORD, CRYPTO_HEX_DEC,
+    CRYPTO_HEX_ENC, CRYPTO_HMAC_SHA256, CRYPTO_RAND_HEX, CRYPTO_RAND_INT, CRYPTO_SHA256,
+    CRYPTO_UUID_V4, CRYPTO_VERIFY_PASSWORD,
 };
 use crate::native::fs::{
     FS_APPEND_TEXT, FS_COPY, FS_EACH_LINE, FS_EXISTS, FS_IS_DIR, FS_IS_FILE, FS_LIST_DIR,
@@ -30,11 +31,12 @@ use crate::vm::opcode::{
     EXT_ENV_LOAD, EXT_ENV_REQUIRE, EXT_FS_BINARY, EXT_FS_UNARY, EXT_LIST_FIRST, EXT_LIST_LAST,
     EXT_LIST_SORT, EXT_MAP_ENTRIES, EXT_MAP_GET, EXT_MAP_KEYS, EXT_MAP_REMOVE, EXT_MAP_VALUES,
     EXT_PATH_OP, EXT_PROCESS_OP, EXT_STR_SPLIT, EXT_STR_TO_FLOAT, EXT_STR_TO_INT, EXT_URL_OP,
-    EXT_CSV_OP, EXT_MATH_OP, EXT_LOG_OP, EXT_HTTP_OP, Op,
+    EXT_CSV_OP, EXT_DB_OP, EXT_MATH_OP, EXT_LOG_OP, EXT_HTTP_OP, Op,
 };
 use crate::vm::value::{
     SCHEMA_BOXED_BOOL, SCHEMA_BOXED_FLOAT, SCHEMA_BOXED_INT, SCHEMA_CLI_ERROR,
-    SCHEMA_CRYPTO_ERROR, SCHEMA_CSV_ERROR, SCHEMA_EMPTY_TAG, SCHEMA_ENV_ERROR, SCHEMA_FS_ERROR, SCHEMA_FS_READER,
+    SCHEMA_CRYPTO_ERROR, SCHEMA_CSV_ERROR, SCHEMA_DB_ERROR, SCHEMA_DB_PARAM, SCHEMA_EMPTY_TAG,
+    SCHEMA_ENV_ERROR, SCHEMA_FS_ERROR, SCHEMA_FS_READER,
     SCHEMA_FS_WRITER, SCHEMA_HTTP_BINARY_RESPONSE, SCHEMA_HTTP_ERROR, SCHEMA_HTTP_REQUEST,
     SCHEMA_HTTP_RESPONSE, SCHEMA_HTTP_ROUTER, SCHEMA_INDEX_ERROR, SCHEMA_JSON_DECODE_ERROR,
     SCHEMA_JSON_ENCODE_ERROR,
@@ -851,6 +853,36 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 });
                 Ok(a)
             }
+            "hash_password" => {
+                let b = self.lower_obj(&args[0])?;
+                let a = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_CRYPTO_OP,
+                    aux: CRYPTO_HASH_PASSWORD,
+                    a,
+                    b,
+                    c: 0,
+                });
+                Ok(a)
+            }
+            "verify_password" | "constant_time_eq" => {
+                let b = self.lower_obj(&args[0])?;
+                let c = self.lower_obj(&args[1])?;
+                let a = self.alloc_temp_s();
+                let aux = if sym == "verify_password" {
+                    CRYPTO_VERIFY_PASSWORD
+                } else {
+                    CRYPTO_CONST_TIME_EQ
+                };
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_CRYPTO_OP,
+                    aux,
+                    a,
+                    b,
+                    c,
+                });
+                Ok(a)
+            }
             other => Err(format!("Unsupported cdt.crypto symbol '{}'", other)),
         }
     }
@@ -1305,6 +1337,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
         tid: &TypeId,
         target: &Expr,
         method: &str,
+        type_args: &[TypeExpr],
         args: &[Expr],
     ) -> Result<u16, String> {
         if let ModuleId::Native(m) = &tid.module
@@ -1316,6 +1349,11 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             && m == "cdt.http"
         {
             return self.lower_http_method(&tid.name, target, method, args);
+        }
+        if let ModuleId::Native(m) = &tid.module
+            && m == "cdt.db"
+        {
+            return self.lower_db_method(&tid.name, target, method, type_args, args);
         }
         let kind = match (&tid.module, tid.name.as_str(), method) {
             (ModuleId::Native(m), "Timestamp", "unix_seconds") if m == "cdt.time" => {
@@ -1735,6 +1773,204 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 Ok(())
             }
             PatternKind::Type { .. } => Err("Unexpected type pattern in value binding".to_string()),
+        }
+    }
+
+    pub(crate) fn lower_db_call(
+        &mut self,
+        sym: &str,
+        args: &[Expr],
+        named_args: &[NamedArg],
+    ) -> Result<u16, String> {
+        use crate::vm::exec_db::*;
+        match sym {
+            "DbError" => self.lower_native_record(
+                SCHEMA_DB_ERROR,
+                &["kind", "message", "code"],
+                args,
+                named_args,
+            ),
+            "connect" => {
+                let b = self.lower_obj(&args[0])?;
+                let a = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_DB_OP,
+                    aux: DB_CONNECT,
+                    a,
+                    b,
+                    c: 0,
+                });
+                Ok(a)
+            }
+            "null" => {
+                let a = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_DB_OP,
+                    aux: DB_PARAM_NULL,
+                    a,
+                    b: 0,
+                    c: 0,
+                });
+                Ok(a)
+            }
+            "int" | "float" | "bool" => {
+                let b = self.lower_scalar(&args[0])?;
+                let a = self.alloc_temp_o();
+                let aux = match sym {
+                    "int" => DB_PARAM_INT,
+                    "float" => DB_PARAM_FLOAT,
+                    _ => DB_PARAM_BOOL,
+                };
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_DB_OP,
+                    aux,
+                    a,
+                    b,
+                    c: 0,
+                });
+                Ok(a)
+            }
+            "text" => {
+                let b = self.lower_obj(&args[0])?;
+                let a = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_DB_OP,
+                    aux: DB_PARAM_TEXT,
+                    a,
+                    b,
+                    c: 0,
+                });
+                Ok(a)
+            }
+            other => Err(format!("Unsupported cdt.db symbol '{}'", other)),
+        }
+    }
+
+    pub(crate) fn lower_db_last_insert_id(&mut self, target: &Expr) -> Result<u16, String> {
+        use crate::vm::exec_db::DB_LAST_INSERT_ID;
+        let b = self.lower_obj(target)?;
+        let a = self.alloc_temp_s();
+        self.ops.push(Op::ExtOp {
+            kind: EXT_DB_OP,
+            aux: DB_LAST_INSERT_ID,
+            a,
+            b,
+            c: 0,
+        });
+        Ok(a)
+    }
+
+    fn pack_db_query_args(&mut self, schema_idx: Option<i64>, args: &[Expr]) -> Result<u16, String> {
+        let sql_reg = self.lower_obj(&args[0])?;
+        let params_reg = if args.len() >= 2 {
+            self.lower_obj(&args[1])?
+        } else {
+            let idx = self.mc.intern_empty()?;
+            let r = self.alloc_temp_o();
+            self.ops.push(Op::LoadConstObj { dst_obj: r, idx });
+            r
+        };
+        let scalar_regs = if let Some(sid) = schema_idx {
+            let s_reg = self.alloc_temp_s();
+            self.load_int_into(s_reg, sid)?;
+            Box::new([s_reg]) as Box<[u16]>
+        } else {
+            Box::new([]) as Box<[u16]>
+        };
+        let desc_idx = self.mc.intern_record_desc(RecordDesc {
+            schema_id: SCHEMA_DB_PARAM,
+            scalar_regs,
+            obj_regs: Box::new([sql_reg, params_reg]),
+        })?;
+        let packed = self.alloc_temp_o();
+        self.ops.push(Op::NewRecord {
+            dst_obj: packed,
+            desc_idx,
+        });
+        Ok(packed)
+    }
+
+    pub(crate) fn lower_db_method(
+        &mut self,
+        type_name: &str,
+        target: &Expr,
+        method: &str,
+        type_args: &[TypeExpr],
+        args: &[Expr],
+    ) -> Result<u16, String> {
+        use crate::vm::exec_db::*;
+        if type_name != "Connection" {
+            return Err(format!("Unsupported db method '{}.{}()'", type_name, method));
+        }
+        let conn_reg = self.lower_obj(target)?;
+        let dst_obj = self.alloc_temp_o();
+        match method {
+            "dialect" => {
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_DB_OP,
+                    aux: DB_DIALECT,
+                    a: dst_obj,
+                    b: conn_reg,
+                    c: 0,
+                });
+                Ok(dst_obj)
+            }
+            "exec" => {
+                let packed = self.pack_db_query_args(None, args)?;
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_DB_OP,
+                    aux: DB_EXEC,
+                    a: dst_obj,
+                    b: conn_reg,
+                    c: packed,
+                });
+                Ok(dst_obj)
+            }
+            "query" => {
+                let target_ty = self.mc.resolve_type(&type_args[0])?;
+                let Type::Custom(tid) = target_ty else {
+                    return Err("Connection.query<T> expects a struct type".to_string());
+                };
+                let sid = self.mc.checked.struct_by_name[&tid.name] as i64;
+                let packed = self.pack_db_query_args(Some(sid), args)?;
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_DB_OP,
+                    aux: DB_QUERY_TYPED,
+                    a: dst_obj,
+                    b: conn_reg,
+                    c: packed,
+                });
+                Ok(dst_obj)
+            }
+            "query_rows" => {
+                let packed = self.pack_db_query_args(None, args)?;
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_DB_OP,
+                    aux: DB_QUERY_ROWS,
+                    a: dst_obj,
+                    b: conn_reg,
+                    c: packed,
+                });
+                Ok(dst_obj)
+            }
+            "begin" | "commit" | "rollback" | "migrate" | "close" => {
+                let aux = match method {
+                    "begin" => DB_BEGIN,
+                    "commit" => DB_COMMIT,
+                    "rollback" => DB_ROLLBACK,
+                    "migrate" => DB_MIGRATE,
+                    _ => DB_CLOSE,
+                };
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_DB_OP,
+                    aux,
+                    a: dst_obj,
+                    b: conn_reg,
+                    c: 0,
+                });
+                Ok(dst_obj)
+            }
+            _ => Err(format!("Unsupported db.Connection method '{}'", method)),
         }
     }
 }

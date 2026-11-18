@@ -7,6 +7,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-18
+
+### Added
+
+* **`cdt.db` Zero-Dependency PostgreSQL & MySQL Drivers**:
+  * Added native PostgreSQL v3.0 wire-protocol driver (`src/native/pg.rs` — `SCRAM-SHA-256`, MD5, cleartext, `?` to `$1..$N` placeholder translation, `Parse/Bind/Describe/Execute/Sync`) and native MySQL v10 wire-protocol driver (`src/native/mysql.rs` — `mysql_native_password`, `caching_sha2_password` fast auth, `COM_QUERY`, prepared statements `COM_STMT_PREPARE`/`EXECUTE`/`CLOSE`).
+  * Exposed unified `cdt.db` API (`db.connect`, `null`, `int`, `float`, `bool`, `text`, `Connection` methods `.exec`, `.query<T>`, `.query_rows`, `.begin`, `.commit`, `.rollback`, `.migrate`, `.dialect`, `.last_insert_id`, `.close`, and `DbError { kind, message, code }`) in `src/native/db.rs`, `src/vm/exec_db.rs`, `EXT_DB_OP`, and `docs/src/library/db.md`.
+* **Declarative `migration` Syntax & `conduit db` CLI**:
+  * Added top-level `migration <version> "<name>" { up { ... } down { ... } }` (and shorthand `up "..."` / `down "..."`) declarations across parser, linker, reachability, typechecker, IR lowering, and binary bundle serialization (`src/ir/bundle.rs`), tracking applied versions in `schema_migrations`.
+  * Added `conduit db <migrate|rollback|status> <file.cdt> --url <dsn> [--steps <n>] [--dry-run]` CLI commands (`src/main.rs`, `docs/src/getting-started/cli.md`).
+* **Password Hashing in `cdt.crypto`**:
+  * Added `crypto.hash_password(password)` (PBKDF2-HMAC-SHA256 with random 16-byte salt, `$pbkdf2-sha256$600000$...`), `crypto.verify_password(password, encoded)`, and `crypto.constant_time_eq(a, b)` (`src/native/crypto.rs`, `src/vm/exec_sys.rs`, `docs/src/library/crypto.md`).
+* **Examples Reorganization**:
+  * Renamed `examples/http_client` to `examples/cli_http` and added `examples/db_service` with `docker-compose.yml` for PostgreSQL 16 and MariaDB 11.8 (`cdt_db_migrations_bundle_and_crypto_passwords_e2e`).
+
+### Fixed
+
+* **Hoisted Loop Constants Before Loop Entry**:
+  * Fixed `FnLowerer` (`src/ir/lower.rs`) by calling `flush_hoisted_constants_if_outer()` at function entry so constants hoisted from a loop are initialized before any code outside the loop reads them.
+* **Native Module Resolution in File Loader**:
+  * Registered `"cdt.db"` in `is_native_module` (`src/frontend/mod.rs`, `src/frontend/linker.rs`) and `is_error_type` (`src/frontend/check_native.rs`) for `conduit run`/`check` and `?` error propagation.
+
+### Changed
+
+* **Documentation & Editor Support**:
+  * Updated `README.md`, `docs/src/SUMMARY.md`, `docs/src/library/index.md`, `docs/src/library/{db,crypto}.md`, `docs/src/getting-started/{cli,installation}.md`, `src/lsp_docs.rs`, `editors/textmate/conduit.tmLanguage.json`, and bumped crate/editor versions to `0.3.1`.
+
 ## [0.3.0] - 2026-11-18
 
 ### Added

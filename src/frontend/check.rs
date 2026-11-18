@@ -95,6 +95,9 @@ pub struct CheckedProgram {
     pub http_direct_fns: HashMap<String, String>,
     pub http_direct_types: HashMap<String, String>,
     pub http_router_plans: Vec<(String, Vec<HttpRouterDeclEntry>)>,
+    pub db_aliases: HashSet<String>,
+    pub db_direct_fns: HashMap<String, String>,
+    pub db_direct_types: HashMap<String, String>,
     pub struct_abouts: HashMap<String, String>,
     pub validator_funcs: HashSet<String>,
     pub error_structs: HashSet<String>,
@@ -175,6 +178,9 @@ pub fn check_program_with_roots(
         http_direct_fns: HashMap::new(),
         http_direct_types: HashMap::new(),
         http_router_plans: Vec::new(),
+        db_aliases: HashSet::new(),
+        db_direct_fns: HashMap::new(),
+        db_direct_types: HashMap::new(),
         struct_abouts: HashMap::new(),
         validator_funcs: HashSet::new(),
         error_structs: HashSet::new(),
@@ -229,6 +235,32 @@ pub fn check_program_with_roots(
         idx += 1;
     }
 
+    if !checked.pending_mono_items.is_empty() {
+        let extra = std::mem::take(&mut checked.pending_mono_items);
+        program.items.extend(extra);
+    }
+
+    let mut seen_mig_versions = HashSet::new();
+    let db_conn_ty = Type::Custom(TypeId::native("cdt.db", "Connection"));
+    let db_err_ty = Type::Custom(TypeId::native("cdt.db", "DbError"));
+    let mig_ret_ty = Type::union(vec![Type::Void, db_err_ty]);
+    for item in &mut program.items {
+        if let ItemKind::Migration { version, up, down, .. } = &mut item.kind {
+            if !seen_mig_versions.insert(*version) {
+                return Err(format!("Duplicate migration version {}", version));
+            }
+            for block in [up, down] {
+                let mut tc = Checker {
+                    checked: &mut checked,
+                    scopes: vec![HashMap::new()],
+                    current_return: mig_ret_ty.clone(),
+                    loop_depth: 0,
+                };
+                tc.bind("db".to_string(), db_conn_ty.clone());
+                tc.check_block(block)?;
+            }
+        }
+    }
     if !checked.pending_mono_items.is_empty() {
         let extra = std::mem::take(&mut checked.pending_mono_items);
         program.items.extend(extra);

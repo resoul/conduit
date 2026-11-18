@@ -180,6 +180,10 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 let sym = sym.clone();
                 return self.lower_math_call(&sym, args);
             }
+            if let Some(sym) = self.mc.checked.crypto_direct_fns.get(name) {
+                let sym = sym.clone();
+                return self.lower_crypto_call(&sym, args, named_args);
+            }
         }
         if let ExprKind::Ident(fn_name) = &callee.kind
             && self.lookup_local(fn_name).is_none()
@@ -270,6 +274,9 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 if self.mc.checked.http_aliases.contains(alias) {
                     return self.lower_http_call(field, type_args, args, named_args);
                 }
+                if self.mc.checked.db_aliases.contains(alias) {
+                    return self.lower_db_call(field, args, named_args);
+                }
             }
             if let Some(reg) = self.lower_builtin_obj_method(target, field, args)? {
                 return Ok(reg);
@@ -277,7 +284,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             if let Type::Custom(tid) = &target.ty
                 && tid.module != ModuleId::Program
             {
-                return self.lower_native_method_obj(tid, target, field, args);
+                return self.lower_native_method_obj(tid, target, field, type_args, args);
             }
         }
 
@@ -376,6 +383,14 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 let sym = sym.clone();
                 return self.lower_http_call(&sym, type_args, args, named_args);
             }
+            if let Some(sym) = self.mc.checked.db_direct_fns.get(name) {
+                let sym = sym.clone();
+                return self.lower_db_call(&sym, args, named_args);
+            }
+            if let Some(sym) = self.mc.checked.db_direct_types.get(name) {
+                let sym = sym.clone();
+                return self.lower_db_call(&sym, args, named_args);
+            }
             if name == "Map" {
                 let dst_obj = self.alloc_temp_o();
                 self.ops.push(Op::NewMap { dst_obj });
@@ -450,9 +465,9 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 }
             }
             (Type::Custom(tid), _)
-                if matches!(&tid.module, ModuleId::Native(m) if m == "cdt.fs" || m == "cdt.http") =>
+                if matches!(&tid.module, ModuleId::Native(m) if m == "cdt.fs" || m == "cdt.http" || m == "cdt.db") =>
             {
-                self.lower_native_method_obj(tid, target, method, args)?;
+                self.lower_native_method_obj(tid, target, method, &[], args)?;
                 Ok(())
             }
             _ => Err(format!("Unsupported void method '.{}()'", method)),
@@ -623,6 +638,11 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                     c: key_reg,
                 });
                 Ok(dst_s)
+            }
+            (Type::Custom(tid), "last_insert_id")
+                if matches!(&tid.module, ModuleId::Native(m) if m == "cdt.db") =>
+            {
+                self.lower_db_last_insert_id(target)
             }
             _ => Err(format!("Unsupported scalar method '.{}()'", method)),
         }
