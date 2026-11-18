@@ -33,6 +33,7 @@
 - [cdt.csv](library/csv.md)
 - [cdt.math](library/math.md)
 - [cdt.log](library/log.md)
+- [cdt.http](library/http.md)
 
 # Practical Guides
 - [Working with Errors](guides/working-with-errors.md)

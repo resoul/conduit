@@ -160,6 +160,7 @@ pub const EXT_CSV_OP: u8 = 37;
 pub const EXT_MATH_OP: u8 = 38;
 pub const EXT_LOG_OP: u8 = 39;
 pub const EXT_LIST_AGG: u8 = 40;
+pub const EXT_HTTP_OP: u8 = 41;
 
 #[cfg(test)]
 mod tests {

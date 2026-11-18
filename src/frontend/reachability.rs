@@ -82,6 +82,20 @@ pub fn shake_unreachable_funcs(
             queue.push_back(seed);
         }
     }
+    for (_, routes) in &checked.cli_dispatches {
+        for r in routes {
+            if reachable.insert(r.handler_name.clone()) {
+                queue.push_back(r.handler_name.clone());
+            }
+        }
+    }
+    for (_, entries) in &checked.http_router_plans {
+        for entry in entries {
+            if reachable.insert(entry.handler_name.clone()) {
+                queue.push_back(entry.handler_name.clone());
+            }
+        }
+    }
 
     while let Some(fname) = queue.pop_front() {
         let Some(&(params, body)) = func_bodies.get(fname.as_str()) else {

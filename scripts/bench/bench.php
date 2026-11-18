@@ -5,6 +5,34 @@ function ms_since(int $t0): float {
     return (hrtime(true) - $t0) / 1e6;
 }
 
+function vm_fib(int $n): int {
+    return $n < 2 ? $n : vm_fib($n - 1) + vm_fib($n - 2);
+}
+
+$t0 = hrtime(true);
+if (vm_fib(35) !== 9227465) exit(1);
+$msVmFib = ms_since($t0);
+
+$t0 = hrtime(true);
+$arithAcc = 0;
+for ($i = 0; $i < 10000000; $i++) {
+    $arithAcc = ($arithAcc * 1664525 + 1013904223 + $i) % 1000000007;
+}
+$msVmArith = ms_since($t0);
+if ($arithAcc < 0) exit(1);
+
+$t0 = hrtime(true);
+$vmM = [];
+for ($i = 0; $i < 100000; $i++) {
+    $vmM[$i] = $i * 3 + 1;
+}
+$mapAcc = 0;
+for ($i = 0; $i < 100000; $i++) {
+    $mapAcc += $vmM[$i];
+}
+$msVmMap = ms_since($t0);
+if ($mapAcc < 0) exit(1);
+
 // 1. FS I/O
 $base = sys_get_temp_dir() . DIRECTORY_SEPARATOR . '_php_bench_' . getmypid();
 @mkdir($base, 0755, true);
@@ -168,6 +196,66 @@ for ($i = 0; $i < 50000; $i++) {
 $msUrl = ms_since($t0);
 if ($urlAcc < 0) exit(1);
 
+$parsePat = function(string $pat): array {
+    $tr = trim($pat, '/');
+    if ($tr === '') return [[], false];
+    $parts = explode('/', $tr);
+    $segs = [];
+    $wc = false;
+    foreach ($parts as $s) {
+        if ($s[0] === ':') $segs[] = [1, substr($s, 1)];
+        elseif ($s[0] === '*') { $segs[] = [2, substr($s, 1)]; $wc = true; }
+        else $segs[] = [0, $s];
+    }
+    return [$segs, $wc];
+};
+$routes = [
+    ['GET', ...$parsePat('/'), fn($p) => [200, 'ok']],
+    ['GET', ...$parsePat('/health'), fn($p) => [200, 'ok']],
+    ['GET', ...$parsePat('/api/v1/items'), fn($p) => [200, 'items']],
+    ['GET', ...$parsePat('/api/v1/users/:id/orders'), fn($p) => [200, $p['id'] ?? '']],
+    ['GET', ...$parsePat('/files/*rest'), fn($p) => [200, 'file']],
+    ['POST', ...$parsePat('/api/v1/echo'), fn($p) => [200, '']],
+];
+$samplePaths = ['/', '/health', '/api/v1/users/42/orders', '/files/docs/readme.md'];
+$t0 = hrtime(true);
+$httpAcc = 0;
+for ($i = 0; $i < 50000; $i++) {
+    $tr = trim($samplePaths[$i & 3], '/');
+    $pathSegs = $tr === '' ? [] : explode('/', $tr);
+    $nSegs = count($pathSegs);
+    $st = 404;
+    $body = '';
+    foreach ($routes as $r) {
+        [$rm, $segs, $wc, $h] = $r;
+        if (!$wc && count($segs) !== $nSegs) continue;
+        $params = [];
+        $ok = true;
+        foreach ($segs as $idx => $seg) {
+            if ($seg[0] === 2) {
+                $params[$seg[1]] = implode('/', array_slice($pathSegs, $idx));
+                break;
+            } elseif ($seg[0] === 1) {
+                if ($idx >= $nSegs || $pathSegs[$idx] === '') { $ok = false; break; }
+                $params[$seg[1]] = $pathSegs[$idx];
+            } elseif ($idx >= $nSegs || $pathSegs[$idx] !== $seg[1]) {
+                $ok = false; break;
+            }
+        }
+        if ($ok && $rm === 'GET') {
+            [$st, $body] = $h($params);
+            break;
+        }
+    }
+    $httpAcc += $st + strlen($body);
+}
+$msHttp = ms_since($t0);
+if ($httpAcc !== 10125000) exit(1);
+
+printf("BENCH|vm_fib_35|%.3f\n", $msVmFib);
+printf("BENCH|vm_arith_10m|%.3f\n", $msVmArith);
+printf("BENCH|vm_map_100k|%.3f\n", $msVmMap);
+
 printf("BENCH|fs_write_text|%.3f\n", $msWriteText);
 printf("BENCH|fs_write_lines|%.3f\n", $msWriteStream);
 printf("BENCH|fs_read_text|%.3f\n", $msReadText);
@@ -186,3 +274,4 @@ printf("BENCH|pipeline_1m|%.3f\n", $msPipe);
 printf("BENCH|pipeline_float_1m|%.3f\n", $msFPipe);
 printf("BENCH|csv_parse_20k|%.3f\n", $msCsv);
 printf("BENCH|url_parse_50k|%.3f\n", $msUrl);
+printf("BENCH|http_router_50k|%.3f\n", $msHttp);

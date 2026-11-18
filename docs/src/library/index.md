@@ -22,7 +22,7 @@ All standard libraries reside in the reserved `cdt.*` namespace.
 | [cdt.time](time.md) | `cdt.time` | System clock, monotonic timestamps, high-resolution duration calculation, and epoch conversion. |
 | [cdt.validation](validation.md) | `cdt.validation` | Schema validation, field rule annotations, issue aggregation, and standard rules (`min`, `max`, `email`). |
 | [cdt.env](env.md) | `cdt.env` | Typed environment configuration (`@env`, `load<T>`), `get`/`require`, and CLI `args()`. |
-| [cdt.cli](cli.md) | `cdt.cli` | Typed CLI parser (`cli { ... }` DSL and `@cli.*` annotations), subcommands, and `--help`. |
+| [cdt.cli](cli.md) | `cdt.cli` | Typed CLI parser & dispatcher (`cli { ... => handler }`, `cli.dispatch<T>()`, `@cli.*`), subcommands, and `--help`. |
 | [cdt.fs](fs.md) | `cdt.fs` | Fast basic and buffered streaming file I/O (`read_text`, `write_atomic`, `each_line`, `Reader`, `Writer`). |
 | [cdt.path](path.md) | `cdt.path` | Cross-platform lexical path manipulation (`join`, `dirname`, `basename`, `ext`, `stem`, `normalize`). |
 | [cdt.process](process.md) | `cdt.process` | External command execution (`run`, `status`), working directory (`cwd`, `set_cwd`), `pid`, and `exit`. |
@@ -31,4 +31,5 @@ All standard libraries reside in the reserved `cdt.*` namespace.
 | [cdt.csv](csv.md) | `cdt.csv` | RFC 4180 CSV parsing (`parse`, `parse_with`, `parse_records`) and serialization (`stringify`, `stringify_with`). |
 | [cdt.math](math.md) | `cdt.math` | `Float` math functions (`sqrt`, `pow`, `sin`, `cos`, `ln`, `floor`, `ceil`, `round`, `hypot`) and constants (`pi`, `e`, `tau`). |
 | [cdt.log](log.md) | `cdt.log` | Leveled `stderr` logger (`debug`, `info`, `warn`, `error`, `set_level`, `set_json`). |
+| [cdt.http](http.md) | `cdt.http` | Zero-dependency HTTP/1.1 client (`get`, `post`, `request_timeout`, `get_bytes`, `https://` via `curl`), declarative `router { ... }` (`http.build<T>()`, `http.serve<T>()`), `Router` middleware, and graceful `.stop()`. |
 

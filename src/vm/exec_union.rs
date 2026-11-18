@@ -158,7 +158,6 @@ impl Vm {
     #[inline(never)]
     pub(crate) fn exec_ext_op(
         &mut self,
-        module: &crate::ir::Module,
         s_base: usize,
         o_base: usize,
         op: Op,
@@ -330,9 +329,6 @@ impl Vm {
                     _ => return Err(err_msg("Expected Tuple in TupleGetObj")),
                 };
                 self.objs[o_base + dst_obj as usize] = elem;
-            }
-            Op::ExtOp { kind, aux, a, b, c } => {
-                self.exec_ext_dispatch(module, s_base, o_base, kind, aux, a, b, c)?;
             }
             _ => unreachable!("unexpected op in exec_ext_op"),
         }

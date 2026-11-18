@@ -70,6 +70,7 @@ pub(crate) fn build_validation_plans(
                 if ann.target == "json"
                     || ann.target == "env"
                     || ann.target.starts_with("cli.")
+                    || ann.target.starts_with("router.")
                     || matches!(ann.target.as_str(), "flag" | "opt" | "arg" | "rest" | "cmd" | "group")
                 {
                     continue;

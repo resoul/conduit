@@ -1,19 +1,23 @@
 services:
   dev:
-    image: airlance/conduit:0.2.3
+    image: airlance/conduit:latest
     working_dir: /work
     volumes:
       - .:/work
+    ports:
+      - "8080:8080"
     environment:
       APP_ENV: dev
       MIN_SCORE: "50"
       APP_TAG: local
-    command: ["watch", "main.cdt", "--", "--verbose", "run"]
+    command: ["watch", "main.cdt", "--", "serve", "--addr", "0.0.0.0:8080"]
 
   prod:
     build: .
+    ports:
+      - "8080:8080"
     environment:
       APP_ENV: prod
       MIN_SCORE: "60"
       APP_TAG: release
-    command: ["--verbose", "run"]
+    command: ["serve", "--addr", "0.0.0.0:8080"]

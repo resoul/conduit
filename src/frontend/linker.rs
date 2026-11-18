@@ -19,6 +19,7 @@ fn is_native_module(path: &str) -> bool {
             | "cdt.csv"
             | "cdt.math"
             | "cdt.log"
+            | "cdt.http"
     )
 }
 

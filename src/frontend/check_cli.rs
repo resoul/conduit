@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use crate::frontend::ast::{Expr, ExprKind, NamedArg, TypeExpr, UnaryOp};
-use crate::frontend::check::{CheckedProgram, Checker};
+use crate::frontend::check::{CheckedProgram, Checker, CliDispatchRoute};
 use crate::frontend::check_native::check_fields_ctor;
 use crate::frontend::types::{ModuleId, Type, TypeId};
 use crate::native::cli::{
@@ -81,9 +81,143 @@ impl Checker<'_> {
                 ensure_cli_plan(self.checked, &tid.name)?;
                 Ok(Type::union(vec![target_ty, cli_err]))
             }
+            "dispatch" | "dispatch_args" => {
+                let expect_args = usize::from(sym == "dispatch_args");
+                if type_args.len() != 1 || !named_args.is_empty() || args.len() != expect_args {
+                    return Err(format!(
+                        "cli.{}<T>({}) expects 1 type argument and {} value argument(s)",
+                        sym,
+                        if expect_args == 1 { "args" } else { "" },
+                        expect_args
+                    ));
+                }
+                let target_ty = self.checked.resolve_type_mut(&type_args[0])?;
+                let Type::Custom(tid) = &target_ty else {
+                    return Err(format!(
+                        "cli.{}<T>() requires a struct type, got {}",
+                        sym, target_ty
+                    ));
+                };
+                if tid.module != ModuleId::Program {
+                    return Err(format!(
+                        "cli.{}<T>() requires a program struct, got {}",
+                        sym, target_ty
+                    ));
+                }
+                if expect_args == 1 {
+                    let expected_args = Type::List(Box::new(Type::String));
+                    self.check_expr(&mut args[0], Some(&expected_args))?;
+                    if args[0].ty != expected_args {
+                        return Err(format!(
+                            "cli.dispatch_args expects [String], got {}",
+                            args[0].ty
+                        ));
+                    }
+                }
+                ensure_cli_plan(self.checked, &tid.name)?;
+                let mut ret_types = ensure_cli_dispatch(self.checked, &tid.name)?;
+                ret_types.push(cli_err);
+                Ok(Type::union(ret_types))
+            }
             other => Err(format!("Unknown cdt.cli symbol '{}'", other)),
         }
     }
+}
+
+fn ensure_cli_dispatch(checked: &mut CheckedProgram, root_name: &str) -> Result<Vec<Type>, String> {
+    if let Some((_, existing)) = checked.cli_dispatches.iter().find(|(n, _)| n == root_name) {
+        let mut rets = vec![Type::Void];
+        for r in existing {
+            rets.push(r.ret_type.clone());
+        }
+        return Ok(rets);
+    }
+
+    let _ = checked
+        .struct_by_name
+        .get(root_name)
+        .ok_or_else(|| format!("Unknown struct '{}' in cdt.cli", root_name))?;
+    let root_ty = Type::Custom(TypeId::program(root_name.to_string()));
+    let mut routes = Vec::new();
+    let mut path = Vec::new();
+    collect_cli_dispatch_routes(checked, root_name, &root_ty, &mut path, &mut routes)?;
+
+    let mut rets = vec![Type::Void];
+    for r in &routes {
+        rets.push(r.ret_type.clone());
+    }
+    checked.cli_dispatches.push((root_name.to_string(), routes));
+    Ok(rets)
+}
+
+fn collect_cli_dispatch_routes(
+    checked: &CheckedProgram,
+    struct_name: &str,
+    root_ty: &Type,
+    path: &mut Vec<u16>,
+    routes: &mut Vec<CliDispatchRoute>,
+) -> Result<(), String> {
+    let sid = *checked
+        .struct_by_name
+        .get(struct_name)
+        .ok_or_else(|| format!("Unknown struct '{}' in cdt.cli", struct_name))?;
+    let st = &checked.structs[sid];
+    for f in &st.fields {
+        let tag = f
+            .cli_ann
+            .as_ref()
+            .and_then(|a| a.target.strip_prefix("cli."))
+            .unwrap_or("");
+        if tag != "cmd" && tag != "group" {
+            continue;
+        }
+        let Type::Optional(inner_ty) = &f.ty else {
+            continue;
+        };
+        let Type::Custom(sub_tid) = &**inner_ty else {
+            continue;
+        };
+        path.push(f.slot_idx);
+        if tag == "group" {
+            collect_cli_dispatch_routes(checked, &sub_tid.name, root_ty, path, routes)?;
+        } else {
+            let Some(handler_name) = &f.cli_handler else {
+                return Err(format!(
+                    "cli.dispatch(): command '{}.{}' has no handler (use '=> handler_fn')",
+                    struct_name, f.name
+                ));
+            };
+            let fid = *checked.func_by_name.get(handler_name).ok_or_else(|| {
+                format!(
+                    "cli.dispatch(): unknown handler function '{}' on '{}.{}'",
+                    handler_name, struct_name, f.name
+                )
+            })?;
+            let sig = &checked.funcs[fid as usize];
+            let sub_ty = (**inner_ty).clone();
+            let takes_parent = if sig.params.len() == 2
+                && sig.params[0] == *root_ty
+                && sig.params[1] == sub_ty
+            {
+                true
+            } else if sig.params.len() == 1 && sig.params[0] == sub_ty {
+                false
+            } else {
+                return Err(format!(
+                    "cli.dispatch(): handler '{}' for '{}.{}' must have signature ({}, {}) -> R or ({}) -> R",
+                    handler_name, struct_name, f.name, root_ty, sub_ty, sub_ty
+                ));
+            };
+            routes.push(CliDispatchRoute {
+                field_slot_path: path.clone(),
+                handler_name: handler_name.clone(),
+                takes_parent,
+                ret_type: sig.return_type.clone(),
+            });
+        }
+        path.pop();
+    }
+    Ok(())
 }
 
 fn ensure_cli_plan(checked: &mut CheckedProgram, root_name: &str) -> Result<(), String> {

@@ -182,9 +182,22 @@ pub(crate) fn register_program_types(
                 });
             }
             let cli_ann = f.annotations.iter().find(|ann| {
-                ann.target.starts_with("cli.")
+                (ann.target.starts_with("cli.") && ann.target != "cli.handler")
                     || matches!(ann.target.as_str(), "flag" | "opt" | "arg" | "rest" | "cmd" | "group")
             }).cloned();
+            let cli_handler = f.annotations.iter().find_map(|ann| {
+                if ann.target == "cli.handler"
+                    && let Some(Expr { kind: ExprKind::Ident(h), .. }) = ann.args.first()
+                {
+                    return Some(h.clone());
+                }
+                None
+            });
+            let router_ann = f
+                .annotations
+                .iter()
+                .find(|ann| ann.target.starts_with("router."))
+                .cloned();
             resolved_fields.push(ResolvedField {
                 name: f.name.clone(),
                 json_name,
@@ -193,6 +206,8 @@ pub(crate) fn register_program_types(
                 slot_idx,
                 env_name,
                 cli_ann,
+                cli_handler,
+                router_ann,
                 default: None,
             });
         }

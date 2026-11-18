@@ -5,6 +5,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
+## [Unreleased]
+
+## [0.3.0] - 2026-11-18
+
+### Added
+
+* **Declarative `router Name { ... }` DSL (`http.build<T>()`, `http.serve<T>()`)**:
+  * Added top-level `router Name { before fn; after fn; get "/path/:id" => fn; ... }` syntax (`src/frontend/parser.rs`, `src/frontend/parser_cli.rs`, `src/frontend/check_sys.rs`, `src/frontend/reachability.rs`, `src/ir/lower_native.rs`) that validates handler signatures at compile time and builds or serves an `http.Router` via `http.build<T>()` and `http.serve<T>(addr)`.
+* **`cdt.cli` Command Handler Binding (`=> handler`) & `cli.dispatch<T>()`**:
+  * Added `=> handler` syntax on `cmd` declarations in `cli` blocks (`src/frontend/parser_cli.rs`) and `cli.dispatch<T>()` / `cli.dispatch_args<T>(args)` (`src/frontend/check_cli.rs`, `src/frontend/reachability.rs`, `src/ir/lower_native.rs`) supporting `(App, Cmd) -> R` and `(Cmd) -> R` handlers (`cdt_cli_dispatch_e2e`, `examples/http_client`).
+* **`cdt.http` HTTP/1.1 Client, Server & Router**:
+  * Added zero-dependency `cdt.http` server/router (`http.router()`, `http.build<T>()`, `http.serve<T>()`, `http.text()`, `http.html()`, `http.json()`, `http.response()`, `http.response_with()`, `Request`, `Response`, `BinaryResponse`, `HttpError`, `Router` methods `.get`, `.post`, `.put`, `.delete`, `.patch`, `.options`, `.head`, `.any`, `.before`, `.after`, `.dispatch`, concurrent worker-pool `.serve` with 30s socket timeouts and `HEAD` handling, and graceful `.stop()`) with `:param` / `*wildcard` segment routing, `keep-alive`, `Content-Length`, and automatic `400`/`404`/`405`/`413`/`500` handling (`src/native/http.rs`, `src/vm/exec_http.rs`, `EXT_HTTP_OP`, `docs/src/library/http.md`, `cdt_http_router_e2e`, `cdt_http_server_graceful_shutdown_e2e`).
+  * Added zero-dependency outbound HTTP client (`http.get()`, `http.post()`, `http.request()`, `http.request_timeout()`, `http.get_bytes()`, `http.request_bytes()`) with automatic redirect following (up to 10 hops), configurable timeout, binary `[Int]` bodies, `http://` over `std::net::TcpStream` (`Content-Length`, `Transfer-Encoding: chunked`), and `https://` via system `curl` fallback (`cdt_http_client_loopback_e2e`).
+* **Unified `examples/http_client` Showcase**:
+  * Renamed `example/` to `examples/` and consolidated the full CLI, HTTP client/server, config/env, JSON pipeline, streaming FS, and Docker `FROM scratch` example inside `examples/http_client/`.
+
+### Changed
+
+* **HTTP Hot-Path & Documentation Updates**:
+  * Pre-cached static `content-type` response header `OrderedMap`s via `LazyLock` (`HEADERS_EMPTY`, `HEADERS_TEXT`, `HEADERS_HTML`, `HEADERS_JSON`), added O(1) non-wildcard route length rejection + single-split path matching in `lookup_route`, eliminated per-request hook `Vec` cloning and intermediate response `HashMap` allocations (`src/native/http.rs`, `src/vm/exec_http.rs`).
+  * Updated LSP hover/completions (`src/lsp_docs.rs`), TextMate grammar (`editors/textmate/`), `README.md`, `docs/src/library/index.md`, `docs/src/library/cli.md`, `docs/src/library/http.md`, and bumped crate/editor versions to `0.3.0`.
+
 ## [0.2.7] - 2026-11-18
 
 ### Added

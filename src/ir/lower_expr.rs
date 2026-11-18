@@ -59,6 +59,11 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
     pub(crate) fn lower_scalar(&mut self, expr: &Expr) -> Result<u16, String> {
         match &expr.kind {
             ExprKind::Int(n) => {
+                if self.loop_depth > 0
+                    && let Some(&reg) = self.hoisted_ints.get(n)
+                {
+                    return Ok(reg);
+                }
                 let dst = self.alloc_temp_s();
                 self.load_int_into(dst, *n)?;
                 Ok(dst)
@@ -89,8 +94,14 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             ExprKind::Unary { op, expr: inner } => match op {
                 UnaryOp::Neg => {
                     if let ExprKind::Int(n) = inner.kind {
+                        let neg = n.wrapping_neg();
+                        if self.loop_depth > 0
+                            && let Some(&reg) = self.hoisted_ints.get(&neg)
+                        {
+                            return Ok(reg);
+                        }
                         let dst = self.alloc_temp_s();
-                        self.load_int_into(dst, n.wrapping_neg())?;
+                        self.load_int_into(dst, neg)?;
                         return Ok(dst);
                     }
                     if let ExprKind::Float(v) = inner.kind {

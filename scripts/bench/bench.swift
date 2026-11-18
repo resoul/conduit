@@ -7,6 +7,30 @@ func msSince(_ t0: UInt64) -> Double {
     return Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000.0
 }
 
+func vmFib(_ n: Int) -> Int {
+    return n < 2 ? n : vmFib(n - 1) + vmFib(n - 2)
+}
+
+var tVm = DispatchTime.now().uptimeNanoseconds
+if vmFib(35) != 9227465 { exit(1) }
+let msVmFib = msSince(tVm)
+
+tVm = DispatchTime.now().uptimeNanoseconds
+var arithAcc = 0
+for i in 0..<10_000_000 {
+    arithAcc = (arithAcc &* 1664525 &+ 1013904223 &+ i) % 1000000007
+}
+let msVmArith = msSince(tVm)
+if arithAcc < 0 { exit(1) }
+
+tVm = DispatchTime.now().uptimeNanoseconds
+var vmM: [Int: Int] = Dictionary(minimumCapacity: 100_000)
+for i in 0..<100_000 { vmM[i] = i * 3 + 1 }
+var mapAcc = 0
+for i in 0..<100_000 { mapAcc += vmM[i] ?? 0 }
+let msVmMap = msSince(tVm)
+if mapAcc < 0 { exit(1) }
+
 struct Item: Codable {
     let id: Int
     let user: String
@@ -181,6 +205,71 @@ for _ in 0..<50000 {
 let msUrl = msSince(t0)
 if urlAcc < 0 { exit(1) }
 
+struct RouteSeg { let kind: Int; let val: String }
+struct RouteDef { let method: String; let segs: [RouteSeg]; let wildcard: Bool; let handler: ([String: String]) -> (Int, String) }
+func parsePat(_ pat: String) -> ([RouteSeg], Bool) {
+    let tr = pat.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    if tr.isEmpty { return ([], false) }
+    var wc = false
+    let segs = tr.split(separator: "/").map { s -> RouteSeg in
+        if s.hasPrefix(":") { return RouteSeg(kind: 1, val: String(s.dropFirst())) }
+        if s.hasPrefix("*") { wc = true; return RouteSeg(kind: 2, val: String(s.dropFirst())) }
+        return RouteSeg(kind: 0, val: String(s))
+    }
+    return (segs, wc)
+}
+func mkRoute(_ m: String, _ p: String, _ h: @escaping ([String: String]) -> (Int, String)) -> RouteDef {
+    let (s, wc) = parsePat(p)
+    return RouteDef(method: m, segs: s, wildcard: wc, handler: h)
+}
+let routes: [RouteDef] = [
+    mkRoute("GET", "/") { _ in (200, "ok") },
+    mkRoute("GET", "/health") { _ in (200, "ok") },
+    mkRoute("GET", "/api/v1/items") { _ in (200, "items") },
+    mkRoute("GET", "/api/v1/users/:id/orders") { p in (200, p["id"] ?? "") },
+    mkRoute("GET", "/files/*rest") { _ in (200, "file") },
+    mkRoute("POST", "/api/v1/echo") { _ in (200, "") },
+]
+let samplePaths = ["/", "/health", "/api/v1/users/42/orders", "/files/docs/readme.md"]
+t0 = DispatchTime.now().uptimeNanoseconds
+var httpAcc = 0
+for i in 0..<50000 {
+    let tr = samplePaths[i & 3].trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    let pathSegs: [Substring] = tr.isEmpty ? [] : tr.split(separator: "/")
+    let nSegs = pathSegs.count
+    var st = 404
+    var body = ""
+    for r in routes {
+        if !r.wildcard && r.segs.count != nSegs { continue }
+        var params: [String: String] = [:]
+        var ok = true
+        for idx in 0..<r.segs.count {
+            let seg = r.segs[idx]
+            if seg.kind == 2 {
+                params[seg.val] = pathSegs[idx...].joined(separator: "/")
+                break
+            } else if seg.kind == 1 {
+                if idx >= nSegs || pathSegs[idx].isEmpty { ok = false; break }
+                params[seg.val] = String(pathSegs[idx])
+            } else if idx >= nSegs || pathSegs[idx] != seg.val {
+                ok = false; break
+            }
+        }
+        if ok && r.method == "GET" {
+            let res = r.handler(params)
+            st = res.0; body = res.1
+            break
+        }
+    }
+    httpAcc += st + body.count
+}
+let msHttp = msSince(t0)
+if httpAcc != 10_125_000 { exit(1) }
+
+print(String(format: "BENCH|vm_fib_35|%.3f", msVmFib))
+print(String(format: "BENCH|vm_arith_10m|%.3f", msVmArith))
+print(String(format: "BENCH|vm_map_100k|%.3f", msVmMap))
+
 print(String(format: "BENCH|fs_write_text|%.3f", msWriteText))
 print(String(format: "BENCH|fs_write_lines|%.3f", msWriteStream))
 print(String(format: "BENCH|fs_read_text|%.3f", msReadText))
@@ -200,3 +289,4 @@ print(String(format: "BENCH|json_decode_10k|%.3f", msJsonDec))
 print(String(format: "BENCH|pipeline_1m|%.3f", msPipe))
 print(String(format: "BENCH|pipeline_float_1m|%.3f", msFPipe))
 print(String(format: "BENCH|url_parse_50k|%.3f", msUrl))
+print(String(format: "BENCH|http_router_50k|%.3f", msHttp))

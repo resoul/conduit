@@ -799,6 +799,29 @@ impl Module {
                                     _ => return Err(format!("Invalid list agg aux {}", aux)),
                                 }
                             }
+                            crate::vm::opcode::EXT_HTTP_OP => match aux {
+                                0..=2 | 11 | 13 | 19..=23 => {
+                                    check_o(a, &ctx)?;
+                                    check_o(b, &ctx)?;
+                                }
+                                3 => {
+                                    check_o(a, &ctx)?;
+                                    check_s(b, &ctx)?;
+                                    check_o(c, &ctx)?;
+                                }
+                                14 => {
+                                    check_o(a, &ctx)?;
+                                    check_o(b, &ctx)?;
+                                    check_s(c, &ctx)?;
+                                }
+                                4 => check_o(a, &ctx)?,
+                                5..=10 | 12 | 15..=18 => {
+                                    check_o(a, &ctx)?;
+                                    check_o(b, &ctx)?;
+                                    check_o(c, &ctx)?;
+                                }
+                                _ => return Err(format!("Invalid http aux {}", aux)),
+                            },
                             _ => return Err(format!("Invalid ExtOp kind {}", kind)),
                         }
                     }

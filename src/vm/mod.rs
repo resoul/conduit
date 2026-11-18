@@ -1,6 +1,7 @@
 pub mod exec;
 pub(crate) mod exec_cold;
 pub(crate) mod exec_fs;
+pub(crate) mod exec_http;
 pub(crate) mod exec_map;
 pub(crate) mod exec_sys;
 pub(crate) mod exec_union;
@@ -12,7 +13,8 @@ pub mod value;
 #[cfg(test)]
 mod tests;
 
-use value::Obj;
+use std::sync::Arc;
+use value::{Obj, StructData};
 
 use crate::ir::Module;
 
@@ -34,11 +36,31 @@ impl std::error::Error for RuntimeError {}
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CallFrame {
     pub func_id: u32,
-    pub return_ip: usize,
-    pub s_base: usize,
-    pub o_base: usize,
+    pub return_ip: u32,
+    pub s_base: u32,
+    pub o_base: u32,
+    pub prev_closure_slot: u32,
     pub ret_reg: u16,
-    pub prev_closure_slot: usize,
+}
+
+impl CallFrame {
+    #[inline(always)]
+    pub(crate) fn pack_closure_slot(slot: usize) -> u32 {
+        if slot == usize::MAX {
+            u32::MAX
+        } else {
+            slot as u32
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn unpack_closure_slot(self) -> usize {
+        if self.prev_closure_slot == u32::MAX {
+            usize::MAX
+        } else {
+            self.prev_closure_slot as usize
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -55,6 +77,8 @@ pub struct Vm {
     pub script_args: Option<Vec<String>>,
     pub(crate) fs_readers: Vec<Option<std::io::BufReader<std::fs::File>>>,
     pub(crate) fs_writers: Vec<Option<std::io::BufWriter<std::fs::File>>>,
+    pub(crate) routers: Vec<crate::native::http::RouterState>,
+    pub(crate) cached_http_req: Option<(Arc<StructData>, Arc<StructData>)>,
 }
 
 impl Vm {
@@ -66,6 +90,8 @@ impl Vm {
             script_args: None,
             fs_readers: Vec::new(),
             fs_writers: Vec::new(),
+            routers: Vec::new(),
+            cached_http_req: None,
         }
     }
 

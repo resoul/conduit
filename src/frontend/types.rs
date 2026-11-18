@@ -286,6 +286,8 @@ pub struct ResolvedField {
     pub slot_idx: u16,
     pub env_name: Option<String>,
     pub cli_ann: Option<crate::frontend::ast::FieldAnnotation>,
+    pub cli_handler: Option<String>,
+    pub router_ann: Option<crate::frontend::ast::FieldAnnotation>,
     pub default: Option<crate::frontend::ast::Expr>,
 }
 

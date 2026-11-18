@@ -29,14 +29,51 @@ func msSince(t time.Time) float64 {
 	return float64(time.Since(t).Nanoseconds()) / 1e6
 }
 
+func vmFib(n int64) int64 {
+	if n < 2 {
+		return n
+	}
+	return vmFib(n-1) + vmFib(n-2)
+}
+
 func main() {
+	t0 := time.Now()
+	if vmFib(35) != 9227465 {
+		return
+	}
+	msVMFib := msSince(t0)
+
+	t0 = time.Now()
+	var arithAcc int64
+	for i := int64(0); i < 10000000; i++ {
+		arithAcc = (arithAcc*1664525 + 1013904223 + i) % 1000000007
+	}
+	msVMArith := msSince(t0)
+	if arithAcc < 0 {
+		return
+	}
+
+	t0 = time.Now()
+	vmM := make(map[int]int, 100000)
+	for i := 0; i < 100000; i++ {
+		vmM[i] = i*3 + 1
+	}
+	mapAcc := 0
+	for i := 0; i < 100000; i++ {
+		mapAcc += vmM[i]
+	}
+	msVMMap := msSince(t0)
+	if mapAcc < 0 {
+		return
+	}
+
 	base := filepath.Join(os.TempDir(), fmt.Sprintf("_go_bench_%d", os.Getpid()))
 	_ = os.MkdirAll(base, 0755)
 	p := filepath.Join(base, "data.txt")
 	pBulk := filepath.Join(base, "bulk.txt")
 	line := "line payload number 0123456789 abcdefghijklmnopqrstuvwxyz\n"
 
-	t0 := time.Now()
+	t0 = time.Now()
 	f, _ := os.Create(p)
 	bw := bufio.NewWriterSize(f, 65536)
 	for i := 0; i < 100000; i++ {
@@ -211,6 +248,102 @@ func main() {
 		return
 	}
 
+	type routeSeg struct {
+		kind int
+		val  string
+	}
+	type routeDef struct {
+		method   string
+		segs     []routeSeg
+		wildcard bool
+		handler  func(map[string]string) (int, string)
+	}
+	parsePat := func(p string) ([]routeSeg, bool) {
+		tr := strings.Trim(p, "/")
+		if tr == "" {
+			return nil, false
+		}
+		parts := strings.Split(tr, "/")
+		segs := make([]routeSeg, len(parts))
+		wc := false
+		for i, s := range parts {
+			if strings.HasPrefix(s, ":") {
+				segs[i] = routeSeg{1, s[1:]}
+			} else if strings.HasPrefix(s, "*") {
+				segs[i] = routeSeg{2, s[1:]}
+				wc = true
+			} else {
+				segs[i] = routeSeg{0, s}
+			}
+		}
+		return segs, wc
+	}
+	mkRoute := func(m, p string, h func(map[string]string) (int, string)) routeDef {
+		s, wc := parsePat(p)
+		return routeDef{m, s, wc, h}
+	}
+	routes := []routeDef{
+		mkRoute("GET", "/", func(_ map[string]string) (int, string) { return 200, "ok" }),
+		mkRoute("GET", "/health", func(_ map[string]string) (int, string) { return 200, "ok" }),
+		mkRoute("GET", "/api/v1/items", func(_ map[string]string) (int, string) { return 200, "items" }),
+		mkRoute("GET", "/api/v1/users/:id/orders", func(p map[string]string) (int, string) { return 200, p["id"] }),
+		mkRoute("GET", "/files/*rest", func(_ map[string]string) (int, string) { return 200, "file" }),
+		mkRoute("POST", "/api/v1/echo", func(_ map[string]string) (int, string) { return 200, "" }),
+	}
+	samplePaths := []string{"/", "/health", "/api/v1/users/42/orders", "/files/docs/readme.md"}
+	t0 = time.Now()
+	httpAcc := 0
+	for i := 0; i < 50000; i++ {
+		tr := strings.Trim(samplePaths[i&3], "/")
+		var pathSegs []string
+		if tr != "" {
+			pathSegs = strings.Split(tr, "/")
+		}
+		st := 404
+		body := ""
+		for _, r := range routes {
+			if !r.wildcard && len(r.segs) != len(pathSegs) {
+				continue
+			}
+			var params map[string]string
+			ok := true
+			for idx, seg := range r.segs {
+				if seg.kind == 2 {
+					if params == nil {
+						params = make(map[string]string, 1)
+					}
+					params[seg.val] = strings.Join(pathSegs[idx:], "/")
+					break
+				} else if seg.kind == 1 {
+					if idx >= len(pathSegs) || pathSegs[idx] == "" {
+						ok = false
+						break
+					}
+					if params == nil {
+						params = make(map[string]string, 1)
+					}
+					params[seg.val] = pathSegs[idx]
+				} else if idx >= len(pathSegs) || pathSegs[idx] != seg.val {
+					ok = false
+					break
+				}
+			}
+			if ok && r.method == "GET" {
+				st, body = r.handler(params)
+				break
+			}
+		}
+		httpAcc += st + len(body)
+	}
+	msHTTP := msSince(t0)
+	if httpAcc != 10125000 {
+		return
+	}
+
+	fmt.Printf("BENCH|vm_fib_35|%.3f\n", msVMFib)
+	fmt.Printf("BENCH|vm_arith_10m|%.3f\n", msVMArith)
+	fmt.Printf("BENCH|vm_map_100k|%.3f\n", msVMMap)
+
 	fmt.Printf("BENCH|fs_write_text|%.3f\n", msWriteText)
 	fmt.Printf("BENCH|fs_write_lines|%.3f\n", msWriteStream)
 	fmt.Printf("BENCH|fs_read_text|%.3f\n", msReadText)
@@ -229,4 +362,5 @@ func main() {
 	fmt.Printf("BENCH|pipeline_float_1m|%.3f\n", msFPipe)
 	fmt.Printf("BENCH|csv_parse_20k|%.3f\n", msCsv)
 	fmt.Printf("BENCH|url_parse_50k|%.3f\n", msURL)
+	fmt.Printf("BENCH|http_router_50k|%.3f\n", msHTTP)
 }

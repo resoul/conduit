@@ -333,6 +333,155 @@ pub fn call_and_closure_workloads() -> Vec<Workload> {
             rust_us: Some(0.017493),
             setup: Box::new(|_| make_create_closure_workload(true, false, true)),
         },
+        Workload {
+            name: "http.router_dispatch",
+            category: "HTTP",
+            size: 6,
+            target_us: None,
+            old_conduit_us: None,
+            php_us: None,
+            go_us: None,
+            rust_us: None,
+            setup: Box::new(|vm| {
+                let (module, bid) = compile_workload(
+                    r#"
+                    import * as http from "cdt.http"
+
+                    func h_root(_req: http.Request) -> http.Response { return http.text("ok") }
+                    func h_health(_req: http.Request) -> http.Response { return http.text("ok") }
+                    func h_items(_req: http.Request) -> http.Response { return http.text("items") }
+                    func h_orders(req: http.Request) -> http.Response {
+                        id := req.params.get("id") ?? ""
+                        return http.text(id)
+                    }
+                    func h_files(_req: http.Request) -> http.Response { return http.text("file") }
+                    func h_echo(req: http.Request) -> http.Response { return http.json(req.body) }
+
+                    router BenchApi {
+                        get "/" => h_root
+                        get "/health" => h_health
+                        get "/api/v1/items" => h_items
+                        get "/api/v1/users/:id/orders" => h_orders
+                        get "/files/*rest" => h_files
+                        post "/api/v1/echo" => h_echo
+                    }
+
+                    export func setup_router() -> http.Router {
+                        return http.build<BenchApi>()
+                    }
+
+                    export func setup_req() -> http.Request {
+                        empty := Map<String, String>()
+                        return http.Request(
+                            method: "GET",
+                            path: "/api/v1/users/42/orders",
+                            body: "",
+                            headers: empty,
+                            query: empty,
+                            params: empty,
+                        )
+                    }
+
+                    export func bench_router(iterations: Int, r: http.Router, req: http.Request) -> Int {
+                        var acc = 0
+                        for _ in 0..iterations {
+                            resp := r.dispatch(req)
+                            acc = acc + resp.status + resp.body.len()
+                        }
+                        return acc
+                    }
+                    "#,
+                    "bench_router",
+                );
+                let router_obj = vm
+                    .call_obj(&module, module.func_id("setup_router").unwrap(), &[], &[])
+                    .unwrap();
+                let req_obj = vm
+                    .call_obj(&module, module.func_id("setup_req").unwrap(), &[], &[])
+                    .unwrap();
+                WorkloadState {
+                    module,
+                    bench_func: bid,
+                    verify_func: bid,
+                    scalar_args: vec![],
+                    obj_args: vec![router_obj, req_obj],
+                    expected_per_op: 202,
+                    after_check: None,
+                }
+            }),
+        },
+        Workload {
+            name: "cli.dispatch_args",
+            category: "CLI",
+            size: 4,
+            target_us: None,
+            old_conduit_us: None,
+            php_us: None,
+            go_us: None,
+            rust_us: None,
+            setup: Box::new(|_| {
+                let (module, bid) = compile_workload(
+                    r#"
+                    import cli from "cdt.cli"
+                    import { CliError } from "cdt.cli"
+
+                    cli BenchCli "CLI dispatch bench" {
+                        flag verbose "v" "Verbose"
+                        cmd get "Get" {
+                            arg url: String "URL"
+                        } => h_get
+                        cmd post "Post" {
+                            arg url: String "URL"
+                        } => h_post
+                        cmd run "Run" {
+                            arg target: String "Target"
+                        } => h_run
+                        cmd ping "Ping" => h_ping
+                    }
+
+                    func h_get(_c: BenchCli_get) -> Int { return 10 }
+                    func h_post(_c: BenchCli_post) -> Int { return 20 }
+                    func h_run(app: BenchCli, c: BenchCli_run) -> Int {
+                        if app.verbose {
+                            return c.target.len() + 39
+                        }
+                        return 0
+                    }
+                    func h_ping(_c: BenchCli_ping) -> Int { return 1 }
+
+                    export func bench_cli(iterations: Int, args: [String]) -> Int {
+                        var acc = 0
+                        for _ in 0..iterations {
+                            switch cli.dispatch_args<BenchCli>(args) {
+                                case Int(n):
+                                    acc = acc + n
+                                case CliError(_):
+                                    acc = acc - 1
+                                case _:
+                                    acc = acc
+                            }
+                        }
+                        return acc
+                    }
+                    "#,
+                    "bench_cli",
+                );
+                let args = Obj::List(ListStorage::Obj(Arc::new(vec![
+                    Obj::str("-v"),
+                    Obj::str("run"),
+                    Obj::str("job"),
+                ])));
+                WorkloadState {
+                    module,
+                    bench_func: bid,
+                    verify_func: bid,
+                    scalar_args: vec![],
+                    obj_args: vec![args],
+                    expected_per_op: 42,
+                    after_check: None,
+                }
+            }),
+        },
     ]
 }
 

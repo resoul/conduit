@@ -131,6 +131,13 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             return;
         }
         match &expr.kind {
+            ExprKind::Int(n) => {
+                if i16::try_from(*n).is_err() && !self.hoisted_ints.contains_key(n) {
+                    let reg = self.alloc_local_s();
+                    self.hoisted_ints.insert(*n, reg);
+                    self.pending_hoist_ints.push(*n);
+                }
+            }
             ExprKind::Float(v) => {
                 let bits = v.to_bits();
                 if !self.hoisted_floats.contains_key(&bits) {
@@ -140,7 +147,14 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 }
             }
             ExprKind::Unary { op: UnaryOp::Neg, expr: inner } => {
-                if let ExprKind::Float(v) = inner.kind {
+                if let ExprKind::Int(n) = inner.kind {
+                    let neg = n.wrapping_neg();
+                    if i16::try_from(neg).is_err() && !self.hoisted_ints.contains_key(&neg) {
+                        let reg = self.alloc_local_s();
+                        self.hoisted_ints.insert(neg, reg);
+                        self.pending_hoist_ints.push(neg);
+                    }
+                } else if let ExprKind::Float(v) = inner.kind {
                     let bits = (-v).to_bits();
                     if !self.hoisted_floats.contains_key(&bits) {
                         let reg = self.alloc_local_s();
@@ -186,7 +200,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 self.collect_loop_consts_expr(target);
                 self.collect_loop_consts_expr(index);
             }
-            ExprKind::Int(_) | ExprKind::Bool(_) | ExprKind::Nil | ExprKind::Ident(_) | ExprKind::Closure { .. } => {}
+            ExprKind::Bool(_) | ExprKind::Nil | ExprKind::Ident(_) | ExprKind::Closure { .. } => {}
         }
     }
 }

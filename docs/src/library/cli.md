@@ -75,7 +75,7 @@ func main() -> Void {
 | `opt name: T "s"? "help"? (= val)?` | `T` (`String`, `Int`, `Float`, `Bool`, or `T?`) | Named option (`--name val`, `--name=val`, `-s val`). |
 | `arg name: T "help"? (= val)?` | `T` (`String`, `Int`, `Float`, `Bool`, or `T?`) | Positional argument in declaration order. |
 | `rest name (: [String])? "help"?` | `[String]` (default `[]`) | Remaining positional arguments (including after `--`). |
-| `cmd name "help"? { ... }` | `Parent_name?` | Subcommand; creates struct `Parent_name`. |
+| `cmd name "help"? { ... } (=> handler)?` | `Parent_name?` | Subcommand; creates struct `Parent_name` and optionally binds a handler (`cli.dispatch<T>()`). |
 | `group name "help"? { ... }` | `Parent_name?` | Command group containing nested `cmd` / `group` items. |
 
 You can also define a standalone reusable group with `cli group Name "help"? { ... }`.
@@ -150,6 +150,8 @@ func run_with(args: [String]) -> String {
 
 - `cli.parse<T>() -> T | CliError` — Parses process arguments (`std::env::args().skip(1)`).
 - `cli.parse_args<T>(args: [String]) -> T | CliError` — Parses an explicit list of argument strings (useful for testing).
+- `cli.dispatch<T>() -> Void | CliError | ...` — Parses process arguments and calls the `=> handler` bound to the matched command (supports `(T, Cmd) -> R` and `(Cmd) -> R`).
+- `cli.dispatch_args<T>(args: [String]) -> Void | CliError | ...` — Parses an explicit `[String]` list and calls the matched command's `=> handler`.
 - `cli.help<T>() -> String` — Returns the formatted `--help` text for `T`.
 - `CliError { kind: String, message: String }` — Error or help signal returned by `parse` / `parse_args`.
   - `kind == "help"` when `-h` or `--help` is passed (`message` contains the formatted help text for the matched command or group).

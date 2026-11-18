@@ -176,6 +176,7 @@ impl Parser {
             TokenKind::KwEnum => self.parse_enum_item(is_exported),
             TokenKind::KwError => self.parse_error_item(is_exported),
             TokenKind::Ident(kw) if kw == "cli" => self.parse_cli_item(is_exported),
+            TokenKind::Ident(kw) if kw == "router" => self.parse_router_item(is_exported),
             TokenKind::KwImport => {
                 if is_exported {
                     return Err(ParserError {

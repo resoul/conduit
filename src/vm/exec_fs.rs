@@ -153,6 +153,8 @@ impl Vm {
         module: &Module,
         s_base: usize,
         o_base: usize,
+        s_top: usize,
+        o_top: usize,
         aux: u8,
         a: u16,
         b: u16,
@@ -268,14 +270,13 @@ impl Vm {
                         return Ok(());
                     }
                 };
-                let orig_s_len = self.scalars.len();
-                let orig_o_len = self.objs.len();
-                let child_s = orig_s_len;
-                let child_o = orig_o_len;
+                let child_s = s_top;
+                let child_o = o_top;
                 let func = &module.functions[func_id as usize];
+                let used_objs = func.num_objs.max(1) as usize;
                 self.ensure_capacity(
                     child_s + func.num_scalars.max(1) as usize,
-                    child_o + func.num_objs.max(1) as usize,
+                    child_o + used_objs,
                 );
 
                 let mut line_arc = Arc::new(VmString::from(String::with_capacity(256)));
@@ -302,20 +303,23 @@ impl Vm {
                                 }
                             }
                             self.objs[child_o] = Obj::Str(Arc::clone(&line_arc));
-                            self.exec_from(module, func_id, child_s, child_o, closure_slot)?;
+                            if let Err(err) =
+                                self.exec_from(module, func_id, child_s, child_o, closure_slot)
+                            {
+                                self.clear_obj_range(child_o, used_objs);
+                                return Err(err);
+                            }
                             self.objs[child_o] = Obj::Empty;
                             count += 1;
                         }
                         Err(e) => {
-                            self.scalars.truncate(orig_s_len);
-                            self.objs.truncate(orig_o_len);
+                            self.clear_obj_range(child_o, used_objs);
                             self.objs[o_base + a as usize] = io_err_obj(&path, &e);
                             return Ok(());
                         }
                     }
                 }
-                self.scalars.truncate(orig_s_len);
-                self.objs.truncate(orig_o_len);
+                self.clear_obj_range(child_o, used_objs);
                 self.objs[o_base + a as usize] = Obj::boxed_int(count);
             }
             _ => return Err(err_msg("Unknown FS binary sub-op")),

@@ -115,6 +115,8 @@ pub(crate) fn ensure_monomorphized_struct(
             slot_idx,
             env_name,
             cli_ann: None,
+            cli_handler: None,
+            router_ann: None,
             default: None,
         });
         subst_fields.push(f_clone);
