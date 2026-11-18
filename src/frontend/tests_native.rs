@@ -1468,3 +1468,104 @@ fn cdt_db_migrations_bundle_and_crypto_passwords_e2e() {
     assert_eq!(rec.schema_id, crate::vm::value::SCHEMA_DB_ERROR);
     let _ = &mut prog;
 }
+
+#[test]
+fn cdt_db_model_schemas_ddl_and_bundle_e2e() {
+    use crate::ir::bundle::{decode_bundle, encode_bundle};
+
+    let src = r#"
+    import * as db from "cdt.db"
+
+    @db.table("users")
+    struct User {
+        @db.pk @db.auto
+        id: Int
+        @db.unique @db.index
+        email: String
+        @db.fk("orgs.id")
+        org_id: Int
+        @db.default("true")
+        active: Bool = true
+        @db.col("bio_text")
+        bio: String?
+    }
+
+    migration 1 "create_users" {
+        up { db.create_table<User>()? }
+        down { db.drop_table<User>()? }
+    }
+
+    export func main() -> String {
+        pg := db.ddl<User>("postgres")
+        my := db.ddl<User>("mysql")
+        return "{pg}|{my}"
+    }
+    "#;
+    let (prog, checked) = crate::frontend::check_source(src).unwrap();
+    let module = crate::ir::lower::compile_program(&prog, &checked).unwrap();
+    module.validate().unwrap();
+    let main_fid = checked.func_by_name["main"];
+    let bytes = encode_bundle(&module, main_fid, 1).unwrap();
+    let (decoded_mod, _, _) = decode_bundle(&bytes).unwrap();
+    assert_eq!(decoded_mod.db_models.len(), 1);
+    assert_eq!(decoded_mod.db_models[0].table_name, "users");
+
+    let mut vm = Vm::new();
+    let out = vm
+        .call_obj(&decoded_mod, decoded_mod.func_id("main").unwrap(), &[], &[])
+        .unwrap();
+    let Obj::Str(s) = out else {
+        panic!("expected String, got {out:?}");
+    };
+    let s = s.as_str();
+    assert!(s.contains("CREATE TABLE IF NOT EXISTS users (id BIGSERIAL PRIMARY KEY, email TEXT NOT NULL UNIQUE, org_id BIGINT NOT NULL REFERENCES orgs(id), active BOOLEAN NOT NULL DEFAULT true, bio_text TEXT);"), "got:\n{s}");
+    assert!(s.contains("CREATE INDEX IF NOT EXISTS idx_users_email ON users (email)"));
+    assert!(s.contains("CREATE TABLE IF NOT EXISTS users (id BIGINT AUTO_INCREMENT PRIMARY KEY, email VARCHAR(255) NOT NULL UNIQUE,"));
+}
+
+#[test]
+fn cdt_cron_schedule_interval_and_bundle_e2e() {
+    use crate::ir::bundle::{decode_bundle, encode_bundle};
+
+    let src = r#"
+    import * as cron from "cdt.cron"
+
+    schedule Jobs {
+        every "*/5 * * * *" => tick_cron
+        interval 20ms => tick_fast
+    }
+
+    func tick_cron() -> Void {
+        return
+    }
+
+    func tick_fast() -> Void {
+        return
+    }
+
+    export func main() -> String | cron.CronError {
+        v1 := cron.validate("*/5 * * * *")
+        v2 := cron.validate("bad")
+        cron.run_once<Jobs>("tick_cron")?
+        sched := cron.start<Jobs>()?
+        r1 := sched.is_running()
+        sched.stop()
+        r2 := sched.is_running()
+        return "{v1}:{v2}:{r1}:{r2}"
+    }
+    "#;
+    let (prog, checked) = crate::frontend::check_source(src).unwrap();
+    let module = crate::ir::lower::compile_program(&prog, &checked).unwrap();
+    module.validate().unwrap();
+    let main_fid = checked.func_by_name["main"];
+    let bytes = encode_bundle(&module, main_fid, 1).unwrap();
+    let (decoded_mod, _, _) = decode_bundle(&bytes).unwrap();
+    assert_eq!(decoded_mod.schedules.len(), 1);
+    assert_eq!(decoded_mod.schedules[0].jobs.len(), 2);
+
+    let mut vm = Vm::new();
+    let out = vm
+        .call_obj(&decoded_mod, decoded_mod.func_id("main").unwrap(), &[], &[])
+        .unwrap();
+    assert_eq!(out, Obj::str("true:false:true:false"));
+}

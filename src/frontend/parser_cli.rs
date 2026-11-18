@@ -380,4 +380,144 @@ impl Parser {
         item.doc = about;
         Ok(item)
     }
+
+    pub(super) fn parse_schedule_item(&mut self, is_exported: bool) -> Result<Item, ParserError> {
+        let start_span = self.bump().span; // consume 'schedule'
+        let (name, _) = self.expect_ident()?;
+        let about = self.try_take_string();
+        self.expect(&TokenKind::LBrace)?;
+        let mut fields = Vec::new();
+        let mut idx = 0usize;
+        while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
+            let tok = self.peek().clone();
+            let TokenKind::Ident(kw) = &tok.kind else {
+                return Err(ParserError {
+                    message: format!(
+                        "Expected 'every' or 'interval' in schedule block, got '{:?}'",
+                        tok.kind
+                    ),
+                    span: tok.span,
+                });
+            };
+            let span = self.bump().span;
+            let ann = match kw.as_str() {
+                "every" => {
+                    let pspan = self.peek().span;
+                    let Some(expr) = self.try_take_string() else {
+                        return Err(ParserError {
+                            message: "Expected cron expression string after 'every'".to_string(),
+                            span: pspan,
+                        });
+                    };
+                    self.expect(&TokenKind::FatArrow)?;
+                    let (handler_name, hspan) = self.expect_ident()?;
+                    FieldAnnotation {
+                        target: "schedule.every".to_string(),
+                        args: vec![
+                            str_expr(expr, pspan),
+                            Expr {
+                                kind: ExprKind::Ident(handler_name),
+                                ty: crate::frontend::types::Type::Void,
+                                span: hspan,
+                            },
+                        ],
+                        span,
+                    }
+                }
+                "interval" => {
+                    let dspan = self.peek().span;
+                    let ms = match self.peek().kind.clone() {
+                        TokenKind::Int(n) if n > 0 => {
+                            self.bump();
+                            let unit_tok = self.peek().clone();
+                            let mult = match &unit_tok.kind {
+                                TokenKind::Ident(u) if u == "ms" => {
+                                    self.bump();
+                                    1i64
+                                }
+                                TokenKind::Ident(u) if u == "s" => {
+                                    self.bump();
+                                    1_000i64
+                                }
+                                TokenKind::Ident(u) if u == "m" => {
+                                    self.bump();
+                                    60_000i64
+                                }
+                                TokenKind::Ident(u) if u == "h" => {
+                                    self.bump();
+                                    3_600_000i64
+                                }
+                                _ => {
+                                    return Err(ParserError {
+                                        message: "Expected duration unit ('ms', 's', 'm', or 'h') after interval integer".to_string(),
+                                        span: unit_tok.span,
+                                    });
+                                }
+                            };
+                            n.saturating_mul(mult)
+                        }
+                        _ => {
+                            return Err(ParserError {
+                                message: "Expected positive integer duration (e.g. 10s, 500ms, 5m) after 'interval'".to_string(),
+                                span: dspan,
+                            });
+                        }
+                    };
+                    self.expect(&TokenKind::FatArrow)?;
+                    let (handler_name, hspan) = self.expect_ident()?;
+                    FieldAnnotation {
+                        target: "schedule.interval".to_string(),
+                        args: vec![
+                            Expr {
+                                kind: ExprKind::Int(ms),
+                                ty: crate::frontend::types::Type::Int,
+                                span: dspan,
+                            },
+                            Expr {
+                                kind: ExprKind::Ident(handler_name),
+                                ty: crate::frontend::types::Type::Void,
+                                span: hspan,
+                            },
+                        ],
+                        span,
+                    }
+                }
+                other => {
+                    return Err(ParserError {
+                        message: format!(
+                            "Unknown schedule entry '{}' (expected 'every' or 'interval')",
+                            other
+                        ),
+                        span: tok.span,
+                    });
+                }
+            };
+            fields.push(FieldDef {
+                name: format!("__job_{}", idx),
+                json_name: None,
+                ty: TypeExpr::Named("Bool".to_string()),
+                annotations: vec![ann],
+                default: Some(Expr {
+                    kind: ExprKind::Bool(false),
+                    ty: crate::frontend::types::Type::Void,
+                    span,
+                }),
+                span,
+            });
+            idx += 1;
+        }
+        self.expect(&TokenKind::RBrace)?;
+
+        let mut item = Item::new_exported(
+            ItemKind::Struct {
+                name,
+                type_params: Vec::new(),
+                fields,
+            },
+            start_span,
+            is_exported,
+        );
+        item.doc = about;
+        Ok(item)
+    }
 }

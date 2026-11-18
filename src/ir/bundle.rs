@@ -470,6 +470,43 @@ pub fn encode_bundle(module: &Module, main_fid: u32, main_ret_tag: u8) -> Result
         w.u32(m.down_func_id);
         Ok(())
     })?;
+    w.list(&module.db_models, |w, m| {
+        w.u32(m.schema_id);
+        w.str(&m.table_name);
+        w.list(&m.columns, |w, c| {
+            w.str(&c.field_name);
+            w.str(&c.col_name);
+            w.bool(c.is_pk);
+            w.bool(c.is_auto);
+            w.bool(c.is_unique);
+            w.bool(c.is_index);
+            match &c.default_sql {
+                Some(s) => { w.u8(1); w.str(s); }
+                None => w.u8(0),
+            }
+            match &c.fk {
+                Some((t, col)) => { w.u8(1); w.str(t); w.str(col); }
+                None => w.u8(0),
+            }
+            Ok(())
+        })
+    })?;
+    w.list(&module.schedules, |w, s| {
+        w.str(&s.name);
+        w.list(&s.jobs, |w, j| {
+            w.str(&j.name);
+            match &j.cron_expr {
+                Some(e) => { w.u8(1); w.str(e); }
+                None => w.u8(0),
+            }
+            match j.interval_ms {
+                Some(ms) => { w.u8(1); w.u64(ms); }
+                None => w.u8(0),
+            }
+            w.u32(j.func_id);
+            Ok(())
+        })
+    })?;
 
     Ok(w.0)
 }
@@ -622,6 +659,51 @@ pub fn decode_bundle(bytes: &[u8]) -> Result<(Module, u32, u8), String> {
             up_func_id,
             down_func_id,
         })
+    })?;
+    module.db_models = r.vec(|r| {
+        let schema_id = r.u32()?;
+        let table_name = r.str()?;
+        let columns = r.vec(|r| {
+            let field_name = r.str()?;
+            let col_name = r.str()?;
+            let is_pk = r.bool()?;
+            let is_auto = r.bool()?;
+            let is_unique = r.bool()?;
+            let is_index = r.bool()?;
+            let default_sql = if r.u8()? == 1 { Some(r.str()?) } else { None };
+            let fk = if r.u8()? == 1 { Some((r.str()?, r.str()?)) } else { None };
+            Ok(crate::ir::DbColumnMeta {
+                field_name,
+                col_name,
+                is_pk,
+                is_auto,
+                is_unique,
+                is_index,
+                default_sql,
+                fk,
+            })
+        })?;
+        Ok(crate::ir::DbModelMeta {
+            schema_id,
+            table_name,
+            columns,
+        })
+    })?;
+    module.schedules = r.vec(|r| {
+        let name = r.str()?;
+        let jobs = r.vec(|r| {
+            let name = r.str()?;
+            let cron_expr = if r.u8()? == 1 { Some(r.str()?) } else { None };
+            let interval_ms = if r.u8()? == 1 { Some(r.u64()?) } else { None };
+            let func_id = r.u32()?;
+            Ok(crate::ir::CronJobSpec {
+                name,
+                cron_expr,
+                interval_ms,
+                func_id,
+            })
+        })?;
+        Ok(crate::ir::SchedulePlan { name, jobs })
     })?;
 
     module.validate()?;

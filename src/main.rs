@@ -107,6 +107,7 @@ fn main() {
         Some("watch") => watch::run_watch_cmd(&args[1..]),
         Some("fmt") => run_fmt_cmd(&args[1..]),
         Some("db") => run_db_cmd(&args[1..]),
+        Some("cron") => run_cron_cmd(&args[1..]),
         Some("lsp") => {
             if let Err(e) = conduit::lsp::run_lsp_server() {
                 eprintln!("LSP error: {}", e);
@@ -118,12 +119,12 @@ fn main() {
         }
         Some("--help" | "-h" | "help") => {
             println!(
-                "Conduit v{}\n\nUsage:\n  conduit bench [--filter <pat>] [--strict]\n  conduit build <file.cdt> [-o <output>]\n  conduit check <file.cdt>\n  conduit db <migrate|rollback|status> <file.cdt> [--url <dsn>] [--steps <n>] [--dry-run]\n  conduit disasm <file.cdt>\n  conduit fmt <file_or_dir> [--check]\n  conduit run <file.cdt> [-- args...]\n  conduit watch <file.cdt> [-- args...]\n  conduit lsp\n  conduit --version, -V\n  conduit --help, -h",
+                "Conduit v{}\n\nUsage:\n  conduit bench [--filter <pat>] [--strict]\n  conduit build <file.cdt> [-o <output>]\n  conduit check <file.cdt>\n  conduit cron <list|print|run> <file.cdt> [job]\n  conduit db <migrate|rollback|status> <file.cdt> [--url <dsn>] [--steps <n>] [--dry-run]\n  conduit disasm <file.cdt>\n  conduit fmt <file_or_dir> [--check]\n  conduit run <file.cdt> [-- args...]\n  conduit watch <file.cdt> [-- args...]\n  conduit lsp\n  conduit --version, -V\n  conduit --help, -h",
                 env!("CARGO_PKG_VERSION")
             );
         }
         Some(cmd) => {
-            eprintln!("Unknown command '{}'. Usage: conduit <bench|build|check|db|disasm|fmt|run|watch|lsp> ...", cmd);
+            eprintln!("Unknown command '{}'. Usage: conduit <bench|build|check|cron|db|disasm|fmt|run|watch|lsp> ...", cmd);
             process::exit(2);
         }
     }
@@ -484,4 +485,87 @@ fn run_build_cmd(args: &[String]) {
         out_path.display(),
         bundle.len()
     );
+}
+
+fn run_cron_cmd(args: &[String]) {
+    let Some(sub) = args.first().map(String::as_str) else {
+        eprintln!("Usage: conduit cron <list|print|run> <file.cdt> [job_name]");
+        process::exit(2);
+    };
+    let Some(file) = args.get(1) else {
+        eprintln!("Usage: conduit cron {} <file.cdt> [job_name]", sub);
+        process::exit(2);
+    };
+    let (program, checked) = match frontend::check_file(Path::new(file)) {
+        Ok(res) => res,
+        Err(e) => {
+            eprintln!("{}", e);
+            process::exit(1);
+        }
+    };
+    let module = match compile_program(&program, &checked) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Compile error: {}", e);
+            process::exit(1);
+        }
+    };
+    match sub {
+        "list" => {
+            for sched in &module.schedules {
+                println!("schedule {}:", sched.name);
+                for job in &sched.jobs {
+                    if let Some(expr) = &job.cron_expr {
+                        println!("  {} -> every \"{}\"", job.name, expr);
+                    } else if let Some(ms) = job.interval_ms {
+                        println!("  {} -> interval {}ms", job.name, ms);
+                    }
+                }
+            }
+        }
+        "print" => {
+            let abs = std::fs::canonicalize(file).unwrap_or_else(|_| PathBuf::from(file));
+            for sched in &module.schedules {
+                for job in &sched.jobs {
+                    if let Some(expr) = &job.cron_expr {
+                        println!("{} conduit cron run {} {}", expr, abs.display(), job.name);
+                    }
+                }
+            }
+        }
+        "run" => {
+            let Some(job_name) = args.get(2) else {
+                eprintln!("Usage: conduit cron run <file.cdt> <job_name>");
+                process::exit(2);
+            };
+            let Some(job) = module
+                .schedules
+                .iter()
+                .flat_map(|s| s.jobs.iter())
+                .find(|j| j.name == *job_name)
+            else {
+                eprintln!("Unknown cron job '{}'", job_name);
+                process::exit(1);
+            };
+            let mut vm = Vm::new();
+            match vm.call(&module, job.func_id, &[], &[]) {
+                Ok(ExecResult::Obj(obj))
+                    if conduit::native::validation::is_err_or_nil_obj(&module, &obj)
+                        && !matches!(obj, conduit::vm::value::Obj::Empty) =>
+                {
+                    eprintln!("Job '{}' failed: {}", job_name, obj.format_obj());
+                    process::exit(1);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("{}", e);
+                    process::exit(1);
+                }
+            }
+        }
+        other => {
+            eprintln!("Unknown cron subcommand '{}'. Expected list, print, or run", other);
+            process::exit(2);
+        }
+    }
 }

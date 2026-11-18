@@ -107,6 +107,7 @@ impl Parser {
         let mut validator_span = None;
         let mut is_exported = false;
         let mut export_span = None;
+        let mut item_annotations = Vec::new();
 
         loop {
             if self.check(&TokenKind::LBracket) {
@@ -129,6 +130,8 @@ impl Parser {
                 }
                 is_validator = true;
                 validator_span = Some(marker_span);
+            } else if self.match_token(&TokenKind::At) {
+                item_annotations.push(self.parse_at_annotation()?);
             } else if self.match_token(&TokenKind::KwExport) {
                 let sp = self.tokens[self.cursor - 1].span;
                 if is_exported {
@@ -168,7 +171,14 @@ impl Parser {
                 true,
             ));
         }
-        match &tok.kind {
+        if !item_annotations.is_empty() && !matches!(tok.kind, TokenKind::KwStruct) {
+            return Err(ParserError {
+                message: "Item annotations (e.g. '@db.table(...)') are only allowed on struct declarations"
+                    .to_string(),
+                span: item_annotations[0].span,
+            });
+        }
+        let mut item = match &tok.kind {
             TokenKind::KwFunc => self.parse_func_item(is_exported, is_validator),
             TokenKind::KwStruct => self.parse_struct_item(is_exported),
             TokenKind::KwType => self.parse_type_alias_item(is_exported),
@@ -177,6 +187,7 @@ impl Parser {
             TokenKind::KwError => self.parse_error_item(is_exported),
             TokenKind::Ident(kw) if kw == "cli" => self.parse_cli_item(is_exported),
             TokenKind::Ident(kw) if kw == "router" => self.parse_router_item(is_exported),
+            TokenKind::Ident(kw) if kw == "schedule" => self.parse_schedule_item(is_exported),
             TokenKind::Ident(kw) if kw == "migration" => self.parse_migration_item(),
             TokenKind::KwImport => {
                 if is_exported {
@@ -194,7 +205,9 @@ impl Parser {
                 ),
                 span: tok.span,
             }),
-        }
+        }?;
+        item.annotations = item_annotations;
+        Ok(item)
     }
 
     fn parse_migration_item(&mut self) -> Result<Item, ParserError> {
@@ -573,6 +586,10 @@ impl Parser {
         let mut field_names = HashSet::new();
         let mut json_names = HashSet::new();
         while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
+            let mut annotations = Vec::new();
+            while self.match_token(&TokenKind::At) {
+                annotations.push(self.parse_at_annotation()?);
+            }
             let (field_name, field_span) = self.expect_ident()?;
             if !field_names.insert(field_name.clone()) {
                 return Err(ParserError {
@@ -585,56 +602,40 @@ impl Parser {
 
             let mut json_name = None;
             let mut json_tag_span = None;
-            let mut annotations = Vec::new();
+            let mut last_line = self.tokens[self.cursor - 1].span.line;
             loop {
-                if self.match_token(&TokenKind::At) {
-                    let ann_span = self.tokens[self.cursor - 1].span;
-                    let (target_first, _) = self.expect_ident()?;
-                    let target = if self.match_token(&TokenKind::Dot) {
-                        format!("{}.{}", target_first, self.expect_ident()?.0)
-                    } else {
-                        target_first
-                    };
-                    let mut args = Vec::new();
-                    if self.match_token(&TokenKind::LParen) {
-                        while !self.check(&TokenKind::RParen) && !self.check(&TokenKind::Eof) {
-                            args.push(self.parse_annotation_arg()?);
-                            if !self.match_token(&TokenKind::Comma) {
-                                break;
-                            }
-                        }
-                        self.expect(&TokenKind::RParen)?;
-                    }
-                    if target == "json" {
+                if self.check(&TokenKind::At)
+                    && self.peek().span.line == last_line
+                {
+                    self.bump();
+                    let ann = self.parse_at_annotation()?;
+                    last_line = self.tokens[self.cursor - 1].span.line;
+                    if ann.target == "json" {
                         if json_tag_span.is_some() {
                             return Err(ParserError {
                                 message: "A field can have only one JSON tag".to_string(),
-                                span: ann_span,
+                                span: ann.span,
                             });
                         }
-                        let [Expr { kind: ExprKind::String(s), .. }] = args.as_slice() else {
+                        let [Expr { kind: ExprKind::String(s), .. }] = ann.args.as_slice() else {
                             return Err(ParserError {
                                 message: "@json(...) expects a single string argument".to_string(),
-                                span: ann_span,
+                                span: ann.span,
                             });
                         };
                         if s.contains(',') {
                             return Err(ParserError {
                                 message: "JSON tag options are not supported; specify only the field name"
                                     .to_string(),
-                                span: ann_span,
+                                span: ann.span,
                             });
                         }
                         if !s.is_empty() {
                             json_name = Some(s.clone());
                         }
-                        json_tag_span = Some(ann_span);
+                        json_tag_span = Some(ann.span);
                     }
-                    annotations.push(FieldAnnotation {
-                        target,
-                        args,
-                        span: ann_span,
-                    });
+                    annotations.push(ann);
                 } else if matches!(&self.peek().kind, TokenKind::FieldTag(_)) {
                     if json_tag_span.is_some() {
                         return Err(ParserError {
@@ -686,6 +687,31 @@ impl Parser {
             start_span,
             is_exported,
         ))
+    }
+
+    fn parse_at_annotation(&mut self) -> Result<FieldAnnotation, ParserError> {
+        let ann_span = self.tokens[self.cursor - 1].span;
+        let (target_first, _) = self.expect_ident()?;
+        let target = if self.match_token(&TokenKind::Dot) {
+            format!("{}.{}", target_first, self.expect_ident()?.0)
+        } else {
+            target_first
+        };
+        let mut args = Vec::new();
+        if self.match_token(&TokenKind::LParen) {
+            while !self.check(&TokenKind::RParen) && !self.check(&TokenKind::Eof) {
+                args.push(self.parse_annotation_arg()?);
+                if !self.match_token(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(&TokenKind::RParen)?;
+        }
+        Ok(FieldAnnotation {
+            target,
+            args,
+            span: ann_span,
+        })
     }
 
     fn parse_type_alias_item(&mut self, is_exported: bool) -> Result<Item, ParserError> {

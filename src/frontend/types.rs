@@ -288,6 +288,7 @@ pub struct ResolvedField {
     pub cli_ann: Option<crate::frontend::ast::FieldAnnotation>,
     pub cli_handler: Option<String>,
     pub router_ann: Option<crate::frontend::ast::FieldAnnotation>,
+    pub db_anns: Vec<crate::frontend::ast::FieldAnnotation>,
     pub default: Option<crate::frontend::ast::Expr>,
 }
 
@@ -295,6 +296,7 @@ pub struct ResolvedField {
 pub struct ResolvedStruct {
     pub schema_id: u32,
     pub name: String,
+    pub db_table: Option<String>,
     pub fields: Vec<ResolvedField>,
     pub scalar_len: u16,
     pub obj_len: u16,

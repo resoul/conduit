@@ -158,12 +158,20 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 if self.mc.checked.math_aliases.contains(alias) {
                     return self.lower_math_call(field, args);
                 }
+                if self.mc.checked.cron_aliases.contains(alias) && field == "validate" {
+                    return self.lower_cron_validate(&args[0]);
+                }
             }
             return self.lower_scalar_method(target, field, args);
         }
         if let ExprKind::Ident(name) = &callee.kind
             && self.lookup_local(name).is_none()
         {
+            if let Some(sym) = self.mc.checked.cron_direct_fns.get(name)
+                && sym == "validate"
+            {
+                return self.lower_cron_validate(&args[0]);
+            }
             if let Some(sym) = self.mc.checked.fs_direct_fns.get(name) {
                 let sym = sym.clone();
                 return self.lower_fs_call(&sym, args, named_args);
@@ -275,7 +283,10 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                     return self.lower_http_call(field, type_args, args, named_args);
                 }
                 if self.mc.checked.db_aliases.contains(alias) {
-                    return self.lower_db_call(field, args, named_args);
+                    return self.lower_db_call(field, type_args, args, named_args);
+                }
+                if self.mc.checked.cron_aliases.contains(alias) {
+                    return self.lower_cron_call(field, type_args, args, named_args);
                 }
             }
             if let Some(reg) = self.lower_builtin_obj_method(target, field, args)? {
@@ -385,11 +396,19 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             }
             if let Some(sym) = self.mc.checked.db_direct_fns.get(name) {
                 let sym = sym.clone();
-                return self.lower_db_call(&sym, args, named_args);
+                return self.lower_db_call(&sym, type_args, args, named_args);
             }
             if let Some(sym) = self.mc.checked.db_direct_types.get(name) {
                 let sym = sym.clone();
-                return self.lower_db_call(&sym, args, named_args);
+                return self.lower_db_call(&sym, type_args, args, named_args);
+            }
+            if let Some(sym) = self.mc.checked.cron_direct_fns.get(name) {
+                let sym = sym.clone();
+                return self.lower_cron_call(&sym, type_args, args, named_args);
+            }
+            if let Some(sym) = self.mc.checked.cron_direct_types.get(name) {
+                let sym = sym.clone();
+                return self.lower_cron_call(&sym, type_args, args, named_args);
             }
             if name == "Map" {
                 let dst_obj = self.alloc_temp_o();
@@ -465,7 +484,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 }
             }
             (Type::Custom(tid), _)
-                if matches!(&tid.module, ModuleId::Native(m) if m == "cdt.fs" || m == "cdt.http" || m == "cdt.db") =>
+                if matches!(&tid.module, ModuleId::Native(m) if m == "cdt.fs" || m == "cdt.http" || m == "cdt.db" || m == "cdt.cron") =>
             {
                 self.lower_native_method_obj(tid, target, method, &[], args)?;
                 Ok(())
@@ -643,6 +662,11 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 if matches!(&tid.module, ModuleId::Native(m) if m == "cdt.db") =>
             {
                 self.lower_db_last_insert_id(target)
+            }
+            (Type::Custom(tid), "is_running")
+                if matches!(&tid.module, ModuleId::Native(m) if m == "cdt.cron") =>
+            {
+                self.lower_cron_is_running(target)
             }
             _ => Err(format!("Unsupported scalar method '.{}()'", method)),
         }

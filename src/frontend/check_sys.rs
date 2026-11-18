@@ -1105,6 +1105,27 @@ impl Checker<'_> {
                 }
                 Ok(db_param)
             }
+            "ddl" => {
+                if type_args.len() != 1 {
+                    return Err("db.ddl<T>(dialect: String) expects 1 type argument".to_string());
+                }
+                if args.len() != 1 || !named_args.is_empty() {
+                    return Err("db.ddl<T>(dialect: String) expects 1 argument".to_string());
+                }
+                let target_ty = self.checked.resolve_type_mut(&type_args[0])?;
+                let Type::Custom(tid) = &target_ty else {
+                    return Err(format!("db.ddl<T>() requires a struct type, got {}", target_ty));
+                };
+                if tid.module != ModuleId::Program || !self.checked.struct_by_name.contains_key(&tid.name) {
+                    return Err(format!("db.ddl<T>() requires a program struct type, got {}", target_ty));
+                }
+                ensure_db_model_plan(self.checked, &tid.name)?;
+                self.check_expr(&mut args[0], Some(&Type::String))?;
+                if args[0].ty != Type::String {
+                    return Err(format!("db.ddl<T>() dialect expects String, got {}", args[0].ty));
+                }
+                Ok(Type::String)
+            }
             other => Err(format!("Unknown cdt.db symbol '{}'", other)),
         }
     }
@@ -1217,7 +1238,373 @@ impl Checker<'_> {
                 }
                 Ok(Type::Void)
             }
+            "create_table" | "drop_table" => {
+                if type_args.len() != 1 || !args.is_empty() {
+                    return Err(format!("Connection.{}<T>() expects 1 type argument and 0 value arguments", method));
+                }
+                let target_ty = self.checked.resolve_type_mut(&type_args[0])?;
+                let Type::Custom(tid) = &target_ty else {
+                    return Err(format!("Connection.{}<T>() requires a struct type, got {}", method, target_ty));
+                };
+                if tid.module != ModuleId::Program || !self.checked.struct_by_name.contains_key(&tid.name) {
+                    return Err(format!("Connection.{}<T>() requires a program struct type, got {}", method, target_ty));
+                }
+                ensure_db_model_plan(self.checked, &tid.name)?;
+                Ok(Type::union(vec![Type::Void, db_err]))
+            }
+            "insert" => {
+                if type_args.len() != 1 || args.len() != 1 {
+                    return Err("Connection.insert<T>(row: T) expects 1 type argument and 1 argument".to_string());
+                }
+                let target_ty = self.checked.resolve_type_mut(&type_args[0])?;
+                let Type::Custom(tid) = &target_ty else {
+                    return Err(format!("Connection.insert<T>() requires a struct type, got {}", target_ty));
+                };
+                if tid.module != ModuleId::Program || !self.checked.struct_by_name.contains_key(&tid.name) {
+                    return Err(format!("Connection.insert<T>() requires a program struct type, got {}", target_ty));
+                }
+                ensure_db_model_plan(self.checked, &tid.name)?;
+                self.check_expr(&mut args[0], Some(&target_ty))?;
+                if !args[0].ty.is_assignable_to(&target_ty) {
+                    return Err(format!("Connection.insert<{}> expects {}, got {}", tid.name, target_ty, args[0].ty));
+                }
+                Ok(Type::union(vec![Type::Int, db_err]))
+            }
+            "all" => {
+                if type_args.len() != 1 || !args.is_empty() {
+                    return Err("Connection.all<T>() expects 1 type argument and 0 arguments".to_string());
+                }
+                let target_ty = self.checked.resolve_type_mut(&type_args[0])?;
+                let Type::Custom(tid) = &target_ty else {
+                    return Err(format!("Connection.all<T>() requires a struct type, got {}", target_ty));
+                };
+                if tid.module != ModuleId::Program || !self.checked.struct_by_name.contains_key(&tid.name) {
+                    return Err(format!("Connection.all<T>() requires a program struct type, got {}", target_ty));
+                }
+                ensure_db_model_plan(self.checked, &tid.name)?;
+                Ok(Type::union(vec![Type::List(Box::new(target_ty)), db_err]))
+            }
+            "find" => {
+                if type_args.len() != 1 || args.len() != 1 {
+                    return Err("Connection.find<T>(id) expects 1 type argument and 1 argument".to_string());
+                }
+                let target_ty = self.checked.resolve_type_mut(&type_args[0])?;
+                let Type::Custom(tid) = &target_ty else {
+                    return Err(format!("Connection.find<T>() requires a struct type, got {}", target_ty));
+                };
+                if tid.module != ModuleId::Program || !self.checked.struct_by_name.contains_key(&tid.name) {
+                    return Err(format!("Connection.find<T>() requires a program struct type, got {}", target_ty));
+                }
+                ensure_db_model_plan(self.checked, &tid.name)?;
+                self.check_expr(&mut args[0], None)?;
+                Ok(Type::union(vec![Type::Optional(Box::new(target_ty)), db_err]))
+            }
+            "delete" => {
+                if type_args.len() != 1 || args.len() != 1 {
+                    return Err("Connection.delete<T>(id) expects 1 type argument and 1 argument".to_string());
+                }
+                let target_ty = self.checked.resolve_type_mut(&type_args[0])?;
+                let Type::Custom(tid) = &target_ty else {
+                    return Err(format!("Connection.delete<T>() requires a struct type, got {}", target_ty));
+                };
+                if tid.module != ModuleId::Program || !self.checked.struct_by_name.contains_key(&tid.name) {
+                    return Err(format!("Connection.delete<T>() requires a program struct type, got {}", target_ty));
+                }
+                ensure_db_model_plan(self.checked, &tid.name)?;
+                self.check_expr(&mut args[0], None)?;
+                Ok(Type::union(vec![Type::Int, db_err]))
+            }
             other => Err(format!("db.Connection has no method '.{}()'", other)),
         }
+    }
+
+    pub(crate) fn check_cron_call(
+        &mut self,
+        sym: &str,
+        type_args: &[TypeExpr],
+        args: &mut [Expr],
+        named_args: &mut [NamedArg],
+    ) -> Result<Type, String> {
+        let cron_err = Type::Custom(TypeId::native("cdt.cron", "CronError"));
+        let sched_ty = Type::Custom(TypeId::native("cdt.cron", "Scheduler"));
+        match sym {
+            "CronError" => {
+                if !type_args.is_empty() {
+                    return Err("CronError does not accept type arguments".to_string());
+                }
+                check_fields_ctor(
+                    self,
+                    "CronError",
+                    &[("kind", Type::String), ("message", Type::String)],
+                    args,
+                    named_args,
+                    cron_err,
+                )
+            }
+            "validate" => {
+                if !type_args.is_empty() || args.len() != 1 || !named_args.is_empty() {
+                    return Err("cron.validate(expr: String) expects 1 argument".to_string());
+                }
+                self.check_expr(&mut args[0], Some(&Type::String))?;
+                if args[0].ty != Type::String {
+                    return Err(format!("cron.validate() expects String, got {}", args[0].ty));
+                }
+                Ok(Type::Bool)
+            }
+            "run" | "start" => {
+                if type_args.len() != 1 || !args.is_empty() || !named_args.is_empty() {
+                    return Err(format!(
+                        "cron.{}<T>() expects 1 schedule type argument and 0 value arguments",
+                        sym
+                    ));
+                }
+                let target_ty = self.checked.resolve_type_mut(&type_args[0])?;
+                let Type::Custom(tid) = &target_ty else {
+                    return Err(format!("cron.{}<T>() requires a schedule type, got {}", sym, target_ty));
+                };
+                if tid.module != ModuleId::Program {
+                    return Err(format!("cron.{}<T>() requires a program schedule type, got {}", sym, target_ty));
+                }
+                ensure_cron_schedule_plan(self.checked, &tid.name)?;
+                if sym == "run" {
+                    Ok(Type::union(vec![Type::Void, cron_err]))
+                } else {
+                    Ok(Type::union(vec![sched_ty, cron_err]))
+                }
+            }
+            "run_once" => {
+                if type_args.len() != 1 || args.len() != 1 || !named_args.is_empty() {
+                    return Err("cron.run_once<T>(job: String) expects 1 type argument and 1 argument".to_string());
+                }
+                let target_ty = self.checked.resolve_type_mut(&type_args[0])?;
+                let Type::Custom(tid) = &target_ty else {
+                    return Err(format!("cron.run_once<T>() requires a schedule type, got {}", target_ty));
+                };
+                if tid.module != ModuleId::Program {
+                    return Err(format!("cron.run_once<T>() requires a program schedule type, got {}", target_ty));
+                }
+                ensure_cron_schedule_plan(self.checked, &tid.name)?;
+                self.check_expr(&mut args[0], Some(&Type::String))?;
+                if args[0].ty != Type::String {
+                    return Err(format!("cron.run_once<T>() expects String job name, got {}", args[0].ty));
+                }
+                Ok(Type::union(vec![Type::Void, cron_err]))
+            }
+            other => Err(format!("Unknown cdt.cron symbol '{}'", other)),
+        }
+    }
+
+    pub(crate) fn check_cron_method(
+        &mut self,
+        type_name: &str,
+        method: &str,
+        args: &mut [Expr],
+    ) -> Result<Type, String> {
+        if type_name != "Scheduler" {
+            return Err(format!("Type 'cron.{}' has no method '.{}()'", type_name, method));
+        }
+        match method {
+            "stop" => {
+                if !args.is_empty() {
+                    return Err("Scheduler.stop() takes 0 arguments".to_string());
+                }
+                Ok(Type::Void)
+            }
+            "is_running" => {
+                if !args.is_empty() {
+                    return Err("Scheduler.is_running() takes 0 arguments".to_string());
+                }
+                Ok(Type::Bool)
+            }
+            other => Err(format!("cron.Scheduler has no method '.{}()'", other)),
+        }
+    }
+}
+
+pub(crate) fn ensure_db_model_plan(checked: &mut CheckedProgram, struct_name: &str) -> Result<(), String> {
+    let sid = *checked
+        .struct_by_name
+        .get(struct_name)
+        .ok_or_else(|| format!("Unknown struct '{}' in cdt.db", struct_name))?;
+    if checked.db_model_plans.iter().any(|m| m.schema_id == sid as u32) {
+        return Ok(());
+    }
+    let st = &checked.structs[sid];
+    let table_name = st
+        .db_table
+        .clone()
+        .unwrap_or_else(|| struct_name.to_ascii_lowercase());
+    let mut columns = Vec::with_capacity(st.fields.len());
+    for f in &st.fields {
+        let base_ty = match &f.ty {
+            Type::Optional(inner) => inner.as_ref(),
+            other => other,
+        };
+        if !matches!(base_ty, Type::Int | Type::Float | Type::Bool | Type::String) {
+            return Err(format!(
+                "DB model '{}' field '{}' has unsupported column type '{}' (supported: Int, Float, Bool, String, and Optionals)",
+                struct_name, f.name, f.ty
+            ));
+        }
+        let mut col_name = f.name.clone();
+        let mut is_pk = false;
+        let mut is_auto = false;
+        let mut is_unique = false;
+        let mut is_index = false;
+        let mut default_sql = None;
+        let mut fk = None;
+        for ann in &f.db_anns {
+            match ann.target.as_str() {
+                "db.pk" => is_pk = true,
+                "db.auto" => {
+                    if *base_ty != Type::Int {
+                        return Err(format!(
+                            "@db.auto on '{}.{}' requires Int field",
+                            struct_name, f.name
+                        ));
+                    }
+                    is_auto = true;
+                }
+                "db.unique" => is_unique = true,
+                "db.index" => is_index = true,
+                "db.col" => {
+                    let [Expr { kind: ExprKind::String(s), .. }] = ann.args.as_slice() else {
+                        return Err(format!("@db.col(...) on '{}.{}' expects 1 String", struct_name, f.name));
+                    };
+                    col_name = s.clone();
+                }
+                "db.default" => {
+                    let [Expr { kind: ExprKind::String(s), .. }] = ann.args.as_slice() else {
+                        return Err(format!("@db.default(...) on '{}.{}' expects 1 String", struct_name, f.name));
+                    };
+                    default_sql = Some(s.clone());
+                }
+                "db.fk" => {
+                    let [Expr { kind: ExprKind::String(s), .. }] = ann.args.as_slice() else {
+                        return Err(format!("@db.fk(...) on '{}.{}' expects 1 String ('table.col')", struct_name, f.name));
+                    };
+                    let Some((t, c)) = s.split_once('.') else {
+                        return Err(format!("@db.fk(\"{}\") on '{}.{}' must be 'table.column'", s, struct_name, f.name));
+                    };
+                    fk = Some((t.to_string(), c.to_string()));
+                }
+                other => {
+                    return Err(format!(
+                        "Unknown DB field annotation '@{}' on '{}.{}'",
+                        other, struct_name, f.name
+                    ));
+                }
+            }
+        }
+        columns.push(crate::ir::DbColumnMeta {
+            field_name: f.name.clone(),
+            col_name,
+            is_pk,
+            is_auto,
+            is_unique,
+            is_index,
+            default_sql,
+            fk,
+        });
+    }
+    checked.db_model_plans.push(crate::ir::DbModelMeta {
+        schema_id: sid as u32,
+        table_name,
+        columns,
+    });
+    Ok(())
+}
+
+pub(crate) fn ensure_cron_schedule_plan(
+    checked: &mut CheckedProgram,
+    schedule_name: &str,
+) -> Result<(), String> {
+    if checked.cron_schedule_plans.iter().any(|(n, _)| n == schedule_name) {
+        return Ok(());
+    }
+    let sid = *checked
+        .struct_by_name
+        .get(schedule_name)
+        .ok_or_else(|| format!("Unknown schedule '{}' in cdt.cron", schedule_name))?;
+    let st = &checked.structs[sid];
+    let mut entries = Vec::new();
+    for f in &st.fields {
+        let Some(ann) = &f.router_ann else {
+            return Err(format!(
+                "Type '{}' is not a 'schedule' declaration (missing job definitions)",
+                schedule_name
+            ));
+        };
+        match ann.target.as_str() {
+            "schedule.every" => {
+                let Some(Expr { kind: ExprKind::String(expr), .. }) = ann.args.first() else {
+                    return Err(format!("Invalid cron expression in schedule '{}'", schedule_name));
+                };
+                crate::native::cron::parse_cron_expr(expr).map_err(|e| {
+                    format!("Invalid cron expression '{}' in schedule '{}': {}", expr, schedule_name, e)
+                })?;
+                let Some(Expr { kind: ExprKind::Ident(handler_name), .. }) = ann.args.get(1) else {
+                    return Err(format!("Invalid job handler in schedule '{}'", schedule_name));
+                };
+                let fid = *checked.func_by_name.get(handler_name).ok_or_else(|| {
+                    format!("Unknown handler '{}' in schedule '{}'", handler_name, schedule_name)
+                })?;
+                let sig = &checked.funcs[fid as usize];
+                if !sig.params.is_empty() || !is_cron_handler_return(&sig.return_type, checked) {
+                    return Err(format!(
+                        "schedule '{}' job '{}' must have signature () -> Void or () -> Void | Error",
+                        schedule_name, handler_name
+                    ));
+                }
+                entries.push(crate::frontend::check::CronScheduleEntry {
+                    name: handler_name.clone(),
+                    cron_expr: Some(expr.clone()),
+                    interval_ms: None,
+                    handler_name: handler_name.clone(),
+                });
+            }
+            "schedule.interval" => {
+                let Some(Expr { kind: ExprKind::Int(ms), .. }) = ann.args.first() else {
+                    return Err(format!("Invalid interval in schedule '{}'", schedule_name));
+                };
+                let Some(Expr { kind: ExprKind::Ident(handler_name), .. }) = ann.args.get(1) else {
+                    return Err(format!("Invalid job handler in schedule '{}'", schedule_name));
+                };
+                let fid = *checked.func_by_name.get(handler_name).ok_or_else(|| {
+                    format!("Unknown handler '{}' in schedule '{}'", handler_name, schedule_name)
+                })?;
+                let sig = &checked.funcs[fid as usize];
+                if !sig.params.is_empty() || !is_cron_handler_return(&sig.return_type, checked) {
+                    return Err(format!(
+                        "schedule '{}' job '{}' must have signature () -> Void or () -> Void | Error",
+                        schedule_name, handler_name
+                    ));
+                }
+                entries.push(crate::frontend::check::CronScheduleEntry {
+                    name: handler_name.clone(),
+                    cron_expr: None,
+                    interval_ms: Some(*ms as u64),
+                    handler_name: handler_name.clone(),
+                });
+            }
+            _ => {
+                return Err(format!(
+                    "Type '{}' is not a 'schedule' declaration",
+                    schedule_name
+                ));
+            }
+        }
+    }
+    checked.cron_schedule_plans.push((schedule_name.to_string(), entries));
+    Ok(())
+}
+
+fn is_cron_handler_return(ty: &Type, checked: &CheckedProgram) -> bool {
+    match ty {
+        Type::Void => true,
+        Type::Union(vars) => vars
+            .iter()
+            .all(|v| *v == Type::Void || crate::frontend::check_native::is_error_type(v, checked)),
+        _ => false,
     }
 }

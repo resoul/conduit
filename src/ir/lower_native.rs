@@ -31,11 +31,11 @@ use crate::vm::opcode::{
     EXT_ENV_LOAD, EXT_ENV_REQUIRE, EXT_FS_BINARY, EXT_FS_UNARY, EXT_LIST_FIRST, EXT_LIST_LAST,
     EXT_LIST_SORT, EXT_MAP_ENTRIES, EXT_MAP_GET, EXT_MAP_KEYS, EXT_MAP_REMOVE, EXT_MAP_VALUES,
     EXT_PATH_OP, EXT_PROCESS_OP, EXT_STR_SPLIT, EXT_STR_TO_FLOAT, EXT_STR_TO_INT, EXT_URL_OP,
-    EXT_CSV_OP, EXT_DB_OP, EXT_MATH_OP, EXT_LOG_OP, EXT_HTTP_OP, Op,
+    EXT_CSV_OP, EXT_DB_OP, EXT_CRON_OP, EXT_MATH_OP, EXT_LOG_OP, EXT_HTTP_OP, Op,
 };
 use crate::vm::value::{
     SCHEMA_BOXED_BOOL, SCHEMA_BOXED_FLOAT, SCHEMA_BOXED_INT, SCHEMA_CLI_ERROR,
-    SCHEMA_CRYPTO_ERROR, SCHEMA_CSV_ERROR, SCHEMA_DB_ERROR, SCHEMA_DB_PARAM, SCHEMA_EMPTY_TAG,
+    SCHEMA_CRYPTO_ERROR, SCHEMA_CSV_ERROR, SCHEMA_CRON_ERROR, SCHEMA_DB_ERROR, SCHEMA_DB_PARAM, SCHEMA_EMPTY_TAG,
     SCHEMA_ENV_ERROR, SCHEMA_FS_ERROR, SCHEMA_FS_READER,
     SCHEMA_FS_WRITER, SCHEMA_HTTP_BINARY_RESPONSE, SCHEMA_HTTP_ERROR, SCHEMA_HTTP_REQUEST,
     SCHEMA_HTTP_RESPONSE, SCHEMA_HTTP_ROUTER, SCHEMA_INDEX_ERROR, SCHEMA_JSON_DECODE_ERROR,
@@ -1355,6 +1355,11 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
         {
             return self.lower_db_method(&tid.name, target, method, type_args, args);
         }
+        if let ModuleId::Native(m) = &tid.module
+            && m == "cdt.cron"
+        {
+            return self.lower_cron_method(&tid.name, target, method);
+        }
         let kind = match (&tid.module, tid.name.as_str(), method) {
             (ModuleId::Native(m), "Timestamp", "unix_seconds") if m == "cdt.time" => {
                 TimeOpKind::UnixSeconds
@@ -1779,6 +1784,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
     pub(crate) fn lower_db_call(
         &mut self,
         sym: &str,
+        type_args: &[TypeExpr],
         args: &[Expr],
         named_args: &[NamedArg],
     ) -> Result<u16, String> {
@@ -1842,6 +1848,19 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 });
                 Ok(a)
             }
+            "ddl" => {
+                let model_idx = self.resolve_db_model_idx(&type_args[0])?;
+                let b = self.lower_obj(&args[0])?;
+                let a = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_DB_OP,
+                    aux: DB_DDL,
+                    a,
+                    b,
+                    c: model_idx,
+                });
+                Ok(a)
+            }
             other => Err(format!("Unsupported cdt.db symbol '{}'", other)),
         }
     }
@@ -1881,6 +1900,38 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             schema_id: SCHEMA_DB_PARAM,
             scalar_regs,
             obj_regs: Box::new([sql_reg, params_reg]),
+        })?;
+        let packed = self.alloc_temp_o();
+        self.ops.push(Op::NewRecord {
+            dst_obj: packed,
+            desc_idx,
+        });
+        Ok(packed)
+    }
+
+    fn resolve_db_model_idx(&self, te: &TypeExpr) -> Result<u16, String> {
+        let target_ty = self.mc.resolve_type(te)?;
+        let Type::Custom(tid) = target_ty else {
+            return Err("Expected struct type for cdt.db model operation".to_string());
+        };
+        let sid = self.mc.checked.struct_by_name[&tid.name] as u32;
+        self.mc
+            .checked
+            .db_model_plans
+            .iter()
+            .position(|m| m.schema_id == sid)
+            .map(|i| i as u16)
+            .ok_or_else(|| format!("Missing DB model plan for '{}'", tid.name))
+    }
+
+    fn pack_db_model_arg(&mut self, model_idx: u16, arg_expr: &Expr) -> Result<u16, String> {
+        let arg_reg = self.lower_obj(arg_expr)?;
+        let m_reg = self.alloc_temp_s();
+        self.load_int_into(m_reg, model_idx as i64)?;
+        let desc_idx = self.mc.intern_record_desc(RecordDesc {
+            schema_id: SCHEMA_DB_PARAM,
+            scalar_regs: Box::new([m_reg]),
+            obj_regs: Box::new([arg_reg]),
         })?;
         let packed = self.alloc_temp_o();
         self.ops.push(Op::NewRecord {
@@ -1970,8 +2021,152 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 });
                 Ok(dst_obj)
             }
+            "create_table" | "drop_table" | "all" => {
+                let model_idx = self.resolve_db_model_idx(&type_args[0])?;
+                let aux = match method {
+                    "create_table" => DB_CREATE_TABLE,
+                    "drop_table" => DB_DROP_TABLE,
+                    _ => DB_ALL,
+                };
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_DB_OP,
+                    aux,
+                    a: dst_obj,
+                    b: conn_reg,
+                    c: model_idx,
+                });
+                Ok(dst_obj)
+            }
+            "insert" | "find" | "delete" => {
+                let model_idx = self.resolve_db_model_idx(&type_args[0])?;
+                let packed = self.pack_db_model_arg(model_idx, &args[0])?;
+                let aux = match method {
+                    "insert" => DB_INSERT,
+                    "find" => DB_FIND,
+                    _ => DB_DELETE,
+                };
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_DB_OP,
+                    aux,
+                    a: dst_obj,
+                    b: conn_reg,
+                    c: packed,
+                });
+                Ok(dst_obj)
+            }
             _ => Err(format!("Unsupported db.Connection method '{}'", method)),
         }
+    }
+
+    fn resolve_cron_schedule_idx(&self, te: &TypeExpr) -> Result<u16, String> {
+        let target_ty = self.mc.resolve_type(te)?;
+        let Type::Custom(tid) = target_ty else {
+            return Err("Expected schedule type for cdt.cron".to_string());
+        };
+        self.mc
+            .checked
+            .cron_schedule_plans
+            .iter()
+            .position(|(n, _)| n == &tid.name)
+            .map(|i| i as u16)
+            .ok_or_else(|| format!("Unknown schedule '{}'", tid.name))
+    }
+
+    pub(crate) fn lower_cron_validate(&mut self, expr: &Expr) -> Result<u16, String> {
+        use crate::vm::exec_cron::CRON_VALIDATE;
+        let b = self.lower_obj(expr)?;
+        let a = self.alloc_temp_s();
+        self.ops.push(Op::ExtOp {
+            kind: EXT_CRON_OP,
+            aux: CRON_VALIDATE,
+            a,
+            b,
+            c: 0,
+        });
+        Ok(a)
+    }
+
+    pub(crate) fn lower_cron_is_running(&mut self, target: &Expr) -> Result<u16, String> {
+        use crate::vm::exec_cron::CRON_IS_RUNNING;
+        let b = self.lower_obj(target)?;
+        let a = self.alloc_temp_s();
+        self.ops.push(Op::ExtOp {
+            kind: EXT_CRON_OP,
+            aux: CRON_IS_RUNNING,
+            a,
+            b,
+            c: 0,
+        });
+        Ok(a)
+    }
+
+    pub(crate) fn lower_cron_call(
+        &mut self,
+        sym: &str,
+        type_args: &[TypeExpr],
+        args: &[Expr],
+        named_args: &[NamedArg],
+    ) -> Result<u16, String> {
+        use crate::vm::exec_cron::*;
+        match sym {
+            "CronError" => self.lower_native_record(
+                SCHEMA_CRON_ERROR,
+                &["kind", "message"],
+                args,
+                named_args,
+            ),
+            "run" | "start" => {
+                let sched_idx = self.resolve_cron_schedule_idx(&type_args[0])?;
+                let a = self.alloc_temp_o();
+                let aux = if sym == "run" { CRON_RUN } else { CRON_START };
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_CRON_OP,
+                    aux,
+                    a,
+                    b: sched_idx,
+                    c: 0,
+                });
+                Ok(a)
+            }
+            "run_once" => {
+                let sched_idx = self.resolve_cron_schedule_idx(&type_args[0])?;
+                let c = self.lower_obj(&args[0])?;
+                let a = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_CRON_OP,
+                    aux: CRON_RUN_ONCE,
+                    a,
+                    b: sched_idx,
+                    c,
+                });
+                Ok(a)
+            }
+            other => Err(format!("Unsupported cdt.cron symbol '{}'", other)),
+        }
+    }
+
+    pub(crate) fn lower_cron_method(
+        &mut self,
+        type_name: &str,
+        target: &Expr,
+        method: &str,
+    ) -> Result<u16, String> {
+        use crate::vm::exec_cron::CRON_STOP;
+        if type_name != "Scheduler" || method != "stop" {
+            return Err(format!("Unsupported cron method '{}.{}()'", type_name, method));
+        }
+        let b = self.lower_obj(target)?;
+        let dst = self.alloc_temp_o();
+        self.ops.push(Op::ExtOp {
+            kind: EXT_CRON_OP,
+            aux: CRON_STOP,
+            a: 0,
+            b,
+            c: 0,
+        });
+        let idx = self.mc.intern_empty()?;
+        self.ops.push(Op::LoadConstObj { dst_obj: dst, idx });
+        Ok(dst)
     }
 }
 

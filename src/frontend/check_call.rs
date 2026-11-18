@@ -128,6 +128,9 @@ impl<'a> Checker<'a> {
                 if self.checked.db_aliases.contains(mod_alias) {
                     return self.check_db_call(field, type_args, args, named_args);
                 }
+                if self.checked.cron_aliases.contains(mod_alias) {
+                    return self.check_cron_call(field, type_args, args, named_args);
+                }
             }
             self.check_expr(target, None)?;
             return self.check_method_call(target, field, type_args, args, named_args);
@@ -268,6 +271,14 @@ impl<'a> Checker<'a> {
                 _ if self.checked.db_direct_types.contains_key(name) => {
                     let sym = self.checked.db_direct_types[name].clone();
                     return self.check_db_call(&sym, type_args, args, named_args);
+                }
+                _ if self.checked.cron_direct_fns.contains_key(name) => {
+                    let sym = self.checked.cron_direct_fns[name].clone();
+                    return self.check_cron_call(&sym, type_args, args, named_args);
+                }
+                _ if self.checked.cron_direct_types.contains_key(name) => {
+                    let sym = self.checked.cron_direct_types[name].clone();
+                    return self.check_cron_call(&sym, type_args, args, named_args);
                 }
                 _ if self.checked.generic_structs.contains_key(name) => {
                     let base = name.clone();

@@ -77,3 +77,13 @@ conduit db rollback main.cdt --url postgres://conduit:secret@127.0.0.1:5432/app 
 ```
 
 Inspects, applies, or rolls back declarative `migration <version> "<name>"` blocks against PostgreSQL or MySQL, tracking applied versions in `schema_migrations`.
+
+### Inspecting & Running Cron Jobs (`conduit cron`)
+
+```bash
+conduit cron list main.cdt
+conduit cron run main.cdt cleanup_sessions
+conduit cron print main.cdt
+```
+
+Lists declared `schedule` jobs, runs a single job immediately, or prints ready-to-paste `crontab` lines to `stdout` without modifying the host system.

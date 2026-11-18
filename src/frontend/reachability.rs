@@ -96,6 +96,13 @@ pub fn shake_unreachable_funcs(
             }
         }
     }
+    for (_, entries) in &checked.cron_schedule_plans {
+        for entry in entries {
+            if reachable.insert(entry.handler_name.clone()) {
+                queue.push_back(entry.handler_name.clone());
+            }
+        }
+    }
     for item in &program.items {
         if let ItemKind::Migration { up, down, .. } = &item.kind {
             let mut up_scopes = vec![HashSet::from(["db".to_string()])];

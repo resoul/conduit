@@ -290,6 +290,7 @@ pub struct Item {
     pub is_exported: bool,
     pub is_imported: bool,
     pub doc: Option<String>,
+    pub annotations: Vec<FieldAnnotation>,
 }
 
 impl Item {
@@ -300,6 +301,7 @@ impl Item {
             is_exported,
             is_imported: false,
             doc: None,
+            annotations: Vec::new(),
         }
     }
 }

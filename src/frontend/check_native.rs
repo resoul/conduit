@@ -23,6 +23,7 @@ pub(crate) fn is_valid_native_type(mod_name: &str, ty_name: &str) -> bool {
             "HttpError" | "Request" | "Response" | "BinaryResponse" | "Router"
         ),
         "cdt.db" => matches!(ty_name, "Connection" | "Param" | "DbError"),
+        "cdt.cron" => matches!(ty_name, "Scheduler" | "CronError"),
         _ => false,
     }
 }
@@ -333,7 +334,7 @@ pub(crate) fn register_native_imports(
                 }
                 for spec in names {
                     match spec.name.as_str() {
-                        "connect" | "int" | "float" | "bool" | "text" | "null" => {
+                        "connect" | "int" | "float" | "bool" | "text" | "null" | "ddl" => {
                             insert_unique(&mut checked.db_direct_fns, &spec.alias, &spec.name)?;
                         }
                         "Connection" | "Param" | "DbError" => {
@@ -344,6 +345,29 @@ pub(crate) fn register_native_imports(
                         other => {
                             return Err(format!(
                                 "Module 'cdt.db' has no exported member '{}'",
+                                other
+                            ));
+                        }
+                    }
+                }
+            }
+            "cdt.cron" => {
+                if let Some(a) = alias {
+                    checked.cron_aliases.insert(a.clone());
+                }
+                for spec in names {
+                    match spec.name.as_str() {
+                        "run" | "start" | "run_once" | "validate" => {
+                            insert_unique(&mut checked.cron_direct_fns, &spec.alias, &spec.name)?;
+                        }
+                        "Scheduler" | "CronError" => {
+                            checked
+                                .cron_direct_types
+                                .insert(spec.alias.clone(), spec.name.clone());
+                        }
+                        other => {
+                            return Err(format!(
+                                "Module 'cdt.cron' has no exported member '{}'",
                                 other
                             ));
                         }
@@ -440,6 +464,10 @@ pub fn resolve_type_expr(te: &TypeExpr, checked: &CheckedProgram) -> Result<Type
                 "cdt.db",
                 &checked.db_direct_types[name],
             ))),
+            _ if checked.cron_direct_types.contains_key(name) => Ok(Type::Custom(TypeId::native(
+                "cdt.cron",
+                &checked.cron_direct_types[name],
+            ))),
             _ if name.contains('.') => {
                 let mut parts = name.splitn(2, '.');
                 let alias = parts.next().unwrap_or("");
@@ -468,6 +496,8 @@ pub fn resolve_type_expr(te: &TypeExpr, checked: &CheckedProgram) -> Result<Type
                     "cdt.http"
                 } else if checked.db_aliases.contains(alias) {
                     "cdt.db"
+                } else if checked.cron_aliases.contains(alias) {
+                    "cdt.cron"
                 } else {
                     return Err(format!("Unknown type '{}'", name));
                 };
@@ -576,6 +606,7 @@ pub(crate) fn is_error_type(ty: &Type, checked: &CheckedProgram) -> bool {
             "cdt.csv" => name == "CsvError",
             "cdt.http" => name == "HttpError",
             "cdt.db" => name == "DbError",
+            "cdt.cron" => name == "CronError",
             _ => false,
         },
         Type::Custom(TypeId {
@@ -707,6 +738,8 @@ pub(crate) fn native_member_field(tid: &TypeId, field: &str) -> Result<(Type, u1
         ("cdt.db", "DbError", "kind") => Ok((Type::String, 0)),
         ("cdt.db", "DbError", "message") => Ok((Type::String, 1)),
         ("cdt.db", "DbError", "code") => Ok((Type::String, 2)),
+        ("cdt.cron", "CronError", "kind") => Ok((Type::String, 0)),
+        ("cdt.cron", "CronError", "message") => Ok((Type::String, 1)),
         _ => Err(format!("Type '{}' has no field '{}'", tid, field)),
     }
 }
@@ -1013,6 +1046,12 @@ impl<'a> Checker<'a> {
             }
             (ModuleId::Native(ref m), _, _) if m == "cdt.db" => {
                 self.check_db_method(&tid.name, method, type_args, args)
+            }
+            (ModuleId::Native(ref m), _, _) if m == "cdt.cron" => {
+                if !type_args.is_empty() {
+                    return Err(format!("Method '.{}()' does not accept type arguments", method));
+                }
+                self.check_cron_method(&tid.name, method, args)
             }
             (ModuleId::Native(ref m), "Timestamp", "unix_seconds" | "unix_milliseconds")
                 if m == "cdt.time" =>

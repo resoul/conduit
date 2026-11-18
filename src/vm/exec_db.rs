@@ -2,9 +2,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ir::Module;
 use crate::native::db::{
-    Cell, DbErr, Dialect, SqlConn, make_db_conn, make_db_error, make_db_param_bool,
-    make_db_param_float, make_db_param_int, make_db_param_null, make_db_param_text, obj_to_cell,
-    query_result_to_maps, query_result_to_structs,
+    Cell, DbErr, Dialect, SqlConn, any_obj_to_cell, build_create_table_sqls, build_delete_sql,
+    build_drop_table_sql, build_find_sql, build_insert_and_cells, build_select_all_sql,
+    make_db_conn, make_db_error, make_db_param_bool, make_db_param_float, make_db_param_int,
+    make_db_param_null, make_db_param_text, obj_to_cell, query_result_to_maps,
+    query_result_to_structs,
 };
 use crate::vm::exec_cold::err_msg;
 use crate::vm::value::{ListStorage, Obj, SCHEMA_DB_CONN, SCHEMA_DB_ERROR, SCHEMA_DB_PARAM};
@@ -26,6 +28,13 @@ pub const DB_ROLLBACK: u8 = 11;
 pub const DB_MIGRATE: u8 = 12;
 pub const DB_LAST_INSERT_ID: u8 = 13;
 pub const DB_CLOSE: u8 = 14;
+pub const DB_CREATE_TABLE: u8 = 16;
+pub const DB_DROP_TABLE: u8 = 17;
+pub const DB_INSERT: u8 = 18;
+pub const DB_ALL: u8 = 19;
+pub const DB_FIND: u8 = 20;
+pub const DB_DELETE: u8 = 21;
+pub const DB_DDL: u8 = 22;
 
 impl Vm {
     fn extract_db_handle(&self, obj: &Obj) -> Result<usize, RuntimeError> {
@@ -243,6 +252,121 @@ impl Vm {
                     Ok(applied) => Obj::boxed_int(applied.len() as i64),
                     Err(EitherMigErr::Db(e)) => e.into_obj(),
                     Err(EitherMigErr::Vm(e)) => return Err(e),
+                };
+                self.objs[o_base + a as usize] = res;
+            }
+            DB_DDL => {
+                let Obj::Str(d) = &self.objs[o_base + b as usize] else {
+                    return Err(err_msg("Expected String dialect in db.ddl()"));
+                };
+                let dialect = match d.as_str() {
+                    "mysql" => Dialect::Mysql,
+                    _ => Dialect::Postgres,
+                };
+                let model = &module.db_models[c as usize];
+                let schema = module
+                    .struct_schemas
+                    .iter()
+                    .find(|s| s.schema_id == model.schema_id)
+                    .ok_or_else(|| err_msg("Missing struct schema for db.ddl()"))?;
+                let sql = build_create_table_sqls(model, schema, dialect).join(";\n");
+                self.objs[o_base + a as usize] = Obj::str(sql);
+            }
+            DB_CREATE_TABLE | DB_DROP_TABLE | DB_ALL => {
+                let id = self.extract_db_handle(&self.objs[o_base + b as usize])?;
+                let model = &module.db_models[c as usize];
+                let schema = module
+                    .struct_schemas
+                    .iter()
+                    .find(|s| s.schema_id == model.schema_id)
+                    .ok_or_else(|| err_msg("Missing struct schema for db model op"))?;
+                let res = match self.db_conns.get(id).and_then(|s| s.as_ref()) {
+                    Some(conn) => match aux {
+                        DB_CREATE_TABLE => {
+                            let sqls = build_create_table_sqls(model, schema, conn.dialect());
+                            let mut out = Obj::Empty;
+                            for sql in sqls {
+                                if let Err(e) = conn.execute(&sql, &[]) {
+                                    out = e.into_obj();
+                                    break;
+                                }
+                            }
+                            out
+                        }
+                        DB_DROP_TABLE => match conn.execute(&build_drop_table_sql(model), &[]) {
+                            Ok(_) => Obj::Empty,
+                            Err(e) => e.into_obj(),
+                        },
+                        _ => match conn.query(&build_select_all_sql(model), &[]) {
+                            Ok(qr) => match query_result_to_structs(&qr, schema) {
+                                Ok(list) => list,
+                                Err(msg) => make_db_error("decode_error", &msg, ""),
+                            },
+                            Err(e) => e.into_obj(),
+                        },
+                    },
+                    None => make_db_error("closed", "Database connection is closed", ""),
+                };
+                self.objs[o_base + a as usize] = res;
+            }
+            DB_INSERT | DB_FIND | DB_DELETE => {
+                let id = self.extract_db_handle(&self.objs[o_base + b as usize])?;
+                let Obj::Record(packed) = &self.objs[o_base + c as usize] else {
+                    return Err(err_msg("Expected packed model arg"));
+                };
+                let model_idx = packed.get_scalar(0) as usize;
+                let arg_obj = packed.get_obj(0).clone();
+                let model = &module.db_models[model_idx];
+                let schema = module
+                    .struct_schemas
+                    .iter()
+                    .find(|s| s.schema_id == model.schema_id)
+                    .ok_or_else(|| err_msg("Missing struct schema for db model op"))?;
+                let res = match self.db_conns.get(id).and_then(|s| s.as_ref()) {
+                    Some(conn) => match aux {
+                        DB_INSERT => {
+                            let Obj::Record(row_rec) = &arg_obj else {
+                                return Err(err_msg("Expected struct record in db.insert()"));
+                            };
+                            match build_insert_and_cells(model, schema, row_rec) {
+                                Ok((sql, cells)) => match conn.execute(&sql, &cells) {
+                                    Ok(n) => {
+                                        let lid = conn.last_insert_id();
+                                        Obj::boxed_int(if lid > 0 { lid } else { n as i64 })
+                                    }
+                                    Err(e) => e.into_obj(),
+                                },
+                                Err(msg) => make_db_error("query_error", &msg, ""),
+                            }
+                        }
+                        DB_FIND => match (build_find_sql(model), any_obj_to_cell(&arg_obj)) {
+                            (Ok(sql), Ok(cell)) => match conn.query(&sql, &[cell]) {
+                                Ok(qr) => {
+                                    if qr.rows.is_empty() {
+                                        Obj::Empty
+                                    } else {
+                                        match query_result_to_structs(&qr, schema) {
+                                            Ok(Obj::List(ListStorage::Obj(items))) => {
+                                                items.first().cloned().unwrap_or(Obj::Empty)
+                                            }
+                                            Ok(_) => Obj::Empty,
+                                            Err(msg) => make_db_error("decode_error", &msg, ""),
+                                        }
+                                    }
+                                }
+                                Err(e) => e.into_obj(),
+                            },
+                            (Err(msg), _) | (_, Err(msg)) => make_db_error("query_error", &msg, ""),
+                        },
+                        _ => match (build_delete_sql(model), any_obj_to_cell(&arg_obj)) {
+                            (Ok(sql), Ok(cell)) => match conn.execute(&sql, &[cell]) {
+                                Ok(n) => Obj::boxed_int(n as i64),
+                                Err(e) => e.into_obj(),
+                            },
+                            (Err(msg), _) | (_, Err(msg)) => make_db_error("query_error", &msg, ""),
+                        },
+                    },
+                    None => make_db_error("closed", "Database connection is closed", ""),
                 };
                 self.objs[o_base + a as usize] = res;
             }

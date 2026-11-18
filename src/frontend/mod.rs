@@ -49,6 +49,7 @@ fn is_native_mod(path: &str) -> bool {
             | "cdt.log"
             | "cdt.http"
             | "cdt.db"
+            | "cdt.cron"
     )
 }
 

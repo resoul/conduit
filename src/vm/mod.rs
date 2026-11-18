@@ -1,5 +1,6 @@
 pub mod exec;
 pub(crate) mod exec_cold;
+pub mod exec_cron;
 pub mod exec_db;
 pub(crate) mod exec_fs;
 pub(crate) mod exec_http;
@@ -80,6 +81,7 @@ pub struct Vm {
     pub(crate) fs_writers: Vec<Option<std::io::BufWriter<std::fs::File>>>,
     pub(crate) routers: Vec<crate::native::http::RouterState>,
     pub(crate) db_conns: Vec<Option<crate::native::db::SqlConn>>,
+    pub(crate) cron_schedulers: Vec<Option<crate::native::cron::CronSchedulerState>>,
     pub(crate) cached_http_req: Option<(Arc<StructData>, Arc<StructData>)>,
 }
 
@@ -94,6 +96,7 @@ impl Vm {
             fs_writers: Vec::new(),
             routers: Vec::new(),
             db_conns: Vec::new(),
+            cron_schedulers: Vec::new(),
             cached_http_req: None,
         }
     }

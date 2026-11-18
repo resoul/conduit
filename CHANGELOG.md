@@ -7,6 +7,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Added
+
+* **`cdt.db` Table & Model Schemas (`@db.*`)**:
+  * Added `@db.table("name")` struct annotation and field annotations (`@db.pk`, `@db.auto`, `@db.unique`, `@db.index`, `@db.col`, `@db.default`, `@db.fk`, supporting both leading and trailing field placement in `src/frontend/parser.rs`) with `DbModelMeta` bundle serialization (`src/ir/bundle.rs`).
+  * Added `db.ddl<T>(dialect)` and `Connection` model methods `.create_table<T>()`, `.drop_table<T>()`, `.insert<T>(row)`, `.all<T>()`, `.find<T>(id)`, `.delete<T>(id)` (`src/native/db.rs`, `src/vm/exec_db.rs`, `cdt_db_model_schemas_ddl_and_bundle_e2e`), and updated `examples/db_service/main.cdt`.
+* **`cdt.cron` Declarative `schedule` & Scheduler**:
+  * Added top-level `schedule Name { every "*/5 * * * *" => fn; interval 10s => fn }` syntax (`src/frontend/parser_cli.rs`, `src/frontend/check_sys.rs`, `src/frontend/reachability.rs`), compile-time 5-field UTC cron validation, isolated per-job VM execution with overlap protection (`src/native/cron.rs`, `src/vm/exec_cron.rs`, `EXT_CRON_OP`), `cron.run<T>()`, `cron.start<T>()`, `cron.run_once<T>()`, `cron.validate()`, `Scheduler` (`.stop()`, `.is_running()`), `conduit cron <list|print|run>` CLI commands, `docs/src/library/cron.md`, LSP docs, and TextMate highlighting (`cdt_cron_schedule_interval_and_bundle_e2e`).
+
 ## [0.3.1] - 2026-11-18
 
 ### Added

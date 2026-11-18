@@ -68,6 +68,35 @@ func main() -> Void | db.DbError {
 | `dialect` | `() -> String` | Returns `"postgres"` or `"mysql"` |
 | `last_insert_id` | `() -> Int` | Returns the last inserted row ID (MySQL) |
 | `close` | `() -> Void` | Closes the connection |
+| `create_table<T>` | `() -> Void \| DbError` | Creates table & indexes from `@db.*` struct model `T` |
+| `drop_table<T>` | `() -> Void \| DbError` | Executes `DROP TABLE IF EXISTS` for model `T` |
+| `insert<T>` | `(row: T) -> Int \| DbError` | Inserts struct `T` (omits `@db.auto` field if `0`) |
+| `all<T>` | `() -> [T] \| DbError` | Selects all rows from model `T`'s table |
+| `find<T>` | `(id: Any) -> T? \| DbError` | Finds a row by `@db.pk` (or `id`) |
+| `delete<T>` | `(id: Any) -> Int \| DbError` | Deletes a row by `@db.pk` (or `id`) |
+
+## Table & Model Schemas (`@db.*`)
+
+Annotate a `struct` with `@db.table("name")` and fields with `@db.pk`, `@db.auto`, `@db.unique`, `@db.index`, `@db.col("col")`, `@db.default("expr")`, or `@db.fk("table.col")`:
+
+```conduit
+@db.table("users")
+struct User {
+    @db.pk @db.auto
+    id: Int
+    @db.unique @db.index
+    email: String
+    active: Bool = true
+    bio: String?
+}
+
+migration 1 "create_users" {
+    up { db.create_table<User>()? }
+    down { db.drop_table<User>()? }
+}
+```
+
+Use `db.ddl<User>("postgres")` or `db.ddl<User>("mysql")` to inspect the generated `CREATE TABLE` / `CREATE INDEX` SQL.
 
 ## Declarative Migrations & CLI
 

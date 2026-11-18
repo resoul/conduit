@@ -82,7 +82,40 @@ pub struct MigrationPlan {
     pub down_func_id: u32,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DbColumnMeta {
+    pub field_name: String,
+    pub col_name: String,
+    pub is_pk: bool,
+    pub is_auto: bool,
+    pub is_unique: bool,
+    pub is_index: bool,
+    pub default_sql: Option<String>,
+    pub fk: Option<(String, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DbModelMeta {
+    pub schema_id: u32,
+    pub table_name: String,
+    pub columns: Vec<DbColumnMeta>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CronJobSpec {
+    pub name: String,
+    pub cron_expr: Option<String>,
+    pub interval_ms: Option<u64>,
+    pub func_id: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchedulePlan {
+    pub name: String,
+    pub jobs: Vec<CronJobSpec>,
+}
+
+#[derive(Debug, Default, Clone)]
 pub struct Module {
     pub functions: Vec<FunctionProto>,
     pub int_consts: Vec<i64>,
@@ -97,6 +130,8 @@ pub struct Module {
     pub env_plans: Vec<crate::native::env::EnvLoadPlan>,
     pub cli_plans: Vec<crate::native::cli::CliPlan>,
     pub migrations: Vec<MigrationPlan>,
+    pub db_models: Vec<DbModelMeta>,
+    pub schedules: Vec<SchedulePlan>,
 }
 
 impl Module {
@@ -860,7 +895,49 @@ impl Module {
                                     check_s(a, &ctx)?;
                                     check_o(b, &ctx)?;
                                 }
+                                16 | 17 | 19 => {
+                                    check_o(a, &ctx)?;
+                                    check_o(b, &ctx)?;
+                                    if (c as usize) >= self.db_models.len() {
+                                        return Err(format!("db model_idx {} out of bounds", c));
+                                    }
+                                }
+                                18 | 20 | 21 => {
+                                    check_o(a, &ctx)?;
+                                    check_o(b, &ctx)?;
+                                    check_o(c, &ctx)?;
+                                }
+                                22 => {
+                                    check_o(a, &ctx)?;
+                                    check_o(b, &ctx)?;
+                                    if (c as usize) >= self.db_models.len() {
+                                        return Err(format!("db model_idx {} out of bounds", c));
+                                    }
+                                }
                                 _ => return Err(format!("Invalid db aux {}", aux)),
+                            },
+                            crate::vm::opcode::EXT_CRON_OP => match aux {
+                                0 | 1 => {
+                                    check_o(a, &ctx)?;
+                                    if (b as usize) >= self.schedules.len() {
+                                        return Err(format!("cron schedule_idx {} out of bounds", b));
+                                    }
+                                }
+                                2 => {
+                                    check_o(a, &ctx)?;
+                                    if (b as usize) >= self.schedules.len() {
+                                        return Err(format!("cron schedule_idx {} out of bounds", b));
+                                    }
+                                    check_o(c, &ctx)?;
+                                }
+                                3 | 5 => {
+                                    check_s(a, &ctx)?;
+                                    check_o(b, &ctx)?;
+                                }
+                                4 => {
+                                    check_o(b, &ctx)?;
+                                }
+                                _ => return Err(format!("Invalid cron aux {}", aux)),
                             },
                             _ => return Err(format!("Invalid ExtOp kind {}", kind)),
                         }
@@ -873,6 +950,16 @@ impl Module {
                 || (mig.down_func_id as usize) >= self.functions.len()
             {
                 return Err(format!("Migration {} '{}' func_id out of bounds", mig.version, mig.name));
+            }
+        }
+        for sched in &self.schedules {
+            for job in &sched.jobs {
+                if (job.func_id as usize) >= self.functions.len() {
+                    return Err(format!(
+                        "Schedule '{}' job '{}' func_id out of bounds",
+                        sched.name, job.name
+                    ));
+                }
             }
         }
         Ok(())

@@ -126,6 +126,7 @@ pub(crate) fn register_program_types(
         checked.structs.push(ResolvedStruct {
             schema_id: *id as u32,
             name: name.clone(),
+            db_table: None,
             fields: Vec::new(),
             scalar_len: 0,
             obj_len: 0,
@@ -196,8 +197,14 @@ pub(crate) fn register_program_types(
             let router_ann = f
                 .annotations
                 .iter()
-                .find(|ann| ann.target.starts_with("router."))
+                .find(|ann| ann.target.starts_with("router.") || ann.target.starts_with("schedule."))
                 .cloned();
+            let db_anns: Vec<FieldAnnotation> = f
+                .annotations
+                .iter()
+                .filter(|ann| ann.target.starts_with("db."))
+                .cloned()
+                .collect();
             resolved_fields.push(ResolvedField {
                 name: f.name.clone(),
                 json_name,
@@ -208,12 +215,28 @@ pub(crate) fn register_program_types(
                 cli_ann,
                 cli_handler,
                 router_ann,
+                db_anns,
                 default: None,
             });
         }
+        let db_table = program.items.iter().find_map(|it| {
+            if let ItemKind::Struct { name: sname, .. } = &it.kind
+                && sname == name
+            {
+                for ann in &it.annotations {
+                    if ann.target == "db.table"
+                        && let Some(Expr { kind: ExprKind::String(t), .. }) = ann.args.first()
+                    {
+                        return Some(t.clone());
+                    }
+                }
+            }
+            None
+        });
         checked.structs[*id] = ResolvedStruct {
             schema_id: *id as u32,
             name: name.clone(),
+            db_table,
             fields: resolved_fields,
             scalar_len,
             obj_len,

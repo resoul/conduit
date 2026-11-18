@@ -34,7 +34,8 @@ Conduit is designed with explicit control flow, strict types, and composable sta
 | `cdt.math` | Floating-point math functions (`sqrt`, `pow`, `sin`, `cos`, `ln`, `floor`, `ceil`, `round`, `hypot`) and constants | [cdt.math](docs/src/library/math.md) |
 | `cdt.log` | Leveled `stderr` logger with optional structured JSON lines | [cdt.log](docs/src/library/log.md) |
 | `cdt.http` | Zero-dependency HTTP/1.1 client (`http.get`, `post`, `request_timeout`, `get_bytes`, `https://` via `curl`), declarative `router { ... }`, multi-threaded `Router`, middleware, and graceful shutdown | [cdt.http](docs/src/library/http.md) |
-| `cdt.db` | Zero-dependency PostgreSQL and MySQL wire-protocol drivers (`connect`, `exec`, `query<T>`, transactions) and declarative `migration`s | [cdt.db](docs/src/library/db.md) |
+| `cdt.db` | Zero-dependency PostgreSQL and MySQL wire-protocol drivers (`connect`, `exec`, `query<T>`, `@db.*` models, transactions) and declarative `migration`s | [cdt.db](docs/src/library/db.md) |
+| `cdt.cron` | Zero-dependency declarative `schedule` blocks, 5-field UTC cron & interval scheduler (`cron.run<T>`, `cron.start<T>`) | [cdt.cron](docs/src/library/cron.md) |
 
 ## Installation
 

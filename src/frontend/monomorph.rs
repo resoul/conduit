@@ -56,6 +56,7 @@ pub(crate) fn ensure_monomorphized_struct(
     checked.structs.push(ResolvedStruct {
         schema_id: sid as u32,
         name: mono_name.clone(),
+        db_table: None,
         fields: Vec::new(),
         scalar_len: 0,
         obj_len: 0,
@@ -117,6 +118,7 @@ pub(crate) fn ensure_monomorphized_struct(
             cli_ann: None,
             cli_handler: None,
             router_ann: None,
+            db_anns: Vec::new(),
             default: None,
         });
         subst_fields.push(f_clone);
@@ -125,6 +127,7 @@ pub(crate) fn ensure_monomorphized_struct(
     checked.structs[sid] = ResolvedStruct {
         schema_id: sid as u32,
         name: mono_name.clone(),
+        db_table: None,
         fields: resolved_fields,
         scalar_len,
         obj_len,
@@ -134,6 +137,7 @@ pub(crate) fn ensure_monomorphized_struct(
         is_exported: false,
         is_imported: false,
         doc: None,
+        annotations: Vec::new(),
         kind: ItemKind::Struct {
             name: mono_name.clone(),
             type_params: Vec::new(),

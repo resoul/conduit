@@ -71,6 +71,8 @@ pub(crate) fn build_validation_plans(
                     || ann.target == "env"
                     || ann.target.starts_with("cli.")
                     || ann.target.starts_with("router.")
+                    || ann.target.starts_with("schedule.")
+                    || ann.target.starts_with("db.")
                     || matches!(ann.target.as_str(), "flag" | "opt" | "arg" | "rest" | "cmd" | "group")
                 {
                     continue;

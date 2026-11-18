@@ -40,6 +40,14 @@ pub enum HttpRouterDeclKind {
 }
 
 #[derive(Debug, Clone)]
+pub struct CronScheduleEntry {
+    pub name: String,
+    pub cron_expr: Option<String>,
+    pub interval_ms: Option<u64>,
+    pub handler_name: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct HttpRouterDeclEntry {
     pub kind: HttpRouterDeclKind,
     pub handler_name: String,
@@ -98,6 +106,11 @@ pub struct CheckedProgram {
     pub db_aliases: HashSet<String>,
     pub db_direct_fns: HashMap<String, String>,
     pub db_direct_types: HashMap<String, String>,
+    pub db_model_plans: Vec<crate::ir::DbModelMeta>,
+    pub cron_aliases: HashSet<String>,
+    pub cron_direct_fns: HashMap<String, String>,
+    pub cron_direct_types: HashMap<String, String>,
+    pub cron_schedule_plans: Vec<(String, Vec<CronScheduleEntry>)>,
     pub struct_abouts: HashMap<String, String>,
     pub validator_funcs: HashSet<String>,
     pub error_structs: HashSet<String>,
@@ -181,6 +194,11 @@ pub fn check_program_with_roots(
         db_aliases: HashSet::new(),
         db_direct_fns: HashMap::new(),
         db_direct_types: HashMap::new(),
+        db_model_plans: Vec::new(),
+        cron_aliases: HashSet::new(),
+        cron_direct_fns: HashMap::new(),
+        cron_direct_types: HashMap::new(),
+        cron_schedule_plans: Vec::new(),
         struct_abouts: HashMap::new(),
         validator_funcs: HashSet::new(),
         error_structs: HashSet::new(),
@@ -275,6 +293,30 @@ pub fn check_program_with_roots(
     build_validation_plans(program, &mut checked)?;
     shake_unreachable_funcs(program, &mut checked, explicit_roots)?;
     finalize_validation_plan_func_ids(&mut checked);
+    let schedule_names: Vec<String> = checked
+        .structs
+        .iter()
+        .filter(|s| {
+            s.fields.iter().any(|f| {
+                f.router_ann
+                    .as_ref()
+                    .is_some_and(|a| a.target.starts_with("schedule."))
+            })
+        })
+        .map(|s| s.name.clone())
+        .collect();
+    for sname in schedule_names {
+        crate::frontend::check_sys::ensure_cron_schedule_plan(&mut checked, &sname)?;
+    }
+    let db_model_names: Vec<String> = checked
+        .structs
+        .iter()
+        .filter(|s| s.db_table.is_some() || s.fields.iter().any(|f| !f.db_anns.is_empty()))
+        .map(|s| s.name.clone())
+        .collect();
+    for mname in db_model_names {
+        crate::frontend::check_sys::ensure_db_model_plan(&mut checked, &mname)?;
+    }
     Ok(checked)
 }
 

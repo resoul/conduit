@@ -156,6 +156,23 @@ impl<'a> ModuleCompiler<'a> {
             }
         }
         self.module.migrations.sort_by_key(|m| m.version);
+        self.module.db_models = self.checked.db_model_plans.clone();
+        for (sched_name, entries) in &self.checked.cron_schedule_plans {
+            let mut jobs = Vec::with_capacity(entries.len());
+            for entry in entries {
+                let func_id = self.checked.func_by_name[&entry.handler_name];
+                jobs.push(crate::ir::CronJobSpec {
+                    name: entry.name.clone(),
+                    cron_expr: entry.cron_expr.clone(),
+                    interval_ms: entry.interval_ms,
+                    func_id,
+                });
+            }
+            self.module.schedules.push(crate::ir::SchedulePlan {
+                name: sched_name.clone(),
+                jobs,
+            });
+        }
         Ok(())
     }
 

@@ -392,3 +392,173 @@ pub fn query_result_to_structs(res: &QueryResult, schema: &StructSchema) -> Resu
     }
     Ok(Obj::List(ListStorage::Obj(Arc::new(out))))
 }
+
+fn sql_col_type(ty: &JsonType, is_auto: bool, is_unique_or_pk: bool, dialect: Dialect) -> (&'static str, bool) {
+    let (inner, is_opt) = match ty {
+        JsonType::Optional(in_ty) => (in_ty.as_ref(), true),
+        other => (other, false),
+    };
+    let sql_ty = match (inner, dialect, is_auto, is_unique_or_pk) {
+        (JsonType::Int, Dialect::Postgres, true, _) => "BIGSERIAL",
+        (JsonType::Int, Dialect::Mysql, true, _) => "BIGINT AUTO_INCREMENT",
+        (JsonType::Int, _, _, _) => "BIGINT",
+        (JsonType::Float, Dialect::Postgres, _, _) => "DOUBLE PRECISION",
+        (JsonType::Float, Dialect::Mysql, _, _) => "DOUBLE",
+        (JsonType::Bool, _, _, _) => "BOOLEAN",
+        (JsonType::String, Dialect::Mysql, _, true) => "VARCHAR(255)",
+        (JsonType::String, _, _, _) => "TEXT",
+        _ => "TEXT",
+    };
+    (sql_ty, is_opt)
+}
+
+pub fn build_create_table_sqls(
+    model: &crate::ir::DbModelMeta,
+    schema: &StructSchema,
+    dialect: Dialect,
+) -> Vec<String> {
+    let mut col_defs = Vec::with_capacity(model.columns.len());
+    let mut idx_sqls = Vec::new();
+    for col in &model.columns {
+        let Some(f) = schema.fields.iter().find(|f| f.name == col.field_name) else {
+            continue;
+        };
+        let (sql_ty, is_opt) = sql_col_type(&f.ty, col.is_auto, col.is_unique || col.is_pk, dialect);
+        let mut def = format!("{} {}", col.col_name, sql_ty);
+        if col.is_pk {
+            def.push_str(" PRIMARY KEY");
+        }
+        if !is_opt && !col.is_pk {
+            def.push_str(" NOT NULL");
+        }
+        if col.is_unique && !col.is_pk {
+            def.push_str(" UNIQUE");
+        }
+        if let Some(d) = &col.default_sql {
+            def.push_str(" DEFAULT ");
+            def.push_str(d);
+        }
+        if let Some((ref_tbl, ref_col)) = &col.fk {
+            def.push_str(&format!(" REFERENCES {}({})", ref_tbl, ref_col));
+        }
+        col_defs.push(def);
+        if col.is_index {
+            idx_sqls.push(format!(
+                "CREATE INDEX IF NOT EXISTS idx_{}_{} ON {} ({})",
+                model.table_name, col.col_name, model.table_name, col.col_name
+            ));
+        }
+    }
+    let mut out = vec![format!(
+        "CREATE TABLE IF NOT EXISTS {} ({})",
+        model.table_name,
+        col_defs.join(", ")
+    )];
+    out.extend(idx_sqls);
+    out
+}
+
+pub fn build_drop_table_sql(model: &crate::ir::DbModelMeta) -> String {
+    format!("DROP TABLE IF EXISTS {}", model.table_name)
+}
+
+pub fn build_insert_and_cells(
+    model: &crate::ir::DbModelMeta,
+    schema: &StructSchema,
+    rec: &StructData,
+) -> Result<(String, Vec<Cell>), String> {
+    let mut cols = Vec::new();
+    let mut placeholders = Vec::new();
+    let mut cells = Vec::new();
+    for col in &model.columns {
+        let Some(f) = schema.fields.iter().find(|f| f.name == col.field_name) else {
+            continue;
+        };
+        let cell = match f.slot {
+            FieldSlot::Scalar { kind, slot } => {
+                let raw = rec.get_scalar(slot as usize);
+                match kind {
+                    ScalarKind::Int => {
+                        let iv = raw as i64;
+                        if col.is_auto && iv == 0 {
+                            continue;
+                        }
+                        Cell::Int(iv)
+                    }
+                    ScalarKind::Float => Cell::Float(f64::from_bits(raw)),
+                    ScalarKind::Bool => Cell::Bool(raw != 0),
+                }
+            }
+            FieldSlot::Obj { slot, .. } => {
+                let o = rec.get_obj(slot as usize);
+                match o {
+                    Obj::Empty => Cell::Null,
+                    Obj::Str(s) => Cell::Text(s.as_str().to_string()),
+                    _ => return Err(format!("Unsupported field '{}.{}' in db.insert()", schema.type_name, f.name)),
+                }
+            }
+        };
+        cols.push(col.col_name.clone());
+        placeholders.push("?");
+        cells.push(cell);
+    }
+    let sql = format!(
+        "INSERT INTO {} ({}) VALUES ({})",
+        model.table_name,
+        cols.join(", "),
+        placeholders.join(", ")
+    );
+    Ok((sql, cells))
+}
+
+pub fn build_select_all_sql(model: &crate::ir::DbModelMeta) -> String {
+    let cols: Vec<&str> = model.columns.iter().map(|c| c.col_name.as_str()).collect();
+    format!("SELECT {} FROM {}", cols.join(", "), model.table_name)
+}
+
+pub fn pk_column_name(model: &crate::ir::DbModelMeta) -> Result<&str, String> {
+    if let Some(pk) = model.columns.iter().find(|c| c.is_pk) {
+        return Ok(pk.col_name.as_str());
+    }
+    if let Some(id_col) = model.columns.iter().find(|c| c.col_name == "id") {
+        return Ok(id_col.col_name.as_str());
+    }
+    Err(format!(
+        "Model for table '{}' has no @db.pk or 'id' column",
+        model.table_name
+    ))
+}
+
+pub fn build_find_sql(model: &crate::ir::DbModelMeta) -> Result<String, String> {
+    let pk = pk_column_name(model)?;
+    let cols: Vec<&str> = model.columns.iter().map(|c| c.col_name.as_str()).collect();
+    Ok(format!(
+        "SELECT {} FROM {} WHERE {} = ? LIMIT 1",
+        cols.join(", "),
+        model.table_name,
+        pk
+    ))
+}
+
+pub fn build_delete_sql(model: &crate::ir::DbModelMeta) -> Result<String, String> {
+    let pk = pk_column_name(model)?;
+    Ok(format!("DELETE FROM {} WHERE {} = ?", model.table_name, pk))
+}
+
+pub fn any_obj_to_cell(obj: &Obj) -> Result<Cell, String> {
+    use crate::vm::value::{SCHEMA_BOXED_BOOL, SCHEMA_BOXED_FLOAT, SCHEMA_BOXED_INT};
+    match obj {
+        Obj::Record(rec) if rec.schema_id == SCHEMA_BOXED_INT => {
+            Ok(Cell::Int(rec.get_scalar(0) as i64))
+        }
+        Obj::Record(rec) if rec.schema_id == SCHEMA_BOXED_FLOAT => {
+            Ok(Cell::Float(f64::from_bits(rec.get_scalar(0))))
+        }
+        Obj::Record(rec) if rec.schema_id == SCHEMA_BOXED_BOOL => {
+            Ok(Cell::Bool(rec.get_scalar(0) != 0))
+        }
+        Obj::Str(s) => Ok(Cell::Text(s.as_str().to_string())),
+        Obj::Empty => Ok(Cell::Null),
+        _ => Err("Expected Int, Float, Bool, or String key for db.find()/delete()".to_string()),
+    }
+}

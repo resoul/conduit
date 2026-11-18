@@ -35,6 +35,7 @@
 - [cdt.log](library/log.md)
 - [cdt.http](library/http.md)
 - [cdt.db](library/db.md)
+- [cdt.cron](library/cron.md)
 
 # Practical Guides
 - [Working with Errors](guides/working-with-errors.md)
