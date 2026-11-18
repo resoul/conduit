@@ -30,7 +30,7 @@ use crate::vm::value::{ListStorage, Obj, SCHEMA_CSV_ERROR, StructData};
 use crate::vm::{RuntimeError, Vm};
 
 impl Vm {
-    fn sys_str(
+    pub(crate) fn sys_str(
         &self,
         o_base: usize,
         reg: u16,

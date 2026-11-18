@@ -1620,6 +1620,7 @@ impl Vm {
             return Ok(acc);
         }
 
+        self.ensure_capacity(stage_s_base + 2, stage_o_base);
         for &item in src {
             let mut cur = to_u64(item);
             for st in stages {
@@ -1641,7 +1642,6 @@ impl Vm {
                         }
                     }
                     StageKind::ReduceScalar => {
-                        self.ensure_capacity(stage_s_base + 2, stage_o_base);
                         self.scalars[stage_s_base] = acc;
                         self.scalars[stage_s_base + 1] = cur;
                         let ExecResult::Scalar(v) = self.exec_from(module, st.func_id, stage_s_base, stage_o_base, st.closure_slot)? else {
@@ -1656,11 +1656,14 @@ impl Vm {
         Ok(acc)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn run_pipeline_reduce(
         &mut self,
         module: &Module,
         s_base: usize,
         o_base: usize,
+        s_top: usize,
+        o_top: usize,
         dst_s: u16,
         src_obj: u16,
         plan_idx: u16,
@@ -1670,8 +1673,8 @@ impl Vm {
         for &st in plan.stages.iter() {
             stages.push(self.resolve_stage(module, o_base, st)?);
         }
-        let stage_s_base = self.scalars.len();
-        let stage_o_base = self.objs.len();
+        let stage_s_base = s_top;
+        let stage_o_base = o_top;
         let init_acc = self.scalars[s_base + dst_s as usize];
 
         let res = match &self.objs[o_base + src_obj as usize] {
@@ -1693,8 +1696,6 @@ impl Vm {
             }
             _ => return Err(err_msg("Expected scalar list in pipeline reduce")),
         };
-        self.scalars.truncate(stage_s_base);
-        self.objs.truncate(stage_o_base);
         self.scalars[s_base + dst_s as usize] = res?;
         Ok(())
     }

@@ -9,6 +9,9 @@ import sys
 import tempfile
 
 METRICS = [
+    ("vm_fib_35", "VM recursive fib(35)"),
+    ("vm_arith_10m", "VM int loop (10M)"),
+    ("vm_map_100k", "VM map set + get (100k)"),
     ("fs_write_text", "fs.write_text (5.53 MiB)"),
     ("fs_write_lines", "Writer.write_line (100k)"),
     ("fs_read_text", "fs.read_text (5.53 MiB)"),
@@ -27,6 +30,7 @@ METRICS = [
     ("pipeline_float_1m", "pipeline float filter/map/reduce (1M)"),
     ("csv_parse_20k", "csv.parse (20k rows)"),
     ("url_parse_50k", "url.parse + query (50k)"),
+    ("http_router_50k", "http.router dispatch (50k)"),
 ]
 
 

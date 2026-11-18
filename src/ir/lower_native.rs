@@ -30,12 +30,14 @@ use crate::vm::opcode::{
     EXT_ENV_LOAD, EXT_ENV_REQUIRE, EXT_FS_BINARY, EXT_FS_UNARY, EXT_LIST_FIRST, EXT_LIST_LAST,
     EXT_LIST_SORT, EXT_MAP_ENTRIES, EXT_MAP_GET, EXT_MAP_KEYS, EXT_MAP_REMOVE, EXT_MAP_VALUES,
     EXT_PATH_OP, EXT_PROCESS_OP, EXT_STR_SPLIT, EXT_STR_TO_FLOAT, EXT_STR_TO_INT, EXT_URL_OP,
-    EXT_CSV_OP, EXT_MATH_OP, EXT_LOG_OP, Op,
+    EXT_CSV_OP, EXT_MATH_OP, EXT_LOG_OP, EXT_HTTP_OP, Op,
 };
 use crate::vm::value::{
     SCHEMA_BOXED_BOOL, SCHEMA_BOXED_FLOAT, SCHEMA_BOXED_INT, SCHEMA_CLI_ERROR,
     SCHEMA_CRYPTO_ERROR, SCHEMA_CSV_ERROR, SCHEMA_EMPTY_TAG, SCHEMA_ENV_ERROR, SCHEMA_FS_ERROR, SCHEMA_FS_READER,
-    SCHEMA_FS_WRITER, SCHEMA_INDEX_ERROR, SCHEMA_JSON_DECODE_ERROR, SCHEMA_JSON_ENCODE_ERROR,
+    SCHEMA_FS_WRITER, SCHEMA_HTTP_BINARY_RESPONSE, SCHEMA_HTTP_ERROR, SCHEMA_HTTP_REQUEST,
+    SCHEMA_HTTP_RESPONSE, SCHEMA_HTTP_ROUTER, SCHEMA_INDEX_ERROR, SCHEMA_JSON_DECODE_ERROR,
+    SCHEMA_JSON_ENCODE_ERROR,
     SCHEMA_KEY_ERROR, SCHEMA_LIST_TAG, SCHEMA_MAP_TAG, SCHEMA_PARSE_ERROR, SCHEMA_PROCESS_ERROR,
     SCHEMA_PROCESS_OUTPUT, SCHEMA_STR_TAG, SCHEMA_TIME_DURATION, SCHEMA_TIME_ERROR,
     SCHEMA_TIME_INSTANT, SCHEMA_TIME_TIMESTAMP, SCHEMA_URL, SCHEMA_URL_ERROR,
@@ -91,6 +93,11 @@ pub(crate) fn type_tag_for_switch(ty: &Type, checked: &CheckedProgram) -> Result
                 ("cdt.url", "UrlError") => Ok(SCHEMA_URL_ERROR),
                 ("cdt.url", "Url") => Ok(SCHEMA_URL),
                 ("cdt.csv", "CsvError") => Ok(SCHEMA_CSV_ERROR),
+                ("cdt.http", "HttpError") => Ok(SCHEMA_HTTP_ERROR),
+                ("cdt.http", "Request") => Ok(SCHEMA_HTTP_REQUEST),
+                ("cdt.http", "Response") => Ok(SCHEMA_HTTP_RESPONSE),
+                ("cdt.http", "BinaryResponse") => Ok(SCHEMA_HTTP_BINARY_RESPONSE),
+                ("cdt.http", "Router") => Ok(SCHEMA_HTTP_ROUTER),
                 _ => Err(format!("Unsupported native type '{}' in switch pattern", tid)),
             },
             _ => Err(format!("Unsupported type '{}' in switch pattern", tid)),
@@ -328,6 +335,152 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                     b: plan_idx as u16,
                     c: c_reg,
                 });
+                Ok(dst_obj)
+            }
+            "dispatch" | "dispatch_args" => {
+                let ty = self.mc.checked.resolve_type(&type_args[0])?;
+                let Type::Custom(tid) = ty else {
+                    return Err(format!("cli.{}<T>() requires a struct type", sym));
+                };
+                let plan_idx = self
+                    .mc
+                    .checked
+                    .cli_plans
+                    .iter()
+                    .position(|(name, _)| name == &tid.name)
+                    .ok_or_else(|| format!("Missing CliPlan for '{}'", tid.name))?;
+                let routes = self
+                    .mc
+                    .checked
+                    .cli_dispatches
+                    .iter()
+                    .find(|(name, _)| name == &tid.name)
+                    .map(|(_, r)| r.clone())
+                    .ok_or_else(|| format!("Missing CliDispatch for '{}'", tid.name))?;
+
+                let (kind, c_reg) = if sym == "dispatch" {
+                    (EXT_CLI_PARSE, 0)
+                } else {
+                    (EXT_CLI_PARSE_ARGS, self.lower_obj(&args[0])?)
+                };
+                let parsed_o = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp {
+                    kind,
+                    aux: 0,
+                    a: parsed_o,
+                    b: plan_idx as u16,
+                    c: c_reg,
+                });
+
+                let dst_obj = self.alloc_temp_o();
+                let is_err_s = self.alloc_temp_s();
+                self.ops.push(Op::IsTypeObj {
+                    dst_s: is_err_s,
+                    src_obj: parsed_o,
+                    expected_tag: SCHEMA_CLI_ERROR,
+                });
+                let err_jump = self.ops.len();
+                self.ops.push(Op::JumpIfFalse { cond: is_err_s, target: 0 });
+                self.ops.push(Op::MoveObj { dst_obj, src: parsed_o });
+                let mut end_jumps = Vec::new();
+                end_jumps.push(self.ops.len());
+                self.ops.push(Op::Jump { target: 0 });
+                let start_dispatch = self.ops.len() as u32;
+                if let Op::JumpIfFalse { target, .. } = &mut self.ops[err_jump] {
+                    *target = start_dispatch;
+                }
+
+                let is_empty_s = self.alloc_temp_s();
+                for route in &routes {
+                    let mut cur_o = parsed_o;
+                    let mut skip_jumps = Vec::new();
+                    for &slot in &route.field_slot_path {
+                        let next_o = self.alloc_temp_o();
+                        self.ops.push(Op::GetFieldObj {
+                            dst_obj: next_o,
+                            rec_obj: cur_o,
+                            field_idx: slot,
+                        });
+                        self.ops.push(Op::IsTypeObj {
+                            dst_s: is_empty_s,
+                            src_obj: next_o,
+                            expected_tag: SCHEMA_EMPTY_TAG,
+                        });
+                        skip_jumps.push(self.ops.len());
+                        self.ops.push(Op::JumpIfTrue { cond: is_empty_s, target: 0 });
+                        cur_o = next_o;
+                    }
+
+                    let arg_base_s = self.alloc_window_s(0);
+                    let arg_base_o = self.alloc_window_o(if route.takes_parent { 2 } else { 1 });
+                    if route.takes_parent {
+                        self.ops.push(Op::MoveObj { dst_obj: arg_base_o, src: parsed_o });
+                        self.ops.push(Op::MoveObj { dst_obj: arg_base_o + 1, src: cur_o });
+                    } else {
+                        self.ops.push(Op::MoveObj { dst_obj: arg_base_o, src: cur_o });
+                    }
+
+                    let fid = *self
+                        .mc
+                        .checked
+                        .func_by_name
+                        .get(&route.handler_name)
+                        .ok_or_else(|| format!("Unknown CLI handler '{}'", route.handler_name))?;
+                    if route.ret_type == Type::Void {
+                        let dummy_s = self.alloc_temp_s();
+                        self.ops.push(Op::CallDirect {
+                            func_id: fid as u16,
+                            arg_base_s,
+                            arg_base_o,
+                            ret_reg: dummy_s,
+                        });
+                        let empty_idx = self.mc.intern_empty()?;
+                        self.ops.push(Op::LoadConstObj { dst_obj, idx: empty_idx });
+                    } else if route.ret_type.is_scalar() {
+                        let ret_s = self.alloc_temp_s();
+                        self.ops.push(Op::CallDirect {
+                            func_id: fid as u16,
+                            arg_base_s,
+                            arg_base_o,
+                            ret_reg: ret_s,
+                        });
+                        let box_kind = match route.ret_type {
+                            Type::Int => 0,
+                            Type::Float => 1,
+                            _ => 2,
+                        };
+                        self.ops.push(Op::BoxScalar {
+                            dst_obj,
+                            src_s: ret_s,
+                            kind: box_kind,
+                        });
+                    } else {
+                        self.ops.push(Op::CallDirect {
+                            func_id: fid as u16,
+                            arg_base_s,
+                            arg_base_o,
+                            ret_reg: dst_obj,
+                        });
+                    }
+
+                    end_jumps.push(self.ops.len());
+                    self.ops.push(Op::Jump { target: 0 });
+                    let next_pc = self.ops.len() as u32;
+                    for sj in skip_jumps {
+                        if let Op::JumpIfTrue { target, .. } = &mut self.ops[sj] {
+                            *target = next_pc;
+                        }
+                    }
+                }
+
+                let empty_idx = self.mc.intern_empty()?;
+                self.ops.push(Op::LoadConstObj { dst_obj, idx: empty_idx });
+                let end_pc = self.ops.len() as u32;
+                for ej in end_jumps {
+                    if let Op::Jump { target } = &mut self.ops[ej] {
+                        *target = end_pc;
+                    }
+                }
                 Ok(dst_obj)
             }
             other => Err(format!("Unsupported cdt.cli symbol '{}'", other)),
@@ -866,6 +1019,287 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
         }
     }
 
+    pub(crate) fn lower_http_call(
+        &mut self,
+        sym: &str,
+        type_args: &[TypeExpr],
+        args: &[Expr],
+        named_args: &[NamedArg],
+    ) -> Result<u16, String> {
+        use crate::vm::exec_http::*;
+        let get_expr = |idx: usize, name: &str| -> &Expr {
+            if !named_args.is_empty() {
+                &named_args.iter().find(|n| n.name == name).unwrap().value
+            } else {
+                &args[idx]
+            }
+        };
+        match sym {
+            "HttpError" => {
+                self.lower_native_record(SCHEMA_HTTP_ERROR, &["kind", "message"], args, named_args)
+            }
+            "Request" => self.lower_native_record(
+                SCHEMA_HTTP_REQUEST,
+                &["method", "path", "body", "headers", "query", "params"],
+                args,
+                named_args,
+            ),
+            "Response" | "BinaryResponse" => {
+                let status_s = self.lower_scalar(get_expr(0, "status"))?;
+                let body_o = self.lower_obj(get_expr(1, "body"))?;
+                let headers_o = self.lower_obj(get_expr(2, "headers"))?;
+                let schema_id = if sym == "BinaryResponse" {
+                    SCHEMA_HTTP_BINARY_RESPONSE
+                } else {
+                    SCHEMA_HTTP_RESPONSE
+                };
+                let desc_idx = self.mc.intern_record_desc(RecordDesc {
+                    schema_id,
+                    scalar_regs: Box::new([status_s]),
+                    obj_regs: Box::new([body_o, headers_o]),
+                })?;
+                let dst_obj = self.alloc_temp_o();
+                self.ops.push(Op::NewRecord { dst_obj, desc_idx });
+                Ok(dst_obj)
+            }
+            "text" | "html" | "json" => {
+                let aux = match sym {
+                    "text" => HTTP_TEXT,
+                    "html" => HTTP_HTML,
+                    _ => HTTP_JSON,
+                };
+                let b = self.lower_obj(&args[0])?;
+                let a = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp { kind: EXT_HTTP_OP, aux, a, b, c: 0 });
+                Ok(a)
+            }
+            "response" => {
+                let b = self.lower_scalar(&args[0])?;
+                let c = self.lower_obj(&args[1])?;
+                let a = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp { kind: EXT_HTTP_OP, aux: HTTP_RESPONSE, a, b, c });
+                Ok(a)
+            }
+            "response_with" => {
+                let status_s = self.lower_scalar(&args[0])?;
+                let body_o = self.lower_obj(&args[1])?;
+                let headers_o = self.lower_obj(&args[2])?;
+                let desc_idx = self.mc.intern_record_desc(RecordDesc {
+                    schema_id: SCHEMA_HTTP_RESPONSE,
+                    scalar_regs: Box::new([status_s]),
+                    obj_regs: Box::new([body_o, headers_o]),
+                })?;
+                let dst_obj = self.alloc_temp_o();
+                self.ops.push(Op::NewRecord { dst_obj, desc_idx });
+                Ok(dst_obj)
+            }
+            "router" => {
+                let a = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp { kind: EXT_HTTP_OP, aux: HTTP_ROUTER, a, b: 0, c: 0 });
+                Ok(a)
+            }
+            "get" => {
+                let b = self.lower_obj(&args[0])?;
+                let a = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp { kind: EXT_HTTP_OP, aux: HTTP_GET, a, b, c: 0 });
+                Ok(a)
+            }
+            "post" => {
+                let b = self.lower_obj(&args[0])?;
+                let c = self.lower_obj(&args[1])?;
+                let a = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp { kind: EXT_HTTP_OP, aux: HTTP_POST, a, b, c });
+                Ok(a)
+            }
+            "get_bytes" => {
+                let b = self.lower_obj(&args[0])?;
+                let a = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp { kind: EXT_HTTP_OP, aux: HTTP_GET_BYTES, a, b, c: 0 });
+                Ok(a)
+            }
+            "request" | "request_timeout" | "request_bytes" => {
+                let method_o = self.lower_obj(&args[0])?;
+                let url_o = self.lower_obj(&args[1])?;
+                let body_o = self.lower_obj(&args[2])?;
+                let headers_o = self.lower_obj(&args[3])?;
+                let empty_m = self.alloc_temp_o();
+                self.ops.push(Op::NewMap { dst_obj: empty_m });
+                let desc_idx = self.mc.intern_record_desc(RecordDesc {
+                    schema_id: SCHEMA_HTTP_REQUEST,
+                    scalar_regs: Box::new([]),
+                    obj_regs: Box::new([method_o, url_o, body_o, headers_o, empty_m, empty_m]),
+                })?;
+                let req_o = self.alloc_temp_o();
+                self.ops.push(Op::NewRecord { dst_obj: req_o, desc_idx });
+                let (aux, c) = match sym {
+                    "request_timeout" => (HTTP_REQUEST_TIMEOUT, self.lower_scalar(&args[4])?),
+                    "request_bytes" => (HTTP_REQUEST_BYTES, 0),
+                    _ => (HTTP_REQUEST, 0),
+                };
+                let a = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp { kind: EXT_HTTP_OP, aux, a, b: req_o, c });
+                Ok(a)
+            }
+            "build" | "serve" => {
+                use crate::frontend::check::HttpRouterDeclKind;
+                let ty = self.mc.checked.resolve_type(&type_args[0])?;
+                let Type::Custom(tid) = ty else {
+                    return Err(format!("http.{}<T>() requires a router type", sym));
+                };
+                let entries = self
+                    .mc
+                    .checked
+                    .http_router_plans
+                    .iter()
+                    .find(|(name, _)| name == &tid.name)
+                    .map(|(_, e)| e.clone())
+                    .ok_or_else(|| format!("Missing router plan for '{}'", tid.name))?;
+                let router_o = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_HTTP_OP,
+                    aux: HTTP_ROUTER,
+                    a: router_o,
+                    b: 0,
+                    c: 0,
+                });
+                for entry in entries {
+                    let fid = *self
+                        .mc
+                        .checked
+                        .func_by_name
+                        .get(&entry.handler_name)
+                        .ok_or_else(|| format!("Unknown router handler '{}'", entry.handler_name))?;
+                    let handler_o = self.alloc_temp_o();
+                    self.ops.push(Op::LoadFuncObj {
+                        dst_obj: handler_o,
+                        func_id: fid as u16,
+                    });
+                    match entry.kind {
+                        HttpRouterDeclKind::Before => {
+                            self.ops.push(Op::ExtOp {
+                                kind: EXT_HTTP_OP,
+                                aux: HTTP_ROUTE_BEFORE,
+                                a: router_o,
+                                b: handler_o,
+                                c: 0,
+                            });
+                        }
+                        HttpRouterDeclKind::After => {
+                            self.ops.push(Op::ExtOp {
+                                kind: EXT_HTTP_OP,
+                                aux: HTTP_ROUTE_AFTER,
+                                a: router_o,
+                                b: handler_o,
+                                c: 0,
+                            });
+                        }
+                        HttpRouterDeclKind::Route(method, pat) => {
+                            let pat_idx = self.mc.intern_str(&pat)?;
+                            let pat_o = self.alloc_temp_o();
+                            self.ops.push(Op::LoadConstObj {
+                                dst_obj: pat_o,
+                                idx: pat_idx,
+                            });
+                            let aux = http_route_aux(&method);
+                            self.ops.push(Op::ExtOp {
+                                kind: EXT_HTTP_OP,
+                                aux,
+                                a: router_o,
+                                b: pat_o,
+                                c: handler_o,
+                            });
+                        }
+                    }
+                }
+                if sym == "build" {
+                    Ok(router_o)
+                } else {
+                    let addr_o = self.lower_obj(&args[0])?;
+                    let dst_o = self.alloc_temp_o();
+                    self.ops.push(Op::ExtOp {
+                        kind: EXT_HTTP_OP,
+                        aux: HTTP_SERVE,
+                        a: dst_o,
+                        b: router_o,
+                        c: addr_o,
+                    });
+                    Ok(dst_o)
+                }
+            }
+            other => Err(format!("Unsupported cdt.http symbol '{}'", other)),
+        }
+    }
+
+    pub(crate) fn lower_http_method(
+        &mut self,
+        type_name: &str,
+        target: &Expr,
+        method: &str,
+        args: &[Expr],
+    ) -> Result<u16, String> {
+        use crate::vm::exec_http::*;
+        let router_o = self.lower_obj(target)?;
+        match (type_name, method) {
+            (
+                "Router",
+                "get" | "post" | "put" | "delete" | "patch" | "options" | "head" | "any",
+            ) => {
+                let aux = http_route_aux(method);
+                let pat_o = self.lower_obj(&args[0])?;
+                let handler_o = self.lower_obj(&args[1])?;
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_HTTP_OP,
+                    aux,
+                    a: router_o,
+                    b: pat_o,
+                    c: handler_o,
+                });
+                Ok(router_o)
+            }
+            ("Router", "before" | "after") => {
+                let aux = if method == "before" {
+                    HTTP_ROUTE_BEFORE
+                } else {
+                    HTTP_ROUTE_AFTER
+                };
+                let handler_o = self.lower_obj(&args[0])?;
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_HTTP_OP,
+                    aux,
+                    a: router_o,
+                    b: handler_o,
+                    c: 0,
+                });
+                Ok(router_o)
+            }
+            ("Router", "dispatch" | "serve") => {
+                let aux = if method == "dispatch" { HTTP_DISPATCH } else { HTTP_SERVE };
+                let arg_o = self.lower_obj(&args[0])?;
+                let dst_o = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_HTTP_OP,
+                    aux,
+                    a: dst_o,
+                    b: router_o,
+                    c: arg_o,
+                });
+                Ok(dst_o)
+            }
+            ("Router", "stop") => {
+                let dst_o = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_HTTP_OP,
+                    aux: HTTP_STOP,
+                    a: dst_o,
+                    b: router_o,
+                    c: 0,
+                });
+                Ok(dst_o)
+            }
+            _ => Err(format!("Unsupported http.{} method '.{}()'", type_name, method)),
+        }
+    }
+
     pub(crate) fn lower_native_method_obj(
         &mut self,
         tid: &TypeId,
@@ -877,6 +1311,11 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             && m == "cdt.fs"
         {
             return self.lower_fs_method(&tid.name, target, method, args);
+        }
+        if let ModuleId::Native(m) = &tid.module
+            && m == "cdt.http"
+        {
+            return self.lower_http_method(&tid.name, target, method, args);
         }
         let kind = match (&tid.module, tid.name.as_str(), method) {
             (ModuleId::Native(m), "Timestamp", "unix_seconds") if m == "cdt.time" => {
@@ -1297,5 +1736,19 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             }
             PatternKind::Type { .. } => Err("Unexpected type pattern in value binding".to_string()),
         }
+    }
+}
+
+fn http_route_aux(method: &str) -> u8 {
+    use crate::vm::exec_http::*;
+    match method {
+        "get" => HTTP_ROUTE_GET,
+        "post" => HTTP_ROUTE_POST,
+        "put" => HTTP_ROUTE_PUT,
+        "delete" => HTTP_ROUTE_DELETE,
+        "patch" => HTTP_ROUTE_PATCH,
+        "options" => HTTP_ROUTE_OPTIONS,
+        "head" => HTTP_ROUTE_HEAD,
+        _ => HTTP_ROUTE_ANY,
     }
 }

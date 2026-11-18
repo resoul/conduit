@@ -9,7 +9,28 @@ import java.util.UUID
 
 fun msSince(t0: Long): Double = (System.nanoTime() - t0) / 1_000_000.0
 
+fun vmFib(n: Long): Long = if (n < 2L) n else vmFib(n - 1L) + vmFib(n - 2L)
+
 fun main() {
+    var tVm = System.nanoTime()
+    if (vmFib(35L) != 9227465L) return
+    val msVmFib = msSince(tVm)
+
+    tVm = System.nanoTime()
+    var arithAcc = 0L
+    for (i in 0L until 10_000_000L) {
+        arithAcc = (arithAcc * 1664525L + 1013904223L + i) % 1000000007L
+    }
+    val msVmArith = msSince(tVm)
+    if (arithAcc < 0L) return
+
+    tVm = System.nanoTime()
+    val vmM = HashMap<Int, Int>(100_000)
+    for (i in 0 until 100_000) vmM[i] = i * 3 + 1
+    var mapAcc = 0L
+    for (i in 0 until 100_000) mapAcc += (vmM[i] ?: 0)
+    val msVmMap = msSince(tVm)
+    if (mapAcc < 0L) return
     // 1. FS I/O
     val base = Files.createTempDirectory("_kt_bench_").toFile()
     val p = File(base, "data.txt").toPath()
@@ -128,6 +149,69 @@ fun main() {
     val msUrl = msSince(t0)
     if (urlAcc < 0) return
 
+    data class RouteDef(val method: String, val segs: List<Pair<Int, String>>, val wildcard: Boolean, val handler: (Map<String, String>) -> Pair<Int, String>)
+    fun parsePat(pat: String): Pair<List<Pair<Int, String>>, Boolean> {
+        val tr = pat.trim('/')
+        if (tr.isEmpty()) return emptyList<Pair<Int, String>>() to false
+        var wc = false
+        val segs = tr.split('/').map { s ->
+            when {
+                s.startsWith(':') -> 1 to s.substring(1)
+                s.startsWith('*') -> { wc = true; 2 to s.substring(1) }
+                else -> 0 to s
+            }
+        }
+        return segs to wc
+    }
+    fun mkRoute(m: String, p: String, h: (Map<String, String>) -> Pair<Int, String>): RouteDef {
+        val (segs, wc) = parsePat(p)
+        return RouteDef(m, segs, wc, h)
+    }
+    val routes = listOf(
+        mkRoute("GET", "/") { 200 to "ok" },
+        mkRoute("GET", "/health") { 200 to "ok" },
+        mkRoute("GET", "/api/v1/items") { 200 to "items" },
+        mkRoute("GET", "/api/v1/users/:id/orders") { p -> 200 to (p["id"] ?: "") },
+        mkRoute("GET", "/files/*rest") { 200 to "file" },
+        mkRoute("POST", "/api/v1/echo") { 200 to "" },
+    )
+    val samplePaths = arrayOf("/", "/health", "/api/v1/users/42/orders", "/files/docs/readme.md")
+    t0 = System.nanoTime()
+    var httpAcc = 0
+    for (i in 0 until 50_000) {
+        val tr = samplePaths[i and 3].trim('/')
+        val pathSegs = if (tr.isEmpty()) emptyList() else tr.split('/')
+        val nSegs = pathSegs.size
+        var st = 404
+        var body = ""
+        for (r in routes) {
+            if (!r.wildcard && r.segs.size != nSegs) continue
+            val params = HashMap<String, String>(2)
+            var ok = true
+            for (idx in r.segs.indices) {
+                val (kind, value) = r.segs[idx]
+                if (kind == 2) { params[value] = pathSegs.subList(idx, nSegs).joinToString("/"); break }
+                else if (kind == 1) {
+                    if (idx >= nSegs || pathSegs[idx].isEmpty()) { ok = false; break }
+                    params[value] = pathSegs[idx]
+                } else if (idx >= nSegs || pathSegs[idx] != value) { ok = false; break }
+            }
+            if (ok && r.method == "GET") {
+                val res = r.handler(params)
+                st = res.first
+                body = res.second
+                break
+            }
+        }
+        httpAcc += st + body.length
+    }
+    val msHttp = msSince(t0)
+    if (httpAcc != 10_125_000) return
+
+    println("BENCH|vm_fib_35|%.3f".format(msVmFib))
+    println("BENCH|vm_arith_10m|%.3f".format(msVmArith))
+    println("BENCH|vm_map_100k|%.3f".format(msVmMap))
+
     println("BENCH|fs_write_text|%.3f".format(msWriteText))
     println("BENCH|fs_write_lines|%.3f".format(msWriteStream))
     println("BENCH|fs_read_text|%.3f".format(msReadText))
@@ -143,4 +227,5 @@ fun main() {
     println("BENCH|pipeline_1m|%.3f".format(msPipe))
     println("BENCH|pipeline_float_1m|%.3f".format(msFPipe))
     println("BENCH|url_parse_50k|%.3f".format(msUrl))
+    println("BENCH|http_router_50k|%.3f".format(msHttp))
 }

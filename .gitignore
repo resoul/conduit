@@ -1,7 +1,9 @@
 /target
 .idea/
 **/.idea/
-**/*.DS_Store
+**/.DS_Store
+.DS_Store
+_conduit_bench_tmp/
 *.swp
 *.log
 /docs/book/

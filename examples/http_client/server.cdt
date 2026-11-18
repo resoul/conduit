@@ -1,0 +1,116 @@
+import * as http from "cdt.http"
+import * as json from "cdt.json"
+import { EncodeError } from "cdt.json"
+
+struct ItemPatch {
+    id: String
+    status: String
+}
+
+func check_admin_auth(req: http.Request) -> http.Response? {
+    if req.path.starts_with("/admin") {
+        token := req.headers.get("authorization") ?? ""
+        if token != "Bearer secret" {
+            return http.response(401, "unauthorized")
+        }
+    }
+    return nil
+}
+
+func add_cors_headers(_req: http.Request, resp: http.Response) -> http.Response {
+    hdrs := resp.headers
+    hdrs.set("x-powered-by", "conduit")
+    hdrs.set("access-control-allow-origin", "*")
+    return http.response_with(resp.status, resp.body, hdrs)
+}
+
+func home_handler(_req: http.Request) -> http.Response {
+    return http.text("cdt-curl demo server")
+}
+
+func get_user_handler(req: http.Request) -> http.Response {
+    id := req.params.get("id") ?? "unknown"
+    return http.json("{\"user_id\":\"" + id + "\"}")
+}
+
+func echo_handler(req: http.Request) -> http.Response {
+    return http.json(req.body)
+}
+
+func patch_item_handler(req: http.Request) -> http.Response {
+    id := req.params.get("id") ?? "0"
+    payload := ItemPatch(id: id, status: "updated")
+    switch json.encode(payload) {
+        case String(s):
+            return http.json(s)
+        case EncodeError(e):
+            return http.response(500, e.message)
+    }
+}
+
+func options_item_handler(_req: http.Request) -> http.Response {
+    return http.response(204, "")
+}
+
+func health_handler(req: http.Request) -> http.Response {
+    return http.text("ok:" + req.method)
+}
+
+func admin_stats_handler(_req: http.Request) -> http.Response {
+    return http.json("{\"status\":\"ok\"}")
+}
+
+export router DemoApi "CdtCurl demo HTTP router" {
+    before check_admin_auth
+    after add_cors_headers
+    get "/" => home_handler
+    get "/users/:id" => get_user_handler
+    post "/echo" => echo_handler
+    patch "/items/:id" => patch_item_handler
+    options "/items/:id" => options_item_handler
+    any "/health" => health_handler
+    get "/admin/stats" => admin_stats_handler
+}
+
+export func build_demo_router() -> http.Router {
+    r := http.build<DemoApi>()
+    r.post("/shutdown", (_req: http.Request) -> http.Response => {
+        r.stop()
+        return http.text("shutting down")
+    })
+    return r
+}
+
+export func run_self_test() -> Void {
+    r := build_demo_router()
+    empty := Map.from([("x", "1")])
+    empty.remove("x")
+
+    r_home := r.dispatch(http.Request(method: "GET", path: "/", body: "", headers: empty, query: empty, params: empty))
+    r_user := r.dispatch(http.Request(method: "GET", path: "/users/42", body: "", headers: empty, query: empty, params: empty))
+    r_patch := r.dispatch(http.Request(method: "PATCH", path: "/items/9", body: "", headers: empty, query: empty, params: empty))
+    r_unauth := r.dispatch(http.Request(method: "GET", path: "/admin/stats", body: "", headers: empty, query: empty, params: empty))
+    r_auth := r.dispatch(http.Request(
+        method: "GET",
+        path: "/admin/stats",
+        body: "",
+        headers: Map.from([("authorization", "Bearer secret")]),
+        query: empty,
+        params: empty,
+    ))
+    powered := r_auth.headers.get("x-powered-by") ?? ""
+
+    print("GET /: {r_home.status} -> {r_home.body}")
+    print("GET /users/42: {r_user.status} -> {r_user.body}")
+    print("PATCH /items/9: {r_patch.status} -> {r_patch.body}")
+    print("GET /admin/stats (no auth): {r_unauth.status} -> {r_unauth.body}")
+    print("GET /admin/stats (auth): {r_auth.status} -> {r_auth.body} [x-powered-by={powered}]")
+}
+
+export func serve_demo(addr: String) -> Void | http.HttpError {
+    r := build_demo_router()
+    print("Listening on http://{addr} (POST /shutdown to stop gracefully)")
+    r.serve(addr)?
+    print("Server stopped cleanly.")
+    return
+}

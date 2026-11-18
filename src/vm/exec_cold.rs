@@ -48,6 +48,32 @@ pub(crate) fn map_set_int_cow(arc: &mut Arc<OrderedMap>, key: i64, val: u64) {
 }
 
 #[inline(always)]
+fn map_set_int_slot(slot: &mut Obj, key: i64, val: u64) -> Result<(), RuntimeError> {
+    match slot {
+        Obj::Map(arc) => {
+            if let Some(m) = Arc::get_mut(arc) {
+                m.set(MapKey::Int(key), MapVal::Scalar(val));
+            } else {
+                map_set_int_cow(arc, key, val);
+            }
+            Ok(())
+        }
+        _ => Err(err_msg("Expected Map in MapSetIntInt")),
+    }
+}
+
+#[inline(always)]
+fn map_get_int_or_slot(slot: &Obj, key: i64, def: u64) -> Result<u64, RuntimeError> {
+    match slot {
+        Obj::Map(arc) => Ok(match arc.get(&MapKey::Int(key)) {
+            Some(MapVal::Scalar(v)) => *v,
+            _ => def,
+        }),
+        _ => Err(err_msg("Expected Map in MapGetIntIntOr")),
+    }
+}
+
+#[inline(always)]
 unsafe fn take_or_clone_obj(o_ptr: *mut Obj, reg: u16, move_objs: bool) -> Obj {
     let slot = unsafe { &mut *o_ptr.add(reg as usize) };
     if move_objs {
@@ -137,6 +163,11 @@ pub(crate) unsafe fn build_record_into_reg(
 
 #[inline]
 fn is_branchless_scalar_body_op(op: Op, idx_reg: u16, limit_reg: u16) -> bool {
+    match op {
+        Op::MapSetIntInt { .. } => return true,
+        Op::MapGetIntIntOr { dst_s, .. } => return dst_s != idx_reg && dst_s != limit_reg,
+        _ => {}
+    }
     let dst = match op {
         Op::LoadImmInt { dst, .. }
         | Op::LoadConstInt { dst, .. }
@@ -398,6 +429,17 @@ pub(crate) unsafe fn exec_for_range_fast(
                         Op::LtFloat { dst, a, b } => s_set!(dst, (f64::from_bits(s_get!(a)) < f64::from_bits(s_get!(b))) as u64),
                         Op::LeFloat { dst, a, b } => s_set!(dst, (f64::from_bits(s_get!(a)) <= f64::from_bits(s_get!(b))) as u64),
                         Op::NotBool { dst, src } => s_set!(dst, (s_get!(src) == 0) as u64),
+                        Op::MapSetIntInt { map_obj, key_s, val_s } => {
+                            let key = s_get!(key_s) as i64;
+                            let val = s_get!(val_s);
+                            map_set_int_slot(unsafe { &mut *o_ptr.add(map_obj as usize) }, key, val)?;
+                        }
+                        Op::MapGetIntIntOr { dst_s, map_obj, key_s, def_s } => {
+                            let key = s_get!(key_s) as i64;
+                            let def = s_get!(def_s);
+                            let val = map_get_int_or_slot(unsafe { &*o_ptr.add(map_obj as usize) }, key, def)?;
+                            s_set!(dst_s, val);
+                        }
                         _ => return Ok(false),
                     }
                 }
@@ -527,7 +569,7 @@ impl Vm {
         }
     }
 
-    #[inline(never)]
+    #[inline(always)]
     pub(crate) fn exec_map_set_int(
         &mut self,
         s_base: usize,
@@ -538,20 +580,10 @@ impl Vm {
     ) -> Result<(), RuntimeError> {
         let key = self.scalars[s_base + key_s as usize] as i64;
         let val = self.scalars[s_base + val_s as usize];
-        match &mut self.objs[o_base + map_obj as usize] {
-            Obj::Map(arc) => {
-                if let Some(m) = Arc::get_mut(arc) {
-                    m.set(MapKey::Int(key), MapVal::Scalar(val));
-                } else {
-                    map_set_int_cow(arc, key, val);
-                }
-                Ok(())
-            }
-            _ => Err(err_msg("Expected Map in MapSetIntInt")),
-        }
+        map_set_int_slot(&mut self.objs[o_base + map_obj as usize], key, val)
     }
 
-    #[inline(never)]
+    #[inline(always)]
     pub(crate) fn exec_map_get_int_or(
         &mut self,
         s_base: usize,
@@ -561,15 +593,9 @@ impl Vm {
         key_s: u16,
         def_s: u16,
     ) -> Result<(), RuntimeError> {
-        let key = MapKey::Int(self.scalars[s_base + key_s as usize] as i64);
+        let key = self.scalars[s_base + key_s as usize] as i64;
         let def = self.scalars[s_base + def_s as usize];
-        let val = match &self.objs[o_base + map_obj as usize] {
-            Obj::Map(arc) => match arc.get(&key) {
-                Some(MapVal::Scalar(v)) => *v,
-                _ => def,
-            },
-            _ => return Err(err_msg("Expected Map in MapGetIntIntOr")),
-        };
+        let val = map_get_int_or_slot(&self.objs[o_base + map_obj as usize], key, def)?;
         self.scalars[s_base + dst_s as usize] = val;
         Ok(())
     }
@@ -617,11 +643,11 @@ impl Vm {
         }
         self.frames.push(CallFrame {
             func_id: caller_func_id,
-            return_ip,
-            s_base: cur_s_base,
-            o_base: cur_o_base,
+            return_ip: return_ip as u32,
+            s_base: cur_s_base as u32,
+            o_base: cur_o_base as u32,
             ret_reg,
-            prev_closure_slot: cur_closure_slot,
+            prev_closure_slot: CallFrame::pack_closure_slot(cur_closure_slot),
         });
         let next_s_base = cur_s_base + arg_base_s as usize;
         let next_o_base = cur_o_base + arg_base_o as usize;

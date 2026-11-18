@@ -24,6 +24,27 @@ pub enum ConstVal {
     String(String),
 }
 
+#[derive(Debug, Clone)]
+pub struct CliDispatchRoute {
+    pub field_slot_path: Vec<u16>,
+    pub handler_name: String,
+    pub takes_parent: bool,
+    pub ret_type: Type,
+}
+
+#[derive(Debug, Clone)]
+pub enum HttpRouterDeclKind {
+    Before,
+    After,
+    Route(String, String),
+}
+
+#[derive(Debug, Clone)]
+pub struct HttpRouterDeclEntry {
+    pub kind: HttpRouterDeclKind,
+    pub handler_name: String,
+}
+
 #[derive(Debug)]
 pub struct CheckedProgram {
     pub structs: Vec<ResolvedStruct>,
@@ -48,6 +69,7 @@ pub struct CheckedProgram {
     pub cli_direct_fns: HashMap<String, String>,
     pub cli_direct_types: HashMap<String, String>,
     pub cli_plans: Vec<(String, crate::native::cli::CliPlan)>,
+    pub cli_dispatches: Vec<(String, Vec<CliDispatchRoute>)>,
     pub fs_aliases: HashSet<String>,
     pub fs_direct_fns: HashMap<String, String>,
     pub fs_direct_types: HashMap<String, String>,
@@ -69,6 +91,10 @@ pub struct CheckedProgram {
     pub math_direct_fns: HashMap<String, String>,
     pub log_aliases: HashSet<String>,
     pub log_direct_fns: HashMap<String, String>,
+    pub http_aliases: HashSet<String>,
+    pub http_direct_fns: HashMap<String, String>,
+    pub http_direct_types: HashMap<String, String>,
+    pub http_router_plans: Vec<(String, Vec<HttpRouterDeclEntry>)>,
     pub struct_abouts: HashMap<String, String>,
     pub validator_funcs: HashSet<String>,
     pub error_structs: HashSet<String>,
@@ -123,6 +149,7 @@ pub fn check_program_with_roots(
         cli_direct_fns: HashMap::new(),
         cli_direct_types: HashMap::new(),
         cli_plans: Vec::new(),
+        cli_dispatches: Vec::new(),
         fs_aliases: HashSet::new(),
         fs_direct_fns: HashMap::new(),
         fs_direct_types: HashMap::new(),
@@ -144,6 +171,10 @@ pub fn check_program_with_roots(
         math_direct_fns: HashMap::new(),
         log_aliases: HashSet::new(),
         log_direct_fns: HashMap::new(),
+        http_aliases: HashSet::new(),
+        http_direct_fns: HashMap::new(),
+        http_direct_types: HashMap::new(),
+        http_router_plans: Vec::new(),
         struct_abouts: HashMap::new(),
         validator_funcs: HashSet::new(),
         error_structs: HashSet::new(),

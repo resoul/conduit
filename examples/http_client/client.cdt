@@ -1,0 +1,143 @@
+import * as http from "cdt.http"
+import * as json from "cdt.json"
+import { EncodeError } from "cdt.json"
+import * as log from "cdt.log"
+import * as time from "cdt.time"
+import * as url from "cdt.url"
+
+export const DEFAULT_TIMEOUT_MS = 10000
+
+export enum OutputMode {
+    Body,
+    Full,
+    JsonLog,
+}
+
+export struct RequestSummary {
+    method: String
+    host: String
+    path: String
+    status: Int
+    elapsed_ms: Int
+    body_bytes: Int
+}
+
+func build_headers(header_raw: String) -> Map<String, String> {
+    hdrs := Map.from([("User-Agent", "cdt-curl/0.1")])
+    if header_raw.trim() == "" {
+        return hdrs
+    }
+    parts := header_raw.split(",")
+    for item in parts {
+        trimmed := item.trim()
+        if trimmed == "" {
+            continue
+        }
+        kv := trimmed.split(":")
+        if kv.len() >= 2 {
+            k := ""
+            v := ""
+            switch kv[0] {
+                case String(s):
+                    k = s.trim()
+            }
+            switch kv[1] {
+                case String(s):
+                    v = s.trim()
+            }
+            if k != "" {
+                hdrs.set(k, v)
+            }
+        }
+    }
+    return hdrs
+}
+
+func print_response(resp: http.Response, mode: OutputMode, elapsed_ms: Int, parsed_url: url.Url) -> Void {
+    switch mode {
+        case OutputMode.Body:
+            print(resp.body)
+        case OutputMode.Full:
+            print("HTTP {resp.status} ({elapsed_ms} ms)")
+            for (k, v) in resp.headers {
+                print("  {k}: {v}")
+            }
+            print("")
+            print(resp.body)
+        case OutputMode.JsonLog:
+            summary := RequestSummary(
+                method: "HTTP",
+                host: parsed_url.host,
+                path: parsed_url.path,
+                status: resp.status,
+                elapsed_ms: elapsed_ms,
+                body_bytes: resp.body.len(),
+            )
+            encoded := json.encode(summary)
+            switch encoded {
+                case String(s):
+                    print(s)
+                case EncodeError(e):
+                    print("JSON encode error: {e.message}")
+            }
+    }
+}
+
+func elapsed_ms_since(started: time.Instant) -> Int {
+    switch time.elapsed(started) {
+        case time.Duration(d):
+            switch d.milliseconds() {
+                case Int(ms):
+                    return ms
+                case _:
+                    return 0
+            }
+        case _:
+            return 0
+    }
+}
+
+export func execute_text(
+    method: String,
+    target_url: String,
+    body: String,
+    header_raw: String,
+    timeout_ms: Int,
+    mode: OutputMode,
+    verbose: Bool,
+) -> Void | http.HttpError | url.UrlError {
+    parsed := url.parse(target_url)?
+    hdrs := build_headers(header_raw)
+    if verbose {
+        log.info("sending {method} {target_url}")
+    }
+    started := time.monotonic()
+    resp := http.request_timeout(method, target_url, body, hdrs, timeout_ms)?
+    elapsed_ms := elapsed_ms_since(started)
+    print_response(resp, mode, elapsed_ms, parsed)
+    return
+}
+
+export func execute_bytes(
+    target_url: String,
+    verbose: Bool,
+) -> Void | http.HttpError | url.UrlError {
+    _parsed := url.parse(target_url)?
+    if verbose {
+        log.info("fetching binary response: {target_url}")
+    }
+    started := time.monotonic()
+    resp := http.get_bytes(target_url)?
+    elapsed_ms := elapsed_ms_since(started)
+    ct := resp.headers.get("content-type") ?? "application/octet-stream"
+    print("HTTP {resp.status} ({elapsed_ms} ms) [{ct}] - {resp.body.len()} bytes")
+    preview_len := 16
+    if resp.body.len() < 16 {
+        preview_len = resp.body.len()
+    }
+    if preview_len > 0 {
+        preview := resp.body.slice(0, preview_len)
+        print("First bytes: {preview}")
+    }
+    return
+}

@@ -1,5 +1,32 @@
 import base64, csv, hashlib, io, json, os, shutil, subprocess, tempfile, time, urllib.parse, uuid
 
+def vm_fib(n):
+    return n if n < 2 else vm_fib(n - 1) + vm_fib(n - 2)
+
+t0 = time.perf_counter()
+if vm_fib(35) != 9227465:
+    raise RuntimeError("unreachable")
+ms_vm_fib = (time.perf_counter() - t0) * 1000.0
+
+t0 = time.perf_counter()
+arith_acc = 0
+for i in range(10000000):
+    arith_acc = (arith_acc * 1664525 + 1013904223 + i) % 1000000007
+ms_vm_arith = (time.perf_counter() - t0) * 1000.0
+if arith_acc < 0:
+    raise RuntimeError("unreachable")
+
+t0 = time.perf_counter()
+vm_m = {}
+for i in range(100000):
+    vm_m[i] = i * 3 + 1
+map_acc = 0
+for i in range(100000):
+    map_acc += vm_m[i]
+ms_vm_map = (time.perf_counter() - t0) * 1000.0
+if map_acc < 0:
+    raise RuntimeError("unreachable")
+
 # 1. FS I/O
 base = os.path.join(tempfile.gettempdir(), f"_py_bench_{os.getpid()}")
 os.makedirs(base, exist_ok=True)
@@ -125,6 +152,67 @@ ms_url = (time.perf_counter() - t0) * 1000.0
 if url_acc < 0:
     raise RuntimeError("unreachable")
 
+def parse_pat(pat):
+    tr = pat.strip("/")
+    if not tr:
+        return [], False
+    segs = []
+    wc = False
+    for s in tr.split("/"):
+        if s.startswith(":"):
+            segs.append((1, s[1:]))
+        elif s.startswith("*"):
+            segs.append((2, s[1:]))
+            wc = True
+        else:
+            segs.append((0, s))
+    return segs, wc
+
+routes = [
+    ("GET", *parse_pat("/"), lambda p: (200, "ok")),
+    ("GET", *parse_pat("/health"), lambda p: (200, "ok")),
+    ("GET", *parse_pat("/api/v1/items"), lambda p: (200, "items")),
+    ("GET", *parse_pat("/api/v1/users/:id/orders"), lambda p: (200, p.get("id", ""))),
+    ("GET", *parse_pat("/files/*rest"), lambda p: (200, "file")),
+    ("POST", *parse_pat("/api/v1/echo"), lambda p: (200, "")),
+]
+sample_paths = ["/", "/health", "/api/v1/users/42/orders", "/files/docs/readme.md"]
+t0 = time.perf_counter()
+http_acc = 0
+for i in range(50000):
+    tr = sample_paths[i & 3].strip("/")
+    path_segs = tr.split("/") if tr else []
+    n_segs = len(path_segs)
+    st, body = 404, ""
+    for rm, segs, wc, h in routes:
+        if not wc and len(segs) != n_segs:
+            continue
+        params = {}
+        ok = True
+        for idx, (kind, val) in enumerate(segs):
+            if kind == 2:
+                params[val] = "/".join(path_segs[idx:])
+                break
+            elif kind == 1:
+                if idx >= n_segs or not path_segs[idx]:
+                    ok = False
+                    break
+                params[val] = path_segs[idx]
+            elif idx >= n_segs or path_segs[idx] != val:
+                ok = False
+                break
+        if ok and rm == "GET":
+            st, body = h(params)
+            break
+    http_acc += st + len(body)
+ms_http = (time.perf_counter() - t0) * 1000.0
+if http_acc != 10125000:
+    raise RuntimeError("unreachable")
+
+print(f"BENCH|vm_fib_35|{ms_vm_fib:.3f}")
+print(f"BENCH|vm_arith_10m|{ms_vm_arith:.3f}")
+print(f"BENCH|vm_map_100k|{ms_vm_map:.3f}")
+
 print(f"BENCH|fs_write_text|{ms_write_text:.3f}")
 print(f"BENCH|fs_write_lines|{ms_write_stream:.3f}")
 print(f"BENCH|fs_read_text|{ms_read_text:.3f}")
@@ -143,3 +231,4 @@ print(f"BENCH|pipeline_1m|{ms_pipe:.3f}")
 print(f"BENCH|pipeline_float_1m|{ms_fpipe:.3f}")
 print(f"BENCH|csv_parse_20k|{ms_csv:.3f}")
 print(f"BENCH|url_parse_50k|{ms_url:.3f}")
+print(f"BENCH|http_router_50k|{ms_http:.3f}")

@@ -6,6 +6,27 @@ import { spawnSync } from "node:child_process";
 
 const ms = (t0) => Number(process.hrtime.bigint() - t0) / 1e6;
 
+const vmFib = (n) => (n < 2 ? n : vmFib(n - 1) + vmFib(n - 2));
+let tVm = process.hrtime.bigint();
+if (vmFib(35) !== 9227465) process.exit(1);
+const msVmFib = ms(tVm);
+
+tVm = process.hrtime.bigint();
+let arithAcc = 0;
+for (let i = 0; i < 10000000; i++) {
+  arithAcc = (arithAcc * 1664525 + 1013904223 + i) % 1000000007;
+}
+const msVmArith = ms(tVm);
+if (arithAcc < 0) process.exit(1);
+
+tVm = process.hrtime.bigint();
+const vmM = new Map();
+for (let i = 0; i < 100000; i++) vmM.set(i, i * 3 + 1);
+let mapAcc = 0;
+for (let i = 0; i < 100000; i++) mapAcc += vmM.get(i);
+const msVmMap = ms(tVm);
+if (mapAcc < 0) process.exit(1);
+
 // 1. FS I/O
 const base = path.join(os.tmpdir(), `_js_bench_${process.pid}`);
 fs.mkdirSync(base, { recursive: true });
@@ -150,6 +171,60 @@ for (let i = 0; i < 50000; i++) {
 const msUrl = ms(t0);
 if (urlAcc < 0) process.exit(1);
 
+const parsePat = (pat) => {
+  const tr = pat.replace(/^\/+|\/+$/g, "");
+  if (!tr) return [[], false];
+  let wc = false;
+  const segs = tr.split("/").map((s) => {
+    if (s[0] === ":") return [1, s.slice(1)];
+    if (s[0] === "*") { wc = true; return [2, s.slice(1)]; }
+    return [0, s];
+  });
+  return [segs, wc];
+};
+const routes = [
+  ["GET", ...parsePat("/"), () => [200, "ok"]],
+  ["GET", ...parsePat("/health"), () => [200, "ok"]],
+  ["GET", ...parsePat("/api/v1/items"), () => [200, "items"]],
+  ["GET", ...parsePat("/api/v1/users/:id/orders"), (p) => [200, p.id ?? ""]],
+  ["GET", ...parsePat("/files/*rest"), () => [200, "file"]],
+  ["POST", ...parsePat("/api/v1/echo"), () => [200, ""]],
+];
+const samplePaths = ["/", "/health", "/api/v1/users/42/orders", "/files/docs/readme.md"];
+t0 = process.hrtime.bigint();
+let httpAcc = 0;
+for (let i = 0; i < 50000; i++) {
+  const tr = samplePaths[i & 3].replace(/^\/+|\/+$/g, "");
+  const pathSegs = tr ? tr.split("/") : [];
+  const nSegs = pathSegs.length;
+  let st = 404;
+  let body = "";
+  for (const [rm, segs, wc, h] of routes) {
+    if (!wc && segs.length !== nSegs) continue;
+    const params = {};
+    let ok = true;
+    for (let idx = 0; idx < segs.length; idx++) {
+      const [kind, val] = segs[idx];
+      if (kind === 2) { params[val] = pathSegs.slice(idx).join("/"); break; }
+      if (kind === 1) {
+        if (idx >= nSegs || !pathSegs[idx]) { ok = false; break; }
+        params[val] = pathSegs[idx];
+      } else if (idx >= nSegs || pathSegs[idx] !== val) { ok = false; break; }
+    }
+    if (ok && rm === "GET") {
+      [st, body] = h(params);
+      break;
+    }
+  }
+  httpAcc += st + body.length;
+}
+const msHttp = ms(t0);
+if (httpAcc !== 10125000) process.exit(1);
+
+console.log(`BENCH|vm_fib_35|${msVmFib.toFixed(3)}`);
+console.log(`BENCH|vm_arith_10m|${msVmArith.toFixed(3)}`);
+console.log(`BENCH|vm_map_100k|${msVmMap.toFixed(3)}`);
+
 console.log(`BENCH|fs_write_text|${msWriteText.toFixed(3)}`);
 console.log(`BENCH|fs_write_lines|${msWriteStream.toFixed(3)}`);
 console.log(`BENCH|fs_read_text|${msReadText.toFixed(3)}`);
@@ -167,3 +242,4 @@ console.log(`BENCH|json_decode_10k|${msJsonDec.toFixed(3)}`);
 console.log(`BENCH|pipeline_1m|${msPipe.toFixed(3)}`);
 console.log(`BENCH|pipeline_float_1m|${msFPipe.toFixed(3)}`);
 console.log(`BENCH|url_parse_50k|${msUrl.toFixed(3)}`);
+console.log(`BENCH|http_router_50k|${msHttp.toFixed(3)}`);

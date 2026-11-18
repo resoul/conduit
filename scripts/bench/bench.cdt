@@ -7,6 +7,26 @@ import * as env from "cdt.env"
 import * as time from "cdt.time"
 import * as csv from "cdt.csv"
 import * as url from "cdt.url"
+import * as http from "cdt.http"
+
+func h_root(_req: http.Request) -> http.Response { return http.text("ok") }
+func h_health(_req: http.Request) -> http.Response { return http.text("ok") }
+func h_items(_req: http.Request) -> http.Response { return http.text("items") }
+func h_orders(req: http.Request) -> http.Response {
+    id := req.params.get("id") ?? ""
+    return http.text(id)
+}
+func h_files(_req: http.Request) -> http.Response { return http.text("file") }
+func h_echo(req: http.Request) -> http.Response { return http.json(req.body) }
+
+router BenchApi {
+    get "/" => h_root
+    get "/health" => h_health
+    get "/api/v1/items" => h_items
+    get "/api/v1/users/:id/orders" => h_orders
+    get "/files/*rest" => h_files
+    post "/api/v1/echo" => h_echo
+}
 
 struct Item {
     id: Int
@@ -20,7 +40,45 @@ func ms_since(t0: time.Instant) -> Float | time.TimeError {
     return ns.to_float() / 1000000.0
 }
 
-export func main() -> Void | fs.FsError | process.ProcessError | crypto.CryptoError | json.DecodeError | json.EncodeError | time.TimeError | csv.CsvError | url.UrlError {
+func vm_fib(n: Int) -> Int {
+    if n < 2 {
+        return n
+    }
+    return vm_fib(n - 1) + vm_fib(n - 2)
+}
+
+export func main() -> Void | KeyError | fs.FsError | process.ProcessError | crypto.CryptoError | json.DecodeError | json.EncodeError | time.TimeError | csv.CsvError | url.UrlError {
+    // ── 0. Pure-VM Computation ───────────────────────────────────────────────
+    t_fib := time.monotonic()
+    fib_res := vm_fib(35)
+    ms_vm_fib := ms_since(t_fib)?
+    if fib_res != 9227465 { return }
+
+    t_arith := time.monotonic()
+    var arith_acc = 0
+    var li = 0
+    while li < 10000000 {
+        arith_acc = (arith_acc * 1664525 + 1013904223 + li) % 1000000007
+        li = li + 1
+    }
+    ms_vm_arith := ms_since(t_arith)?
+    if arith_acc < 0 { return }
+
+    t_map := time.monotonic()
+    vm_m := Map<Int, Int>()
+    li = 0
+    while li < 100000 {
+        vm_m.set(li, li * 3 + 1)
+        li = li + 1
+    }
+    var map_acc = 0
+    li = 0
+    while li < 100000 {
+        map_acc = map_acc + (vm_m.get(li) ?? 0)
+        li = li + 1
+    }
+    ms_vm_map := ms_since(t_map)?
+    if map_acc < 0 { return }
     // ── 1. FS I/O (100k lines / 5.53 MiB) ────────────────────────────────────
     cwd := process.cwd()?
     base := path.join(cwd, "_conduit_bench_tmp")
@@ -230,6 +288,30 @@ export func main() -> Void | fs.FsError | process.ProcessError | crypto.CryptoEr
     ms_url := ms_since(t_url)?
     if url_acc < 0 { return }
 
+    router_obj := http.build<BenchApi>()
+    empty_hdrs := Map<String, String>()
+    req0 := http.Request(method: "GET", path: "/", body: "", headers: empty_hdrs, query: empty_hdrs, params: empty_hdrs)
+    req1 := http.Request(method: "GET", path: "/health", body: "", headers: empty_hdrs, query: empty_hdrs, params: empty_hdrs)
+    req2 := http.Request(method: "GET", path: "/api/v1/users/42/orders", body: "", headers: empty_hdrs, query: empty_hdrs, params: empty_hdrs)
+    req3 := http.Request(method: "GET", path: "/files/docs/readme.md", body: "", headers: empty_hdrs, query: empty_hdrs, params: empty_hdrs)
+    t_http := time.monotonic()
+    i = 0
+    http_acc := 0
+    while i < 12500 {
+        r0 := router_obj.dispatch(req0)
+        r1 := router_obj.dispatch(req1)
+        r2 := router_obj.dispatch(req2)
+        r3 := router_obj.dispatch(req3)
+        http_acc = http_acc + r0.status + r0.body.len() + r1.status + r1.body.len() + r2.status + r2.body.len() + r3.status + r3.body.len()
+        i = i + 1
+    }
+    ms_http := ms_since(t_http)?
+    if http_acc != 10125000 { return }
+
+    print("BENCH|vm_fib_35|" + ms_vm_fib.to_string())
+    print("BENCH|vm_arith_10m|" + ms_vm_arith.to_string())
+    print("BENCH|vm_map_100k|" + ms_vm_map.to_string())
+
     print("BENCH|fs_write_text|" + ms_write_text.to_string())
     print("BENCH|fs_write_lines|" + ms_write_stream.to_string())
     print("BENCH|fs_read_text|" + ms_read_text.to_string())
@@ -248,5 +330,6 @@ export func main() -> Void | fs.FsError | process.ProcessError | crypto.CryptoEr
     print("BENCH|pipeline_float_1m|" + ms_fpipe.to_string())
     print("BENCH|csv_parse_20k|" + ms_csv.to_string())
     print("BENCH|url_parse_50k|" + ms_url.to_string())
+    print("BENCH|http_router_50k|" + ms_http.to_string())
     return
 }

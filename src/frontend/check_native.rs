@@ -18,6 +18,10 @@ pub(crate) fn is_valid_native_type(mod_name: &str, ty_name: &str) -> bool {
         "cdt.crypto" => ty_name == "CryptoError",
         "cdt.url" => matches!(ty_name, "UrlError" | "Url"),
         "cdt.csv" => ty_name == "CsvError",
+        "cdt.http" => matches!(
+            ty_name,
+            "HttpError" | "Request" | "Response" | "BinaryResponse" | "Router"
+        ),
         _ => false,
     }
 }
@@ -114,7 +118,7 @@ pub(crate) fn register_native_imports(
                 }
                 for spec in names {
                     match spec.name.as_str() {
-                        "parse" | "parse_args" | "help" => {
+                        "parse" | "parse_args" | "help" | "dispatch" | "dispatch_args" => {
                             insert_unique(&mut checked.cli_direct_fns, &spec.alias, &spec.name)?;
                         }
                         "CliError" => {
@@ -296,6 +300,31 @@ pub(crate) fn register_native_imports(
                     }
                 }
             }
+            "cdt.http" => {
+                if let Some(a) = alias {
+                    checked.http_aliases.insert(a.clone());
+                }
+                for spec in names {
+                    match spec.name.as_str() {
+                        "text" | "html" | "json" | "response" | "response_with" | "router"
+                        | "build" | "serve" | "get" | "post" | "request" | "request_timeout"
+                        | "get_bytes" | "request_bytes" => {
+                            insert_unique(&mut checked.http_direct_fns, &spec.alias, &spec.name)?;
+                        }
+                        "HttpError" | "Request" | "Response" | "BinaryResponse" | "Router" => {
+                            checked
+                                .http_direct_types
+                                .insert(spec.alias.clone(), spec.name.clone());
+                        }
+                        other => {
+                            return Err(format!(
+                                "Module 'cdt.http' has no exported member '{}'",
+                                other
+                            ));
+                        }
+                    }
+                }
+            }
             other => return Err(format!("Unknown or unlinked module '{}'", other)),
         }
     }
@@ -378,6 +407,10 @@ pub fn resolve_type_expr(te: &TypeExpr, checked: &CheckedProgram) -> Result<Type
                 "cdt.csv",
                 &checked.csv_direct_types[name],
             ))),
+            _ if checked.http_direct_types.contains_key(name) => Ok(Type::Custom(TypeId::native(
+                "cdt.http",
+                &checked.http_direct_types[name],
+            ))),
             _ if name.contains('.') => {
                 let mut parts = name.splitn(2, '.');
                 let alias = parts.next().unwrap_or("");
@@ -402,6 +435,8 @@ pub fn resolve_type_expr(te: &TypeExpr, checked: &CheckedProgram) -> Result<Type
                     "cdt.url"
                 } else if checked.csv_aliases.contains(alias) {
                     "cdt.csv"
+                } else if checked.http_aliases.contains(alias) {
+                    "cdt.http"
                 } else {
                     return Err(format!("Unknown type '{}'", name));
                 };
@@ -508,6 +543,7 @@ pub(crate) fn is_error_type(ty: &Type, checked: &CheckedProgram) -> bool {
             "cdt.crypto" => name == "CryptoError",
             "cdt.url" => name == "UrlError",
             "cdt.csv" => name == "CsvError",
+            "cdt.http" => name == "HttpError",
             _ => false,
         },
         Type::Custom(TypeId {
@@ -607,6 +643,35 @@ pub(crate) fn native_member_field(tid: &TypeId, field: &str) -> Result<(Type, u1
         ("cdt.csv", "CsvError", "line") => Ok((Type::Int, 0)),
         ("cdt.csv", "CsvError", "kind") => Ok((Type::String, 0)),
         ("cdt.csv", "CsvError", "message") => Ok((Type::String, 1)),
+        ("cdt.http", "HttpError", "kind") => Ok((Type::String, 0)),
+        ("cdt.http", "HttpError", "message") => Ok((Type::String, 1)),
+        ("cdt.http", "Request", "method") => Ok((Type::String, 0)),
+        ("cdt.http", "Request", "path") => Ok((Type::String, 1)),
+        ("cdt.http", "Request", "body") => Ok((Type::String, 2)),
+        ("cdt.http", "Request", "headers") => Ok((
+            Type::Map(Box::new(Type::String), Box::new(Type::String)),
+            3,
+        )),
+        ("cdt.http", "Request", "query") => Ok((
+            Type::Map(Box::new(Type::String), Box::new(Type::String)),
+            4,
+        )),
+        ("cdt.http", "Request", "params") => Ok((
+            Type::Map(Box::new(Type::String), Box::new(Type::String)),
+            5,
+        )),
+        ("cdt.http", "Response", "status") => Ok((Type::Int, 0)),
+        ("cdt.http", "Response", "body") => Ok((Type::String, 0)),
+        ("cdt.http", "Response", "headers") => Ok((
+            Type::Map(Box::new(Type::String), Box::new(Type::String)),
+            1,
+        )),
+        ("cdt.http", "BinaryResponse", "status") => Ok((Type::Int, 0)),
+        ("cdt.http", "BinaryResponse", "body") => Ok((Type::List(Box::new(Type::Int)), 0)),
+        ("cdt.http", "BinaryResponse", "headers") => Ok((
+            Type::Map(Box::new(Type::String), Box::new(Type::String)),
+            1,
+        )),
         _ => Err(format!("Type '{}' has no field '{}'", tid, field)),
     }
 }
@@ -900,6 +965,9 @@ impl<'a> Checker<'a> {
         match (tid.module.clone(), tid.name.as_str(), method) {
             (ModuleId::Native(ref m), _, _) if m == "cdt.fs" => {
                 self.check_fs_method(&tid.name, method, args)
+            }
+            (ModuleId::Native(ref m), _, _) if m == "cdt.http" => {
+                self.check_http_method(&tid.name, method, args)
             }
             (ModuleId::Native(ref m), "Timestamp", "unix_seconds" | "unix_milliseconds")
                 if m == "cdt.time" =>

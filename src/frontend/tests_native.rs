@@ -508,6 +508,63 @@ export func get_help() -> String {
 }
 
 #[test]
+fn cdt_cli_dispatch_e2e() {
+    let src = r#"
+import cli from "cdt.cli"
+import { CliError } from "cdt.cli"
+
+cli App "Dispatch demo" {
+    flag verbose "v" "Verbose output"
+    cmd greet "Greet someone" {
+        arg name: String "Target name"
+    } => on_greet
+    cmd ping "Ping" => on_ping
+}
+
+func on_greet(app: App, c: App_greet) -> String {
+    if app.verbose {
+        return "HELLO:" + c.name
+    }
+    return "hello:" + c.name
+}
+
+func on_ping(_c: App_ping) -> String {
+    return "pong"
+}
+
+export func run_dispatch(args: [String]) -> String | CliError {
+    res := cli.dispatch_args<App>(args)?
+    switch res {
+        case String(s):
+            return s
+        case _:
+            return "none"
+    }
+}
+"#;
+    let module = compile_source(src).expect("compile cli dispatch");
+    let fid = module.func_id("run_dispatch").unwrap();
+    let mk_args = |items: &[&str]| -> Obj {
+        Obj::List(crate::vm::value::ListStorage::Obj(std::sync::Arc::new(
+            items.iter().map(|s| Obj::str(*s)).collect(),
+        )))
+    };
+    let mut vm = Vm::new();
+    assert_eq!(
+        vm.call_obj(&module, fid, &[], &[mk_args(&["-v", "greet", "Ada"])]).unwrap(),
+        Obj::str("HELLO:Ada")
+    );
+    assert_eq!(
+        vm.call_obj(&module, fid, &[], &[mk_args(&["ping"])]).unwrap(),
+        Obj::str("pong")
+    );
+    let help = vm.call_obj(&module, fid, &[], &[mk_args(&["--help"])]).unwrap();
+    let Obj::Record(rec) = help else { panic!("expected CliError") };
+    assert_eq!(rec.schema_id, crate::vm::value::SCHEMA_CLI_ERROR);
+    assert_eq!(rec.get_obj(0), &Obj::str("help"));
+}
+
+#[test]
 fn cdt_fs_basic_and_streaming() {
     let dir = std::env::temp_dir().join(format!("conduit_fs_test_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -1052,4 +1109,301 @@ fn cdt_math_and_log_e2e() {
         vm.call_obj(&module, fid, &[], &[]).unwrap(),
         Obj::str("5|8|3|warn")
     );
+}
+
+#[test]
+fn cdt_http_router_e2e() {
+    let src = r#"
+        import * as http from "cdt.http"
+
+        export func test_router() -> String {
+            r := http.router()
+            prefix := "hi"
+            r.get("/users/:id", (req: http.Request) -> http.Response => {
+                id := req.params.get("id") ?? ""
+                return http.text(prefix + ":" + id)
+            })
+            r.post("/items", (req: http.Request) -> http.Response => {
+                return http.json(req.body)
+            })
+            r.get("/files/*rest", (req: http.Request) -> http.Response => {
+                rest := req.params.get("rest") ?? ""
+                return http.response(201, rest)
+            })
+            r.patch("/items/:id", (req: http.Request) -> http.Response => {
+                id := req.params.get("id") ?? ""
+                return http.text("patched:" + id)
+            })
+            r.options("/items/:id", (req: http.Request) -> http.Response => {
+                return http.response(204, "")
+            })
+            r.any("/health", (req: http.Request) -> http.Response => {
+                return http.text("ok:" + req.method)
+            })
+            r.before((req: http.Request) -> http.Response? => {
+                if req.path == "/blocked" {
+                    return http.response(401, "nope")
+                }
+                return nil
+            })
+            r.after((req: http.Request, resp: http.Response) -> http.Response => {
+                hdrs := resp.headers
+                hdrs.set("x-mw", "1")
+                return http.response_with(resp.status, resp.body, hdrs)
+            })
+
+            empty := Map.from([("x", "1")])
+            empty.remove("x")
+            r1 := r.dispatch(http.Request(method: "GET", path: "/users/42", body: "", headers: empty, query: empty, params: empty))
+            r2 := r.dispatch(http.Request(method: "POST", path: "/items", body: "{\"ok\":true}", headers: empty, query: empty, params: empty))
+            r3 := r.dispatch(http.Request(method: "GET", path: "/files/a/b.txt", body: "", headers: empty, query: empty, params: empty))
+            r405 := r.dispatch(http.Request(method: "DELETE", path: "/users/42", body: "", headers: empty, query: empty, params: empty))
+            r404 := r.dispatch(http.Request(method: "GET", path: "/missing", body: "", headers: empty, query: empty, params: empty))
+            rp := r.dispatch(http.Request(method: "PATCH", path: "/items/9", body: "", headers: empty, query: empty, params: empty))
+            ro := r.dispatch(http.Request(method: "OPTIONS", path: "/items/9", body: "", headers: empty, query: empty, params: empty))
+            ra := r.dispatch(http.Request(method: "PUT", path: "/health", body: "", headers: empty, query: empty, params: empty))
+            rb := r.dispatch(http.Request(method: "GET", path: "/blocked", body: "", headers: empty, query: empty, params: empty))
+            mw := rb.headers.get("x-mw") ?? ""
+            return r1.status.to_string() + ":" + r1.body + "|" + r2.status.to_string() + ":" + r2.body + "|" + r3.status.to_string() + ":" + r3.body + "|" + r405.status.to_string() + "|" + r404.status.to_string() + "|" + rp.body + "|" + ro.status.to_string() + "|" + ra.body + "|" + rb.status.to_string() + ":" + mw
+        }
+
+        func decl_before(req: http.Request) -> http.Response? {
+            if req.path == "/deny" {
+                return http.response(403, "denied")
+            }
+            return nil
+        }
+
+        func decl_after(_req: http.Request, resp: http.Response) -> http.Response {
+            hdrs := resp.headers
+            hdrs.set("x-decl", "yes")
+            return http.response_with(resp.status, resp.body, hdrs)
+        }
+
+        func decl_hello(req: http.Request) -> http.Response {
+            name := req.params.get("name") ?? ""
+            return http.text("hi:" + name)
+        }
+
+        func decl_echo(req: http.Request) -> http.Response {
+            return http.text("post:" + req.body)
+        }
+
+        router Api "Declarative router" {
+            before decl_before
+            after decl_after
+            get "/hello/:name" => decl_hello
+            post "/echo" => decl_echo
+        }
+
+        export func test_decl_router() -> String {
+            dr := http.build<Api>()
+            empty := Map.from([("x", "1")])
+            empty.remove("x")
+            d1 := dr.dispatch(http.Request(method: "GET", path: "/hello/ada", body: "", headers: empty, query: empty, params: empty))
+            d2 := dr.dispatch(http.Request(method: "POST", path: "/echo", body: "42", headers: empty, query: empty, params: empty))
+            d3 := dr.dispatch(http.Request(method: "GET", path: "/deny", body: "", headers: empty, query: empty, params: empty))
+            tag := d1.headers.get("x-decl") ?? ""
+            return d1.body + "|" + d2.body + "|" + d3.status.to_string() + ":" + d3.body + "|" + tag
+        }
+    "#;
+    let module = crate::frontend::compile_source(src).expect("compile http");
+    let fid = module.func_id("test_router").unwrap();
+    let decl_fid = module.func_id("test_decl_router").unwrap();
+    let mut vm = Vm::new();
+    let res = vm.call_obj(&module, fid, &[], &[]).unwrap();
+    assert_eq!(res, Obj::str("200:hi:42|200:{\"ok\":true}|201:a/b.txt|405|404|patched:9|204|ok:PUT|401:1"));
+    let decl_res = vm.call_obj(&module, decl_fid, &[], &[]).unwrap();
+    assert_eq!(decl_res, Obj::str("hi:ada|post:42|403:denied|yes"));
+}
+
+#[test]
+fn cdt_http_client_loopback_e2e() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        for idx in 0..7 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 2048];
+            let n = stream.read(&mut buf).unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+            match idx {
+                0 => {
+                    assert!(req.starts_with("GET /hello HTTP/1.1\r\n"), "req0: {req}");
+                    stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nX-Test: yes\r\n\r\nworld")
+                        .unwrap();
+                }
+                1 => {
+                    assert!(req.starts_with("POST /echo HTTP/1.1\r\n"), "req1: {req}");
+                    assert!(req.ends_with("\r\n\r\nping"), "req1 body: {req}");
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\npong\r\n0\r\n\r\n",
+                        )
+                        .unwrap();
+                }
+                2 => {
+                    assert!(req.starts_with("PUT /custom HTTP/1.1\r\n"), "req2: {req}");
+                    assert!(req.contains("X-Auth: secret\r\n"), "req2 hdr: {req}");
+                    assert!(req.ends_with("\r\n\r\ndata"), "req2 body: {req}");
+                    stream
+                        .write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 7\r\n\r\ncreated")
+                        .unwrap();
+                }
+                3 => {
+                    assert!(req.starts_with("GET /redir HTTP/1.1\r\n"), "req3: {req}");
+                    stream
+                        .write_all(b"HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\n\r\n")
+                        .unwrap();
+                }
+                4 => {
+                    assert!(req.starts_with("GET /final HTTP/1.1\r\n"), "req4: {req}");
+                    stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfound")
+                        .unwrap();
+                }
+                5 => {
+                    assert!(req.starts_with("GET /bin HTTP/1.1\r\n"), "req5: {req}");
+                    let mut resp = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n".to_vec();
+                    resp.extend_from_slice(&[0u8, 255, 128, 1]);
+                    stream.write_all(&resp).unwrap();
+                }
+                6 => {
+                    assert!(req.starts_with("POST /bin-echo HTTP/1.1\r\n"), "req6: {req}");
+                    assert!(buf[..n].ends_with(&[10u8, 250, 42]), "req6 bin body");
+                    let mut resp = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n".to_vec();
+                    resp.extend_from_slice(&[10u8, 250, 42]);
+                    stream.write_all(&resp).unwrap();
+                }
+                _ => unreachable!(),
+            }
+        }
+    });
+
+    let src = format!(
+        r#"
+        import * as http from "cdt.http"
+
+        export func test_client() -> String | http.HttpError | IndexError {{
+            r1 := http.get("http://127.0.0.1:{port}/hello")?
+            r2 := http.post("http://127.0.0.1:{port}/echo", "ping")?
+            hdrs := Map.from([("X-Auth", "secret")])
+            r3 := http.request("PUT", "http://127.0.0.1:{port}/custom", "data", hdrs)?
+            r4 := http.request_timeout("GET", "http://127.0.0.1:{port}/redir", "", Map.from([("X-A", "1")]), 5000)?
+            rw := http.response_with(202, "ok", Map.from([("x-custom", "yes")]))
+            rw_hdr := rw.headers.get("x-custom") ?? ""
+            xt := r1.headers.get("x-test") ?? ""
+            b1 := http.get_bytes("http://127.0.0.1:{port}/bin")?
+            b2 := http.request_bytes("POST", "http://127.0.0.1:{port}/bin-echo", [10, 250, 42], Map.from([("Content-Type", "application/octet-stream")]))?
+            b1_1 := b1.body[1]?
+            b2_1 := b2.body[1]?
+            return r1.status.to_string() + ":" + r1.body + ":" + xt + "|" + r2.status.to_string() + ":" + r2.body + "|" + r3.status.to_string() + ":" + r3.body + "|" + r4.status.to_string() + ":" + r4.body + "|" + rw.status.to_string() + ":" + rw_hdr + "|" + b1.body.len().to_string() + ":" + b1_1.to_string() + "|" + b2_1.to_string()
+        }}
+
+        export func test_bad_url() -> String | http.HttpError {{
+            _r := http.get("ftp://invalid")?
+            return "unexpected"
+        }}
+
+        export func test_bad_timeout() -> String | http.HttpError {{
+            _r := http.request_timeout("GET", "http://127.0.0.1:{port}/hello", "", Map.from([("X-A", "1")]), 0)?
+            return "unexpected"
+        }}
+        "#
+    );
+
+    let module = crate::frontend::compile_source(&src).expect("compile http client");
+    let fid = module.func_id("test_client").unwrap();
+    let bad_fid = module.func_id("test_bad_url").unwrap();
+    let bad_to_fid = module.func_id("test_bad_timeout").unwrap();
+    let mut vm = Vm::new();
+    let res = vm.call_obj(&module, fid, &[], &[]).unwrap();
+    assert_eq!(res, Obj::str("200:world:yes|200:pong|201:created|200:found|202:yes|4:255|250"));
+    handle.join().unwrap();
+    let bad_res = vm.call_obj(&module, bad_fid, &[], &[]).unwrap();
+    let Obj::Record(rec) = bad_res else {
+        panic!("expected HttpError record, got {bad_res:?}");
+    };
+    assert_eq!(rec.schema_id, crate::vm::value::SCHEMA_HTTP_ERROR);
+    assert_eq!(rec.get_obj(0), &Obj::str("invalid_url"));
+    let bad_to = vm.call_obj(&module, bad_to_fid, &[], &[]).unwrap();
+    let Obj::Record(rec_to) = bad_to else {
+        panic!("expected HttpError record, got {bad_to:?}");
+    };
+    assert_eq!(rec_to.schema_id, crate::vm::value::SCHEMA_HTTP_ERROR);
+    assert_eq!(rec_to.get_obj(0), &Obj::str("invalid_timeout"));
+}
+
+#[test]
+fn cdt_http_server_graceful_shutdown_e2e() {
+    use std::net::TcpListener;
+
+    let port = {
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        probe.local_addr().unwrap().port()
+    };
+
+    let server_src = format!(
+        r#"
+        import * as http from "cdt.http"
+
+        export func run_server() -> Void | http.HttpError {{
+            r := http.router()
+            r.get("/hello", (req: http.Request) -> http.Response => {{
+                return http.text("hi")
+            }})
+            r.post("/stop", (req: http.Request) -> http.Response => {{
+                r.stop()
+                return http.text("stopping")
+            }})
+            return r.serve("127.0.0.1:{port}")
+        }}
+        "#
+    );
+
+    let client_src = format!(
+        r#"
+        import * as http from "cdt.http"
+
+        export func hit_hello() -> String | http.HttpError {{
+            r := http.get("http://127.0.0.1:{port}/hello")?
+            return r.status.to_string() + ":" + r.body
+        }}
+
+        export func hit_stop() -> String | http.HttpError {{
+            r := http.post("http://127.0.0.1:{port}/stop", "")?
+            return r.status.to_string() + ":" + r.body
+        }}
+        "#
+    );
+
+    let srv_mod = crate::frontend::compile_source(&server_src).expect("compile server");
+    let cli_mod = crate::frontend::compile_source(&client_src).expect("compile client");
+    let srv_fid = srv_mod.func_id("run_server").unwrap();
+    let hello_fid = cli_mod.func_id("hit_hello").unwrap();
+    let stop_fid = cli_mod.func_id("hit_stop").unwrap();
+
+    let srv_handle = std::thread::spawn(move || Vm::new().call_obj(&srv_mod, srv_fid, &[], &[]).unwrap());
+
+    let mut client_vm = Vm::new();
+    let mut hello_res = Obj::Empty;
+    for _ in 0..50 {
+        let res = client_vm.call_obj(&cli_mod, hello_fid, &[], &[]).unwrap();
+        if matches!(res, Obj::Str(_)) {
+            hello_res = res;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(hello_res, Obj::str("200:hi"));
+
+    let stop_res = client_vm.call_obj(&cli_mod, stop_fid, &[], &[]).unwrap();
+    assert_eq!(stop_res, Obj::str("200:stopping"));
+
+    let srv_ret = srv_handle.join().unwrap();
+    assert_eq!(srv_ret, Obj::Empty);
 }

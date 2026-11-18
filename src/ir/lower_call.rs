@@ -267,6 +267,9 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 if self.mc.checked.log_aliases.contains(alias) {
                     return self.lower_log_call(field, args);
                 }
+                if self.mc.checked.http_aliases.contains(alias) {
+                    return self.lower_http_call(field, type_args, args, named_args);
+                }
             }
             if let Some(reg) = self.lower_builtin_obj_method(target, field, args)? {
                 return Ok(reg);
@@ -365,6 +368,14 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 let sym = sym.clone();
                 return self.lower_log_call(&sym, args);
             }
+            if let Some(sym) = self.mc.checked.http_direct_fns.get(name) {
+                let sym = sym.clone();
+                return self.lower_http_call(&sym, type_args, args, named_args);
+            }
+            if let Some(sym) = self.mc.checked.http_direct_types.get(name) {
+                let sym = sym.clone();
+                return self.lower_http_call(&sym, type_args, args, named_args);
+            }
             if name == "Map" {
                 let dst_obj = self.alloc_temp_o();
                 self.ops.push(Op::NewMap { dst_obj });
@@ -438,7 +449,9 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                     Ok(())
                 }
             }
-            (Type::Custom(tid), _) if matches!(&tid.module, ModuleId::Native(m) if m == "cdt.fs") => {
+            (Type::Custom(tid), _)
+                if matches!(&tid.module, ModuleId::Native(m) if m == "cdt.fs" || m == "cdt.http") =>
+            {
                 self.lower_native_method_obj(tid, target, method, args)?;
                 Ok(())
             }
@@ -887,7 +900,11 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
         }
 
         let ret_reg = if ret_scalar {
-            self.alloc_temp_s()
+            if !s_vals.is_empty() && arg_base_s >= self.local_s_end {
+                arg_base_s
+            } else {
+                self.alloc_temp_s()
+            }
         } else if ret_obj {
             self.alloc_temp_o()
         } else {

@@ -84,10 +84,10 @@ impl Vm {
                 func_id = frame.func_id;
                 func = unsafe { module.functions.get_unchecked(func_id as usize) };
                 ops_ptr = func.ops.as_ptr();
-                ip = frame.return_ip;
-                s_base = frame.s_base;
-                o_base = frame.o_base;
-                cur_closure_slot = frame.prev_closure_slot;
+                ip = frame.return_ip as usize;
+                s_base = frame.s_base as usize;
+                o_base = frame.o_base as usize;
+                cur_closure_slot = frame.unpack_closure_slot();
                 sync_frame_ptrs!();
                 *o_mut!(frame.ret_reg) = val;
             }};
@@ -223,7 +223,14 @@ impl Vm {
                     s_set!(dst, ((s_get!(a) as i64) == imm as i64) as u64);
                 }
                 Op::LtIntImm { dst, a, imm } => {
-                    s_set!(dst, ((s_get!(a) as i64) < imm as i64) as u64);
+                    let lt = (s_get!(a) as i64) < imm as i64;
+                    s_set!(dst, lt as u64);
+                    debug_assert!(ip < func.ops.len());
+                    if let Op::JumpIfFalse { cond, target } = unsafe { *ops_ptr.add(ip) }
+                        && cond == dst
+                    {
+                        ip = if lt { ip + 1 } else { target as usize };
+                    }
                 }
                 Op::EqFloat { dst, a, b } => {
                     let eq = f64::from_bits(s_get!(a)) == f64::from_bits(s_get!(b));
@@ -266,7 +273,7 @@ impl Vm {
                             let step_ip = ip - 1;
                             let t = target as usize;
                             if t < step_ip
-                                && step_ip - t <= 8
+                                && step_ip - t <= 12
                                 && !matches!(
                                     unsafe { *ops_ptr.add(t) },
                                     Op::CallDirect { .. }
@@ -320,11 +327,11 @@ impl Vm {
                     }
                     self.frames.push(CallFrame {
                         func_id,
-                        return_ip: ip,
-                        s_base,
-                        o_base,
+                        return_ip: ip as u32,
+                        s_base: s_base as u32,
+                        o_base: o_base as u32,
                         ret_reg,
-                        prev_closure_slot: cur_closure_slot,
+                        prev_closure_slot: CallFrame::pack_closure_slot(cur_closure_slot),
                     });
                     func_id = callee_id as u32;
                     func = unsafe { module.functions.get_unchecked(func_id as usize) };
@@ -400,10 +407,10 @@ impl Vm {
                     func_id = frame.func_id;
                     func = unsafe { module.functions.get_unchecked(func_id as usize) };
                     ops_ptr = func.ops.as_ptr();
-                    ip = frame.return_ip;
-                    s_base = frame.s_base;
-                    o_base = frame.o_base;
-                    cur_closure_slot = frame.prev_closure_slot;
+                    ip = frame.return_ip as usize;
+                    s_base = frame.s_base as usize;
+                    o_base = frame.o_base as usize;
+                    cur_closure_slot = frame.unpack_closure_slot();
                     sync_frame_ptrs!();
                     s_set!(frame.ret_reg, val);
                 }
@@ -418,10 +425,10 @@ impl Vm {
                     func_id = frame.func_id;
                     func = unsafe { module.functions.get_unchecked(func_id as usize) };
                     ops_ptr = func.ops.as_ptr();
-                    ip = frame.return_ip;
-                    s_base = frame.s_base;
-                    o_base = frame.o_base;
-                    cur_closure_slot = frame.prev_closure_slot;
+                    ip = frame.return_ip as usize;
+                    s_base = frame.s_base as usize;
+                    o_base = frame.o_base as usize;
+                    cur_closure_slot = frame.unpack_closure_slot();
                     sync_frame_ptrs!();
                 }
                 Op::LoadConstObj { dst_obj, idx } => {
@@ -572,11 +579,9 @@ impl Vm {
                 Op::NewMap { dst_obj } => *o_mut!(dst_obj) = Obj::Map(Arc::new(OrderedMap::new())),
                 Op::MapSetIntInt { map_obj, key_s, val_s } => {
                     self.exec_map_set_int(s_base, o_base, map_obj, key_s, val_s)?;
-                    sync_frame_ptrs!();
                 }
                 Op::MapGetIntIntOr { dst_s, map_obj, key_s, def_s } => {
                     self.exec_map_get_int_or(s_base, o_base, dst_s, map_obj, key_s, def_s)?;
-                    sync_frame_ptrs!();
                 }
                 Op::MapLen { dst_s, map_obj } => {
                     let len = match o_ref!(map_obj) {
@@ -657,9 +662,20 @@ impl Vm {
                 | Op::ListEnumerate { .. }
                 | Op::ListJoin { .. }
                 | Op::TupleGetScalar { .. }
-                | Op::TupleGetObj { .. }) => self.exec_ext_op(module, s_base, o_base, op)?,
-                Op::ExtOp { .. } => {
-                    self.exec_ext_op(module, s_base, o_base, op)?;
+                | Op::TupleGetObj { .. }) => self.exec_ext_op(s_base, o_base, op)?,
+                Op::ExtOp { kind, aux, a, b, c } => {
+                    self.exec_ext_dispatch(
+                        module,
+                        s_base,
+                        o_base,
+                        s_base + func.num_scalars as usize,
+                        o_base + func.num_objs as usize,
+                        kind,
+                        aux,
+                        a,
+                        b,
+                        c,
+                    )?;
                     sync_frame_ptrs!();
                 }
             }

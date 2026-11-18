@@ -133,7 +133,7 @@ impl<'a> ModuleCompiler<'a> {
 
         Ok(FunctionProto {
             name: name.to_string(),
-            num_scalars: lowerer.max_s.max(lowerer.scalar_params_count),
+            num_scalars: lowerer.max_s.max(lowerer.scalar_params_count).max(1),
             num_objs: lowerer.max_o.max(lowerer.obj_params_count),
             scalar_params: lowerer.scalar_params_count,
             obj_params: lowerer.obj_params_count,
@@ -262,8 +262,10 @@ pub(crate) struct FnLowerer<'a, 'b> {
     pub stmt_slots: HashMap<usize, VarSlot>,
     pub pat_slots: HashMap<(usize, String), VarSlot>,
     pub loop_slots: HashMap<usize, LoopPrealloc>,
+    pub(crate) hoisted_ints: HashMap<i64, u16>,
     pub(crate) hoisted_floats: HashMap<u64, u16>,
     pub(crate) hoisted_strs: HashMap<String, u16>,
+    pub(crate) pending_hoist_ints: Vec<i64>,
     pub(crate) pending_hoist_floats: Vec<u64>,
     pub(crate) pending_hoist_strs: Vec<String>,
     pub scopes: Vec<HashMap<String, (VarSlot, Type)>>,
@@ -326,8 +328,10 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             stmt_slots: HashMap::new(),
             pat_slots: HashMap::new(),
             loop_slots: HashMap::new(),
+            hoisted_ints: HashMap::new(),
             hoisted_floats: HashMap::new(),
             hoisted_strs: HashMap::new(),
+            pending_hoist_ints: Vec::new(),
             pending_hoist_floats: Vec::new(),
             pending_hoist_strs: Vec::new(),
             scopes: vec![init_scope],
@@ -477,6 +481,10 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
     fn flush_hoisted_constants_if_outer(&mut self) -> Result<(), String> {
         if self.loop_depth != 0 {
             return Ok(());
+        }
+        for val in std::mem::take(&mut self.pending_hoist_ints) {
+            let reg = self.hoisted_ints[&val];
+            self.load_int_into(reg, val)?;
         }
         for bits in std::mem::take(&mut self.pending_hoist_floats) {
             let reg = self.hoisted_floats[&bits];

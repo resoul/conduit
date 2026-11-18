@@ -4,6 +4,7 @@ pub mod crypto;
 pub mod csv;
 pub mod env;
 pub mod fs;
+pub mod http;
 pub mod json_decode;
 pub mod json_encode;
 pub(crate) mod json_lexer;

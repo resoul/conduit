@@ -196,11 +196,24 @@ impl Parser {
             args,
             span,
         };
+        let mut annotations = vec![ann];
+        if !is_group && self.match_token(&TokenKind::FatArrow) {
+            let (handler_name, hspan) = self.expect_ident()?;
+            annotations.push(FieldAnnotation {
+                target: "cli.handler".to_string(),
+                args: vec![Expr {
+                    kind: ExprKind::Ident(handler_name),
+                    ty: crate::frontend::types::Type::Void,
+                    span: hspan,
+                }],
+                span: hspan,
+            });
+        }
         Ok(FieldDef {
             name,
             json_name: None,
             ty: TypeExpr::Optional(Box::new(TypeExpr::Named(sub_struct_name))),
-            annotations: vec![ann],
+            annotations,
             default: None,
             span,
         })
@@ -269,5 +282,102 @@ fn make_cli_ann(target: &str, short: Option<String>, help: Option<String>, span:
         target: format!("cli.{}", target),
         args,
         span,
+    }
+}
+
+impl Parser {
+    pub(super) fn parse_router_item(&mut self, is_exported: bool) -> Result<Item, ParserError> {
+        let start_span = self.bump().span; // consume 'router'
+        let (name, _) = self.expect_ident()?;
+        let about = self.try_take_string();
+        self.expect(&TokenKind::LBrace)?;
+        let mut fields = Vec::new();
+        let mut idx = 0usize;
+        while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
+            let tok = self.peek().clone();
+            let TokenKind::Ident(kw) = &tok.kind else {
+                return Err(ParserError {
+                    message: format!(
+                        "Expected 'before', 'after', 'get', 'post', 'put', 'delete', 'patch', 'options', 'head', or 'any' in router block, got '{:?}'",
+                        tok.kind
+                    ),
+                    span: tok.span,
+                });
+            };
+            let span = self.bump().span;
+            let ann = match kw.as_str() {
+                "before" | "after" => {
+                    let _ = self.match_token(&TokenKind::FatArrow);
+                    let (handler_name, hspan) = self.expect_ident()?;
+                    FieldAnnotation {
+                        target: format!("router.{}", kw),
+                        args: vec![Expr {
+                            kind: ExprKind::Ident(handler_name),
+                            ty: crate::frontend::types::Type::Void,
+                            span: hspan,
+                        }],
+                        span,
+                    }
+                }
+                "get" | "post" | "put" | "delete" | "patch" | "options" | "head" | "any" => {
+                    let pspan = self.peek().span;
+                    let Some(pat) = self.try_take_string() else {
+                        return Err(ParserError {
+                            message: format!("Expected route pattern string after '{}'", kw),
+                            span: pspan,
+                        });
+                    };
+                    self.expect(&TokenKind::FatArrow)?;
+                    let (handler_name, hspan) = self.expect_ident()?;
+                    FieldAnnotation {
+                        target: format!("router.{}", kw),
+                        args: vec![
+                            str_expr(pat, pspan),
+                            Expr {
+                                kind: ExprKind::Ident(handler_name),
+                                ty: crate::frontend::types::Type::Void,
+                                span: hspan,
+                            },
+                        ],
+                        span,
+                    }
+                }
+                other => {
+                    return Err(ParserError {
+                        message: format!(
+                            "Unknown router member '{}' (expected before, after, get, post, put, delete, patch, options, head, or any)",
+                            other
+                        ),
+                        span: tok.span,
+                    });
+                }
+            };
+            fields.push(FieldDef {
+                name: format!("__route_{}", idx),
+                json_name: None,
+                ty: TypeExpr::Named("Bool".to_string()),
+                annotations: vec![ann],
+                default: Some(Expr {
+                    kind: ExprKind::Bool(false),
+                    ty: crate::frontend::types::Type::Void,
+                    span,
+                }),
+                span,
+            });
+            idx += 1;
+        }
+        self.expect(&TokenKind::RBrace)?;
+
+        let mut item = Item::new_exported(
+            ItemKind::Struct {
+                name,
+                type_params: Vec::new(),
+                fields,
+            },
+            start_span,
+            is_exported,
+        );
+        item.doc = about;
+        Ok(item)
     }
 }

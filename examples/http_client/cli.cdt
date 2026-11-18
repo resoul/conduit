@@ -1,0 +1,114 @@
+import { EnvError } from "cdt.env"
+import * as fs from "cdt.fs"
+import * as http from "cdt.http"
+import { DecodeError, EncodeError } from "cdt.json"
+import { TimeError } from "cdt.time"
+import * as url from "cdt.url"
+import { ValidationError } from "cdt.validation"
+import { DEFAULT_TIMEOUT_MS, OutputMode, execute_bytes, execute_text } from "./client"
+import { DEFAULT_MIN_SCORE, load_config } from "./config"
+import { process_events } from "./pipeline"
+import { run_self_test, serve_demo } from "./server"
+
+export cli CdtCurl "Zero-dependency HTTP/1.1 client, demo server & Conduit showcase" {
+    flag verbose "v" "Enable structured request logging"
+    flag include_headers "i" "Include response status and headers"
+    flag json_log "j" "Emit JSON request summary"
+    opt timeout: Int "t" "Request timeout in milliseconds" = DEFAULT_TIMEOUT_MS
+
+    cmd get "Send an HTTP GET request" {
+        arg target_url: String "Target URL (http:// or https://)"
+        opt headers: String "H" "Comma-separated headers (Key: Value, ...)" = ""
+    } => handle_get
+    cmd post "Send an HTTP POST request" {
+        arg target_url: String "Target URL (http:// or https://)"
+        opt data: String "d" "Request body" = ""
+        opt headers: String "H" "Comma-separated headers (Key: Value, ...)" = "Content-Type: application/json"
+    } => handle_post
+    cmd req "Send a custom HTTP request" {
+        arg method: String "HTTP method (GET, POST, PUT, PATCH, DELETE, ...)"
+        arg target_url: String "Target URL"
+        opt data: String "d" "Request body" = ""
+        opt headers: String "H" "Comma-separated headers (Key: Value, ...)" = ""
+    } => handle_req
+    cmd bytes "Fetch a binary response as [Int] bytes" {
+        arg target_url: String "Target URL"
+    } => handle_bytes
+    cmd self_test "Run in-memory router & middleware self-test" => handle_self_test
+    cmd serve "Start the demo HTTP/1.1 router server" {
+        opt addr: String "a" "Bind address" = "0.0.0.0:8080"
+    } => handle_serve
+    cmd check "Validate environment configuration" => handle_check
+    cmd events "Process JSON events through a filter/map/sum pipeline" {
+        opt min_score: Int "m" "Override MIN_SCORE threshold" = -1
+        opt file: String "f" "Path to JSON events file" = "events.json"
+    } => handle_events
+    cmd stream "Stream lines from a text file" {
+        opt file: String "f" "Path to text file" = "notes.txt"
+    } => handle_stream
+}
+
+func pick_mode(app: CdtCurl) -> OutputMode {
+    if app.json_log {
+        return OutputMode.JsonLog
+    }
+    if app.include_headers {
+        return OutputMode.Full
+    }
+    return OutputMode.Body
+}
+
+func handle_get(app: CdtCurl, c: CdtCurl_get) -> Void | http.HttpError | url.UrlError {
+    execute_text("GET", c.target_url, "", c.headers, app.timeout, pick_mode(app), app.verbose)?
+    return
+}
+
+func handle_post(app: CdtCurl, c: CdtCurl_post) -> Void | http.HttpError | url.UrlError {
+    execute_text("POST", c.target_url, c.data, c.headers, app.timeout, pick_mode(app), app.verbose)?
+    return
+}
+
+func handle_req(app: CdtCurl, c: CdtCurl_req) -> Void | http.HttpError | url.UrlError {
+    execute_text(c.method, c.target_url, c.data, c.headers, app.timeout, pick_mode(app), app.verbose)?
+    return
+}
+
+func handle_bytes(app: CdtCurl, c: CdtCurl_bytes) -> Void | http.HttpError | url.UrlError {
+    execute_bytes(c.target_url, app.verbose)?
+    return
+}
+
+func handle_self_test(_c: CdtCurl_self_test) -> Void {
+    run_self_test()
+}
+
+func handle_serve(c: CdtCurl_serve) -> Void | http.HttpError {
+    serve_demo(c.addr)?
+    return
+}
+
+func handle_check(_c: CdtCurl_check) -> Void | EnvError | ValidationError {
+    cfg := load_config()?
+    print("config ok: env={cfg.app_env}, min_score={cfg.min_score} (default={DEFAULT_MIN_SCORE}), tag={cfg.tag}")
+    return
+}
+
+func handle_events(c: CdtCurl_events) -> Void | EnvError | ValidationError | fs.FsError | DecodeError | EncodeError | TimeError {
+    cfg := load_config()?
+    threshold := cfg.min_score
+    if c.min_score >= 0 {
+        threshold = c.min_score
+    }
+    raw := fs.read_text(c.file)?
+    report := process_events(raw, cfg.app_env, cfg.tag, threshold)?
+    print(report)
+    return
+}
+
+func handle_stream(c: CdtCurl_stream) -> Void | fs.FsError {
+    lines := fs.read_lines(c.file)?
+    for line in lines {
+        print("line: {line}")
+    }
+    return
+}

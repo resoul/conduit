@@ -1,7 +1,7 @@
-use crate::frontend::ast::{Expr, NamedArg, TypeExpr};
-use crate::frontend::check::Checker;
+use crate::frontend::ast::{Expr, ExprKind, NamedArg, TypeExpr};
+use crate::frontend::check::{CheckedProgram, Checker, HttpRouterDeclEntry, HttpRouterDeclKind};
 use crate::frontend::check_native::check_fields_ctor;
-use crate::frontend::types::{Type, TypeId};
+use crate::frontend::types::{ModuleId, Type, TypeId};
 
 impl Checker<'_> {
     pub(crate) fn check_path_call(
@@ -512,4 +512,516 @@ impl Checker<'_> {
             other => Err(format!("Unknown cdt.log symbol '{}'", other)),
         }
     }
+
+    pub(crate) fn check_http_call(
+        &mut self,
+        sym: &str,
+        type_args: &[TypeExpr],
+        args: &mut [Expr],
+        named_args: &mut [NamedArg],
+    ) -> Result<Type, String> {
+        let http_err = Type::Custom(TypeId::native("cdt.http", "HttpError"));
+        let req_ty = Type::Custom(TypeId::native("cdt.http", "Request"));
+        let resp_ty = Type::Custom(TypeId::native("cdt.http", "Response"));
+        let bin_resp_ty = Type::Custom(TypeId::native("cdt.http", "BinaryResponse"));
+        let router_ty = Type::Custom(TypeId::native("cdt.http", "Router"));
+        let str_map = Type::Map(Box::new(Type::String), Box::new(Type::String));
+        let int_list = Type::List(Box::new(Type::Int));
+
+        match sym {
+            "HttpError" => {
+                if !type_args.is_empty() {
+                    return Err("HttpError does not accept type arguments".to_string());
+                }
+                check_fields_ctor(
+                    self,
+                    "HttpError",
+                    &[("kind", Type::String), ("message", Type::String)],
+                    args,
+                    named_args,
+                    http_err,
+                )
+            }
+            "Request" => {
+                if !type_args.is_empty() {
+                    return Err("Request does not accept type arguments".to_string());
+                }
+                check_fields_ctor(
+                    self,
+                    "Request",
+                    &[
+                        ("method", Type::String),
+                        ("path", Type::String),
+                        ("body", Type::String),
+                        ("headers", str_map.clone()),
+                        ("query", str_map.clone()),
+                        ("params", str_map),
+                    ],
+                    args,
+                    named_args,
+                    req_ty,
+                )
+            }
+            "Response" => {
+                if !type_args.is_empty() {
+                    return Err("Response does not accept type arguments".to_string());
+                }
+                check_fields_ctor(
+                    self,
+                    "Response",
+                    &[
+                        ("status", Type::Int),
+                        ("body", Type::String),
+                        ("headers", str_map),
+                    ],
+                    args,
+                    named_args,
+                    resp_ty,
+                )
+            }
+            "BinaryResponse" => {
+                if !type_args.is_empty() {
+                    return Err("BinaryResponse does not accept type arguments".to_string());
+                }
+                check_fields_ctor(
+                    self,
+                    "BinaryResponse",
+                    &[
+                        ("status", Type::Int),
+                        ("body", int_list),
+                        ("headers", str_map),
+                    ],
+                    args,
+                    named_args,
+                    bin_resp_ty,
+                )
+            }
+            "text" | "html" | "json" => {
+                if !type_args.is_empty() || !named_args.is_empty() || args.len() != 1 {
+                    return Err(format!("http.{}(body) expects 1 String argument", sym));
+                }
+                self.check_expr(&mut args[0], Some(&Type::String))?;
+                if args[0].ty != Type::String {
+                    return Err(format!("http.{} expects String, got {}", sym, args[0].ty));
+                }
+                Ok(resp_ty)
+            }
+            "response" => {
+                if !type_args.is_empty() || !named_args.is_empty() || args.len() != 2 {
+                    return Err("http.response(status, body) expects Int and String".to_string());
+                }
+                self.check_expr(&mut args[0], Some(&Type::Int))?;
+                if args[0].ty != Type::Int {
+                    return Err(format!("http.response status expects Int, got {}", args[0].ty));
+                }
+                self.check_expr(&mut args[1], Some(&Type::String))?;
+                if args[1].ty != Type::String {
+                    return Err(format!("http.response body expects String, got {}", args[1].ty));
+                }
+                Ok(resp_ty)
+            }
+            "response_with" => {
+                if !type_args.is_empty() || !named_args.is_empty() || args.len() != 3 {
+                    return Err(
+                        "http.response_with(status, body, headers) expects (Int, String, Map<String, String>)"
+                            .to_string(),
+                    );
+                }
+                self.check_expr(&mut args[0], Some(&Type::Int))?;
+                if args[0].ty != Type::Int {
+                    return Err(format!("http.response_with status expects Int, got {}", args[0].ty));
+                }
+                self.check_expr(&mut args[1], Some(&Type::String))?;
+                if args[1].ty != Type::String {
+                    return Err(format!("http.response_with body expects String, got {}", args[1].ty));
+                }
+                self.check_expr(&mut args[2], Some(&str_map))?;
+                if args[2].ty != str_map {
+                    return Err(format!(
+                        "http.response_with headers expects Map<String, String>, got {}",
+                        args[2].ty
+                    ));
+                }
+                Ok(resp_ty)
+            }
+            "router" => {
+                if !type_args.is_empty() || !named_args.is_empty() || !args.is_empty() {
+                    return Err("http.router() takes 0 arguments".to_string());
+                }
+                Ok(router_ty)
+            }
+            "build" | "serve" => {
+                let expect_args = usize::from(sym == "serve");
+                if type_args.len() != 1 || !named_args.is_empty() || args.len() != expect_args {
+                    return Err(format!(
+                        "http.{}<T>({}) expects 1 type argument and {} value argument(s)",
+                        sym,
+                        if expect_args == 1 { "addr" } else { "" },
+                        expect_args
+                    ));
+                }
+                let target_ty = self.checked.resolve_type_mut(&type_args[0])?;
+                let Type::Custom(tid) = &target_ty else {
+                    return Err(format!("http.{}<T>() requires a router type, got {}", sym, target_ty));
+                };
+                if tid.module != ModuleId::Program {
+                    return Err(format!("http.{}<T>() requires a program router type, got {}", sym, target_ty));
+                }
+                if expect_args == 1 {
+                    self.check_expr(&mut args[0], Some(&Type::String))?;
+                    if args[0].ty != Type::String {
+                        return Err(format!("http.serve<T> addr expects String, got {}", args[0].ty));
+                    }
+                }
+                ensure_http_router_plan(self.checked, &tid.name, &req_ty, &resp_ty)?;
+                if sym == "build" {
+                    Ok(router_ty)
+                } else {
+                    Ok(Type::union(vec![Type::Void, http_err]))
+                }
+            }
+            "get" => {
+                if !type_args.is_empty() || !named_args.is_empty() || args.len() != 1 {
+                    return Err("http.get(url) expects 1 String argument".to_string());
+                }
+                self.check_expr(&mut args[0], Some(&Type::String))?;
+                if args[0].ty != Type::String {
+                    return Err(format!("http.get url expects String, got {}", args[0].ty));
+                }
+                Ok(Type::union(vec![resp_ty, http_err]))
+            }
+            "post" => {
+                if !type_args.is_empty() || !named_args.is_empty() || args.len() != 2 {
+                    return Err("http.post(url, body) expects 2 String arguments".to_string());
+                }
+                self.check_expr(&mut args[0], Some(&Type::String))?;
+                if args[0].ty != Type::String {
+                    return Err(format!("http.post url expects String, got {}", args[0].ty));
+                }
+                self.check_expr(&mut args[1], Some(&Type::String))?;
+                if args[1].ty != Type::String {
+                    return Err(format!("http.post body expects String, got {}", args[1].ty));
+                }
+                Ok(Type::union(vec![resp_ty, http_err]))
+            }
+            "request" => {
+                if !type_args.is_empty() || !named_args.is_empty() || args.len() != 4 {
+                    return Err(
+                        "http.request(method, url, body, headers) expects (String, String, String, Map<String, String>)"
+                            .to_string(),
+                    );
+                }
+                for (i, label) in [(0, "method"), (1, "url"), (2, "body")] {
+                    self.check_expr(&mut args[i], Some(&Type::String))?;
+                    if args[i].ty != Type::String {
+                        return Err(format!(
+                            "http.request {} expects String, got {}",
+                            label, args[i].ty
+                        ));
+                    }
+                }
+                self.check_expr(&mut args[3], Some(&str_map))?;
+                if args[3].ty != str_map {
+                    return Err(format!(
+                        "http.request headers expects Map<String, String>, got {}",
+                        args[3].ty
+                    ));
+                }
+                Ok(Type::union(vec![resp_ty, http_err]))
+            }
+            "request_timeout" => {
+                if !type_args.is_empty() || !named_args.is_empty() || args.len() != 5 {
+                    return Err(
+                        "http.request_timeout(method, url, body, headers, timeout_ms) expects (String, String, String, Map<String, String>, Int)"
+                            .to_string(),
+                    );
+                }
+                for (i, label) in [(0, "method"), (1, "url"), (2, "body")] {
+                    self.check_expr(&mut args[i], Some(&Type::String))?;
+                    if args[i].ty != Type::String {
+                        return Err(format!(
+                            "http.request_timeout {} expects String, got {}",
+                            label, args[i].ty
+                        ));
+                    }
+                }
+                self.check_expr(&mut args[3], Some(&str_map))?;
+                if args[3].ty != str_map {
+                    return Err(format!(
+                        "http.request_timeout headers expects Map<String, String>, got {}",
+                        args[3].ty
+                    ));
+                }
+                self.check_expr(&mut args[4], Some(&Type::Int))?;
+                if args[4].ty != Type::Int {
+                    return Err(format!(
+                        "http.request_timeout timeout_ms expects Int, got {}",
+                        args[4].ty
+                    ));
+                }
+                Ok(Type::union(vec![resp_ty, http_err]))
+            }
+            "get_bytes" => {
+                if !type_args.is_empty() || !named_args.is_empty() || args.len() != 1 {
+                    return Err("http.get_bytes(url) expects 1 String argument".to_string());
+                }
+                self.check_expr(&mut args[0], Some(&Type::String))?;
+                if args[0].ty != Type::String {
+                    return Err(format!("http.get_bytes url expects String, got {}", args[0].ty));
+                }
+                Ok(Type::union(vec![bin_resp_ty, http_err]))
+            }
+            "request_bytes" => {
+                if !type_args.is_empty() || !named_args.is_empty() || args.len() != 4 {
+                    return Err(
+                        "http.request_bytes(method, url, body, headers) expects (String, String, [Int], Map<String, String>)"
+                            .to_string(),
+                    );
+                }
+                for (i, label) in [(0, "method"), (1, "url")] {
+                    self.check_expr(&mut args[i], Some(&Type::String))?;
+                    if args[i].ty != Type::String {
+                        return Err(format!(
+                            "http.request_bytes {} expects String, got {}",
+                            label, args[i].ty
+                        ));
+                    }
+                }
+                self.check_expr(&mut args[2], Some(&int_list))?;
+                if args[2].ty != int_list {
+                    return Err(format!(
+                        "http.request_bytes body expects [Int], got {}",
+                        args[2].ty
+                    ));
+                }
+                self.check_expr(&mut args[3], Some(&str_map))?;
+                if args[3].ty != str_map {
+                    return Err(format!(
+                        "http.request_bytes headers expects Map<String, String>, got {}",
+                        args[3].ty
+                    ));
+                }
+                Ok(Type::union(vec![bin_resp_ty, http_err]))
+            }
+            other => Err(format!("Unknown cdt.http symbol '{}'", other)),
+        }
+    }
+
+    pub(crate) fn check_http_method(
+        &mut self,
+        type_name: &str,
+        method: &str,
+        args: &mut [Expr],
+    ) -> Result<Type, String> {
+        let http_err = Type::Custom(TypeId::native("cdt.http", "HttpError"));
+        let req_ty = Type::Custom(TypeId::native("cdt.http", "Request"));
+        let resp_ty = Type::Custom(TypeId::native("cdt.http", "Response"));
+        match (type_name, method) {
+            (
+                "Router",
+                "get" | "post" | "put" | "delete" | "patch" | "options" | "head" | "any",
+            ) => {
+                if args.len() != 2 {
+                    return Err(format!("Router.{}(pattern, handler) expects 2 arguments", method));
+                }
+                self.check_expr(&mut args[0], Some(&Type::String))?;
+                if args[0].ty != Type::String {
+                    return Err(format!("Router.{} pattern expects String, got {}", method, args[0].ty));
+                }
+                let expected_cb = Type::Function {
+                    params: vec![req_ty.clone()],
+                    return_type: Box::new(resp_ty.clone()),
+                };
+                self.check_expr(&mut args[1], Some(&expected_cb))?;
+                let Type::Function { params, return_type } = &args[1].ty else {
+                    return Err(format!("Router.{} handler must be (Request) -> Response, got {}", method, args[1].ty));
+                };
+                if params.len() != 1 || params[0] != req_ty || **return_type != resp_ty {
+                    return Err(format!(
+                        "Router.{} handler must be (Request) -> Response, got {}",
+                        method, args[1].ty
+                    ));
+                }
+                Ok(Type::Void)
+            }
+            ("Router", "before") => {
+                if args.len() != 1 {
+                    return Err("Router.before(handler) expects 1 function argument".to_string());
+                }
+                let opt_resp = Type::Optional(Box::new(resp_ty));
+                let expected_cb = Type::Function {
+                    params: vec![req_ty.clone()],
+                    return_type: Box::new(opt_resp.clone()),
+                };
+                self.check_expr(&mut args[0], Some(&expected_cb))?;
+                let Type::Function { params, return_type } = &args[0].ty else {
+                    return Err(format!(
+                        "Router.before handler must be (Request) -> Response?, got {}",
+                        args[0].ty
+                    ));
+                };
+                if params.len() != 1 || params[0] != req_ty || **return_type != opt_resp {
+                    return Err(format!(
+                        "Router.before handler must be (Request) -> Response?, got {}",
+                        args[0].ty
+                    ));
+                }
+                Ok(Type::Void)
+            }
+            ("Router", "after") => {
+                if args.len() != 1 {
+                    return Err("Router.after(handler) expects 1 function argument".to_string());
+                }
+                let expected_cb = Type::Function {
+                    params: vec![req_ty.clone(), resp_ty.clone()],
+                    return_type: Box::new(resp_ty.clone()),
+                };
+                self.check_expr(&mut args[0], Some(&expected_cb))?;
+                let Type::Function { params, return_type } = &args[0].ty else {
+                    return Err(format!(
+                        "Router.after handler must be (Request, Response) -> Response, got {}",
+                        args[0].ty
+                    ));
+                };
+                if params.len() != 2
+                    || params[0] != req_ty
+                    || params[1] != resp_ty
+                    || **return_type != resp_ty
+                {
+                    return Err(format!(
+                        "Router.after handler must be (Request, Response) -> Response, got {}",
+                        args[0].ty
+                    ));
+                }
+                Ok(Type::Void)
+            }
+            ("Router", "dispatch") => {
+                if args.len() != 1 {
+                    return Err("Router.dispatch(req) expects 1 Request argument".to_string());
+                }
+                self.check_expr(&mut args[0], Some(&req_ty))?;
+                if args[0].ty != req_ty {
+                    return Err(format!("Router.dispatch expects Request, got {}", args[0].ty));
+                }
+                Ok(resp_ty)
+            }
+            ("Router", "serve") => {
+                if args.len() != 1 {
+                    return Err("Router.serve(addr) expects 1 String argument".to_string());
+                }
+                self.check_expr(&mut args[0], Some(&Type::String))?;
+                if args[0].ty != Type::String {
+                    return Err(format!("Router.serve expects String, got {}", args[0].ty));
+                }
+                Ok(Type::union(vec![Type::Void, http_err]))
+            }
+            ("Router", "stop") => {
+                if !args.is_empty() {
+                    return Err("Router.stop() takes 0 arguments".to_string());
+                }
+                Ok(Type::Void)
+            }
+            _ => Err(format!("Type 'http.{}' has no method '.{}()'", type_name, method)),
+        }
+    }
+}
+
+fn ensure_http_router_plan(
+    checked: &mut CheckedProgram,
+    router_name: &str,
+    req_ty: &Type,
+    resp_ty: &Type,
+) -> Result<(), String> {
+    if checked.http_router_plans.iter().any(|(n, _)| n == router_name) {
+        return Ok(());
+    }
+    let sid = *checked
+        .struct_by_name
+        .get(router_name)
+        .ok_or_else(|| format!("Unknown router '{}' in cdt.http", router_name))?;
+    let st = &checked.structs[sid];
+    let mut entries = Vec::new();
+    let opt_resp = Type::Optional(Box::new(resp_ty.clone()));
+    for f in &st.fields {
+        let Some(ann) = &f.router_ann else {
+            return Err(format!(
+                "Type '{}' is not a 'router' declaration (missing route definitions)",
+                router_name
+            ));
+        };
+        match ann.target.as_str() {
+            "router.before" => {
+                let Some(Expr { kind: ExprKind::Ident(handler_name), .. }) = ann.args.first() else {
+                    return Err(format!("Invalid before handler in router '{}'", router_name));
+                };
+                let fid = *checked.func_by_name.get(handler_name).ok_or_else(|| {
+                    format!("Unknown handler '{}' in router '{}'", handler_name, router_name)
+                })?;
+                let sig = &checked.funcs[fid as usize];
+                if sig.params.len() != 1 || sig.params[0] != *req_ty || sig.return_type != opt_resp {
+                    return Err(format!(
+                        "router '{}' before handler '{}' must have signature (http.Request) -> http.Response?",
+                        router_name, handler_name
+                    ));
+                }
+                entries.push(HttpRouterDeclEntry {
+                    kind: HttpRouterDeclKind::Before,
+                    handler_name: handler_name.clone(),
+                });
+            }
+            "router.after" => {
+                let Some(Expr { kind: ExprKind::Ident(handler_name), .. }) = ann.args.first() else {
+                    return Err(format!("Invalid after handler in router '{}'", router_name));
+                };
+                let fid = *checked.func_by_name.get(handler_name).ok_or_else(|| {
+                    format!("Unknown handler '{}' in router '{}'", handler_name, router_name)
+                })?;
+                let sig = &checked.funcs[fid as usize];
+                if sig.params.len() != 2
+                    || sig.params[0] != *req_ty
+                    || sig.params[1] != *resp_ty
+                    || sig.return_type != *resp_ty
+                {
+                    return Err(format!(
+                        "router '{}' after handler '{}' must have signature (http.Request, http.Response) -> http.Response",
+                        router_name, handler_name
+                    ));
+                }
+                entries.push(HttpRouterDeclEntry {
+                    kind: HttpRouterDeclKind::After,
+                    handler_name: handler_name.clone(),
+                });
+            }
+            tag => {
+                let Some(method) = tag.strip_prefix("router.") else {
+                    continue;
+                };
+                let Some(Expr { kind: ExprKind::String(pat), .. }) = ann.args.first() else {
+                    return Err(format!("Invalid route pattern in router '{}'", router_name));
+                };
+                let Some(Expr { kind: ExprKind::Ident(handler_name), .. }) = ann.args.get(1) else {
+                    return Err(format!("Invalid route handler in router '{}'", router_name));
+                };
+                let fid = *checked.func_by_name.get(handler_name).ok_or_else(|| {
+                    format!("Unknown handler '{}' in router '{}'", handler_name, router_name)
+                })?;
+                let sig = &checked.funcs[fid as usize];
+                if sig.params.len() != 1 || sig.params[0] != *req_ty || sig.return_type != *resp_ty {
+                    return Err(format!(
+                        "router '{}' route '{} {}' handler '{}' must have signature (http.Request) -> http.Response",
+                        router_name,
+                        method.to_ascii_uppercase(),
+                        pat,
+                        handler_name
+                    ));
+                }
+                entries.push(HttpRouterDeclEntry {
+                    kind: HttpRouterDeclKind::Route(method.to_string(), pat.clone()),
+                    handler_name: handler_name.clone(),
+                });
+            }
+        }
+    }
+    checked.http_router_plans.push((router_name.to_string(), entries));
+    Ok(())
 }
