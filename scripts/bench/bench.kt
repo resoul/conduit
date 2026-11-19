@@ -5,7 +5,16 @@ import java.nio.file.Files
 import java.nio.file.Paths
 import java.security.MessageDigest
 import java.util.Base64
+import java.util.LinkedHashMap
 import java.util.UUID
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
+
+sealed interface BenchEvent {
+    object Tick : BenchEvent
+    class Add(val a: Long, val b: Long) : BenchEvent
+    class Scale(val v: Long, val f: Long) : BenchEvent
+}
 
 fun msSince(t0: Long): Double = (System.nanoTime() - t0) / 1_000_000.0
 
@@ -31,6 +40,24 @@ fun main() {
     for (i in 0 until 100_000) mapAcc += (vmM[i] ?: 0)
     val msVmMap = msSince(tVm)
     if (mapAcc < 0L) return
+
+    tVm = System.nanoTime()
+    var adtAcc = 0L
+    for (i in 0L until 1_000_000L) {
+        val ev: BenchEvent = when ((i and 3L).toInt()) {
+            0 -> BenchEvent.Tick
+            1 -> BenchEvent.Add(i, 7L)
+            2 -> BenchEvent.Scale(i, 3L)
+            else -> BenchEvent.Add(i, -2L)
+        }
+        adtAcc += when (ev) {
+            is BenchEvent.Tick -> 1L
+            is BenchEvent.Add -> ev.a + ev.b
+            is BenchEvent.Scale -> ev.v * ev.f
+        }
+    }
+    val msAdt = msSince(tVm)
+    if (adtAcc != 625_001_500_000L) return
     // 1. FS I/O
     val base = Files.createTempDirectory("_kt_bench_").toFile()
     val p = File(base, "data.txt").toPath()
@@ -208,9 +235,60 @@ fun main() {
     val msHttp = msSince(t0)
     if (httpAcc != 10_125_000) return
 
+    val b64UrlEnc = Base64.getUrlEncoder().withoutPadding()
+    val b64UrlDec = Base64.getUrlDecoder()
+    val jwtSecret = "conduit_bench_jwt_secret_key_32b".toByteArray(StandardCharsets.UTF_8)
+    val macInst = Mac.getInstance("HmacSHA256")
+    macInst.init(SecretKeySpec(jwtSecret, "HmacSHA256"))
+    val jwtHdr = b64UrlEnc.encodeToString("{\"alg\":\"HS256\",\"typ\":\"JWT\"}".toByteArray(StandardCharsets.UTF_8))
+    t0 = System.nanoTime()
+    var jwtAcc = 0
+    for (i in 0 until 10_000) {
+        val payJson = "{\"sub\":\"user\",\"uid\":$i}"
+        val payB64 = b64UrlEnc.encodeToString(payJson.toByteArray(StandardCharsets.UTF_8))
+        val sigInput = "$jwtHdr.$payB64"
+        val sigB64 = b64UrlEnc.encodeToString(macInst.doFinal(sigInput.toByteArray(StandardCharsets.UTF_8)))
+        val tok = "$sigInput.$sigB64"
+
+        val parts = tok.split('.')
+        if (parts.size != 3) return
+        val expectedSig = b64UrlEnc.encodeToString(
+            macInst.doFinal("${parts[0]}.${parts[1]}".toByteArray(StandardCharsets.UTF_8))
+        )
+        if (!MessageDigest.isEqual(
+                parts[2].toByteArray(StandardCharsets.UTF_8),
+                expectedSig.toByteArray(StandardCharsets.UTF_8)
+            )
+        ) return
+        val rawPay = String(b64UrlDec.decode(parts[1]), StandardCharsets.UTF_8)
+        val colonIdx = rawPay.lastIndexOf(':')
+        val braceIdx = rawPay.lastIndexOf('}')
+        if (colonIdx < 0 || braceIdx < 0) return
+        jwtAcc += rawPay.substring(colonIdx + 1, braceIdx).trim().toInt()
+    }
+    val msJwt = msSince(t0)
+    if (jwtAcc != 49_995_000) return
+
+    val lru = object : LinkedHashMap<String, String>(4096, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?): Boolean {
+            return size > 4096
+        }
+    }
+    t0 = System.nanoTime()
+    var cacheAcc = 0
+    for (i in 0 until 100_000) {
+        lru["k${i and 8191}"] = "v"
+        if (lru["k${(i + 6144) and 8191}"] != null) {
+            cacheAcc++
+        }
+    }
+    val msCache = msSince(t0)
+    if (cacheAcc != 97905) return
+
     println("BENCH|vm_fib_35|%.3f".format(msVmFib))
     println("BENCH|vm_arith_10m|%.3f".format(msVmArith))
     println("BENCH|vm_map_100k|%.3f".format(msVmMap))
+    println("BENCH|adt_switch_1m|%.3f".format(msAdt))
 
     println("BENCH|fs_write_text|%.3f".format(msWriteText))
     println("BENCH|fs_write_lines|%.3f".format(msWriteStream))
@@ -228,4 +306,6 @@ fun main() {
     println("BENCH|pipeline_float_1m|%.3f".format(msFPipe))
     println("BENCH|url_parse_50k|%.3f".format(msUrl))
     println("BENCH|http_router_50k|%.3f".format(msHttp))
+    println("BENCH|jwt_hs256_10k|%.3f".format(msJwt))
+    println("BENCH|cache_lru_100k|%.3f".format(msCache))
 }

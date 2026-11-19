@@ -29,6 +29,57 @@ fn is_json_call_expr(expr: &Expr, checked: &CheckedProgram) -> bool {
 }
 
 impl<'a, 'b> FnLowerer<'a, 'b> {
+    pub(crate) fn emit_defer_try_check(
+        &mut self,
+        inner_ty: &Type,
+        obj_reg: u16,
+        empty_is_err: bool,
+    ) -> Result<(), String> {
+        let mut fail_tys: Vec<Type> = Vec::new();
+        match inner_ty {
+            Type::Optional(_) => fail_tys.push(Type::Nil),
+            Type::Union(vars) => {
+                for v in vars {
+                    if crate::frontend::check_native::is_error_type(v, self.mc.checked)
+                        || (empty_is_err && matches!(v, Type::Nil | Type::Void))
+                    {
+                        fail_tys.push(v.clone());
+                    }
+                }
+            }
+            other if crate::frontend::check_native::is_error_type(other, self.mc.checked) => {
+                fail_tys.push(other.clone());
+            }
+            _ => {}
+        }
+        for fail_ty in &fail_tys {
+            let expected_tag =
+                crate::ir::lower_native::type_tag_for_switch(fail_ty, self.mc.checked)?;
+            let is_err_s = self.alloc_temp_s();
+            self.ops.push(Op::IsTypeObj {
+                dst_s: is_err_s,
+                src_obj: obj_reg,
+                expected_tag,
+            });
+            let j_next = self.ops.len();
+            self.ops.push(Op::JumpIfFalse {
+                cond: is_err_s,
+                target: 0,
+            });
+            if let Some(ret_slot) = self.defer_ret_slot {
+                self.ops.push(Op::MoveObj {
+                    dst_obj: ret_slot.reg,
+                    src: obj_reg,
+                });
+            }
+            let j_epi = self.ops.len();
+            self.ops.push(Op::Jump { target: 0 });
+            self.defer_epilogue_jumps.push(j_epi);
+            self.patch_here(j_next);
+        }
+        Ok(())
+    }
+
     pub(crate) fn load_int_into(&mut self, dst: u16, n: i64) -> Result<(), String> {
         if let Ok(imm) = i32::try_from(n) {
             self.ops.push(Op::LoadImmInt { dst, imm });
@@ -157,11 +208,16 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 let src_obj = self.lower_obj(inner)?;
                 let dst_s = self.alloc_temp_s();
                 let ret_on_err = can_propagate_try(&inner.ty, &self.return_ty, self.mc.checked);
-                self.ops.push(Op::TryUnwrapScalar {
-                    dst_s,
-                    src_obj,
-                    ret_on_err,
-                });
+                if ret_on_err && self.has_defer {
+                    self.emit_defer_try_check(&inner.ty, src_obj, true)?;
+                    self.ops.push(Op::UnboxScalar { dst_s, src_obj });
+                } else {
+                    self.ops.push(Op::TryUnwrapScalar {
+                        dst_s,
+                        src_obj,
+                        ret_on_err,
+                    });
+                }
                 Ok(dst_s)
             }
             ExprKind::Call { .. } => self.lower_call_scalar(expr),
@@ -277,6 +333,15 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 _ => Err("Unsupported index target".to_string()),
             },
             ExprKind::Member { target, field } => {
+                if let ExprKind::Ident(ename) = &target.kind
+                    && self.lookup_local(ename).is_none()
+                    && let Some(dvars) = self.mc.checked.data_enums.get(ename).cloned()
+                {
+                    let var = dvars.iter().find(|v| &v.name == field).ok_or_else(|| {
+                        format!("Enum '{}' has no variant '{}'", ename, field)
+                    })?;
+                    return self.lower_struct_ctor(&var.struct_name, &[], &[]);
+                }
                 if let ExprKind::Ident(alias) = &target.kind
                     && self.lookup_local(alias).is_none()
                     && self.mc.checked.is_native_alias(alias, "cdt.validation")
@@ -351,11 +416,15 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 }
                 let obj_reg = self.lower_obj(inner)?;
                 let empty_is_err = empty_is_err_for_try(&inner.ty);
-                self.ops.push(Op::TryCheckObj {
-                    src_obj: obj_reg,
-                    ret_on_err,
-                    empty_is_err,
-                });
+                if ret_on_err && self.has_defer {
+                    self.emit_defer_try_check(&inner.ty, obj_reg, empty_is_err)?;
+                } else {
+                    self.ops.push(Op::TryCheckObj {
+                        src_obj: obj_reg,
+                        ret_on_err,
+                        empty_is_err,
+                    });
+                }
                 Ok(obj_reg)
             }
             ExprKind::Closure { params, return_type, body } => {

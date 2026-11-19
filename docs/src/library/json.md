@@ -42,6 +42,27 @@ name: String `json:"display_name"` @validation.min(2)
 
 Only a JSON field-name override is supported; comma-separated tag options such as `omitempty` are not supported.
 
+## Tagged Unions (Data Enums)
+
+Data enums (enums where at least one variant declares payload fields) are automatically encoded and decoded as tagged JSON objects using `"type"` as the variant discriminator key:
+
+```conduit
+enum Event {
+    Ping,
+    Message(user: String, text: String, room: Int = 1)
+}
+
+raw_msg := json.encode(Event.Message(user: "alice", text: "hello"))?
+// {"type":"Message","user":"alice","text":"hello","room":1}
+
+raw_ping := json.encode(Event.Ping)?
+// {"type":"Ping"}
+
+ev := json.decode<Event>("{\"room\":2,\"text\":\"hi\",\"type\":\"Message\",\"user\":\"bob\"}")?
+```
+
+During `json.decode<T>`, `"type"` may appear at any position inside the JSON object. Missing `"type"`, unknown variant names, or unknown extra fields produce a `json.DecodeError`.
+
 ---
 
 ## Runnable Example

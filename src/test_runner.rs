@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::time::Instant;
@@ -65,7 +66,12 @@ pub fn run_test_cmd(args: &[String]) {
             Ok(m) => m,
             Err(e) => {
                 println!("  FAIL  {} (compile error)", file.display());
-                for line in e.lines() {
+                let rendered = conduit::diagnostics::render_diagnostics(
+                    &e,
+                    Some(file),
+                    std::io::stdout().is_terminal(),
+                );
+                for line in rendered.lines() {
                     println!("        {}", line);
                 }
                 failed += 1;

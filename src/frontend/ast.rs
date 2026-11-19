@@ -114,6 +114,11 @@ impl Expr {
 #[derive(Debug, Clone, PartialEq)]
 pub enum PatternKind {
     Type { name: String, binding: String },
+    EnumVariant {
+        enum_name: String,
+        variant_name: String,
+        bindings: Vec<(Option<String>, String)>,
+    },
     Tuple(Vec<Pattern>),
     Nil,
     Wildcard,
@@ -181,6 +186,7 @@ pub enum StmtKind {
         expr: Expr,
         cases: Vec<SwitchCase>,
     },
+    Defer(Block),
     Break,
     Continue,
     Expr(Expr),
@@ -236,6 +242,13 @@ pub struct ImportSpecifier {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct EnumVariantDef {
+    pub name: String,
+    pub fields: Vec<FieldDef>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum ItemKind {
     Func {
         name: String,
@@ -261,7 +274,7 @@ pub enum ItemKind {
     },
     Enum {
         name: String,
-        variants: Vec<String>,
+        variants: Vec<EnumVariantDef>,
     },
     Error {
         name: String,
@@ -295,6 +308,7 @@ pub struct Item {
     pub is_imported: bool,
     pub doc: Option<String>,
     pub annotations: Vec<FieldAnnotation>,
+    pub source_file: Option<String>,
 }
 
 impl Item {
@@ -306,6 +320,7 @@ impl Item {
             is_imported: false,
             doc: None,
             annotations: Vec::new(),
+            source_file: None,
         }
     }
 }

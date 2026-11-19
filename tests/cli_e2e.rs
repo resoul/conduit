@@ -281,3 +281,139 @@ test "gamma after fail" {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn cli_check_pretty_multi_error_and_imported_file_diagnostics() {
+    let multi_err = temp_cdt(
+        "multi_err.cdt",
+        "func a() -> Int {\n    x := \"hello\" + 1\n    return x\n}\nexport func main() -> Void {\n    y := missing_ident\n}\n",
+    );
+    let out = Command::new(conduit_bin())
+        .args(["check", multi_err.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("error[2:"), "{stderr}");
+    assert!(stderr.contains("error[6:"), "{stderr}");
+    assert!(stderr.contains("-->"), "{stderr}");
+    assert!(stderr.contains(" | "), "{stderr}");
+    assert!(stderr.contains("^"), "{stderr}");
+    assert!(stderr.contains("aborting due to 2 previous errors"), "{stderr}");
+    let _ = fs::remove_dir_all(multi_err.parent().unwrap());
+
+    let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("conduit_cli_diag_mod_{}_{}", std::process::id(), n));
+    fs::create_dir_all(&dir).unwrap();
+    let mod_file = dir.join("bad_mod.cdt");
+    fs::write(
+        &mod_file,
+        "export func broken() -> Int {\n    bad := \"abc\" + 2\n    return bad\n}\n",
+    )
+    .unwrap();
+    let main_file = dir.join("main.cdt");
+    fs::write(
+        &main_file,
+        "import { broken } from \"./bad_mod\"\nexport func main() -> Void {\n    broken()\n}\n",
+    )
+    .unwrap();
+    let imp_out = Command::new(conduit_bin())
+        .args(["check", main_file.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!imp_out.status.success());
+    let imp_stderr = String::from_utf8_lossy(&imp_out.stderr);
+    assert!(imp_stderr.contains("bad_mod.cdt"), "{imp_stderr}");
+    assert!(imp_stderr.contains("bad := \"abc\" + 2"), "{imp_stderr}");
+    assert!(imp_stderr.contains("^"), "{imp_stderr}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cli_routes_and_openapi_commands() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let auth_main = manifest_dir.join("examples/auth_api/main.cdt");
+    let cli_http_main = manifest_dir.join("examples/cli_http/main.cdt");
+
+    let routes_auth = Command::new(conduit_bin())
+        .args(["routes", auth_main.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        routes_auth.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&routes_auth.stderr)
+    );
+    let routes_auth_out = String::from_utf8_lossy(&routes_auth.stdout);
+    assert!(routes_auth_out.contains("router AuthApi"), "{routes_auth_out}");
+    assert!(routes_auth_out.contains("POST"), "{routes_auth_out}");
+    assert!(routes_auth_out.contains("/auth/login"), "{routes_auth_out}");
+    assert!(routes_auth_out.contains("LoginRequest"), "{routes_auth_out}");
+    assert!(routes_auth_out.contains("/api/me"), "{routes_auth_out}");
+    assert!(routes_auth_out.contains("before: require_jwt"), "{routes_auth_out}");
+
+    let routes_cli = Command::new(conduit_bin())
+        .args(["routes", cli_http_main.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        routes_cli.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&routes_cli.stderr)
+    );
+    let routes_cli_out = String::from_utf8_lossy(&routes_cli.stdout);
+    assert!(routes_cli_out.contains("router DemoApi"), "{routes_cli_out}");
+    assert!(routes_cli_out.contains("cors: *"), "{routes_cli_out}");
+    assert!(routes_cli_out.contains("/admin/stats"), "{routes_cli_out}");
+    assert!(routes_cli_out.contains("before: check_admin_auth"), "{routes_cli_out}");
+
+    let openapi_out = Command::new(conduit_bin())
+        .args([
+            "openapi",
+            auth_main.to_str().unwrap(),
+            "--server",
+            "http://127.0.0.1:8080",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        openapi_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&openapi_out.stderr)
+    );
+    let spec = String::from_utf8_lossy(&openapi_out.stdout);
+    assert!(spec.contains(r#""openapi": "3.0.3""#), "{spec}");
+    assert!(spec.contains(r#""http://127.0.0.1:8080""#), "{spec}");
+    assert!(spec.contains(r#""/auth/login""#), "{spec}");
+    assert!(spec.contains(r#""/api/me""#), "{spec}");
+    assert!(spec.contains("LoginRequest"), "{spec}");
+    assert!(spec.contains(r#""format": "email""#), "{spec}");
+    assert!(spec.contains(r#""minLength": 6"#), "{spec}");
+    assert!(spec.contains(r#""enum""#), "{spec}");
+    assert!(spec.contains("TokenReply"), "{spec}");
+    assert!(spec.contains("ValidationErrorResponse"), "{spec}");
+
+    let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let out_dir = std::env::temp_dir().join(format!("conduit_openapi_out_{}_{}", std::process::id(), n));
+    fs::create_dir_all(&out_dir).unwrap();
+    let spec_file = out_dir.join("openapi.json");
+    let write_out = Command::new(conduit_bin())
+        .args([
+            "openapi",
+            auth_main.to_str().unwrap(),
+            "-o",
+            spec_file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(write_out.status.success());
+    let written = fs::read_to_string(&spec_file).unwrap();
+    assert!(written.contains(r#""openapi": "3.0.3""#));
+    let _ = fs::remove_dir_all(&out_dir);
+
+    let bad_router = Command::new(conduit_bin())
+        .args(["routes", auth_main.to_str().unwrap(), "--router", "Unknown"])
+        .output()
+        .unwrap();
+    assert!(!bad_router.status.success());
+}

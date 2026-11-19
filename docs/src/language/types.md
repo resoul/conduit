@@ -204,7 +204,34 @@ func label(r: Role) -> String {
 }
 ```
 
-Enums support `==`, `!=`, `switch` matching, lists (`[Role]`), and maps (`Map<Role, String>`) with zero heap allocation.
+Unit-only enums (no payload fields) support `==`, `!=`, `switch` matching, lists (`[Role]`), and maps (`Map<Role, String>`) with zero heap allocation.
+
+### Tagged Unions (Data Enums)
+
+Enum variants can also carry named payload fields and default field values, creating tagged union types (`export enum` works identically across modules):
+
+```conduit
+enum Event {
+    Ping,
+    Message(user: String, text: String, room: Int = 1),
+    Close(code: Int = 1000)
+}
+
+func describe(ev: Event) -> String {
+    switch ev {
+        case Event.Ping:
+            return "ping"
+        case Event.Message(user, text):
+            return "{user}: {text}"
+        case Event.Close(code: c):
+            return "closed:{c}"
+    }
+}
+```
+
+- **Construction**: Unit variants use `Event.Ping`; payload variants accept named or positional arguments and apply field defaults: `Event.Message(user: "alice", text: "hi")`.
+- **Destructuring in `switch`**: Match with positional bindings (`Event.Message(u, t)`), named bindings (`Event.Message(text: t)`), wildcard discard (`Event.Message(_)`), or exhaustive matching across all variants.
+- **JSON & OpenAPI**: `json.encode` / `json.decode` serialize data enums using `"type"` as the discriminator field (e.g. `{"type":"Ping"}` or `{"type":"Message","user":"alice","text":"hi","room":1}`), so variant fields cannot be named `"type"`. `conduit openapi` automatically emits `oneOf` with `discriminator.propertyName = "type"`.
 
 ---
 

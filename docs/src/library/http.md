@@ -133,6 +133,22 @@ When a request matches `/users`, the router automatically:
 2. Runs all `@validation.*` and custom `[#validator]` rules on `CreateUser` (returns `422 Unprocessable Entity` JSON `{"error":"validation_failed","issues":[...]}` on failure).
 3. Invokes `create_user(req, body)` with the validated struct.
 
+The typed body parameter can also be a tagged-union data `enum` (decoded via its `"type"` discriminator field).
+
+## Route Inspection & OpenAPI 3.0.3 (`conduit routes` & `conduit openapi`)
+
+Declarative `router` blocks can be inspected or exported to an OpenAPI 3.0.3 specification directly from the CLI without starting the server:
+
+```bash
+# Print the route table (METHOD, PATH, HANDLER, BODY, middleware)
+conduit routes main.cdt
+
+# Generate OpenAPI 3.0.3 JSON specification
+conduit openapi main.cdt --title "Users API" --version "1.0.0" --server http://localhost:8080 -o openapi.json
+```
+
+`conduit openapi` automatically extracts path parameters (`:id`, `*rest`), request body schemas (including `@validation.*` constraints and data `enum` `oneOf` + `discriminator` schemas), and inferred response status codes (`http.ok_json`, `http.status_json`, `http.no_content`, `http.redirect`, plus `400`/`422` error contracts).
+
 ## Imperative Example
 
 ```conduit

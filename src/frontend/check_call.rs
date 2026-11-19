@@ -58,7 +58,9 @@ impl<'a> Checker<'a> {
             self.bind(p.name.clone(), ty.clone());
         }
         for s in &mut body.stmts {
-            self.check_stmt(s)?;
+            if let Err(e) = self.check_stmt(s) {
+                self.record_stmt_error(s, e);
+            }
         }
         self.pop_scope();
         self.current_return = saved_ret;
@@ -115,6 +117,19 @@ impl<'a> Checker<'a> {
             {
                 if mod_alias == "Map" && field == "from" {
                     return self.check_map_from(type_args, args, named_args);
+                }
+                if let Some(dvars) = self.checked.data_enums.get(mod_alias).cloned() {
+                    if !type_args.is_empty() {
+                        return Err(format!(
+                            "Enum variant '{}.{}' does not accept type arguments",
+                            mod_alias, field
+                        ));
+                    }
+                    let var = dvars.iter().find(|v| &v.name == field).ok_or_else(|| {
+                        format!("Enum '{}' has no variant '{}'", mod_alias, field)
+                    })?;
+                    let _ = self.check_struct_ctor(&var.struct_name, args, named_args)?;
+                    return Ok(Type::DataEnum(mod_alias.clone()));
                 }
                 if let Some(&mod_name) = self.checked.native_aliases.get(mod_alias) {
                     return self.check_native_module_call(mod_name, field, type_args, args, named_args);

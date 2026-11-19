@@ -253,6 +253,15 @@ fn encode_json_type(ty: &JsonType, w: &mut Writer) {
         JsonType::List(inner) => { w.u8(5); encode_json_type(inner, w); }
         JsonType::Map(val) => { w.u8(6); encode_json_type(val, w); }
         JsonType::Struct(id) => { w.u8(7); w.u32(*id); }
+        JsonType::TaggedEnum { name, variants } => {
+            w.u8(8);
+            w.str(name);
+            w.u32(variants.len() as u32);
+            for (vname, sid) in variants {
+                w.str(vname);
+                w.u32(*sid);
+            }
+        }
     }
 }
 
@@ -266,6 +275,11 @@ fn decode_json_type(r: &mut Reader<'_>) -> Result<JsonType, String> {
         5 => Ok(JsonType::List(Box::new(decode_json_type(r)?))),
         6 => Ok(JsonType::Map(Box::new(decode_json_type(r)?))),
         7 => Ok(JsonType::Struct(r.u32()?)),
+        8 => {
+            let name = r.str()?;
+            let variants = r.vec(|r| Ok((r.str()?, r.u32()?)))?;
+            Ok(JsonType::TaggedEnum { name, variants })
+        }
         tag => Err(format!("Invalid JsonType tag {} in bundle", tag)),
     }
 }
@@ -414,6 +428,10 @@ pub fn encode_bundle(module: &Module, main_fid: u32, main_ret_tag: u8) -> Result
         w.u32(s.schema_id);
         w.str(&s.type_name);
         w.bool(s.is_error);
+        w.bool(s.enum_tag.is_some());
+        if let Some(tag) = &s.enum_tag {
+            w.str(tag);
+        }
         w.list(&s.fields, |w, f| {
             w.str(&f.name);
             w.str(&f.json_name);
@@ -595,12 +613,13 @@ pub fn decode_bundle(bytes: &[u8]) -> Result<(Module, u32, u8), String> {
         let schema_id = r.u32()?;
         let type_name = r.str()?;
         let is_error = r.bool()?;
+        let enum_tag = if r.bool()? { Some(r.str()?) } else { None };
         let field_defs = r.vec(|r| Ok(StructFieldDef {
             name: r.str()?,
             json_name: r.str()?,
             ty: decode_json_type(r)?,
         }))?;
-        Ok(StructSchema::with_error_flag(schema_id, type_name, field_defs, is_error))
+        Ok(StructSchema::with_flags(schema_id, type_name, field_defs, is_error, enum_tag))
     })?;
     let json_roots = r.vec(decode_json_type)?;
     module.json_plans = json_roots

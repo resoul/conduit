@@ -78,6 +78,29 @@ func check_positive(n: Int) -> Int {
 
 ---
 
+## Deferred Cleanup (`defer`)
+
+The `defer` statement registers an expression or block to run when the enclosing function exits:
+
+```conduit
+func handle_conn(db: db.Conn) -> Void | db.DbError {
+    defer db.close()
+
+    tx := db.begin()?
+    defer {
+        print("finishing handler")
+    }
+
+    // Both defers run in LIFO order on normal exit, early `return`, or `?` propagation
+}
+```
+
+- **LIFO order**: Defers run in reverse order of registration (most recently executed `defer` runs first).
+- **All exit paths**: Defers trigger on normal function fallthrough, explicit `return` (after evaluating the return value), and `?` error propagation.
+- **Compile-time restrictions**: `return`, `?`, and nested `defer` statements are not allowed inside a `defer` body.
+
+---
+
 ## Pipeline Operator (`|>`)
 
 The pipe operator `|>` passes the result of the left-hand expression as the first argument to the right-hand function:

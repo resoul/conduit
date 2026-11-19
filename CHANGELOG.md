@@ -9,6 +9,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
+* **Multi-Error Snippet Diagnostics (`conduit check`, `conduit run`, `conduit test`, `conduit lsp`)**:
+  * Added `src/diagnostics.rs` (`parse_diagnostic`, `tag_file_error`, `render_diagnostic`, `render_diagnostics`) rendering Rust/Elm-style source snippets with line/column gutters, `^` caret indicators, multi-file attribution (`--> path/to/file.cdt:line:col`), and summary footers (`error: aborting due to N previous errors`).
+  * Updated the typechecker and linker (`src/frontend/{check,check_sys,check_call,monomorph,linker,mod}.rs`) to accumulate multiple errors across functions, statements, DSL blocks, and imported modules in a single pass with `Type::Any` recovery, and updated `conduit lsp` (`src/lsp.rs`) to publish the full diagnostic array.
+* **HTTP Route Table & OpenAPI 3.0.3 Specification Generator (`conduit routes`, `conduit openapi`)**:
+  * Added `src/openapi.rs` and CLI commands `conduit routes <file.cdt> [--router <name>]` and `conduit openapi <file.cdt> [--router <name>] [--title <str>] [--version <str>] [--server <url>] [-o <file>]` (`src/main.rs`, `docs/src/getting-started/cli.md`, `cli_routes_and_openapi_commands`).
+  * Automatically extracts declarative `router` tables (`METHOD`, `PATH`, `HANDLER`, `BODY`, `before`/`after` middleware, `cors`, `static`), converts `:param` / `*wildcard` path segments, maps `@validation.*` rules to OpenAPI 3.0.3 JSON Schema constraints (`minLength`, `maxLength`, `minimum`, `maximum`, `format`, `enum`), and infers handler response status codes and payload schemas (`200`, `201`, `204`, `302`, `400`, `422`, custom statuses).
+* **Deferred Cleanup (`defer`)**:
+  * Added `defer <expr>` and `defer { ... }` statements (`TokenKind::KwDefer`, `StmtKind::Defer(Block)`) executing in LIFO order when the enclosing function or closure exits via normal fallthrough, early `return` (after evaluating the return value), or `?` error propagation—implemented with zero new VM opcodes (`src/frontend/{lexer,ast,parser_stmt,check}.rs`, `src/ir/{lower,lower_expr,lower_prealloc,lower_loops}.rs`, `docs/src/language/control-flow.md`).
+  * Enforced compile-time rejection of `return`, `?`, and nested `defer` inside a `defer` body (`defer_lifo_early_return_try_propagation_loops_closures_and_bundle_e2e`).
+* **Tagged-Union Data Enums (`enum` with Named Payload Fields)**:
+  * Extended `enum` declarations (`src/frontend/{ast,parser,types,monomorph_reg,check,linker}.rs`, `src/ir/lower*.rs`, `docs/src/language/types.md`) to support variants with named payload fields and default values (`enum Event { Ping, Message(user: String, text: String, room: Int = 1) }`, `Type::DataEnum`), while preserving zero-allocation scalar `i64` representation for unit-only enums (`Type::Enum`).
+  * Added positional and named variant destructuring in `switch` (`case Event.Message(u, t):`, `case Event.Message(text: t):`, `case Event.Message(_):`, `case Event.Ping:`), union type matching (`Event | Error`), and compile-time `switch` exhaustiveness checking for data enums.
+  * Added RFC 8259 JSON serialization and key-order-independent deserialization with `"type"` discriminator (`JsonType::TaggedEnum`, `PlanNode::TaggedEnum`, `StructSchema.enum_tag`, binary bundle roundtrip in `src/ir/bundle.rs`), OpenAPI 3.0.3 `oneOf` + `discriminator` schema generation (`src/openapi.rs`), typed `router` body contract support (`src/frontend/check_sys.rs`, `src/ir/lower_native.rs`), and LSP hover/completion (`src/lsp.rs`, `src/lsp_docs.rs`, `data_enum_tagged_union_switch_json_cross_module_openapi_and_bundle_e2e`).
 * **Built-in `.cdt` Test Runner (`conduit test`, `test "..." { ... }`)**:
   * Added top-level `test "<name>" { ... }` declarations across AST, parser, linker (stripping tests from imported modules), reachability tree-shaking, typechecker (with duplicate test name rejection and `?` propagation without error return annotations), IR lowering (`TestSpec`), and LSP document symbols (`src/frontend/{ast,parser,linker,reachability,check}.rs`, `src/ir/{mod,lower}.rs`, `src/lsp.rs`).
   * Added prelude assertion builtins `assert(cond, msg?)`, `assert_eq(actual, expected, msg?)`, `assert_ne(actual, unexpected, msg?)`, and `fail(msg)` backed by `EXT_ASSERT` (`src/frontend/check_call.rs`, `src/ir/lower_call.rs`, `src/vm/opcode.rs`, `src/vm/exec_map.rs`), plus LSP docs and TextMate / VitePress Shiki highlighting.
@@ -25,6 +38,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Changed
 
+* **Cross-Language Benchmarks (`scripts/bench/`) & `cdt.cache` LRU Fast-Path**:
+  * Added `adt_switch_1m` (1M tagged-union variant switches), `jwt_hs256_10k` (10k HS256 sign + verify cycles), and `cache_lru_100k` (100k LRU cache set + get operations with eviction) across `scripts/bench/run_all.py` and `scripts/bench/bench.{cdt,go,swift,kt,mjs,php,py}`.
+  * Optimized `CacheInner` in `src/native/cache.rs` by tracking active `ttl_entries` so non-TTL LRU caches skip $O(N)$ expiration scans and `SystemTime::now()` syscalls on eviction/read and perform a single `HashMap::get_mut` lookup (~22x speedup on `cache_lru_100k`).
 * **Documentation Site (VitePress)**:
   * Migrated the documentation build and GitHub Pages artifact from mdBook to VitePress while keeping Markdown pages under `docs/src`; added a home page, sidebar navigation, local search, and Conduit syntax highlighting through the existing TextMate grammar.
   * Added npm scripts for local development, production builds, and previewing the built site; documented the workflow in `README.md`.

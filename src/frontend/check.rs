@@ -58,6 +58,13 @@ pub struct HttpRouterDeclEntry {
     pub body_struct: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct DataEnumVariant {
+    pub name: String,
+    pub struct_name: String,
+    pub schema_id: u32,
+}
+
 #[derive(Debug)]
 pub struct CheckedProgram {
     pub structs: Vec<ResolvedStruct>,
@@ -84,6 +91,7 @@ pub struct CheckedProgram {
     pub pending_mono_items: Vec<Item>,
     pub consts: HashMap<String, (Type, ConstVal)>,
     pub enums: HashMap<String, Vec<String>>,
+    pub data_enums: HashMap<String, Vec<DataEnumVariant>>,
 }
 
 impl CheckedProgram {
@@ -113,6 +121,19 @@ fn with_span(span: crate::frontend::lexer::Span, err: String) -> String {
         err
     } else {
         format!("[{}:{}] {}", span.line, span.col, err)
+    }
+}
+
+fn format_check_err(
+    span: crate::frontend::lexer::Span,
+    source_file: Option<&str>,
+    err: String,
+) -> String {
+    let msg = with_span(span, err);
+    if let Some(f) = source_file {
+        crate::diagnostics::tag_file_error(std::path::Path::new(f), msg)
+    } else {
+        msg
     }
 }
 
@@ -149,13 +170,15 @@ pub fn check_program_with_roots(
         pending_mono_items: Vec::new(),
         consts: HashMap::new(),
         enums: HashMap::new(),
+        data_enums: HashMap::new(),
     };
 
     register_native_imports(program, &mut checked)?;
     register_program_types(program, &mut checked)?;
     register_program_consts(program, &mut checked)?;
     check_validator_contracts(program, &mut checked)?;
-    check_default_exprs(program, &mut checked)?;
+    let mut all_errors: Vec<String> = Vec::new();
+    check_default_exprs(program, &mut checked, &mut all_errors);
 
     let mut idx = 0usize;
     while idx < program.items.len() {
@@ -164,6 +187,7 @@ pub fn check_program_with_roots(
             ItemKind::Func { type_params, .. } if type_params.is_empty()
         );
         if is_concrete_fn {
+            let source_file = program.items[idx].source_file.clone();
             let ItemKind::Func {
                 name,
                 params,
@@ -180,11 +204,15 @@ pub fn check_program_with_roots(
                 scopes: vec![HashMap::new()],
                 current_return: sig.return_type.clone(),
                 loop_depth: 0,
+                in_defer: false,
+                errors: Vec::new(),
+                source_file,
             };
             for (param, ty) in params.iter().zip(sig.params.iter()) {
                 tc.bind(param.name.clone(), ty.clone());
             }
-            tc.check_block(body)?;
+            let _ = tc.check_block(body);
+            all_errors.extend(tc.errors);
             if !checked.pending_mono_items.is_empty() {
                 let extra = std::mem::take(&mut checked.pending_mono_items);
                 program.items.extend(extra);
@@ -203,9 +231,15 @@ pub fn check_program_with_roots(
     let db_err_ty = Type::Custom(TypeId::native("cdt.db", "DbError"));
     let mig_ret_ty = Type::union(vec![Type::Void, db_err_ty]);
     for item in &mut program.items {
+        let source_file = item.source_file.clone();
+        let item_span = item.span;
         if let ItemKind::Migration { version, up, down, .. } = &mut item.kind {
             if !seen_mig_versions.insert(*version) {
-                return Err(format!("Duplicate migration version {}", version));
+                all_errors.push(format_check_err(
+                    item_span,
+                    source_file.as_deref(),
+                    format!("Duplicate migration version {}", version),
+                ));
             }
             for block in [up, down] {
                 let mut tc = Checker {
@@ -213,19 +247,26 @@ pub fn check_program_with_roots(
                     scopes: vec![HashMap::new()],
                     current_return: mig_ret_ty.clone(),
                     loop_depth: 0,
+                    in_defer: false,
+                    errors: Vec::new(),
+                    source_file: source_file.clone(),
                 };
                 tc.bind("db".to_string(), db_conn_ty.clone());
-                tc.check_block(block)?;
+                let _ = tc.check_block(block);
+                all_errors.extend(tc.errors);
             }
         }
     }
     let mut seen_test_names = HashSet::new();
     for item in &mut program.items {
+        let source_file = item.source_file.clone();
+        let item_span = item.span;
         if let ItemKind::Test { name, body } = &mut item.kind {
             if !seen_test_names.insert(name.clone()) {
-                return Err(format!(
-                    "[{}:{}] Duplicate test name '{}'",
-                    item.span.line, item.span.col, name
+                all_errors.push(format_check_err(
+                    item_span,
+                    source_file.as_deref(),
+                    format!("Duplicate test name '{}'", name),
                 ));
             }
             let mut tc = Checker {
@@ -233,8 +274,12 @@ pub fn check_program_with_roots(
                 scopes: vec![HashMap::new()],
                 current_return: Type::Void,
                 loop_depth: 0,
+                in_defer: false,
+                errors: Vec::new(),
+                source_file,
             };
-            tc.check_block(body)?;
+            let _ = tc.check_block(body);
+            all_errors.extend(tc.errors);
         }
     }
     if !checked.pending_mono_items.is_empty() {
@@ -248,7 +293,44 @@ pub fn check_program_with_roots(
         _ => true,
     });
 
-    build_validation_plans(program, &mut checked)?;
+    if let Err(e) = build_validation_plans(program, &mut checked) {
+        all_errors.push(e);
+    }
+
+    let mut struct_locs: HashMap<String, (crate::frontend::lexer::Span, Option<String>)> =
+        HashMap::new();
+    for item in &program.items {
+        if let ItemKind::Struct { name, .. } = &item.kind {
+            struct_locs.insert(name.clone(), (item.span, item.source_file.clone()));
+        }
+    }
+
+    let router_names: Vec<String> = checked
+        .structs
+        .iter()
+        .filter(|s| {
+            s.fields.iter().any(|f| {
+                f.router_ann
+                    .as_ref()
+                    .is_some_and(|a| a.target.starts_with("router."))
+            })
+        })
+        .map(|s| s.name.clone())
+        .collect();
+    let req_ty = Type::Custom(TypeId::native("cdt.http", "Request"));
+    let resp_ty = Type::Custom(TypeId::native("cdt.http", "Response"));
+    for rname in router_names {
+        if let Err(e) =
+            crate::frontend::check_sys::ensure_http_router_plan(&mut checked, &rname, &req_ty, &resp_ty)
+        {
+            let (sp, sf) = struct_locs
+                .get(&rname)
+                .cloned()
+                .unwrap_or((crate::frontend::lexer::Span::new(0, 0), None));
+            all_errors.push(format_check_err(sp, sf.as_deref(), e));
+        }
+    }
+
     let schedule_names: Vec<String> = checked
         .structs
         .iter()
@@ -262,7 +344,13 @@ pub fn check_program_with_roots(
         .map(|s| s.name.clone())
         .collect();
     for sname in schedule_names {
-        crate::frontend::check_sys::ensure_cron_schedule_plan(&mut checked, &sname)?;
+        if let Err(e) = crate::frontend::check_sys::ensure_cron_schedule_plan(&mut checked, &sname) {
+            let (sp, sf) = struct_locs
+                .get(&sname)
+                .cloned()
+                .unwrap_or((crate::frontend::lexer::Span::new(0, 0), None));
+            all_errors.push(format_check_err(sp, sf.as_deref(), e));
+        }
     }
     let db_model_names: Vec<String> = checked
         .structs
@@ -271,15 +359,33 @@ pub fn check_program_with_roots(
         .map(|s| s.name.clone())
         .collect();
     for mname in db_model_names {
-        crate::frontend::check_sys::ensure_db_model_plan(&mut checked, &mname)?;
+        if let Err(e) = crate::frontend::check_sys::ensure_db_model_plan(&mut checked, &mname) {
+            let (sp, sf) = struct_locs
+                .get(&mname)
+                .cloned()
+                .unwrap_or((crate::frontend::lexer::Span::new(0, 0), None));
+            all_errors.push(format_check_err(sp, sf.as_deref(), e));
+        }
     }
+
+    if !all_errors.is_empty() {
+        let mut seen_errs = HashSet::new();
+        all_errors.retain(|e| seen_errs.insert(e.clone()));
+        return Err(all_errors.join("\n"));
+    }
+
     shake_unreachable_funcs(program, &mut checked, explicit_roots)?;
     finalize_validation_plan_func_ids(&mut checked);
     Ok(checked)
 }
 
-fn check_default_exprs(program: &mut Program, checked: &mut CheckedProgram) -> Result<(), String> {
+fn check_default_exprs(
+    program: &mut Program,
+    checked: &mut CheckedProgram,
+    all_errors: &mut Vec<String>,
+) {
     for item in &mut program.items {
+        let source_file = item.source_file.clone();
         match &mut item.kind {
             ItemKind::Struct { name, type_params, fields, .. } if type_params.is_empty() => {
                 let sid = checked.struct_by_name[name];
@@ -291,15 +397,30 @@ fn check_default_exprs(program: &mut Program, checked: &mut CheckedProgram) -> R
                             scopes: vec![HashMap::new()],
                             current_return: Type::Void,
                             loop_depth: 0,
+                            in_defer: false,
+                            errors: Vec::new(),
+                            source_file: source_file.clone(),
                         };
-                        tc.check_expr(def_expr, Some(&expected))?;
-                        if !def_expr.ty.is_assignable_to(&expected) {
-                            return Err(format!(
-                                "Default value for field '{}.{}' expected {}, got {}",
-                                name, f.name, expected, def_expr.ty
+                        let res = tc.check_expr(def_expr, Some(&expected));
+                        all_errors.extend(tc.errors);
+                        if let Err(e) = res {
+                            all_errors.push(format_check_err(
+                                f.span,
+                                source_file.as_deref(),
+                                e,
                             ));
+                        } else if !def_expr.ty.is_assignable_to(&expected) {
+                            all_errors.push(format_check_err(
+                                def_expr.span,
+                                source_file.as_deref(),
+                                format!(
+                                    "Default value for field '{}.{}' expected {}, got {}",
+                                    name, f.name, expected, def_expr.ty
+                                ),
+                            ));
+                        } else {
+                            checked.structs[sid].fields[i].default = Some(def_expr.clone());
                         }
-                        checked.structs[sid].fields[i].default = Some(def_expr.clone());
                     }
                 }
             }
@@ -313,22 +434,146 @@ fn check_default_exprs(program: &mut Program, checked: &mut CheckedProgram) -> R
                             scopes: vec![HashMap::new()],
                             current_return: Type::Void,
                             loop_depth: 0,
+                            in_defer: false,
+                            errors: Vec::new(),
+                            source_file: source_file.clone(),
                         };
-                        tc.check_expr(def_expr, Some(&expected))?;
-                        if !def_expr.ty.is_assignable_to(&expected) {
-                            return Err(format!(
-                                "Default value for parameter '{}' of '{}' expected {}, got {}",
-                                p.name, name, expected, def_expr.ty
+                        let res = tc.check_expr(def_expr, Some(&expected));
+                        all_errors.extend(tc.errors);
+                        if let Err(e) = res {
+                            all_errors.push(format_check_err(
+                                p.span,
+                                source_file.as_deref(),
+                                e,
                             ));
+                        } else if !def_expr.ty.is_assignable_to(&expected) {
+                            all_errors.push(format_check_err(
+                                def_expr.span,
+                                source_file.as_deref(),
+                                format!(
+                                    "Default value for parameter '{}' of '{}' expected {}, got {}",
+                                    p.name, name, expected, def_expr.ty
+                                ),
+                            ));
+                        } else {
+                            checked.funcs[fid].defaults[i] = Some(def_expr.clone());
                         }
-                        checked.funcs[fid].defaults[i] = Some(def_expr.clone());
+                    }
+                }
+            }
+            ItemKind::Enum { name, variants } => {
+                if let Some(dvars) = checked.data_enums.get(name).cloned() {
+                    for (vast, dv) in variants.iter_mut().zip(dvars.iter()) {
+                        let sid = checked.struct_by_name[&dv.struct_name];
+                        for (i, f) in vast.fields.iter_mut().enumerate() {
+                            if let Some(def_expr) = &mut f.default {
+                                let expected = checked.structs[sid].fields[i].ty.clone();
+                                let mut tc = Checker {
+                                    checked,
+                                    scopes: vec![HashMap::new()],
+                                    current_return: Type::Void,
+                                    loop_depth: 0,
+                                    in_defer: false,
+                                    errors: Vec::new(),
+                                    source_file: source_file.clone(),
+                                };
+                                let res = tc.check_expr(def_expr, Some(&expected));
+                                all_errors.extend(tc.errors);
+                                if let Err(e) = res {
+                                    all_errors.push(format_check_err(
+                                        f.span,
+                                        source_file.as_deref(),
+                                        e,
+                                    ));
+                                } else if !def_expr.ty.is_assignable_to(&expected) {
+                                    all_errors.push(format_check_err(
+                                        def_expr.span,
+                                        source_file.as_deref(),
+                                        format!(
+                                            "Default value for field '{}.{}.{}' expected {}, got {}",
+                                            name, vast.name, f.name, expected, def_expr.ty
+                                        ),
+                                    ));
+                                } else {
+                                    checked.structs[sid].fields[i].default = Some(def_expr.clone());
+                                }
+                            }
+                        }
                     }
                 }
             }
             _ => {}
         }
     }
-    Ok(())
+}
+
+pub(crate) type ResolvedDataEnumBindings<'a> = (
+    &'a DataEnumVariant,
+    Vec<(String, &'a crate::frontend::types::ResolvedField)>,
+);
+
+pub(crate) fn resolve_data_enum_bindings<'a>(
+    checked: &'a CheckedProgram,
+    ename: &str,
+    vname: &str,
+    bindings: &[(Option<String>, String)],
+) -> Result<ResolvedDataEnumBindings<'a>, String> {
+    let vars = checked
+        .data_enums
+        .get(ename)
+        .ok_or_else(|| format!("Unknown data enum '{}'", ename))?;
+    let var = vars
+        .iter()
+        .find(|v| v.name == vname)
+        .ok_or_else(|| format!("Enum '{}' has no variant '{}'", ename, vname))?;
+    let sid = checked.struct_by_name[&var.struct_name];
+    let fields = &checked.structs[sid].fields;
+
+    if fields.is_empty() && !bindings.is_empty() {
+        return Err(format!(
+            "Unit enum variant '{}.{}' does not have payload fields",
+            ename, vname
+        ));
+    }
+
+    let mut out = Vec::with_capacity(bindings.len());
+    let mut seen_locals = HashSet::new();
+    let all_positional = bindings.iter().all(|(opt, _)| opt.is_none());
+
+    for (pos, (opt_fname, local)) in bindings.iter().enumerate() {
+        let target_field = if let Some(fname) = opt_fname {
+            fields.iter().find(|f| &f.name == fname).ok_or_else(|| {
+                format!("Enum variant '{}.{}' has no field '{}'", ename, vname, fname)
+            })?
+        } else if local == "_" {
+            if all_positional && pos < fields.len() {
+                &fields[pos]
+            } else {
+                continue;
+            }
+        } else if let Some(by_name) = fields.iter().find(|f| &f.name == local) {
+            by_name
+        } else if all_positional && bindings.len() == fields.len() {
+            &fields[pos]
+        } else {
+            return Err(format!(
+                "Enum variant '{}.{}' has no field '{}'",
+                ename, vname, local
+            ));
+        };
+
+        if local != "_" {
+            if !seen_locals.insert(local.clone()) {
+                return Err(format!(
+                    "Duplicate binding variable '{}' in pattern '{}.{}'",
+                    local, ename, vname
+                ));
+            }
+            out.push((local.clone(), target_field));
+        }
+    }
+
+    Ok((var, out))
 }
 
 pub(crate) struct Checker<'a> {
@@ -336,6 +581,9 @@ pub(crate) struct Checker<'a> {
     scopes: Vec<HashMap<String, Type>>,
     pub(crate) current_return: Type,
     pub(crate) loop_depth: usize,
+    pub(crate) in_defer: bool,
+    pub(crate) errors: Vec<String>,
+    pub(crate) source_file: Option<String>,
 }
 
 impl<'a> Checker<'a> {
@@ -373,10 +621,59 @@ impl<'a> Checker<'a> {
         None
     }
 
+    fn bind_pattern_any(&mut self, pat: &Pattern) {
+        match &pat.kind {
+            PatternKind::Ident(name) => {
+                if self.lookup(name).is_none() {
+                    self.bind(name.clone(), Type::Any);
+                }
+            }
+            PatternKind::Tuple(pats) => {
+                for p in pats {
+                    self.bind_pattern_any(p);
+                }
+            }
+            PatternKind::EnumVariant { bindings, .. } => {
+                for (_, var) in bindings {
+                    if var != "_" && self.lookup(var).is_none() {
+                        self.bind(var.clone(), Type::Any);
+                    }
+                }
+            }
+            PatternKind::Wildcard | PatternKind::Nil | PatternKind::Type { .. } => {}
+        }
+    }
+
+    pub(crate) fn record_stmt_error(&mut self, stmt: &Stmt, err: String) {
+        self.errors.push(format_check_err(
+            stmt.span,
+            self.source_file.as_deref(),
+            err,
+        ));
+        match &stmt.kind {
+            StmtKind::Define { name, .. } if self.lookup(name).is_none() => {
+                self.bind(name.clone(), Type::Any);
+            }
+            StmtKind::DestructureDefine { pattern, .. } => {
+                self.bind_pattern_any(pattern);
+            }
+            StmtKind::VarDecl { name, ty, .. } if self.lookup(name).is_none() => {
+                let fallback = ty
+                    .as_ref()
+                    .and_then(|te| self.checked.resolve_type(te).ok())
+                    .unwrap_or(Type::Any);
+                self.bind(name.clone(), fallback);
+            }
+            _ => {}
+        }
+    }
+
     fn check_block(&mut self, block: &mut Block) -> Result<(), String> {
         self.push_scope();
         for stmt in &mut block.stmts {
-            self.check_stmt(stmt)?;
+            if let Err(e) = self.check_stmt(stmt) {
+                self.record_stmt_error(stmt, e);
+            }
         }
         self.pop_scope();
         Ok(())
@@ -447,6 +744,9 @@ impl<'a> Checker<'a> {
                 }
             }
             StmtKind::Return(opt) => {
+                if self.in_defer {
+                    return Err("Cannot use 'return' inside 'defer'".to_string());
+                }
                 if let Some(expr) = opt {
                     let expected_ret = self.current_return.clone();
                     self.check_expr(expr, Some(&expected_ret))?;
@@ -505,7 +805,9 @@ impl<'a> Checker<'a> {
                 self.push_scope();
                 self.bind_pattern(pattern, &elem_ty)?;
                 for s in &mut body.stmts {
-                    self.check_stmt(s)?;
+                    if let Err(e) = self.check_stmt(s) {
+                        self.record_stmt_error(s, e);
+                    }
                 }
                 self.pop_scope();
                 self.loop_depth -= 1;
@@ -524,14 +826,68 @@ impl<'a> Checker<'a> {
             }
             StmtKind::Switch { expr, cases } => {
                 self.check_expr(expr, None)?;
+                let mut has_catch_all = false;
+                let mut covered_variants = HashSet::new();
                 for case in cases {
+                    match &case.pattern.kind {
+                        PatternKind::Wildcard => has_catch_all = true,
+                        PatternKind::Ident(n) if !n.contains('.') => has_catch_all = true,
+                        PatternKind::Ident(n) => {
+                            if let Some((_, rhs)) = n.split_once('.') {
+                                covered_variants.insert(rhs.to_string());
+                            }
+                        }
+                        PatternKind::Type { name, .. } => {
+                            if let Some((_, rhs)) = name.rsplit_once('.') {
+                                covered_variants.insert(rhs.to_string());
+                            } else if let Type::DataEnum(ename) = &expr.ty
+                                && name == ename
+                            {
+                                has_catch_all = true;
+                            }
+                        }
+                        PatternKind::EnumVariant { variant_name, .. } => {
+                            covered_variants.insert(variant_name.clone());
+                        }
+                        _ => {}
+                    }
                     self.push_scope();
                     self.bind_switch_pattern(&case.pattern, &expr.ty)?;
                     for s in &mut case.body.stmts {
-                        self.check_stmt(s)?;
+                        if let Err(e) = self.check_stmt(s) {
+                            self.record_stmt_error(s, e);
+                        }
                     }
                     self.pop_scope();
                 }
+                if let Type::DataEnum(ename) = &expr.ty
+                    && !has_catch_all
+                    && let Some(dvars) = self.checked.data_enums.get(ename)
+                {
+                    let missing: Vec<&str> = dvars
+                        .iter()
+                        .filter(|v| !covered_variants.contains(&v.name))
+                        .map(|v| v.name.as_str())
+                        .collect();
+                    if !missing.is_empty() {
+                        return Err(format!(
+                            "Non-exhaustive switch on enum '{}': missing variant(s) {}",
+                            ename,
+                            missing.join(", ")
+                        ));
+                    }
+                }
+            }
+            StmtKind::Defer(block) => {
+                if self.in_defer {
+                    return Err("Cannot nest 'defer' inside 'defer'".to_string());
+                }
+                let prev_loop = self.loop_depth;
+                self.loop_depth = 0;
+                self.in_defer = true;
+                let _ = self.check_block(block);
+                self.in_defer = false;
+                self.loop_depth = prev_loop;
             }
             StmtKind::Break | StmtKind::Continue => {
                 if self.loop_depth == 0 {
@@ -562,27 +918,97 @@ impl<'a> Checker<'a> {
 
     fn bind_switch_pattern(&mut self, pat: &Pattern, scrutinee_ty: &Type) -> Result<(), String> {
         if let PatternKind::Ident(pat_name) = &pat.kind
-            && let Type::Enum(ename) = scrutinee_ty
             && let Some((lhs, rhs)) = pat_name.split_once('.')
         {
-            if lhs != ename {
-                return Err(format!(
-                    "Enum pattern '{}' does not match enum type '{}'",
-                    pat_name, ename
-                ));
+            if let Type::Enum(ename) = scrutinee_ty {
+                if lhs != ename {
+                    return Err(format!(
+                        "Enum pattern '{}' does not match enum type '{}'",
+                        pat_name, ename
+                    ));
+                }
+                let variants = self.checked.enums.get(ename).ok_or_else(|| {
+                    format!("Unknown enum '{}'", ename)
+                })?;
+                if !variants.iter().any(|v| v == rhs) {
+                    return Err(format!("Enum '{}' has no variant '{}'", ename, rhs));
+                }
+                return Ok(());
             }
-            let variants = self.checked.enums.get(ename).ok_or_else(|| {
-                format!("Unknown enum '{}'", ename)
-            })?;
-            if !variants.iter().any(|v| v == rhs) {
-                return Err(format!("Enum '{}' has no variant '{}'", ename, rhs));
+            if let Type::DataEnum(ename) = scrutinee_ty {
+                if lhs != ename {
+                    return Err(format!(
+                        "Enum pattern '{}' does not match enum type '{}'",
+                        pat_name, ename
+                    ));
+                }
+                let (var, _) = resolve_data_enum_bindings(self.checked, ename, rhs, &[])?;
+                let sid = self.checked.struct_by_name[&var.struct_name];
+                if !self.checked.structs[sid].fields.is_empty() {
+                    return Err(format!(
+                        "Variant '{}.{}' has payload fields; match with 'case {}.{}({{...}}):' or 'case {}.{}(_):'",
+                        ename, rhs, ename, rhs, ename, rhs
+                    ));
+                }
+                return Ok(());
             }
-            return Ok(());
         }
         if let PatternKind::Type { name, binding } = &pat.kind {
+            if let Type::DataEnum(ename) = scrutinee_ty
+                && let Some((lhs, rhs)) = name.rsplit_once('.')
+            {
+                if lhs != ename {
+                    return Err(format!(
+                        "Enum pattern '{}' does not match enum type '{}'",
+                        name, ename
+                    ));
+                }
+                let (_, resolved_fields) = resolve_data_enum_bindings(
+                    self.checked,
+                    ename,
+                    rhs,
+                    &[(None, binding.clone())],
+                )?;
+                let to_bind: Vec<(String, Type)> = resolved_fields
+                    .into_iter()
+                    .map(|(local, f)| (local, f.ty.clone()))
+                    .collect();
+                for (local, ty) in to_bind {
+                    self.bind(local, ty);
+                }
+                return Ok(());
+            }
             let resolved = resolve_switch_pattern_type(name, scrutinee_ty, self.checked)?;
             if binding != "_" {
                 self.bind(binding.clone(), resolved);
+            }
+            Ok(())
+        } else if let PatternKind::EnumVariant {
+            enum_name,
+            variant_name,
+            bindings,
+        } = &pat.kind
+        {
+            let Type::DataEnum(ename) = scrutinee_ty else {
+                return Err(format!(
+                    "Variant pattern '{}.{}' requires enum type, got {}",
+                    enum_name, variant_name, scrutinee_ty
+                ));
+            };
+            if enum_name != ename {
+                return Err(format!(
+                    "Enum pattern '{}.{}' does not match enum type '{}'",
+                    enum_name, variant_name, ename
+                ));
+            }
+            let (_, resolved_fields) =
+                resolve_data_enum_bindings(self.checked, ename, variant_name, bindings)?;
+            let to_bind: Vec<(String, Type)> = resolved_fields
+                .into_iter()
+                .map(|(local, f)| (local, f.ty.clone()))
+                .collect();
+            for (local, ty) in to_bind {
+                self.bind(local, ty);
             }
             Ok(())
         } else {
@@ -682,6 +1108,9 @@ impl<'a> Checker<'a> {
                 Type::Tuple(tys)
             }
             ExprKind::Try(inner) => {
+                if self.in_defer {
+                    return Err("Cannot use '?' inside 'defer'; handle errors explicitly with 'switch'".to_string());
+                }
                 self.check_expr(inner, None)?;
                 match &inner.ty {
                     Type::Union(vars) => {
@@ -711,6 +1140,22 @@ impl<'a> Checker<'a> {
                         .ok_or_else(|| format!("Enum '{}' has no variant '{}'", ename, field))?;
                     const_inline = Some(ExprKind::Int(idx as i64));
                     Type::Enum(ename.clone())
+                } else if let ExprKind::Ident(ename) = &target.kind
+                    && self.lookup(ename).is_none()
+                    && let Some(dvars) = self.checked.data_enums.get(ename)
+                {
+                    let var = dvars
+                        .iter()
+                        .find(|v| &v.name == field)
+                        .ok_or_else(|| format!("Enum '{}' has no variant '{}'", ename, field))?;
+                    let sid = self.checked.struct_by_name[&var.struct_name];
+                    if !self.checked.structs[sid].fields.is_empty() {
+                        return Err(format!(
+                            "Enum variant '{}.{}' requires arguments",
+                            ename, field
+                        ));
+                    }
+                    Type::DataEnum(ename.clone())
                 } else if let ExprKind::Ident(alias) = &target.kind
                     && self.lookup(alias).is_none()
                     && self.checked.is_native_alias(alias, "cdt.validation")

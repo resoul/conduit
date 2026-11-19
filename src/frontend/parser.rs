@@ -616,10 +616,24 @@ impl Parser {
         let type_params = self.parse_type_params()?;
 
         self.expect(&TokenKind::LBrace)?;
+        let fields = self.parse_field_list(&TokenKind::RBrace)?;
+        self.expect(&TokenKind::RBrace)?;
+        Ok(Item::new_exported(
+            ItemKind::Struct {
+                name,
+                type_params,
+                fields,
+            },
+            start_span,
+            is_exported,
+        ))
+    }
+
+    fn parse_field_list(&mut self, closing: &TokenKind) -> Result<Vec<FieldDef>, ParserError> {
         let mut fields = Vec::new();
         let mut field_names = HashSet::new();
         let mut json_names = HashSet::new();
-        while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
+        while !self.check(closing) && !self.check(&TokenKind::Eof) {
             let mut annotations = Vec::new();
             while self.match_token(&TokenKind::At) {
                 annotations.push(self.parse_at_annotation()?);
@@ -638,9 +652,7 @@ impl Parser {
             let mut json_tag_span = None;
             let mut last_line = self.tokens[self.cursor - 1].span.line;
             loop {
-                if self.check(&TokenKind::At)
-                    && self.peek().span.line == last_line
-                {
+                if self.check(&TokenKind::At) && self.peek().span.line == last_line {
                     self.bump();
                     let ann = self.parse_at_annotation()?;
                     last_line = self.tokens[self.cursor - 1].span.line;
@@ -659,8 +671,9 @@ impl Parser {
                         };
                         if s.contains(',') {
                             return Err(ParserError {
-                                message: "JSON tag options are not supported; specify only the field name"
-                                    .to_string(),
+                                message:
+                                    "JSON tag options are not supported; specify only the field name"
+                                        .to_string(),
                                 span: ann.span,
                             });
                         }
@@ -711,16 +724,7 @@ impl Parser {
             });
             self.match_token(&TokenKind::Comma);
         }
-        self.expect(&TokenKind::RBrace)?;
-        Ok(Item::new_exported(
-            ItemKind::Struct {
-                name,
-                type_params,
-                fields,
-            },
-            start_span,
-            is_exported,
-        ))
+        Ok(fields)
     }
 
     fn parse_at_annotation(&mut self) -> Result<FieldAnnotation, ParserError> {
@@ -790,8 +794,31 @@ impl Parser {
         self.expect(&TokenKind::LBrace)?;
         let mut variants = Vec::new();
         while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
-            let (v, _) = self.expect_ident()?;
-            variants.push(v);
+            let (v, vspan) = self.expect_ident()?;
+            let fields = if self.match_token(&TokenKind::LParen) {
+                let parsed = self.parse_field_list(&TokenKind::RParen)?;
+                self.expect(&TokenKind::RParen)?;
+                for f in &parsed {
+                    let eff = f.json_name.as_deref().unwrap_or(&f.name);
+                    if f.name == "type" || eff == "type" {
+                        return Err(ParserError {
+                            message: format!(
+                                "Field '{}' in enum variant '{}.{}' cannot use reserved name 'type'",
+                                f.name, name, v
+                            ),
+                            span: f.span,
+                        });
+                    }
+                }
+                parsed
+            } else {
+                Vec::new()
+            };
+            variants.push(EnumVariantDef {
+                name: v,
+                fields,
+                span: vspan,
+            });
             self.match_token(&TokenKind::Comma);
         }
         self.expect(&TokenKind::RBrace)?;

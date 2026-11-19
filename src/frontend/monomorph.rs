@@ -92,7 +92,7 @@ pub(crate) fn ensure_monomorphized_struct(
             o
         };
         let json_name = f.json_name.clone().unwrap_or_else(|| f.name.clone());
-        if let Some(jty) = type_to_json_type(&fty, &checked.struct_by_name) {
+        if let Some(jty) = type_to_json_type(&fty, checked) {
             schema_fields.push(crate::native::StructFieldDef {
                 name: f.name.clone(),
                 json_name: json_name.clone(),
@@ -138,6 +138,7 @@ pub(crate) fn ensure_monomorphized_struct(
         is_imported: false,
         doc: None,
         annotations: Vec::new(),
+        source_file: None,
         kind: ItemKind::Struct {
             name: mono_name.clone(),
             type_params: Vec::new(),

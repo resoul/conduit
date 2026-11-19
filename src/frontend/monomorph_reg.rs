@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::frontend::ast::*;
-use crate::frontend::check::{CheckedProgram, type_to_json_type};
+use crate::frontend::check::{CheckedProgram, DataEnumVariant, type_to_json_type};
 use crate::frontend::monomorph::{GenericFuncTemplate, GenericStructTemplate};
 use crate::frontend::monomorph_subst::resolve_type_expr_with_scope;
 use crate::frontend::reachability::expand_program_aliases;
@@ -23,6 +23,7 @@ pub(crate) fn register_program_types(
     checked: &mut CheckedProgram,
 ) -> Result<(), String> {
     let mut struct_defs: Vec<(usize, String, Vec<FieldDef>)> = Vec::new();
+    let mut enum_tags: HashMap<usize, String> = HashMap::new();
     let mut aliases: HashMap<String, TypeExpr> = HashMap::new();
     for item in &program.items {
         match &item.kind {
@@ -76,6 +77,7 @@ pub(crate) fn register_program_types(
             }
             ItemKind::Enum { name, variants } => {
                 if checked.enums.contains_key(name)
+                    || checked.data_enums.contains_key(name)
                     || checked.struct_by_name.contains_key(name)
                     || checked.generic_structs.contains_key(name)
                 {
@@ -83,11 +85,42 @@ pub(crate) fn register_program_types(
                 }
                 let mut seen = HashSet::new();
                 for v in variants {
-                    if !seen.insert(v.clone()) {
-                        return Err(format!("Duplicate variant '{}' in enum '{}'", v, name));
+                    if !seen.insert(v.name.clone()) {
+                        return Err(format!("Duplicate variant '{}' in enum '{}'", v.name, name));
+                    }
+                    for f in &v.fields {
+                        let eff = f.json_name.as_deref().unwrap_or(&f.name);
+                        if f.name == "type" || eff == "type" {
+                            return Err(format!(
+                                "Field '{}' in enum variant '{}.{}' cannot use reserved name 'type'",
+                                f.name, name, v.name
+                            ));
+                        }
                     }
                 }
-                checked.enums.insert(name.clone(), variants.clone());
+                if variants.iter().all(|v| v.fields.is_empty()) {
+                    checked.enums.insert(
+                        name.clone(),
+                        variants.iter().map(|v| v.name.clone()).collect(),
+                    );
+                } else {
+                    let mut dvars = Vec::with_capacity(variants.len());
+                    for v in variants {
+                        let sname = format!("__enum_{}__{}", name, v.name);
+                        let id = struct_defs.len();
+                        if checked.struct_by_name.insert(sname.clone(), id).is_some() {
+                            return Err(format!("Duplicate synthetic enum variant '{}'", sname));
+                        }
+                        enum_tags.insert(id, v.name.clone());
+                        struct_defs.push((id, sname.clone(), v.fields.clone()));
+                        dvars.push(DataEnumVariant {
+                            name: v.name.clone(),
+                            struct_name: sname,
+                            schema_id: id as u32,
+                        });
+                    }
+                    checked.data_enums.insert(name.clone(), dvars);
+                }
             }
             _ => {}
         }
@@ -116,6 +149,14 @@ pub(crate) fn register_program_types(
                 ItemKind::Error { name, fields } => {
                     let id = checked.struct_by_name[name];
                     struct_defs.push((id, name.clone(), fields.clone()));
+                }
+                ItemKind::Enum { name, variants } => {
+                    if let Some(dvars) = checked.data_enums.get(name) {
+                        for (v, dv) in variants.iter().zip(dvars.iter()) {
+                            let id = checked.struct_by_name[&dv.struct_name];
+                            struct_defs.push((id, dv.struct_name.clone(), v.fields.clone()));
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -153,7 +194,7 @@ pub(crate) fn register_program_types(
                 o
             };
             let json_name = f.json_name.clone().unwrap_or_else(|| f.name.clone());
-            if let Some(jty) = type_to_json_type(&ty, &checked.struct_by_name) {
+            if let Some(jty) = type_to_json_type(&ty, checked) {
                 schema_fields.push(StructFieldDef {
                     name: f.name.clone(),
                     json_name: json_name.clone(),
@@ -241,11 +282,12 @@ pub(crate) fn register_program_types(
             scalar_len,
             obj_len,
         };
-        checked.struct_schemas[*id] = StructSchema::with_error_flag(
+        checked.struct_schemas[*id] = StructSchema::with_flags(
             *id as u32,
             name,
             schema_fields,
             checked.error_structs.contains(name),
+            enum_tags.get(id).cloned(),
         );
     }
 

@@ -133,7 +133,7 @@ pub(crate) fn type_to_type_expr(ty: &Type) -> TypeExpr {
         Type::Nil => TypeExpr::Named("Nil".into()),
         Type::Void => TypeExpr::Named("Void".into()),
         Type::Any => TypeExpr::Named("Any".into()),
-        Type::TypeParam(n) | Type::Enum(n) => TypeExpr::Named(n.clone()),
+        Type::TypeParam(n) | Type::Enum(n) | Type::DataEnum(n) => TypeExpr::Named(n.clone()),
         Type::List(t) => TypeExpr::List(Box::new(type_to_type_expr(t))),
         Type::Optional(t) => TypeExpr::Optional(Box::new(type_to_type_expr(t))),
         Type::Map(k, v) => TypeExpr::Generic {
@@ -408,6 +408,7 @@ pub(crate) fn subst_block(block: &mut Block, subst: &HashMap<String, TypeExpr>) 
             }
             StmtKind::Return(Some(e)) => subst_expr(e, subst),
             StmtKind::Return(None) | StmtKind::Break | StmtKind::Continue => {}
+            StmtKind::Defer(block) => subst_block(block, subst),
             StmtKind::If { condition, then_block, else_block } => {
                 subst_expr(condition, subst);
                 subst_block(then_block, subst);

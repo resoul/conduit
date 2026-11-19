@@ -24,6 +24,7 @@ impl Parser {
             TokenKind::KwFor => self.parse_for_stmt(),
             TokenKind::KwWhile => self.parse_while_stmt(),
             TokenKind::KwSwitch => self.parse_switch_stmt(),
+            TokenKind::KwDefer => self.parse_defer_stmt(),
             TokenKind::KwBreak => Ok(Stmt::new(StmtKind::Break, self.bump().span)),
             TokenKind::KwContinue => Ok(Stmt::new(StmtKind::Continue, self.bump().span)),
             TokenKind::KwVar => self.parse_var_decl_stmt(),
@@ -61,6 +62,21 @@ impl Parser {
                 }
             }
         }
+    }
+
+    fn parse_defer_stmt(&mut self) -> Result<Stmt, ParserError> {
+        let span = self.expect(&TokenKind::KwDefer)?.span;
+        let block = if self.check(&TokenKind::LBrace) {
+            self.parse_block()?
+        } else {
+            let expr = self.parse_expr()?;
+            let expr_span = expr.span;
+            Block {
+                stmts: vec![Stmt::new(StmtKind::Expr(expr), expr_span)],
+                span,
+            }
+        };
+        Ok(Stmt::new(StmtKind::Defer(block), span))
     }
 
     fn parse_return_stmt(&mut self) -> Result<Stmt, ParserError> {
@@ -208,30 +224,66 @@ impl Parser {
             }
             TokenKind::Ident(name) => {
                 self.bump();
-                let mut full_name = if self.match_token(&TokenKind::Dot) {
-                    format!("{}.{}", name, self.expect_ident()?.0)
-                } else {
-                    name
-                };
+                let mut full_name = name;
+                while self.match_token(&TokenKind::Dot) {
+                    full_name.push('.');
+                    full_name.push_str(&self.expect_ident()?.0);
+                }
                 if self.check(&TokenKind::Lt) {
                     let args = self.parse_type_arg_list()?;
                     let rendered: Vec<String> = args.iter().map(format_type_expr).collect();
                     full_name = format!("{}<{}>", full_name, rendered.join(", "));
                 }
                 if self.match_token(&TokenKind::LParen) {
-                    let binding = if self.match_token(&TokenKind::Underscore) {
-                        "_".to_string()
-                    } else {
-                        self.expect_ident()?.0
-                    };
+                    let mut bindings: Vec<(Option<String>, String)> = Vec::new();
+                    while !self.check(&TokenKind::RParen) && !self.check(&TokenKind::Eof) {
+                        let b = if self.match_token(&TokenKind::Underscore) {
+                            (None, "_".to_string())
+                        } else {
+                            let (first, _) = self.expect_ident()?;
+                            if self.match_token(&TokenKind::Colon) {
+                                let target = if self.match_token(&TokenKind::Underscore) {
+                                    "_".to_string()
+                                } else {
+                                    self.expect_ident()?.0
+                                };
+                                (Some(first), target)
+                            } else {
+                                (None, first)
+                            }
+                        };
+                        bindings.push(b);
+                        if !self.match_token(&TokenKind::Comma) {
+                            break;
+                        }
+                    }
                     self.expect(&TokenKind::RParen)?;
-                    Ok(Pattern::new(
-                        PatternKind::Type {
-                            name: full_name,
-                            binding,
-                        },
-                        tok.span,
-                    ))
+                    if bindings.len() == 1 && bindings[0].0.is_none() {
+                        Ok(Pattern::new(
+                            PatternKind::Type {
+                                name: full_name,
+                                binding: bindings.into_iter().next().unwrap().1,
+                            },
+                            tok.span,
+                        ))
+                    } else if let Some((ename, vname)) = full_name.rsplit_once('.') {
+                        Ok(Pattern::new(
+                            PatternKind::EnumVariant {
+                                enum_name: ename.to_string(),
+                                variant_name: vname.to_string(),
+                                bindings,
+                            },
+                            tok.span,
+                        ))
+                    } else {
+                        Err(ParserError {
+                            message: format!(
+                                "Pattern '{}' expects a single binding variable",
+                                full_name
+                            ),
+                            span: tok.span,
+                        })
+                    }
                 } else {
                     Ok(Pattern::new(PatternKind::Ident(full_name), tok.span))
                 }

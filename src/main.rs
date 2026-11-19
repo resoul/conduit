@@ -1,4 +1,5 @@
 use std::env;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -105,6 +106,8 @@ fn main() {
         Some("check") => run_check_cmd(args.get(1)),
         Some("disasm") => run_disasm_cmd(args.get(1)),
         Some("run") => run_exec_cmd(&args[1..]),
+        Some("routes") => run_routes_cmd(&args[1..]),
+        Some("openapi") => run_openapi_cmd(&args[1..]),
         Some("test") => test_runner::run_test_cmd(&args[1..]),
         Some("watch") => watch::run_watch_cmd(&args[1..]),
         Some("fmt") => run_fmt_cmd(&args[1..]),
@@ -121,12 +124,12 @@ fn main() {
         }
         Some("--help" | "-h" | "help") => {
             println!(
-                "Conduit v{}\n\nUsage:\n  conduit bench [--filter <pat>] [--strict]\n  conduit build <file.cdt> [-o <output>]\n  conduit check <file.cdt>\n  conduit cron <list|print|run> <file.cdt> [job]\n  conduit db <migrate|rollback|status> <file.cdt> [--url <dsn>] [--steps <n>] [--dry-run]\n  conduit disasm <file.cdt>\n  conduit fmt <file_or_dir> [--check]\n  conduit run <file.cdt> [-- args...]\n  conduit test [file_or_dir] [--filter <pat>] [--fail-fast]\n  conduit watch <file.cdt> [-- args...]\n  conduit lsp\n  conduit --version, -V\n  conduit --help, -h",
+                "Conduit v{}\n\nUsage:\n  conduit bench [--filter <pat>] [--strict]\n  conduit build <file.cdt> [-o <output>]\n  conduit check <file.cdt>\n  conduit cron <list|print|run> <file.cdt> [job]\n  conduit db <migrate|rollback|status> <file.cdt> [--url <dsn>] [--steps <n>] [--dry-run]\n  conduit disasm <file.cdt>\n  conduit fmt <file_or_dir> [--check]\n  conduit openapi <file.cdt> [--router <name>] [--title <str>] [--version <str>] [--server <url>] [-o <file>]\n  conduit routes <file.cdt> [--router <name>]\n  conduit run <file.cdt> [-- args...]\n  conduit test [file_or_dir] [--filter <pat>] [--fail-fast]\n  conduit watch <file.cdt> [-- args...]\n  conduit lsp\n  conduit --version, -V\n  conduit --help, -h",
                 env!("CARGO_PKG_VERSION")
             );
         }
         Some(cmd) => {
-            eprintln!("Unknown command '{}'. Usage: conduit <bench|build|check|cron|db|disasm|fmt|run|test|watch|lsp> ...", cmd);
+            eprintln!("Unknown command '{}'. Usage: conduit <bench|build|check|cron|db|disasm|fmt|openapi|routes|run|test|watch|lsp> ...", cmd);
             process::exit(2);
         }
     }
@@ -217,7 +220,7 @@ fn run_db_cmd(args: &[String]) {
     let (program, checked) = match frontend::check_file(Path::new(&file_str)) {
         Ok(res) => res,
         Err(e) => {
-            eprintln!("Check error: {}", e);
+            print_check_error(Path::new(&file_str), &e);
             process::exit(1);
         }
     };
@@ -300,6 +303,15 @@ fn run_db_cmd(args: &[String]) {
     }
 }
 
+fn print_check_error(path: &Path, err: &str) {
+    let rendered = conduit::diagnostics::render_diagnostics(
+        err,
+        Some(path),
+        std::io::stderr().is_terminal(),
+    );
+    eprintln!("{}", rendered);
+}
+
 fn require_path_arg<'a>(arg: Option<&'a String>, cmd: &str) -> &'a Path {
     let Some(path) = arg else {
         eprintln!("Usage: conduit {} <file.cdt>", cmd);
@@ -319,7 +331,7 @@ fn run_check_cmd(arg: Option<&String>) {
             );
         }
         Err(e) => {
-            eprintln!("Check error: {}", e);
+            print_check_error(path, &e);
             process::exit(1);
         }
     }
@@ -330,7 +342,7 @@ fn run_disasm_cmd(arg: Option<&String>) {
     match frontend::compile_file(path) {
         Ok(module) => print!("{}", module.disassemble()),
         Err(e) => {
-            eprintln!("Compile error: {}", e);
+            print_check_error(path, &e);
             process::exit(1);
         }
     }
@@ -347,7 +359,7 @@ fn run_exec_cmd(args: &[String]) {
     let (program, checked) = match frontend::check_file(path) {
         Ok(res) => res,
         Err(e) => {
-            eprintln!("Check error: {}", e);
+            print_check_error(path, &e);
             process::exit(1);
         }
     };
@@ -438,7 +450,7 @@ fn run_build_cmd(args: &[String]) {
     let (program, checked) = match frontend::check_file(in_path) {
         Ok(res) => res,
         Err(e) => {
-            eprintln!("Check error: {}", e);
+            print_check_error(in_path, &e);
             process::exit(1);
         }
     };
@@ -501,7 +513,7 @@ fn run_cron_cmd(args: &[String]) {
     let (program, checked) = match frontend::check_file(Path::new(file)) {
         Ok(res) => res,
         Err(e) => {
-            eprintln!("{}", e);
+            print_check_error(Path::new(file), &e);
             process::exit(1);
         }
     };
@@ -569,5 +581,179 @@ fn run_cron_cmd(args: &[String]) {
             eprintln!("Unknown cron subcommand '{}'. Expected list, print, or run", other);
             process::exit(2);
         }
+    }
+}
+
+fn run_routes_cmd(args: &[String]) {
+    let mut file: Option<String> = None;
+    let mut router: Option<String> = None;
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--router" | "-r" => {
+                i += 1;
+                if i < args.len() {
+                    router = Some(args[i].clone());
+                } else {
+                    eprintln!("Missing router name after {}", args[i - 1]);
+                    process::exit(2);
+                }
+            }
+            arg if !arg.starts_with('-') && file.is_none() => {
+                file = Some(arg.to_string());
+            }
+            other => {
+                eprintln!(
+                    "Usage: conduit routes <file.cdt> [--router <name>] (unexpected '{}')",
+                    other
+                );
+                process::exit(2);
+            }
+        }
+        i += 1;
+    }
+    let Some(file_str) = file else {
+        eprintln!("Usage: conduit routes <file.cdt> [--router <name>]");
+        process::exit(2);
+    };
+    let path = Path::new(&file_str);
+    let (_, checked) = match frontend::check_file(path) {
+        Ok(res) => res,
+        Err(e) => {
+            print_check_error(path, &e);
+            process::exit(1);
+        }
+    };
+    match conduit::openapi::format_routes(&checked, router.as_deref()) {
+        Ok(table) => println!("{}", table),
+        Err(e) => {
+            eprintln!("Routes error: {}", e);
+            process::exit(1);
+        }
+    }
+}
+
+fn run_openapi_cmd(args: &[String]) {
+    let mut file: Option<String> = None;
+    let mut router: Option<String> = None;
+    let mut title: Option<String> = None;
+    let mut version: Option<String> = None;
+    let mut server: Option<String> = None;
+    let mut output: Option<String> = None;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--router" | "-r" => {
+                i += 1;
+                if i < args.len() {
+                    router = Some(args[i].clone());
+                } else {
+                    eprintln!("Missing router name after {}", args[i - 1]);
+                    process::exit(2);
+                }
+            }
+            "--title" => {
+                i += 1;
+                if i < args.len() {
+                    title = Some(args[i].clone());
+                } else {
+                    eprintln!("Missing title after --title");
+                    process::exit(2);
+                }
+            }
+            "--version" => {
+                i += 1;
+                if i < args.len() {
+                    version = Some(args[i].clone());
+                } else {
+                    eprintln!("Missing version after --version");
+                    process::exit(2);
+                }
+            }
+            "--server" | "-s" => {
+                i += 1;
+                if i < args.len() {
+                    server = Some(args[i].clone());
+                } else {
+                    eprintln!("Missing URL after {}", args[i - 1]);
+                    process::exit(2);
+                }
+            }
+            "-o" | "--output" => {
+                i += 1;
+                if i < args.len() {
+                    output = Some(args[i].clone());
+                } else {
+                    eprintln!("Missing output path after {}", args[i - 1]);
+                    process::exit(2);
+                }
+            }
+            arg if !arg.starts_with('-') && file.is_none() => {
+                file = Some(arg.to_string());
+            }
+            other => {
+                eprintln!(
+                    "Usage: conduit openapi <file.cdt> [--router <name>] [--title <str>] [--version <str>] [--server <url>] [-o <file>] (unexpected '{}')",
+                    other
+                );
+                process::exit(2);
+            }
+        }
+        i += 1;
+    }
+
+    let Some(file_str) = file else {
+        eprintln!(
+            "Usage: conduit openapi <file.cdt> [--router <name>] [--title <str>] [--version <str>] [--server <url>] [-o <file>]"
+        );
+        process::exit(2);
+    };
+    let path = Path::new(&file_str);
+    let (program, checked) = match frontend::check_file(path) {
+        Ok(res) => res,
+        Err(e) => {
+            print_check_error(path, &e);
+            process::exit(1);
+        }
+    };
+
+    let resolved_title = title.unwrap_or_else(|| {
+        if let Some(r) = &router {
+            r.clone()
+        } else if checked.http_router_plans.len() == 1 {
+            conduit::openapi::clean_symbol_name(&checked.http_router_plans[0].0).to_string()
+        } else {
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("Conduit API")
+                .to_string()
+        }
+    });
+    let resolved_version = version.as_deref().unwrap_or("0.1.0");
+
+    let spec = match conduit::openapi::generate_openapi_json(
+        &program,
+        &checked,
+        &resolved_title,
+        resolved_version,
+        router.as_deref(),
+        server.as_deref(),
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("OpenAPI error: {}", e);
+            process::exit(1);
+        }
+    };
+
+    if let Some(out_file) = output {
+        if let Err(e) = std::fs::write(&out_file, format!("{}\n", spec)) {
+            eprintln!("Failed to write '{}': {}", out_file, e);
+            process::exit(1);
+        }
+    } else {
+        println!("{}", spec);
     }
 }

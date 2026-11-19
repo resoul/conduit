@@ -47,14 +47,23 @@ pub(crate) fn build_validation_plans(
     checked: &mut CheckedProgram,
 ) -> Result<(), String> {
     let mut plans = Vec::with_capacity(checked.structs.len());
+    let mut targets: Vec<(&str, &Vec<FieldDef>)> = Vec::new();
     for item in &program.items {
-        let fields_ast = match &item.kind {
-            ItemKind::Struct { name, fields, .. } => Some((name.as_str(), fields)),
-            _ => None,
-        };
-        let Some((struct_name, fields)) = fields_ast else {
-            continue;
-        };
+        match &item.kind {
+            ItemKind::Struct { name, fields, .. } => {
+                targets.push((name.as_str(), fields));
+            }
+            ItemKind::Enum { name, variants } => {
+                if let Some(dvars) = checked.data_enums.get(name) {
+                    for (vast, dv) in variants.iter().zip(dvars.iter()) {
+                        targets.push((dv.struct_name.as_str(), &vast.fields));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for (struct_name, fields) in targets {
         let sid = checked.struct_by_name[struct_name];
         let resolved_struct = &checked.structs[sid];
         let mut fplans = Vec::with_capacity(fields.len());

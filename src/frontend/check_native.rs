@@ -238,6 +238,7 @@ pub fn resolve_type_expr(te: &TypeExpr, checked: &CheckedProgram) -> Result<Type
                 Ok(Type::Custom(TypeId::program(name)))
             }
             _ if checked.enums.contains_key(name) => Ok(Type::Enum(name.clone())),
+            _ if checked.data_enums.contains_key(name) => Ok(Type::DataEnum(name.clone())),
             _ if checked.native_direct_types.contains_key(name) => {
                 let (mod_name, ty_name) = &checked.native_direct_types[name];
                 Ok(Type::Custom(TypeId::native(*mod_name, ty_name)))
@@ -312,22 +313,26 @@ pub fn resolve_type_expr(te: &TypeExpr, checked: &CheckedProgram) -> Result<Type
     }
 }
 
-pub fn type_to_json_type(ty: &Type, structs: &HashMap<String, usize>) -> Option<JsonType> {
+pub fn type_to_json_type(ty: &Type, checked: &CheckedProgram) -> Option<JsonType> {
     match ty {
         Type::Int => Some(JsonType::Int),
         Type::Float => Some(JsonType::Float),
         Type::Bool => Some(JsonType::Bool),
         Type::String => Some(JsonType::String),
         Type::Optional(inner) => {
-            Some(JsonType::Optional(Box::new(type_to_json_type(inner, structs)?)))
+            Some(JsonType::Optional(Box::new(type_to_json_type(inner, checked)?)))
         }
-        Type::List(inner) => Some(JsonType::List(Box::new(type_to_json_type(inner, structs)?))),
+        Type::List(inner) => Some(JsonType::List(Box::new(type_to_json_type(inner, checked)?))),
         Type::Map(k, v) if **k == Type::String => {
-            Some(JsonType::Map(Box::new(type_to_json_type(v, structs)?)))
+            Some(JsonType::Map(Box::new(type_to_json_type(v, checked)?)))
         }
         Type::Custom(tid) if tid.module == ModuleId::Program => {
-            structs.get(&tid.name).map(|&idx| JsonType::Struct(idx as u32))
+            checked.struct_by_name.get(&tid.name).map(|&idx| JsonType::Struct(idx as u32))
         }
+        Type::DataEnum(ename) => checked.data_enums.get(ename).map(|vars| JsonType::TaggedEnum {
+            name: ename.clone(),
+            variants: vars.iter().map(|v| (v.name.clone(), v.schema_id)).collect(),
+        }),
         _ => None,
     }
 }

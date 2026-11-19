@@ -1394,10 +1394,17 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                                 c: handler_o,
                             });
                             if let Some(body_name) = &entry.body_struct {
-                                let sid = self.mc.checked.struct_by_name[body_name] as u32;
-                                let plan_idx = self
-                                    .mc
-                                    .add_json_decode_plan(&crate::native::JsonType::Struct(sid))?;
+                                let json_ty = if self.mc.checked.data_enums.contains_key(body_name) {
+                                    crate::frontend::check::type_to_json_type(
+                                        &Type::DataEnum(body_name.clone()),
+                                        self.mc.checked,
+                                    )
+                                    .ok_or_else(|| format!("Invalid router body type '{}'", body_name))?
+                                } else {
+                                    let sid = self.mc.checked.struct_by_name[body_name] as u32;
+                                    crate::native::JsonType::Struct(sid)
+                                };
+                                let plan_idx = self.mc.add_json_decode_plan(&json_ty)?;
                                 self.ops.push(Op::ExtOp {
                                     kind: EXT_HTTP_OP,
                                     aux: HTTP_ROUTE_TYPED_BODY,
@@ -1483,7 +1490,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 let target_ty = self.mc.resolve_type(&type_args[0])?;
                 let json_ty = crate::frontend::check_native::type_to_json_type(
                     &target_ty,
-                    &self.mc.checked.struct_by_name,
+                    self.mc.checked,
                 )
                 .ok_or_else(|| format!("Unsupported JSON type '{}' in http.get_json()", target_ty))?;
                 let plan_idx = self.mc.add_json_decode_plan(&json_ty)?;
@@ -2107,7 +2114,9 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 }
                 Ok(())
             }
-            PatternKind::Type { .. } => Err("Unexpected type pattern in value binding".to_string()),
+            PatternKind::Type { .. } | PatternKind::EnumVariant { .. } => {
+                Err("Unexpected type pattern in value binding".to_string())
+            }
         }
     }
 

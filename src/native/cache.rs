@@ -391,6 +391,7 @@ struct CacheInner {
     entries: HashMap<String, CacheEntry>,
     lru_order: BTreeMap<u64, String>,
     lru_clock: u64,
+    ttl_entries: usize,
     wal: Option<WalState>,
 }
 
@@ -401,12 +402,16 @@ impl CacheInner {
             entries: HashMap::new(),
             lru_order: BTreeMap::new(),
             lru_clock: 0,
+            ttl_entries: 0,
             wal: None,
         }
     }
 
     fn remove_key_only(&mut self, key: &str) -> bool {
         if let Some(old) = self.entries.remove(key) {
+            if old.expires_at_ms.is_some() {
+                self.ttl_entries = self.ttl_entries.saturating_sub(1);
+            }
             self.lru_order.remove(&old.lru_seq);
             true
         } else {
@@ -414,19 +419,15 @@ impl CacheInner {
         }
     }
 
-    fn touch_existing(&mut self, key: &str) {
-        if let Some(entry) = self.entries.get_mut(key) {
-            self.lru_order.remove(&entry.lru_seq);
-            self.lru_clock = self.lru_clock.wrapping_add(1);
-            let seq = self.lru_clock;
-            entry.lru_seq = seq;
-            self.lru_order.insert(seq, key.to_string());
-        }
-    }
-
     fn insert_in_memory(&mut self, key: String, value: String, expires_at_ms: Option<i64>) {
         if let Some(old) = self.entries.remove(&key) {
+            if old.expires_at_ms.is_some() {
+                self.ttl_entries = self.ttl_entries.saturating_sub(1);
+            }
             self.lru_order.remove(&old.lru_seq);
+        }
+        if expires_at_ms.is_some() {
+            self.ttl_entries += 1;
         }
         self.lru_clock = self.lru_clock.wrapping_add(1);
         let seq = self.lru_clock;
@@ -442,6 +443,9 @@ impl CacheInner {
     }
 
     fn prune_expired(&mut self, now_ms: i64) -> usize {
+        if self.ttl_entries == 0 {
+            return 0;
+        }
         let expired_keys: Vec<(String, u64)> = self
             .entries
             .iter()
@@ -450,7 +454,11 @@ impl CacheInner {
             .collect();
         let count = expired_keys.len();
         for (k, seq) in expired_keys {
-            self.entries.remove(&k);
+            if let Some(old) = self.entries.remove(&k)
+                && old.expires_at_ms.is_some()
+            {
+                self.ttl_entries = self.ttl_entries.saturating_sub(1);
+            }
             self.lru_order.remove(&seq);
         }
         count
@@ -461,13 +469,22 @@ impl CacheInner {
         if self.max_entries == 0 || self.entries.len() <= self.max_entries {
             return evicted;
         }
-        self.prune_expired(now_ms);
+        if self.ttl_entries > 0 {
+            self.prune_expired(now_ms);
+        }
+        let record_evicted = self.wal.is_some();
         while self.entries.len() > self.max_entries {
             let Some((_, k)) = self.lru_order.pop_first() else {
                 break;
             };
-            self.entries.remove(&k);
-            evicted.push(k);
+            if let Some(old) = self.entries.remove(&k)
+                && old.expires_at_ms.is_some()
+            {
+                self.ttl_entries = self.ttl_entries.saturating_sub(1);
+            }
+            if record_evicted {
+                evicted.push(k);
+            }
         }
         evicted
     }
@@ -634,6 +651,7 @@ impl CacheStore {
                     "clear" => {
                         inner.entries.clear();
                         inner.lru_order.clear();
+                        inner.ttl_entries = 0;
                     }
                     other => {
                         return Err((
@@ -673,18 +691,20 @@ impl CacheStore {
     }
 
     pub(crate) fn get_str(&self, key: &str) -> Option<String> {
-        let now = now_unix_ms();
-        let mut inner = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let expired = inner
-            .entries
-            .get(key)
-            .is_some_and(|e| e.is_expired(now));
-        if expired {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let inner = &mut *guard;
+        let next_seq = inner.lru_clock.wrapping_add(1);
+        let entry = inner.entries.get_mut(key)?;
+        if entry.expires_at_ms.is_some() && entry.is_expired(now_unix_ms()) {
             inner.remove_key_only(key);
             return None;
         }
-        let val = inner.entries.get(key).map(|e| e.value.clone())?;
-        inner.touch_existing(key);
+        let val = entry.value.clone();
+        let old_seq = entry.lru_seq;
+        entry.lru_seq = next_seq;
+        inner.lru_clock = next_seq;
+        inner.lru_order.remove(&old_seq);
+        inner.lru_order.insert(next_seq, key.to_string());
         Some(val)
     }
 
@@ -694,17 +714,26 @@ impl CacheStore {
         val: &str,
         ttl_ms: Option<i64>,
     ) -> Result<(), (&'static str, String)> {
+        let mut now_cached: Option<i64> = None;
         let exp = match ttl_ms {
             None => None,
             Some(ms) if ms < 0 => {
                 return Err(("invalid_input", "Cache TTL must be non-negative".to_string()));
             }
             Some(0) => None,
-            Some(ms) => Some(now_unix_ms().saturating_add(ms)),
+            Some(ms) => {
+                let n = now_unix_ms();
+                now_cached = Some(n);
+                Some(n.saturating_add(ms))
+            }
         };
-        let now = now_unix_ms();
         let mut inner = self.state.lock().unwrap_or_else(|e| e.into_inner());
         inner.insert_in_memory(key.to_string(), val.to_string(), exp);
+        let now = if inner.ttl_entries > 0 {
+            now_cached.unwrap_or_else(now_unix_ms)
+        } else {
+            0
+        };
         let evicted = inner.enforce_cap(now);
         if inner.wal.is_some() {
             let mut buf = Vec::with_capacity(key.len() + val.len() + 48);
@@ -835,6 +864,7 @@ impl CacheStore {
         let mut inner = self.state.lock().unwrap_or_else(|e| e.into_inner());
         inner.entries.clear();
         inner.lru_order.clear();
+        inner.ttl_entries = 0;
         if inner.wal.is_some() {
             inner.write_wal_bytes(b"{\"op\":\"clear\"}\n", 1)?;
         }

@@ -14,6 +14,8 @@ The `conduit` CLI provides tools for checking, compiling, executing, disassembli
 | `conduit watch` | `<file.cdt> [args...]` | Watches `.cdt` files and automatically recompiles and restarts on changes. |
 | `conduit lsp` | None | Starts the stdio Language Server (diagnostics, hover, definition, symbols, rename, formatting, completion) for IDEs. |
 | `conduit fmt` | `<file_or_dir> [--check]` | Formats `.cdt` source files (or checks formatting with `--check`). |
+| `conduit routes` | `<file.cdt> [--router <name>]` | Prints the declarative HTTP router route table (`METHOD`, `PATH`, `HANDLER`, `BODY`, middleware). |
+| `conduit openapi` | `<file.cdt> [--router <name>] [--title <str>] [--version <str>] [--server <url>] [-o <file>]` | Generates an OpenAPI 3.0.3 JSON specification from declarative `router` and `@validation.*` schemas. |
 | `conduit check` | `<file.cdt>` | Performs static semantic analysis and type checking without running code. |
 | `conduit disasm` | `<file.cdt>` | Compiles the program and prints the disassembled register bytecode. |
 | `conduit bench` | `[--filter <pat>] [--strict]` | Runs the built-in VM benchmark suite and checks target performance gates. |
@@ -30,10 +32,14 @@ The `conduit` CLI provides tools for checking, compiling, executing, disassembli
 conduit check main.cdt
 ```
 
-If checks pass, Conduit prints a summary of compiled types and functions (`OK: N type(s), M function(s)`). If an error exists, Conduit displays a diagnostic highlighting the line, column, and rule violation:
+If checks pass, Conduit prints a summary of compiled types and functions (`OK: N type(s), M function(s)`). If errors exist across functions or imported files, Conduit displays snippet-based caret diagnostics pointing to each file, line, and column:
 
 ```text
-[14:10] Check error: ...
+error[2:10]: Operator '+' cannot be applied to String and Int
+ --> main.cdt:2:10
+   |
+ 2 |     x := "hello" + 1
+   |          ^
 ```
 
 ### Disassembling Bytecode
@@ -98,3 +104,12 @@ conduit test tests/ --filter auth --fail-fast
 ```
 
 Executes top-level `test "<name>" { ... }` blocks in isolated VM instances using built-in `assert`, `assert_eq`, `assert_ne`, and `fail` assertions, and returns a non-zero exit code if any test fails or fails to compile.
+
+### Inspecting Routes & Generating OpenAPI (`conduit routes`, `conduit openapi`)
+
+```bash
+conduit routes main.cdt
+conduit openapi main.cdt --title "My Service" --server http://127.0.0.1:8080 -o openapi.json
+```
+
+Inspects declarative `router` schemas, group/route middleware, CORS/static directives, typed JSON request contracts (`@validation.*`), and inferred handler JSON/text responses to display a formatted route table or emit an OpenAPI 3.0.3 specification.

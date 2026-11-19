@@ -12,6 +12,10 @@ conduit fmt .
 conduit check main.cdt
 conduit test .
 
+# Inspect the HTTP router table and generate OpenAPI 3.0.3 JSON spec
+conduit routes server.cdt
+conduit openapi server.cdt --title "CdtCurl Demo API" --version "1.0.0"
+
 # HTTP router & middleware self-test
 conduit run main.cdt -- self-test
 

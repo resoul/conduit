@@ -84,6 +84,10 @@ pub enum JsonType {
     List(Box<JsonType>),
     Map(Box<JsonType>),
     Struct(u32),
+    TaggedEnum {
+        name: String,
+        variants: Vec<(String, u32)>,
+    },
 }
 
 impl JsonType {
@@ -99,6 +103,7 @@ impl JsonType {
             JsonType::Struct(id) => find_schema(schemas, *id)
                 .map(|s| s.type_name.clone())
                 .unwrap_or_else(|| format!("Struct#{}", id)),
+            JsonType::TaggedEnum { name, .. } => name.clone(),
         }
     }
 }
@@ -136,6 +141,7 @@ pub struct StructSchema {
     pub fields: Box<[CompiledStructField]>,
     pub has_duplicate_json_names: bool,
     pub is_error: bool,
+    pub enum_tag: Option<String>,
 }
 
 impl StructSchema {
@@ -144,7 +150,7 @@ impl StructSchema {
         type_name: impl Into<String>,
         field_defs: Vec<StructFieldDef>,
     ) -> Self {
-        Self::with_error_flag(schema_id, type_name, field_defs, false)
+        Self::with_flags(schema_id, type_name, field_defs, false, None)
     }
 
     pub fn with_error_flag(
@@ -152,6 +158,16 @@ impl StructSchema {
         type_name: impl Into<String>,
         field_defs: Vec<StructFieldDef>,
         is_error: bool,
+    ) -> Self {
+        Self::with_flags(schema_id, type_name, field_defs, is_error, None)
+    }
+
+    pub fn with_flags(
+        schema_id: u32,
+        type_name: impl Into<String>,
+        field_defs: Vec<StructFieldDef>,
+        is_error: bool,
+        enum_tag: Option<String>,
     ) -> Self {
         let mut scalar_len: u16 = 0;
         let mut obj_len: u16 = 0;
@@ -226,6 +242,7 @@ impl StructSchema {
             fields: fields.into_boxed_slice(),
             has_duplicate_json_names,
             is_error,
+            enum_tag,
         }
     }
 }
@@ -277,6 +294,10 @@ pub(crate) enum PlanNode {
         val_name: String,
     },
     Struct(CompiledStructDecodePlan),
+    TaggedEnum {
+        type_name: String,
+        variants: Box<[(String, CompiledStructDecodePlan)]>,
+    },
     Unavailable(u32),
 }
 
@@ -335,6 +356,26 @@ impl PlanCompiler<'_> {
                 val_name: val.display_name(self.schemas),
             },
             JsonType::Struct(id) => self.compile_struct(*id),
+            JsonType::TaggedEnum { name, variants } => {
+                let mut compiled = Vec::with_capacity(variants.len());
+                let mut missing_sid = None;
+                for (vname, sid) in variants {
+                    if let PlanNode::Struct(plan) = self.compile_struct(*sid) {
+                        compiled.push((vname.clone(), plan));
+                    } else {
+                        missing_sid = Some(*sid);
+                        break;
+                    }
+                }
+                if let Some(sid) = missing_sid {
+                    PlanNode::Unavailable(sid)
+                } else {
+                    PlanNode::TaggedEnum {
+                        type_name: name.clone(),
+                        variants: compiled.into_boxed_slice(),
+                    }
+                }
+            }
         };
         self.nodes[idx] = node;
         idx

@@ -320,6 +320,12 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                     });
                     return Ok(dst_obj);
                 }
+                if let Some(dvars) = self.mc.checked.data_enums.get(alias).cloned() {
+                    let var = dvars.iter().find(|v| &v.name == field).ok_or_else(|| {
+                        format!("Enum '{}' has no variant '{}'", alias, field)
+                    })?;
+                    return self.lower_struct_ctor(&var.struct_name, args, named_args);
+                }
                 if let Some(&mod_name) = self.mc.checked.native_aliases.get(alias) {
                     return self.lower_native_obj_call(mod_name, field, type_args, args, named_args);
                 }
@@ -645,7 +651,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
         }
     }
 
-    fn lower_struct_ctor(
+    pub(crate) fn lower_struct_ctor(
         &mut self,
         name: &str,
         args: &[Expr],
@@ -718,7 +724,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
         match method {
             "decode" => {
                 let target_ty = self.resolve_type(&type_args[0])?;
-                let jty = type_to_json_type(&target_ty, &self.mc.checked.struct_by_name)
+                let jty = type_to_json_type(&target_ty, self.mc.checked)
                     .ok_or_else(|| format!("Unsupported json.decode type {}", target_ty))?;
                 let plan_idx = self.mc.add_json_decode_plan(&jty)?;
                 let src_obj = self.lower_obj(&args[0])?;

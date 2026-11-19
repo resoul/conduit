@@ -232,6 +232,45 @@ fn encode_list(
 }
 
 #[inline]
+fn encode_struct_field(
+    rec: &StructData,
+    field: &crate::native::CompiledStructField,
+    schemas: &[StructSchema],
+    out: &mut Vec<u8>,
+) -> Result<(), JsonError> {
+    match field.slot {
+        FieldSlot::Scalar {
+            kind: ScalarKind::Int,
+            slot,
+        } => write_i64(out, rec.get_scalar(slot as usize) as i64),
+        FieldSlot::Scalar {
+            kind: ScalarKind::Float,
+            slot,
+        } => {
+            if let Err(err) = write_f64(out, f64::from_bits(rec.get_scalar(slot as usize))) {
+                return Err(err_at_field(&field.json_name, err));
+            }
+        }
+        FieldSlot::Scalar {
+            kind: ScalarKind::Bool,
+            slot,
+        } => {
+            out.extend_from_slice(if rec.get_scalar(slot as usize) != 0 {
+                b"true"
+            } else {
+                b"false"
+            });
+        }
+        FieldSlot::Obj { slot, .. } => {
+            if let Err(err) = encode_obj(rec.get_obj(slot as usize), schemas, out) {
+                return Err(err_at_field(&field.json_name, err));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[inline]
 fn encode_struct(
     rec: &StructData,
     schemas: &[StructSchema],
@@ -243,41 +282,28 @@ fn encode_struct(
             rec.schema_id
         )));
     };
+    if let Some(tag) = schema.enum_tag.as_deref() {
+        out.extend_from_slice(b"{\"type\":");
+        write_escaped_bytes(tag, out);
+        for (idx, field) in schema.fields.iter().enumerate() {
+            if idx == 0 {
+                out.push(b',');
+                out.extend_from_slice(field.wire_prefix.strip_prefix(b"{").unwrap_or(&field.wire_prefix));
+            } else {
+                out.extend_from_slice(&field.wire_prefix);
+            }
+            encode_struct_field(rec, field, schemas, out)?;
+        }
+        out.push(b'}');
+        return Ok(());
+    }
     if schema.fields.is_empty() {
         out.extend_from_slice(b"{}");
         return Ok(());
     }
     for field in schema.fields.iter() {
         out.extend_from_slice(&field.wire_prefix);
-        match field.slot {
-            FieldSlot::Scalar {
-                kind: ScalarKind::Int,
-                slot,
-            } => write_i64(out, rec.get_scalar(slot as usize) as i64),
-            FieldSlot::Scalar {
-                kind: ScalarKind::Float,
-                slot,
-            } => {
-                if let Err(err) = write_f64(out, f64::from_bits(rec.get_scalar(slot as usize))) {
-                    return Err(err_at_field(&field.json_name, err));
-                }
-            }
-            FieldSlot::Scalar {
-                kind: ScalarKind::Bool,
-                slot,
-            } => {
-                out.extend_from_slice(if rec.get_scalar(slot as usize) != 0 {
-                    b"true"
-                } else {
-                    b"false"
-                });
-            }
-            FieldSlot::Obj { slot, .. } => {
-                if let Err(err) = encode_obj(rec.get_obj(slot as usize), schemas, out) {
-                    return Err(err_at_field(&field.json_name, err));
-                }
-            }
-        }
+        encode_struct_field(rec, field, schemas, out)?;
     }
     out.push(b'}');
     Ok(())

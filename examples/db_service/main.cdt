@@ -31,6 +31,7 @@ migration 2 "seed_admin" {
 export func main() -> Void | db.DbError | crypto.CryptoError | env.EnvError | validation.ValidationError | time.TimeError {
     dsn := env.require("DATABASE_URL")?
     conn := db.connect(dsn)?
+    defer conn.close()
     applied := conn.migrate()?
 
     d := conn.dialect()
@@ -84,6 +85,4 @@ export func main() -> Void | db.DbError | crypto.CryptoError | env.EnvError | va
         ok := crypto.verify_password("hunter2", u.pw_hash)
         print("user[{uid}] email={uemail} active={uactive} pw_match={ok}")
     }
-
-    conn.close()
 }

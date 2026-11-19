@@ -27,6 +27,33 @@ for (let i = 0; i < 100000; i++) mapAcc += vmM.get(i);
 const msVmMap = ms(tVm);
 if (mapAcc < 0) process.exit(1);
 
+tVm = process.hrtime.bigint();
+let adtAcc = 0;
+for (let i = 0; i < 1000000; i++) {
+  const r = i & 3;
+  const ev =
+    r === 0
+      ? { type: 0 }
+      : r === 1
+      ? { type: 1, a: i, b: 7 }
+      : r === 2
+      ? { type: 2, v: i, f: 3 }
+      : { type: 1, a: i, b: -2 };
+  switch (ev.type) {
+    case 0:
+      adtAcc += 1;
+      break;
+    case 1:
+      adtAcc += ev.a + ev.b;
+      break;
+    case 2:
+      adtAcc += ev.v * ev.f;
+      break;
+  }
+}
+const msAdt = ms(tVm);
+if (adtAcc !== 625001500000) process.exit(1);
+
 // 1. FS I/O
 const base = path.join(os.tmpdir(), `_js_bench_${process.pid}`);
 fs.mkdirSync(base, { recursive: true });
@@ -221,9 +248,66 @@ for (let i = 0; i < 50000; i++) {
 const msHttp = ms(t0);
 if (httpAcc !== 10125000) process.exit(1);
 
+const jwtSecret = "conduit_bench_jwt_secret_key_32b";
+const jwtHdr = Buffer.from('{"alg":"HS256","typ":"JWT"}').toString("base64url");
+t0 = process.hrtime.bigint();
+let jwtAcc = 0;
+for (let i = 0; i < 10000; i++) {
+  const payB64 = Buffer.from(JSON.stringify({ sub: "user", uid: i })).toString("base64url");
+  const sigInput = `${jwtHdr}.${payB64}`;
+  const sigB64 = crypto.createHmac("sha256", jwtSecret).update(sigInput).digest("base64url");
+  const tok = `${sigInput}.${sigB64}`;
+
+  const parts = tok.split(".");
+  if (parts.length !== 3) process.exit(1);
+  const expectedSig = crypto
+    .createHmac("sha256", jwtSecret)
+    .update(`${parts[0]}.${parts[1]}`)
+    .digest("base64url");
+  if (
+    parts[2].length !== expectedSig.length ||
+    !crypto.timingSafeEqual(Buffer.from(parts[2]), Buffer.from(expectedSig))
+  ) {
+    process.exit(1);
+  }
+  const cl = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+  jwtAcc += cl.uid;
+}
+const msJwt = ms(t0);
+if (jwtAcc !== 49995000) process.exit(1);
+
+const lru = new Map();
+const lruSet = (k, v) => {
+  if (lru.has(k)) {
+    lru.delete(k);
+  } else if (lru.size >= 4096) {
+    const oldest = lru.keys().next().value;
+    lru.delete(oldest);
+  }
+  lru.set(k, v);
+};
+const lruGet = (k) => {
+  if (!lru.has(k)) return undefined;
+  const v = lru.get(k);
+  lru.delete(k);
+  lru.set(k, v);
+  return v;
+};
+t0 = process.hrtime.bigint();
+let cacheAcc = 0;
+for (let i = 0; i < 100000; i++) {
+  lruSet(`k${i & 8191}`, "v");
+  if (lruGet(`k${(i + 6144) & 8191}`) !== undefined) {
+    cacheAcc++;
+  }
+}
+const msCache = ms(t0);
+if (cacheAcc !== 97905) process.exit(1);
+
 console.log(`BENCH|vm_fib_35|${msVmFib.toFixed(3)}`);
 console.log(`BENCH|vm_arith_10m|${msVmArith.toFixed(3)}`);
 console.log(`BENCH|vm_map_100k|${msVmMap.toFixed(3)}`);
+console.log(`BENCH|adt_switch_1m|${msAdt.toFixed(3)}`);
 
 console.log(`BENCH|fs_write_text|${msWriteText.toFixed(3)}`);
 console.log(`BENCH|fs_write_lines|${msWriteStream.toFixed(3)}`);
@@ -243,3 +327,5 @@ console.log(`BENCH|pipeline_1m|${msPipe.toFixed(3)}`);
 console.log(`BENCH|pipeline_float_1m|${msFPipe.toFixed(3)}`);
 console.log(`BENCH|url_parse_50k|${msUrl.toFixed(3)}`);
 console.log(`BENCH|http_router_50k|${msHttp.toFixed(3)}`);
+console.log(`BENCH|jwt_hs256_10k|${msJwt.toFixed(3)}`);
+console.log(`BENCH|cache_lru_100k|${msCache.toFixed(3)}`);

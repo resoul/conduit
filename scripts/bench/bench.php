@@ -33,6 +33,25 @@ for ($i = 0; $i < 100000; $i++) {
 $msVmMap = ms_since($t0);
 if ($mapAcc < 0) exit(1);
 
+$t0 = hrtime(true);
+$adtAcc = 0;
+for ($i = 0; $i < 1000000; $i++) {
+    $r = $i & 3;
+    $ev = match ($r) {
+        0 => ['t' => 0],
+        1 => ['t' => 1, 'a' => $i, 'b' => 7],
+        2 => ['t' => 2, 'v' => $i, 'f' => 3],
+        default => ['t' => 1, 'a' => $i, 'b' => -2],
+    };
+    $adtAcc += match ($ev['t']) {
+        0 => 1,
+        1 => $ev['a'] + $ev['b'],
+        2 => $ev['v'] * $ev['f'],
+    };
+}
+$msAdt = ms_since($t0);
+if ($adtAcc !== 625001500000) exit(1);
+
 // 1. FS I/O
 $base = sys_get_temp_dir() . DIRECTORY_SEPARATOR . '_php_bench_' . getmypid();
 @mkdir($base, 0755, true);
@@ -252,9 +271,56 @@ for ($i = 0; $i < 50000; $i++) {
 $msHttp = ms_since($t0);
 if ($httpAcc !== 10125000) exit(1);
 
+$b64urlEnc = fn(string $s): string => rtrim(strtr(base64_encode($s), '+/', '-_'), '=');
+$b64urlDec = fn(string $s): string => base64_decode(strtr($s, '-_', '+/'), true) ?: '';
+$jwtSecret = 'conduit_bench_jwt_secret_key_32b';
+$jwtHdr = $b64urlEnc('{"alg":"HS256","typ":"JWT"}');
+$t0 = hrtime(true);
+$jwtAcc = 0;
+for ($i = 0; $i < 10000; $i++) {
+    $payB64 = $b64urlEnc(json_encode(['sub' => 'user', 'uid' => $i]));
+    $sigInput = $jwtHdr . '.' . $payB64;
+    $sigB64 = $b64urlEnc(hash_hmac('sha256', $sigInput, $jwtSecret, true));
+    $tok = $sigInput . '.' . $sigB64;
+
+    $parts = explode('.', $tok);
+    if (count($parts) !== 3) exit(1);
+    $expectedSig = $b64urlEnc(hash_hmac('sha256', $parts[0] . '.' . $parts[1], $jwtSecret, true));
+    if (!hash_equals($expectedSig, $parts[2])) exit(1);
+    $cl = json_decode($b64urlDec($parts[1]), true);
+    $jwtAcc += $cl['uid'];
+}
+$msJwt = ms_since($t0);
+if ($jwtAcc !== 49995000) exit(1);
+
+$lru = [];
+$t0 = hrtime(true);
+$cacheAcc = 0;
+for ($i = 0; $i < 100000; $i++) {
+    $ks = 'k' . ($i & 8191);
+    if (isset($lru[$ks])) {
+        unset($lru[$ks]);
+    } elseif (count($lru) >= 4096) {
+        $oldest = array_key_first($lru);
+        unset($lru[$oldest]);
+    }
+    $lru[$ks] = 'v';
+
+    $kg = 'k' . (($i + 6144) & 8191);
+    if (isset($lru[$kg])) {
+        $v = $lru[$kg];
+        unset($lru[$kg]);
+        $lru[$kg] = $v;
+        $cacheAcc++;
+    }
+}
+$msCache = ms_since($t0);
+if ($cacheAcc !== 97905) exit(1);
+
 printf("BENCH|vm_fib_35|%.3f\n", $msVmFib);
 printf("BENCH|vm_arith_10m|%.3f\n", $msVmArith);
 printf("BENCH|vm_map_100k|%.3f\n", $msVmMap);
+printf("BENCH|adt_switch_1m|%.3f\n", $msAdt);
 
 printf("BENCH|fs_write_text|%.3f\n", $msWriteText);
 printf("BENCH|fs_write_lines|%.3f\n", $msWriteStream);
@@ -275,3 +341,5 @@ printf("BENCH|pipeline_float_1m|%.3f\n", $msFPipe);
 printf("BENCH|csv_parse_20k|%.3f\n", $msCsv);
 printf("BENCH|url_parse_50k|%.3f\n", $msUrl);
 printf("BENCH|http_router_50k|%.3f\n", $msHttp);
+printf("BENCH|jwt_hs256_10k|%.3f\n", $msJwt);
+printf("BENCH|cache_lru_100k|%.3f\n", $msCache);

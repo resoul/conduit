@@ -77,7 +77,7 @@ impl Checker<'_> {
                     Type::Custom(tid) if tid.module == ModuleId::Program
                 ) || matches!(claims_ty, Type::Map(k, _) if **k == Type::String);
                 if !valid_obj_kind
-                    || type_to_json_type(claims_ty, &self.checked.struct_by_name).is_none()
+                    || type_to_json_type(claims_ty, self.checked).is_none()
                 {
                     return Err(format!(
                         "jwt.{} claims must be a JSON-serializable struct or Map<String, ...>, got {}",
@@ -106,7 +106,7 @@ impl Checker<'_> {
                     ));
                 }
                 let target_ty = self.checked.resolve_type_mut(&type_args[0])?;
-                if type_to_json_type(&target_ty, &self.checked.struct_by_name).is_none() {
+                if type_to_json_type(&target_ty, self.checked).is_none() {
                     return Err(format!(
                         "jwt.{}<{}>: target type is not JSON-decodable",
                         sym, target_ty
@@ -154,7 +154,7 @@ impl Checker<'_> {
                     );
                 }
                 let target_ty = self.checked.resolve_type_mut(&type_args[0])?;
-                if type_to_json_type(&target_ty, &self.checked.struct_by_name).is_none() {
+                if type_to_json_type(&target_ty, self.checked).is_none() {
                     return Err(format!(
                         "jwt.decode_unverified<{}>: target type is not JSON-decodable",
                         target_ty
@@ -372,7 +372,7 @@ impl Checker<'_> {
                     );
                 }
                 let target_ty = self.checked.resolve_type_mut(&type_args[0])?;
-                if type_to_json_type(&target_ty, &self.checked.struct_by_name).is_none() {
+                if type_to_json_type(&target_ty, self.checked).is_none() {
                     return Err(format!(
                         "Cache.get_json<{}>: target type is not JSON-decodable",
                         target_ty
@@ -394,7 +394,7 @@ impl Checker<'_> {
                 } else {
                     self.check_expr(&mut args[1], None)?;
                 }
-                if type_to_json_type(&args[1].ty, &self.checked.struct_by_name).is_none() {
+                if type_to_json_type(&args[1].ty, self.checked).is_none() {
                     return Err(format!(
                         "Cache.set_json: value type {} is not JSON-serializable",
                         args[1].ty
@@ -692,7 +692,7 @@ impl Checker<'_> {
                     );
                 }
                 let target_ty = self.checked.resolve_type_mut(&type_args[0])?;
-                if type_to_json_type(&target_ty, &self.checked.struct_by_name).is_none() {
+                if type_to_json_type(&target_ty, self.checked).is_none() {
                     return Err(format!(
                         "Client.get_json<{}>: target type is not JSON-decodable",
                         target_ty
@@ -714,7 +714,7 @@ impl Checker<'_> {
                 } else {
                     self.check_expr(&mut args[1], None)?;
                 }
-                if type_to_json_type(&args[1].ty, &self.checked.struct_by_name).is_none() {
+                if type_to_json_type(&args[1].ty, self.checked).is_none() {
                     return Err(format!(
                         "Client.set_json: value type {} is not JSON-serializable",
                         args[1].ty

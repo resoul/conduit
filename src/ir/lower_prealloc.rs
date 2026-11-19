@@ -89,6 +89,10 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                     self.prealloc_block(&case.body);
                 }
             }
+            StmtKind::Defer(block) => {
+                self.has_defer = true;
+                self.prealloc_block(block);
+            }
         }
     }
 
@@ -96,7 +100,8 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
         let pkey = pat as *const Pattern as usize;
         match (&pat.kind, ty) {
             (PatternKind::Wildcard | PatternKind::Nil, _) => {}
-            (PatternKind::Ident(name), Type::Enum(_)) if name.contains('.') => {}
+            (PatternKind::Ident(name), Type::Enum(_) | Type::DataEnum(_))
+                if name.contains('.') => {}
             (PatternKind::Ident(name), _) => {
                 let slot = self.prealloc_slot_for_ty(ty);
                 self.pat_slots.insert((pkey, name.clone()), slot);
@@ -111,6 +116,21 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                     self.prealloc_pattern(p, &Type::Any);
                 }
             }
+            (PatternKind::Type { name, binding }, Type::DataEnum(ename)) => {
+                if let Some((_, vname)) = name.rsplit_once('.')
+                    && let Ok((_, resolved)) = crate::frontend::check::resolve_data_enum_bindings(
+                        self.mc.checked,
+                        ename,
+                        vname,
+                        &[(None, binding.clone())],
+                    )
+                {
+                    for (local, field) in resolved {
+                        let slot = self.prealloc_slot_for_ty(&field.ty);
+                        self.pat_slots.insert((pkey, local), slot);
+                    }
+                }
+            }
             (PatternKind::Type { name, binding }, _) => {
                 if binding != "_" {
                     let resolved = crate::frontend::monomorph::resolve_switch_pattern_type(
@@ -121,6 +141,26 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                     .unwrap_or(Type::Any);
                     let slot = self.prealloc_slot_for_ty(&resolved);
                     self.pat_slots.insert((pkey, binding.clone()), slot);
+                }
+            }
+            (
+                PatternKind::EnumVariant {
+                    enum_name,
+                    variant_name,
+                    bindings,
+                },
+                _,
+            ) => {
+                if let Ok((_, resolved)) = crate::frontend::check::resolve_data_enum_bindings(
+                    self.mc.checked,
+                    enum_name,
+                    variant_name,
+                    bindings,
+                ) {
+                    for (local, field) in resolved {
+                        let slot = self.prealloc_slot_for_ty(&field.ty);
+                        self.pat_slots.insert((pkey, local), slot);
+                    }
                 }
             }
         }

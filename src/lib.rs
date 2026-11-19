@@ -1,8 +1,10 @@
 pub mod benchmarks;
+pub mod diagnostics;
 pub mod fmt;
 pub mod frontend;
 pub mod ir;
 pub mod lsp;
 pub mod lsp_docs;
 pub mod native;
+pub mod openapi;
 pub mod vm;

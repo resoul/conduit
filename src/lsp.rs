@@ -154,35 +154,49 @@ fn validate_and_cache(
                 escape_json(uri)
             )
         }
-        Err(err) => {
-            let (line, col, msg) = parse_error_span(&err);
-            format_diagnostic(uri, line, col, msg)
+        Err(err) => format_diagnostics(uri, &path, &err),
+    }
+}
+
+fn format_diagnostics(uri: &str, doc_path: &std::path::Path, raw_err: &str) -> String {
+    let diags = crate::diagnostics::parse_diagnostics(raw_err);
+    let doc_canon = std::fs::canonicalize(doc_path).ok();
+    let doc_str = doc_path.to_string_lossy();
+    let mut entries = Vec::with_capacity(diags.len());
+    for d in diags {
+        let same_file = match d.file.as_deref() {
+            None => true,
+            Some(f) => {
+                f == doc_str.as_ref()
+                    || doc_canon
+                        .as_ref()
+                        .is_some_and(|c| std::fs::canonicalize(f).ok().as_ref() == Some(c))
+            }
+        };
+        if same_file {
+            let l = d.line.saturating_sub(1);
+            let c = d.col.saturating_sub(1);
+            entries.push(format!(
+                r#"{{"range":{{"start":{{"line":{},"character":{}}},"end":{{"line":{},"character":{}}}}},"severity":1,"source":"conduit","message":"{}"}}"#,
+                l,
+                c,
+                l,
+                c + 1,
+                escape_json(&d.message)
+            ));
+        } else {
+            let f = d.file.as_deref().unwrap_or("");
+            let msg = format!("in {}:{}:{}: {}", f, d.line, d.col, d.message);
+            entries.push(format!(
+                r#"{{"range":{{"start":{{"line":0,"character":0}},"end":{{"line":0,"character":1}}}},"severity":1,"source":"conduit","message":"{}"}}"#,
+                escape_json(&msg)
+            ));
         }
     }
-}
-
-fn parse_error_span(err: &str) -> (usize, usize, &str) {
-    if let Some(rest) = err.strip_prefix('[')
-        && let Some((coords, msg)) = rest.split_once(']')
-        && let Some((l_str, c_str)) = coords.split_once(':')
-        && let (Ok(l), Ok(c)) = (l_str.trim().parse::<usize>(), c_str.trim().parse::<usize>())
-    {
-        return (l, c, msg.trim());
-    }
-    (1, 1, err)
-}
-
-fn format_diagnostic(uri: &str, line: usize, col: usize, msg: &str) -> String {
-    let l = line.saturating_sub(1);
-    let c = col.saturating_sub(1);
     format!(
-        r#"{{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{{"uri":"{}","diagnostics":[{{"range":{{"start":{{"line":{},"character":{}}},"end":{{"line":{},"character":{}}}}},"severity":1,"source":"conduit","message":"{}"}}]}}}}"#,
+        r#"{{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{{"uri":"{}","diagnostics":[{}]}}}}"#,
         escape_json(uri),
-        l,
-        c,
-        l,
-        c + 1,
-        escape_json(msg)
+        entries.join(",")
     )
 }
 
@@ -533,21 +547,45 @@ fn handle_completion(
         .collect();
 
     if let Some((_, checked)) = cache.get(&uri) {
-        if let Some(prefix) = get_dot_prefix_alias(doc, line, character)
-            && let Some(variants) = checked.enums.get(&prefix)
-        {
-            let vitems: Vec<String> = variants
-                .iter()
-                .map(|v| {
-                    format!(
-                        r#"{{"label":"{}","kind":20,"detail":"{}.{}"}}"#,
-                        escape_json(v),
-                        escape_json(&prefix),
-                        escape_json(v)
-                    )
-                })
-                .collect();
-            return format!(r#"{{"jsonrpc":"2.0","id":{},"result":[{}]}}"#, id, vitems.join(","));
+        if let Some(prefix) = get_dot_prefix_alias(doc, line, character) {
+            if let Some(variants) = checked.enums.get(&prefix) {
+                let vitems: Vec<String> = variants
+                    .iter()
+                    .map(|v| {
+                        format!(
+                            r#"{{"label":"{}","kind":20,"detail":"{}.{}"}}"#,
+                            escape_json(v),
+                            escape_json(&prefix),
+                            escape_json(v)
+                        )
+                    })
+                    .collect();
+                return format!(r#"{{"jsonrpc":"2.0","id":{},"result":[{}]}}"#, id, vitems.join(","));
+            }
+            if let Some(dvars) = checked.data_enums.get(&prefix) {
+                let vitems: Vec<String> = dvars
+                    .iter()
+                    .map(|dv| {
+                        let fields = &checked.structs[checked.struct_by_name[&dv.struct_name]].fields;
+                        let detail = if fields.is_empty() {
+                            format!("{}.{}", prefix, dv.name)
+                        } else {
+                            let fstr = fields
+                                .iter()
+                                .map(|f| format!("{}: {}", f.name, f.ty))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            format!("{}.{}({})", prefix, dv.name, fstr)
+                        };
+                        format!(
+                            r#"{{"label":"{}","kind":20,"detail":"{}"}}"#,
+                            escape_json(&dv.name),
+                            escape_json(&detail)
+                        )
+                    })
+                    .collect();
+                return format!(r#"{{"jsonrpc":"2.0","id":{},"result":[{}]}}"#, id, vitems.join(","));
+            }
         }
         for f in &checked.funcs {
             if !f.name.contains("__") {
@@ -579,7 +617,7 @@ fn handle_completion(
                 ));
             }
         }
-        for ename in checked.enums.keys() {
+        for ename in checked.enums.keys().chain(checked.data_enums.keys()) {
             if !ename.contains("__") {
                 items.push(format!(
                     r#"{{"label":"{}","kind":10,"detail":"enum {}"}}"#,
@@ -632,19 +670,46 @@ fn find_enum_hover(
     checked: &CheckedProgram,
     doc: &str,
 ) -> Option<String> {
-    let variants = checked.enums.get(word).or_else(|| {
+    let mut out = if let Some(variants) = checked.enums.get(word).or_else(|| {
         let suffix = format!("__{}", word);
         checked
             .enums
             .iter()
             .find(|(k, _)| k.ends_with(&suffix))
             .map(|(_, v)| v)
-    })?;
-    let mut out = format!(
-        "```conduit\nenum {} {{ {} }}\n```",
-        word,
-        variants.join(", ")
-    );
+    }) {
+        format!(
+            "```conduit\nenum {} {{ {} }}\n```",
+            word,
+            variants.join(", ")
+        )
+    } else {
+        let dvars = checked.data_enums.get(word).or_else(|| {
+            let suffix = format!("__{}", word);
+            checked
+                .data_enums
+                .iter()
+                .find(|(k, _)| k.ends_with(&suffix))
+                .map(|(_, v)| v)
+        })?;
+        let lines: Vec<String> = dvars
+            .iter()
+            .map(|dv| {
+                let fields = &checked.structs[checked.struct_by_name[&dv.struct_name]].fields;
+                if fields.is_empty() {
+                    format!("  {}", dv.name)
+                } else {
+                    let fstr = fields
+                        .iter()
+                        .map(|f| format!("{}: {}", f.name, f.ty))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("  {}({})", dv.name, fstr)
+                }
+            })
+            .collect();
+        format!("```conduit\nenum {} {{\n{}\n}}\n```", word, lines.join("\n"))
+    };
     if let Some(item) = prog
         .items
         .iter()

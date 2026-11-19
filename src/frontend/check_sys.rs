@@ -1023,7 +1023,7 @@ impl Checker<'_> {
     }
 }
 
-fn ensure_http_router_plan(
+pub(crate) fn ensure_http_router_plan(
     checked: &mut CheckedProgram,
     router_name: &str,
     req_ty: &Type,
@@ -1191,6 +1191,13 @@ fn ensure_http_router_plan(
                     && checked.struct_by_name.contains_key(&tid.name)
                 {
                     Some(tid.name.clone())
+                } else if sig.params.len() == 2
+                    && sig.params[0] == *req_ty
+                    && sig.return_type == *resp_ty
+                    && let Type::DataEnum(ename) = &sig.params[1]
+                    && checked.data_enums.contains_key(ename)
+                {
+                    Some(ename.clone())
                 } else {
                     return Err(format!(
                         "router '{}' route '{} {}' handler '{}' must have signature (http.Request) -> http.Response or (http.Request, BodyStruct) -> http.Response",

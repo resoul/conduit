@@ -344,6 +344,30 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                     self.patch_here(jf);
                 }
                 PatternKind::Ident(name) => {
+                    if let Type::DataEnum(ename) = &expr.ty
+                        && let Some((_, vname)) = name.split_once('.')
+                    {
+                        let (var, _) = crate::frontend::check::resolve_data_enum_bindings(
+                            self.mc.checked,
+                            ename,
+                            vname,
+                            &[],
+                        )?;
+                        let cond_s = self.alloc_temp_s();
+                        self.ops.push(Op::IsTypeObj {
+                            dst_s: cond_s,
+                            src_obj: scr_reg,
+                            expected_tag: var.schema_id,
+                        });
+                        let jf = self.ops.len();
+                        self.ops.push(Op::JumpIfFalse { cond: cond_s, target: 0 });
+                        self.lower_block_stmts(&case.body.stmts)?;
+                        let je = self.ops.len();
+                        self.ops.push(Op::Jump { target: 0 });
+                        end_jumps.push(je);
+                        self.patch_here(jf);
+                        continue;
+                    }
                     if let Type::Enum(ename) = &expr.ty
                         && let Some((_, vname)) = name.split_once('.')
                     {
@@ -381,27 +405,149 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                     self.scopes.pop();
                     break;
                 }
+                PatternKind::EnumVariant {
+                    enum_name,
+                    variant_name,
+                    bindings,
+                } => {
+                    let (var, resolved) = crate::frontend::check::resolve_data_enum_bindings(
+                        self.mc.checked,
+                        enum_name,
+                        variant_name,
+                        bindings,
+                    )?;
+                    let expected_tag = var.schema_id;
+                    let cond_s = self.alloc_temp_s();
+                    self.ops.push(Op::IsTypeObj {
+                        dst_s: cond_s,
+                        src_obj: scr_reg,
+                        expected_tag,
+                    });
+                    let jf = self.ops.len();
+                    self.ops.push(Op::JumpIfFalse { cond: cond_s, target: 0 });
+                    self.scopes.push(HashMap::new());
+                    let pkey = &case.pattern as *const Pattern as usize;
+                    for (local, field) in resolved {
+                        let slot = self.pat_slots[&(pkey, local.clone())];
+                        if field.is_scalar {
+                            self.ops.push(Op::GetFieldScalar {
+                                dst_s: slot.reg,
+                                rec_obj: scr_reg,
+                                field_idx: field.slot_idx,
+                            });
+                        } else {
+                            self.ops.push(Op::GetFieldObj {
+                                dst_obj: slot.reg,
+                                rec_obj: scr_reg,
+                                field_idx: field.slot_idx,
+                            });
+                        }
+                        self.bind_var(local, slot, field.ty.clone());
+                    }
+                    for s in &case.body.stmts {
+                        self.lower_stmt(s)?;
+                    }
+                    self.scopes.pop();
+                    let je = self.ops.len();
+                    self.ops.push(Op::Jump { target: 0 });
+                    end_jumps.push(je);
+                    self.patch_here(jf);
+                }
                 PatternKind::Type { name, binding } => {
+                    if let Type::DataEnum(ename) = &expr.ty {
+                        let (_, vname) = name.rsplit_once('.').ok_or_else(|| {
+                            format!("Invalid enum variant pattern '{}'", name)
+                        })?;
+                        let (var, resolved) = crate::frontend::check::resolve_data_enum_bindings(
+                            self.mc.checked,
+                            ename,
+                            vname,
+                            &[(None, binding.clone())],
+                        )?;
+                        let expected_tag = var.schema_id;
+                        let cond_s = self.alloc_temp_s();
+                        self.ops.push(Op::IsTypeObj {
+                            dst_s: cond_s,
+                            src_obj: scr_reg,
+                            expected_tag,
+                        });
+                        let jf = self.ops.len();
+                        self.ops.push(Op::JumpIfFalse { cond: cond_s, target: 0 });
+                        self.scopes.push(HashMap::new());
+                        let pkey = &case.pattern as *const Pattern as usize;
+                        for (local, field) in resolved {
+                            let slot = self.pat_slots[&(pkey, local.clone())];
+                            if field.is_scalar {
+                                self.ops.push(Op::GetFieldScalar {
+                                    dst_s: slot.reg,
+                                    rec_obj: scr_reg,
+                                    field_idx: field.slot_idx,
+                                });
+                            } else {
+                                self.ops.push(Op::GetFieldObj {
+                                    dst_obj: slot.reg,
+                                    rec_obj: scr_reg,
+                                    field_idx: field.slot_idx,
+                                });
+                            }
+                            self.bind_var(local, slot, field.ty.clone());
+                        }
+                        for s in &case.body.stmts {
+                            self.lower_stmt(s)?;
+                        }
+                        self.scopes.pop();
+                        let je = self.ops.len();
+                        self.ops.push(Op::Jump { target: 0 });
+                        end_jumps.push(je);
+                        self.patch_here(jf);
+                        continue;
+                    }
                     let resolved = crate::frontend::monomorph::resolve_switch_pattern_type(
                         name,
                         &expr.ty,
                         self.mc.checked,
                     )?;
-                    let expected_tag =
-                        crate::ir::lower_native::type_tag_for_switch(&resolved, self.mc.checked)?;
                     let obj_scr = if scr_is_scalar {
                         self.emit_box_scalar_from(scr_reg, &expr.ty)
                     } else {
                         scr_reg
                     };
-                    let cond_s = self.alloc_temp_s();
-                    self.ops.push(Op::IsTypeObj {
-                        dst_s: cond_s,
-                        src_obj: obj_scr,
-                        expected_tag,
-                    });
-                    let jf = self.ops.len();
-                    self.ops.push(Op::JumpIfFalse { cond: cond_s, target: 0 });
+                    let jf = if let Type::DataEnum(ename) = &resolved {
+                        let schema_ids: Vec<u32> = self.mc.checked.data_enums[ename]
+                            .iter()
+                            .map(|v| v.schema_id)
+                            .collect();
+                        let cond_s = self.alloc_temp_s();
+                        let mut hit_jumps = Vec::with_capacity(schema_ids.len());
+                        for sid in schema_ids {
+                            self.ops.push(Op::IsTypeObj {
+                                dst_s: cond_s,
+                                src_obj: obj_scr,
+                                expected_tag: sid,
+                            });
+                            let jh = self.ops.len();
+                            self.ops.push(Op::JumpIfTrue { cond: cond_s, target: 0 });
+                            hit_jumps.push(jh);
+                        }
+                        let miss = self.ops.len();
+                        self.ops.push(Op::Jump { target: 0 });
+                        for jh in hit_jumps {
+                            self.patch_here(jh);
+                        }
+                        miss
+                    } else {
+                        let expected_tag =
+                            crate::ir::lower_native::type_tag_for_switch(&resolved, self.mc.checked)?;
+                        let cond_s = self.alloc_temp_s();
+                        self.ops.push(Op::IsTypeObj {
+                            dst_s: cond_s,
+                            src_obj: obj_scr,
+                            expected_tag,
+                        });
+                        let j = self.ops.len();
+                        self.ops.push(Op::JumpIfFalse { cond: cond_s, target: 0 });
+                        j
+                    };
                     self.scopes.push(HashMap::new());
                     if binding != "_" {
                         let pkey = &case.pattern as *const Pattern as usize;
@@ -582,6 +728,15 @@ fn bind_free_pat(pat: &Pattern, bound: &mut Vec<HashSet<String>>) {
                 top.insert(binding.clone());
             }
         }
+        PatternKind::EnumVariant { bindings, .. } => {
+            if let Some(top) = bound.last_mut() {
+                for (_, v) in bindings {
+                    if v != "_" {
+                        top.insert(v.clone());
+                    }
+                }
+            }
+        }
         PatternKind::Tuple(ps) => {
             for p in ps {
                 bind_free_pat(p, bound);
@@ -647,6 +802,9 @@ fn collect_free_stmt(stmt: &Stmt, bound: &mut Vec<HashSet<String>>, out: &mut Ha
                 collect_free_block(&c.body, bound, out);
                 bound.pop();
             }
+        }
+        StmtKind::Defer(block) => {
+            collect_free_block(block, bound, out);
         }
     }
 }

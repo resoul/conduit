@@ -59,6 +59,7 @@ pub enum Type {
     Map(Box<Type>, Box<Type>),
     Optional(Box<Type>),
     Enum(String),
+    DataEnum(String),
     Custom(TypeId),
     Generic {
         type_id: TypeId,
@@ -235,7 +236,7 @@ impl std::fmt::Display for Type {
             Type::List(inner) => write!(f, "[{}]", inner),
             Type::Map(key, val) => write!(f, "Map<{}, {}>", key, val),
             Type::Optional(inner) => write!(f, "{}?", inner),
-            Type::Enum(name) => write!(f, "{}", name),
+            Type::Enum(name) | Type::DataEnum(name) => write!(f, "{}", name),
             Type::Custom(name) => write!(f, "{}", name),
             Type::Generic { type_id, type_args } => {
                 let s = type_args

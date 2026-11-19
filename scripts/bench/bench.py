@@ -1,4 +1,4 @@
-import base64, csv, hashlib, io, json, os, shutil, subprocess, tempfile, time, urllib.parse, uuid
+import base64, collections, csv, hashlib, hmac, io, json, os, shutil, subprocess, tempfile, time, urllib.parse, uuid
 
 def vm_fib(n):
     return n if n < 2 else vm_fib(n - 1) + vm_fib(n - 2)
@@ -25,6 +25,29 @@ for i in range(100000):
     map_acc += vm_m[i]
 ms_vm_map = (time.perf_counter() - t0) * 1000.0
 if map_acc < 0:
+    raise RuntimeError("unreachable")
+
+t0 = time.perf_counter()
+adt_acc = 0
+for i in range(1000000):
+    r = i & 3
+    if r == 0:
+        ev = (0,)
+    elif r == 1:
+        ev = (1, i, 7)
+    elif r == 2:
+        ev = (2, i, 3)
+    else:
+        ev = (1, i, -2)
+    t_kind = ev[0]
+    if t_kind == 0:
+        adt_acc += 1
+    elif t_kind == 1:
+        adt_acc += ev[1] + ev[2]
+    else:
+        adt_acc += ev[1] * ev[2]
+ms_adt = (time.perf_counter() - t0) * 1000.0
+if adt_acc != 625001500000:
     raise RuntimeError("unreachable")
 
 # 1. FS I/O
@@ -209,9 +232,58 @@ ms_http = (time.perf_counter() - t0) * 1000.0
 if http_acc != 10125000:
     raise RuntimeError("unreachable")
 
+def b64url_enc(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode("ascii")
+
+def b64url_dec(s: str) -> bytes:
+    pad = "=" * ((4 - len(s) % 4) % 4)
+    return base64.urlsafe_b64decode(s + pad)
+
+jwt_secret = b"conduit_bench_jwt_secret_key_32b"
+jwt_hdr = b64url_enc(b'{"alg":"HS256","typ":"JWT"}')
+t0 = time.perf_counter()
+jwt_acc = 0
+for i in range(10000):
+    pay_b64 = b64url_enc(json.dumps({"sub": "user", "uid": i}, separators=(",", ":")).encode("utf-8"))
+    sig_input = f"{jwt_hdr}.{pay_b64}"
+    sig_b64 = b64url_enc(hmac.new(jwt_secret, sig_input.encode("ascii"), hashlib.sha256).digest())
+    tok = f"{sig_input}.{sig_b64}"
+
+    parts = tok.split(".")
+    if len(parts) != 3:
+        raise RuntimeError("unreachable")
+    expected_sig = b64url_enc(hmac.new(jwt_secret, f"{parts[0]}.{parts[1]}".encode("ascii"), hashlib.sha256).digest())
+    if not hmac.compare_digest(parts[2], expected_sig):
+        raise RuntimeError("unreachable")
+    cl = json.loads(b64url_dec(parts[1]))
+    jwt_acc += cl["uid"]
+ms_jwt = (time.perf_counter() - t0) * 1000.0
+if jwt_acc != 49995000:
+    raise RuntimeError("unreachable")
+
+lru = collections.OrderedDict()
+t0 = time.perf_counter()
+cache_acc = 0
+for i in range(100000):
+    ks = f"k{i & 8191}"
+    if ks in lru:
+        lru.move_to_end(ks)
+    elif len(lru) >= 4096:
+        lru.popitem(last=False)
+    lru[ks] = "v"
+
+    kg = f"k{(i + 6144) & 8191}"
+    if kg in lru:
+        lru.move_to_end(kg)
+        cache_acc += 1
+ms_cache = (time.perf_counter() - t0) * 1000.0
+if cache_acc != 97905:
+    raise RuntimeError("unreachable")
+
 print(f"BENCH|vm_fib_35|{ms_vm_fib:.3f}")
 print(f"BENCH|vm_arith_10m|{ms_vm_arith:.3f}")
 print(f"BENCH|vm_map_100k|{ms_vm_map:.3f}")
+print(f"BENCH|adt_switch_1m|{ms_adt:.3f}")
 
 print(f"BENCH|fs_write_text|{ms_write_text:.3f}")
 print(f"BENCH|fs_write_lines|{ms_write_stream:.3f}")
@@ -232,3 +304,5 @@ print(f"BENCH|pipeline_float_1m|{ms_fpipe:.3f}")
 print(f"BENCH|csv_parse_20k|{ms_csv:.3f}")
 print(f"BENCH|url_parse_50k|{ms_url:.3f}")
 print(f"BENCH|http_router_50k|{ms_http:.3f}")
+print(f"BENCH|jwt_hs256_10k|{ms_jwt:.3f}")
+print(f"BENCH|cache_lru_100k|{ms_cache:.3f}")

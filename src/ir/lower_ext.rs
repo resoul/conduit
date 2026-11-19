@@ -55,7 +55,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
 
     fn json_plan_for_type(&mut self, te: &TypeExpr, ctx: &str) -> Result<u16, String> {
         let target_ty = self.mc.resolve_type(te)?;
-        let json_ty = type_to_json_type(&target_ty, &self.mc.checked.struct_by_name)
+        let json_ty = type_to_json_type(&target_ty, self.mc.checked)
             .ok_or_else(|| format!("Unsupported JSON type '{}' in {}", target_ty, ctx))?;
         self.mc.add_json_decode_plan(&json_ty)
     }

@@ -11,6 +11,23 @@ export struct Job {
     created_at: String @validation.not_empty
 }
 
+export enum JobPayload {
+    SendEmail(to: String, subject: String),
+    Webhook(url: String, retries: Int = 3),
+    Heartbeat
+}
+
+export func describe_payload(p: JobPayload) -> String {
+    switch p {
+        case JobPayload.SendEmail(to, subject):
+            return "email->{to}:{subject}"
+        case JobPayload.Webhook(url, retries):
+            return "webhook->{url}(retries={retries})"
+        case JobPayload.Heartbeat:
+            return "heartbeat"
+    }
+}
+
 export func make_job(kind: String) -> Job | time.TimeError | validation.ValidationError {
     now := time.now()?
     ts := now.to_iso()?
@@ -29,6 +46,7 @@ func enqueue_job(r: redis.Client, job: Job) -> Int | redis.RedisError {
 export func main() -> Void | redis.RedisError | lock.LockError | time.TimeError | validation.ValidationError {
     url := env.get("REDIS_URL") ?? "redis://:conduit_redis_secret@127.0.0.1:16379/0"
     r := redis.connect(url)?
+    defer r.close()
     pong := r.ping()?
     print("Redis connected: {pong}")
 
@@ -60,6 +78,4 @@ export func main() -> Void | redis.RedisError | lock.LockError | time.TimeError 
         case redis.RedisError(e):
             return e
     }
-
-    r.close()
 }

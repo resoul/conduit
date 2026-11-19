@@ -9,6 +9,7 @@ fn is_native_module(path: &str) -> bool {
 
 struct LinkState<'a> {
     modules: &'a HashMap<&'a str, &'a str>,
+    module_paths: &'a HashMap<&'a str, String>,
     loaded: HashMap<String, (HashMap<String, String>, HashSet<String>)>,
     visiting: HashSet<String>,
     used_names: HashSet<String>,
@@ -86,6 +87,15 @@ pub fn link_imports(
     program: &mut Program,
     modules: &HashMap<&str, &str>,
 ) -> Result<(), String> {
+    let empty_paths = HashMap::new();
+    link_imports_with_paths(program, modules, &empty_paths)
+}
+
+pub fn link_imports_with_paths(
+    program: &mut Program,
+    modules: &HashMap<&str, &str>,
+    module_paths: &HashMap<&str, String>,
+) -> Result<(), String> {
     let root_defs = collect_local_defs(&program.items);
     let mut preferred: HashMap<(String, String), String> = HashMap::new();
     let mut claimed: HashSet<String> = root_defs.clone();
@@ -106,6 +116,7 @@ pub fn link_imports(
 
     let mut state = LinkState {
         modules,
+        module_paths,
         loaded: HashMap::new(),
         visiting: HashSet::new(),
         used_names: root_defs.clone(),
@@ -210,7 +221,16 @@ fn load_module(
     let mod_id = state.next_mod_id;
     state.next_mod_id += 1;
 
-    let mut mod_prog = parse_source(src)?;
+    let display_path = state
+        .module_paths
+        .get(norm.as_str())
+        .or_else(|| state.module_paths.get(path))
+        .cloned()
+        .unwrap_or_else(|| path.to_string());
+    let display_path_ref = std::path::Path::new(&display_path);
+
+    let mut mod_prog =
+        parse_source(src).map_err(|e| crate::diagnostics::tag_file_error(display_path_ref, e))?;
     let local_defs = collect_local_defs(&mod_prog.items);
     let mut env = process_module_imports(&mod_prog.items, &local_defs, state, Some(mod_id))?;
 
@@ -265,7 +285,8 @@ fn load_module(
         .items
         .retain(|it| !matches!(it.kind, ItemKind::Test { .. }));
     env.sym_map.extend(local_to_global.clone());
-    rewrite_items(&mut mod_prog.items, &env)?;
+    rewrite_items(&mut mod_prog.items, &env)
+        .map_err(|e| crate::diagnostics::tag_file_error(display_path_ref, e))?;
 
     for mut item in mod_prog.items {
         if matches!(item.kind, ItemKind::ExportList { .. }) {
@@ -294,6 +315,9 @@ fn load_module(
         rename_item_decl(&mut item, &local_to_global);
         item.is_imported = true;
         item.is_exported = false;
+        if item.source_file.is_none() {
+            item.source_file = Some(display_path.clone());
+        }
         state.merged_items.push(item);
     }
 
@@ -404,7 +428,49 @@ fn rewrite_items(items: &mut [Item], env: &RewriteEnv) -> Result<(), String> {
                 let mut scopes = Vec::new();
                 rewrite_block_stmts(body, env, &mut scopes)?;
             }
-            ItemKind::Enum { .. } | ItemKind::Import { .. } => {}
+            ItemKind::Enum { variants, .. } => {
+                for v in variants {
+                    for f in &mut v.fields {
+                        rewrite_type_expr(&mut f.ty, env)?;
+                        if let Some(def) = &mut f.default {
+                            let mut empty_scopes = Vec::new();
+                            rewrite_expr(def, env, &mut empty_scopes)?;
+                        }
+                        for ann in &mut f.annotations {
+                            let mut empty_scopes = Vec::new();
+                            for a in &mut ann.args {
+                                rewrite_expr(a, env, &mut empty_scopes)?;
+                            }
+                            if matches!(
+                                ann.target.as_str(),
+                                "json" | "env" | "flag" | "opt" | "arg" | "rest" | "cmd" | "group"
+                            ) || ann.target.starts_with("db.")
+                                || ann.target.starts_with("cli.")
+                                || ann.target.starts_with("router.")
+                                || ann.target.starts_with("schedule.")
+                            {
+                                continue;
+                            }
+                            if let Some((ns, member)) = ann.target.split_once('.') {
+                                if let Some(exports) = env.ns_map.get(ns) {
+                                    let resolved = exports.get(member).ok_or_else(|| {
+                                        format!(
+                                            "Module alias '{}' has no exported member '{}'",
+                                            ns, member
+                                        )
+                                    })?;
+                                    ann.target = resolved.clone();
+                                } else if let Some(scoped) = env.nat_ns_rename.get(ns) {
+                                    ann.target = format!("{}.{}", scoped, member);
+                                }
+                            } else if let Some(mapped) = env.sym_map.get(&ann.target) {
+                                ann.target = mapped.clone();
+                            }
+                        }
+                    }
+                }
+            }
+            ItemKind::Import { .. } => {}
         }
     }
     Ok(())
@@ -465,6 +531,13 @@ pub(crate) fn bind_pat_names(pat: &Pattern, scope: &mut HashSet<String>) {
     match &pat.kind {
         PatternKind::Ident(n) | PatternKind::Type { binding: n, .. } => {
             scope.insert(n.clone());
+        }
+        PatternKind::EnumVariant { bindings, .. } => {
+            for (_, v) in bindings {
+                if v != "_" {
+                    scope.insert(v.clone());
+                }
+            }
         }
         PatternKind::Tuple(ps) => {
             for p in ps {
@@ -548,6 +621,9 @@ fn rewrite_block_stmts(
                 rewrite_expr(condition, env, scopes)?;
                 rewrite_block_stmts(body, env, scopes)?;
             }
+            StmtKind::Defer(block) => {
+                rewrite_block_stmts(block, env, scopes)?;
+            }
             StmtKind::Switch { expr, cases } => {
                 rewrite_expr(expr, env, scopes)?;
                 for case in cases {
@@ -571,7 +647,16 @@ fn rewrite_block_stmts(
                         if let Some(dot) = name.find('.') {
                             let (ns, member) = (&name[..dot], &name[dot + 1..]);
                             if let Some(exports) = env.ns_map.get(ns) {
-                                if let Some(resolved) = exports.get(member) {
+                                if let Some((ename, vname)) = member.split_once('.') {
+                                    if let Some(resolved) = exports.get(ename) {
+                                        *name = format!("{}.{}", resolved, vname);
+                                    } else {
+                                        return Err(format!(
+                                            "Module alias '{}' has no exported enum '{}'",
+                                            ns, ename
+                                        ));
+                                    }
+                                } else if let Some(resolved) = exports.get(member) {
                                     *name = resolved.clone();
                                 } else {
                                     return Err(format!(
@@ -581,9 +666,27 @@ fn rewrite_block_stmts(
                                 }
                             } else if let Some(scoped) = env.nat_ns_rename.get(ns) {
                                 *name = format!("{}.{}", scoped, member);
+                            } else if let Some(mapped) = env.sym_map.get(ns) {
+                                *name = format!("{}.{}", mapped, member);
                             }
                         } else if let Some(mapped) = env.sym_map.get(name) {
                             *name = mapped.clone();
+                        }
+                    }
+                    if let PatternKind::EnumVariant { enum_name, .. } = &mut case.pattern.kind {
+                        if let Some((ns, ename)) = enum_name.split_once('.') {
+                            if let Some(exports) = env.ns_map.get(ns) {
+                                if let Some(resolved) = exports.get(ename) {
+                                    *enum_name = resolved.clone();
+                                } else {
+                                    return Err(format!(
+                                        "Module alias '{}' has no exported enum '{}'",
+                                        ns, ename
+                                    ));
+                                }
+                            }
+                        } else if let Some(mapped) = env.sym_map.get(enum_name) {
+                            *enum_name = mapped.clone();
                         }
                     }
                     let mut case_scope = HashSet::new();

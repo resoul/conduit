@@ -267,7 +267,7 @@
       "patterns": [
         {
           "name": "keyword.control.flow.conduit",
-          "match": "\\b(if|else|guard|return|switch|case|for|while|in|break|continue)\\b"
+          "match": "\\b(if|else|guard|defer|return|switch|case|for|while|in|break|continue)\\b"
         },
         {
           "name": "keyword.control.import.conduit",

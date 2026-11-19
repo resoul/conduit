@@ -8,21 +8,21 @@ Conduit is designed with explicit control flow, strict types, and composable sta
 
 - **Zero External Dependencies**: Implemented purely using the Rust standard library (`std`) with no external crates.
 - **Register Bytecode VM**: Compiles `.cdt` programs to compact register bytecode (`Op`) with split scalar/object registers, copy-on-write (`Arc`) collections, and fused `|>` pipelines.
-- **Static Type System & Canonical Identity**: Catches type mismatches, unhandled error unions, and non-exhaustive `switch` cases at compile time, preserving distinct module-scoped type identities across imports.
-- **Generics, Collections & Closures**: Supports user-defined generic structs and functions (`struct Box<T>`, `func find<T>`), safe indexing on `[T]` (`IndexError`), insertion-ordered `Map<K, V>` (`KeyError`), string interpolation (`"hello {x}"`), anonymous lexical closures, and `|>` pipelines.
+- **Static Type System & Tagged Unions**: Catches type mismatches, unhandled error unions, and non-exhaustive `switch` cases at compile time with multi-error source-snippet diagnostics, scalar and payload `enum`s (tagged unions with named fields and default values), and distinct module-scoped type identities across imports.
+- **Generics, Collections, Closures & `defer`**: Supports user-defined generic structs and functions (`struct Box<T>`, `func find<T>`), safe indexing on `[T]` (`IndexError`), insertion-ordered `Map<K, V>` (`KeyError`), string interpolation (`"hello {x}"`), anonymous lexical closures, `|>` pipelines, and LIFO `defer` cleanup on function exit or `?` error propagation.
 - **TS-Style Modules & Tree-Shaking**: Supports `import { a, b } from "./mod"` and `import * as ns from "./mod"` with explicit `export` privacy and dead-code elimination of unreachable functions.
 - **Errors as Values**: Functions return explicit union types (`T | Error`), inspected via exhaustive `switch` or propagated via `?`—zero exceptions.
 - **Strict Numbers (`Int` & `Float`)**: 64-bit integers (`Int`) and IEEE 754 floats (`Float`) never mix implicitly; conversions (`.to_float()`, `.floor()`, `.ceil()`, `.round()`, `.to_string()`) are always explicit.
 - **Explicit Schema Validation**: Mark validators with `[#validator]`, attach `@rule` / `@module.rule(...)` annotations to fields, and execute recursive checks explicitly via `validation.check()`.
-- **Standard Library (`cdt.*`)**: Built-in host-native modules for HTTP (`cdt.http`), SQL databases (`cdt.db`), cron scheduling (`cdt.cron`), JSON (`cdt.json`), schema validation (`cdt.validation`), time (`cdt.time`), environment config (`cdt.env`), CLI parsing & dispatch (`cdt.cli`), filesystem (`cdt.fs`), paths (`cdt.path`), processes (`cdt.process`), crypto (`cdt.crypto`), URLs (`cdt.url`), CSV (`cdt.csv`), math (`cdt.math`), and logging (`cdt.log`).
+- **Standard Library (`cdt.*`)**: Built-in host-native modules for HTTP (`cdt.http`), SQL databases (`cdt.db`), Redis (`cdt.redis`), JWT (`cdt.jwt`), in-memory/WAL cache (`cdt.cache`), mutex/RW/file locks (`cdt.lock`), cron scheduling (`cdt.cron`), JSON (`cdt.json`), schema validation (`cdt.validation`), time (`cdt.time`), environment config (`cdt.env`), CLI parsing & dispatch (`cdt.cli`), filesystem (`cdt.fs`), paths (`cdt.path`), processes (`cdt.process`), crypto (`cdt.crypto`), URLs (`cdt.url`), CSV (`cdt.csv`), math (`cdt.math`), and logging (`cdt.log`).
 
 ## Standard Library
 
 | Module | Purpose | Docs |
 | :--- | :--- | :--- |
-| `cdt.json` | Strict RFC 8259 typed decoding (`json.decode<T>`), deterministic encoding (`json.encode`), and unstructured `json.Value` trees (`json.parse`, `json.stringify`) | [cdt.json](docs/src/library/json.md) |
-| `cdt.validation` | Field annotations, custom `[#validator]` functions, built-in `min`/`max`/`email` rules, and recursive `validation.check()` | [cdt.validation](docs/src/library/validation.md) |
-| `cdt.time` | System clock (`Timestamp`), monotonic time (`Instant`), arithmetic (`Duration`), and safe `TimeError` handling | [cdt.time](docs/src/library/time.md) |
+| `cdt.json` | Strict RFC 8259 typed decoding (`json.decode<T>`), deterministic encoding (`json.encode`), tagged-union `enum` discriminator (`"type"`), and unstructured `json.Value` trees (`json.parse`, `json.stringify`) | [cdt.json](docs/src/library/json.md) |
+| `cdt.validation` | Field annotations, custom `[#validator]` functions, built-in `min`/`max`/`min_len`/`max_len`/`range`/`not_empty`/`one_of`/`email`/`url`/`uuid` rules, and recursive `validation.check()` | [cdt.validation](docs/src/library/validation.md) |
+| `cdt.time` | System clock (`Timestamp`), ISO-8601 UTC formatting/parsing & calendar accessors, monotonic time (`Instant`), arithmetic (`Duration`), `sleep`, and safe `TimeError` handling | [cdt.time](docs/src/library/time.md) |
 | `cdt.env` | Typed environment configuration (`@env`, `env.load<T>()`), `get`/`require`, and raw `args()` | [cdt.env](docs/src/library/env.md) |
 | `cdt.cli` | Declarative `cli { ... => handler }` DSL & `@cli.*` annotations, `cli.parse<T>()`, `cli.dispatch<T>()`, and `--help` | [cdt.cli](docs/src/library/cli.md) |
 | `cdt.fs` | Basic & buffered streaming file I/O (`read_text`, `write_atomic`, `each_line`, `Reader`, `Writer`) | [cdt.fs](docs/src/library/fs.md) |
@@ -34,8 +34,12 @@ Conduit is designed with explicit control flow, strict types, and composable sta
 | `cdt.math` | Floating-point math functions (`sqrt`, `pow`, `sin`, `cos`, `ln`, `floor`, `ceil`, `round`, `hypot`) and constants | [cdt.math](docs/src/library/math.md) |
 | `cdt.log` | Leveled `stderr` logger with optional structured JSON lines | [cdt.log](docs/src/library/log.md) |
 | `cdt.http` | Zero-dependency HTTP/1.1 client (`http.get`, `get_json<T>`, `post`, `post_json`, `request_timeout`, `get_bytes`, `https://` via `curl`), declarative `router { ... }` (`group`, `static`, `cors`, typed JSON validation contracts), multi-threaded `Router`, and graceful shutdown | [cdt.http](docs/src/library/http.md) |
-| `cdt.db` | Zero-dependency PostgreSQL and MySQL wire-protocol drivers (`connect`, `exec`, `query<T>`, `@db.*` models, transactions) and declarative `migration`s | [cdt.db](docs/src/library/db.md) |
+| `cdt.db` | Zero-dependency PostgreSQL and MySQL wire-protocol drivers (`connect`, `exec`, `query<T>`, `query_one<T>`, `@db.*` models with `find_by`/`update`/`count`, transactions) and declarative `migration`s | [cdt.db](docs/src/library/db.md) |
 | `cdt.cron` | Zero-dependency declarative `schedule` blocks, 5-field UTC cron & interval scheduler (`cron.run<T>`, `cron.start<T>`) | [cdt.cron](docs/src/library/cron.md) |
+| `cdt.jwt` | Pure-Rust HS256 & HS512 JWT signing, constant-time verification (`jwt.sign`, `jwt.verify<T>`), and `exp`/`nbf`/`iat` validation | [cdt.jwt](docs/src/library/jwt.md) |
+| `cdt.lock` | Process-wide named mutexes, writer-fair RWLocks, and inter-process OS advisory file locks (`lock.with`, `lock.file`) | [cdt.lock](docs/src/library/lock.md) |
+| `cdt.cache` | Thread-safe TTL + LRU in-memory stores, stampede-safe `get_or_set`, atomic `incr`, snapshots, and append-only WAL persistence | [cdt.cache](docs/src/library/cache.md) |
+| `cdt.redis` | Zero-dependency RESP2 TCP client (KV, JSON, Hash, List, Set, raw `cmd`) and Lua-verified distributed locks (`with_lock`) | [cdt.redis](docs/src/library/redis.md) |
 
 ## Installation
 
@@ -62,6 +66,10 @@ conduit run main.cdt
 
 # Run built-in tests in .cdt files
 conduit test
+
+# Inspect HTTP router table or export OpenAPI 3.0.3 JSON spec
+conduit routes main.cdt
+conduit openapi main.cdt -o openapi.json
 
 # Watch and auto-reload on .cdt changes
 conduit watch main.cdt

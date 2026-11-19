@@ -2623,3 +2623,391 @@ fn cdt_redis_resp2_commands_json_and_distributed_locks_e2e() {
         Obj::str("invalid_url:auth:PONG|world:true:true:false:true:true:true:false|1:5:4:1:bolt|true:Alice:Alice:true|2:a:b|true:true:1:true:hi|true:true:true:true:false:true|1:true")
     );
 }
+
+#[test]
+fn defer_lifo_early_return_try_propagation_loops_closures_and_bundle_e2e() {
+    let bad_ret = "func f() -> Int {\n    defer {\n        return 1\n    }\n    return 0\n}\n";
+    assert!(check_source(bad_ret).is_err(), "return inside defer must fail");
+
+    let bad_try = r#"
+error E { msg: String }
+func fail() -> Int | E { return E("x") }
+func f() -> Int | E {
+    defer { _ := fail()? }
+    return 0
+}
+"#;
+    assert!(check_source(bad_try).is_err(), "? inside defer must fail");
+
+    let bad_nested = "func f() -> Void {\n    defer {\n        defer print(\"x\")\n    }\n}\n";
+    assert!(check_source(bad_nested).is_err(), "nested defer must fail");
+
+    let src = r#"
+import "cdt.cache" as cache
+
+error AppErr {
+    msg: String
+}
+
+func push_log(st: cache.Cache, key: String, item: String) -> Void {
+    cur := st.get(key) ?? ""
+    if cur == "" {
+        _s1 := st.set(key, item)
+    } else {
+        _s2 := st.set(key, "{cur},{item}")
+    }
+}
+
+func fallthrough_case(st: cache.Cache) -> Void {
+    defer push_log(st, "l1", "f1")
+    defer {
+        push_log(st, "l1", "f2a")
+        push_log(st, "l1", "f2b")
+    }
+    push_log(st, "l1", "body")
+}
+
+func early_ret(st: cache.Cache, early: Bool) -> Int {
+    var out = 10
+    defer {
+        push_log(st, "l2", "a")
+        out = 999
+    }
+    if early {
+        out = 42
+        return out
+    }
+    defer push_log(st, "l2", "b")
+    out = 7
+    return out
+}
+
+func might_fail(fail: Bool) -> Int | AppErr {
+    if fail {
+        return AppErr("boom")
+    }
+    return 5
+}
+
+func try_prop(st: cache.Cache, fail: Bool) -> Int | AppErr {
+    defer push_log(st, "l3", "cleanup")
+    v := might_fail(fail)?
+    defer push_log(st, "l3", "after_ok")
+    return v + 1
+}
+
+func loop_and_closure(st: cache.Cache) -> Int {
+    for _ in 0..3 {
+        defer push_log(st, "l4", "loop")
+    }
+    tag := "cls"
+    cb := () => {
+        push_log(st, "l4", tag)
+    }
+    defer cb()
+    inner := () => {
+        defer push_log(st, "l4", "inner_d")
+        push_log(st, "l4", "inner_body")
+    }
+    inner()
+    push_log(st, "l4", "after_inner")
+    return 11
+}
+
+func run() -> String {
+    st := cache.open("defer_test_shared")
+    st.clear()
+    fallthrough_case(st)
+
+    r_early := early_ret(st, true)
+    r_normal := early_ret(st, false)
+
+    var try_err = "ok"
+    switch try_prop(st, true) {
+        case Int(_): try_err = "unexpected"
+        case AppErr(e): try_err = e.msg
+    }
+    var try_ok = 0
+    switch try_prop(st, false) {
+        case Int(n): try_ok = n
+        case AppErr(_): try_ok = -1
+    }
+
+    inner_res := loop_and_closure(st)
+
+    s1 := st.get("l1") ?? ""
+    s2 := st.get("l2") ?? ""
+    s3 := st.get("l3") ?? ""
+    s4 := st.get("l4") ?? ""
+    return "{s1}|{r_early},{r_normal}:{s2}|{try_err},{try_ok}:{s3}|{inner_res}:{s4}"
+}
+"#;
+    let module = compile_source(src).expect("defer program should compile");
+    let fid = module.func_id("run").unwrap();
+    let bundle = crate::ir::bundle::encode_bundle(&module, fid, crate::ir::bundle::RET_OBJ).unwrap();
+    let (decoded, entry, _) = crate::ir::bundle::decode_bundle(&bundle).unwrap();
+    decoded.validate().unwrap();
+
+    let mut vm = Vm::new();
+    let out = vm.call_obj(&decoded, entry, &[], &[]).unwrap();
+    assert_eq!(
+        out,
+        Obj::str(
+            "body,f2a,f2b,f1|42,7:a,b,a|boom,6:cleanup,after_ok,cleanup|11:inner_body,inner_d,after_inner,cls,loop,loop,loop"
+        )
+    );
+}
+
+#[test]
+fn data_enum_tagged_union_switch_json_cross_module_openapi_and_bundle_e2e() {
+    let bad_reserved = "enum Bad {\n    A(type: Int)\n}\n";
+    assert!(
+        check_source(bad_reserved).is_err(),
+        "field named 'type' in data enum must fail"
+    );
+
+    let bad_non_exhaustive = r#"
+enum M {
+    Ping,
+    Say(text: String)
+}
+func f(m: M) -> String {
+    switch m {
+        case M.Ping: return "p"
+    }
+    return ""
+}
+"#;
+    assert!(
+        check_source(bad_non_exhaustive).is_err(),
+        "non-exhaustive switch on data enum must fail"
+    );
+
+    let bad_payload_no_parens = r#"
+enum M {
+    Ping,
+    Say(text: String)
+}
+func f(m: M) -> String {
+    switch m {
+        case M.Ping: return "p"
+        case M.Say: return "s"
+    }
+}
+"#;
+    assert!(
+        check_source(bad_payload_no_parens).is_err(),
+        "payload variant matched without () must fail"
+    );
+
+    let proto_mod = r#"
+export enum Packet {
+    Ack,
+    Data(payload: String, seq: Int = 0)
+}
+
+export func make_pkt(s: String) -> Packet {
+    return Packet.Data(payload: s, seq: 7)
+}
+"#;
+
+    let main_src = r#"
+import "cdt.json" as json
+import { Packet, make_pkt } from "proto"
+
+enum Msg {
+    Say(text: String, room: Int = 1),
+    Move(dx: Int, dy: Int = 0),
+    Ping
+}
+
+enum Node {
+    Leaf(val: Int),
+    Pair(left: Node, right: Node)
+}
+
+error BadMsg {
+    reason: String
+}
+
+func make_result(ok: Bool) -> Msg | BadMsg {
+    if !ok {
+        return BadMsg("invalid")
+    }
+    return Msg.Say(text: "ok")
+}
+
+func describe(m: Msg) -> String {
+    switch m {
+        case Msg.Say(t, r):
+            return "say:{t}:{r}"
+        case Msg.Move(_, dy: y):
+            return "move:{y}"
+        case Msg.Ping:
+            return "ping"
+    }
+}
+
+func sum_tree(n: Node) -> Int {
+    switch n {
+        case Node.Leaf(v):
+            return v
+        case Node.Pair(l, r):
+            return sum_tree(l) + sum_tree(r)
+    }
+}
+
+func handle_res_inner(flag: Bool) -> String | BadMsg {
+    m := make_result(flag)?
+    return describe(m)
+}
+
+func handle_res(flag: Bool) -> String {
+    switch handle_res_inner(flag) {
+        case String(s): return s
+        case BadMsg(e): return "err:{e.reason}"
+    }
+}
+
+func run_inner() -> String | json.DecodeError | json.EncodeError {
+    m1 := Msg.Say("hi", 3)
+    m2 := Msg.Say(text: "yo")
+    m3 := Msg.Move(5)
+    m4 := Msg.Ping
+
+    var named_bind = ""
+    switch m2 {
+        case Msg.Say(text: txt):
+            named_bind = txt
+        case Msg.Move(_):
+            named_bind = "mv"
+        case Msg.Ping:
+            named_bind = "p"
+    }
+
+    j1 := json.encode(m2)?
+    j4 := json.encode(m4)?
+
+    d1 := json.decode<Msg>(j1)?
+    d_reordered := json.decode<Msg>("{\"room\":9,\"text\":\"reordered\",\"type\":\"Say\"}")?
+    d4 := json.decode<Msg>("{\"type\":\"Ping\"}")?
+
+    list_in := [Msg.Ping, Msg.Move(dx: 2, dy: 4)]
+    list_json := json.encode(list_in)?
+    list_out := json.decode<[Msg]>(list_json)?
+
+    mp := Map<String, Msg>()
+    mp.set("k", Msg.Say(text: "mapped"))
+    mp_json := json.encode(mp)?
+    mp_out := json.decode<Map<String, Msg>>(mp_json)?
+    mp_val := describe(mp_out.get("k") ?? Msg.Ping)
+
+    tree := Node.Pair(left: Node.Leaf(4), right: Node.Pair(left: Node.Leaf(5), right: Node.Leaf(6)))
+    tree_json := json.encode(tree)?
+    tree_dec := json.decode<Node>(tree_json)?
+    tree_sum := sum_tree(tree_dec)
+
+    pkt := make_pkt("hello")
+    var pkt_str = ""
+    switch pkt {
+        case Packet.Ack: pkt_str = "ack"
+        case Packet.Data(p, s): pkt_str = "{p}:{s}"
+    }
+    pkt_json := json.encode(Packet.Ack)?
+    var ack_rt = false
+    switch json.decode<Packet>(pkt_json) {
+        case Packet(rt):
+            switch rt {
+                case Packet.Ack: ack_rt = true
+                case Packet.Data(_): ack_rt = false
+            }
+        case json.DecodeError(_): ack_rt = false
+    }
+
+    s_m1 := describe(m1)
+    s_m3 := describe(m3)
+    s_m4 := describe(m4)
+    h_t := handle_res(true)
+    h_f := handle_res(false)
+    s_d1 := describe(d1)
+    s_dr := describe(d_reordered)
+    s_d4 := describe(d4)
+    l_len := list_out.len()
+    return "{s_m1}|{named_bind}|{s_m3}|{s_m4}|{h_t}|{h_f}|{j1}|{j4}|{s_d1}|{s_dr}|{s_d4}|{l_len}|{mp_val}|{tree_sum}|{pkt_str}:{ack_rt}"
+}
+
+export func decode_raw_msg(raw: String) -> String | json.DecodeError {
+    m := json.decode<Msg>(raw)?
+    return describe(m)
+}
+
+export func run() -> String {
+    switch run_inner() {
+        case String(s): return s
+        case json.DecodeError(e): return "dec_err:{e.message}"
+        case json.EncodeError(e): return "enc_err:{e.message}"
+    }
+}
+"#;
+
+    let mut mods = HashMap::new();
+    mods.insert("proto", proto_mod);
+    let module = compile_with_modules(main_src, &mods).expect("data enum program should compile");
+    let fid = module.func_id("run").unwrap();
+    let bundle = crate::ir::bundle::encode_bundle(&module, fid, crate::ir::bundle::RET_OBJ).unwrap();
+    let (decoded, entry, _) = crate::ir::bundle::decode_bundle(&bundle).unwrap();
+    decoded.validate().unwrap();
+
+    let mut vm = Vm::new();
+    let out = vm.call_obj(&decoded, entry, &[], &[]).unwrap();
+    assert_eq!(
+        out,
+        Obj::str(
+            "say:hi:3|yo|move:0|ping|say:ok:1|err:invalid|{\"type\":\"Say\",\"text\":\"yo\",\"room\":1}|{\"type\":\"Ping\"}|say:yo:1|say:reordered:9|ping|2|say:mapped:1|15|hello:7:true"
+        )
+    );
+
+    let dec_fid = decoded.func_id("decode_raw_msg").unwrap();
+    let err_missing = vm
+        .call_obj(&decoded, dec_fid, &[], &[Obj::str("{\"text\":\"hi\"}")])
+        .unwrap_err();
+    assert!(
+        err_missing.message.contains("Missing discriminator field 'type'"),
+        "unexpected err: {}",
+        err_missing.message
+    );
+    let err_unknown = vm
+        .call_obj(&decoded, dec_fid, &[], &[Obj::str("{\"type\":\"Ghost\"}")])
+        .unwrap_err();
+    assert!(
+        err_unknown.message.contains("Unknown variant 'Ghost'"),
+        "unexpected err: {}",
+        err_unknown.message
+    );
+
+    let openapi_src = r#"
+import "cdt.http" as http
+
+enum Msg {
+    Say(text: String, room: Int = 1),
+    Ping
+}
+
+router EventsApi "Events" {
+    post "/events" => handle_event
+}
+
+func handle_event(req: http.Request, body: Msg) -> http.Response {
+    return http.ok_json(Msg.Ping)
+}
+"#;
+    let (prog, checked) = check_source(openapi_src).unwrap();
+    let spec = crate::openapi::generate_openapi_json(&prog, &checked, "Events", "1.0.0", None, None).unwrap();
+    assert!(spec.contains("\"$ref\": \"#/components/schemas/Msg\""), "{}", spec);
+    assert!(spec.contains("\"oneOf\""), "{}", spec);
+    assert!(spec.contains("\"discriminator\""), "{}", spec);
+    assert!(spec.contains("\"propertyName\": \"type\""), "{}", spec);
+    assert!(spec.contains("\"Msg_Say\""), "{}", spec);
+    assert!(spec.contains("\"Msg_Ping\""), "{}", spec);
+    assert!(spec.contains("\"mapping\""), "{}", spec);
+}

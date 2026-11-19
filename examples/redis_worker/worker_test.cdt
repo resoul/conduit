@@ -1,7 +1,8 @@
+import * as json from "cdt.json"
 import * as redis from "cdt.redis"
 import * as lock from "cdt.lock"
 import * as validation from "cdt.validation"
-import { Job, make_job } from "./main"
+import { Job, JobPayload, describe_payload, make_job } from "./main"
 
 test "redis_worker Job validation accepts UUID and allowed kind" {
     job := make_job("webhook")?
@@ -32,4 +33,18 @@ test "redis_worker rejects invalid Redis URL cleanly" {
 test "redis_worker in-process lock guards batch step" {
     v := lock.with("worker:local", () => 100 + 23)?
     assert_eq(v, 123)
+}
+
+test "redis_worker JobPayload tagged union switch and JSON roundtrip" {
+    p1 := JobPayload.Webhook(url: "https://example.com/hook")
+    assert_eq(describe_payload(p1), "webhook->https://example.com/hook(retries=3)")
+
+    raw := json.encode(p1)?
+    assert(raw.contains("\"type\":\"Webhook\""))
+    decoded := json.decode<JobPayload>(raw)?
+    assert_eq(describe_payload(decoded), "webhook->https://example.com/hook(retries=3)")
+
+    hb_raw := json.encode(JobPayload.Heartbeat)?
+    hb := json.decode<JobPayload>(hb_raw)?
+    assert_eq(describe_payload(hb), "heartbeat")
 }

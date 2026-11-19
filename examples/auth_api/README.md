@@ -13,8 +13,10 @@ End-to-end zero-dependency backend showcase combining:
 ```bash
 cd examples/auth_api
 
-# Type-check & inspect cron schedule
+# Type-check, inspect HTTP routes, export OpenAPI 3.0.3 & inspect cron schedule
 conduit check main.cdt
+conduit routes main.cdt
+conduit openapi main.cdt --title "Conduit Auth API" --version "1.0.0"
 conduit cron list main.cdt
 
 # Run built-in .cdt tests

@@ -8,6 +8,19 @@ import * as time from "cdt.time"
 import * as csv from "cdt.csv"
 import * as url from "cdt.url"
 import * as http from "cdt.http"
+import * as jwt from "cdt.jwt"
+import * as cache from "cdt.cache"
+
+enum BenchEvent {
+    Tick,
+    Add(a: Int, b: Int),
+    Scale(val: Int, factor: Int)
+}
+
+struct BenchClaim {
+    sub: String
+    uid: Int
+}
 
 func h_root(_req: http.Request) -> http.Response { return http.text("ok") }
 func h_health(_req: http.Request) -> http.Response { return http.text("ok") }
@@ -47,7 +60,7 @@ func vm_fib(n: Int) -> Int {
     return vm_fib(n - 1) + vm_fib(n - 2)
 }
 
-export func main() -> Void | KeyError | fs.FsError | process.ProcessError | crypto.CryptoError | json.DecodeError | json.EncodeError | time.TimeError | csv.CsvError | url.UrlError {
+export func main() -> Void | KeyError | fs.FsError | process.ProcessError | crypto.CryptoError | json.DecodeError | json.EncodeError | time.TimeError | csv.CsvError | url.UrlError | jwt.JwtError | cache.CacheError {
     // ── 0. Pure-VM Computation ───────────────────────────────────────────────
     t_fib := time.monotonic()
     fib_res := vm_fib(35)
@@ -79,6 +92,32 @@ export func main() -> Void | KeyError | fs.FsError | process.ProcessError | cryp
     }
     ms_vm_map := ms_since(t_map)?
     if map_acc < 0 { return }
+
+    t_adt := time.monotonic()
+    var adt_acc = 0
+    li = 0
+    while li < 1000000 {
+        rem := li % 4
+        var ev = BenchEvent.Tick
+        if rem == 1 {
+            ev = BenchEvent.Add(a: li, b: 7)
+        } else if rem == 2 {
+            ev = BenchEvent.Scale(val: li, factor: 3)
+        } else if rem == 3 {
+            ev = BenchEvent.Add(a: li, b: -2)
+        }
+        switch ev {
+            case BenchEvent.Tick:
+                adt_acc = adt_acc + 1
+            case BenchEvent.Add(a, b):
+                adt_acc = adt_acc + a + b
+            case BenchEvent.Scale(v, f):
+                adt_acc = adt_acc + v * f
+        }
+        li = li + 1
+    }
+    ms_adt := ms_since(t_adt)?
+    if adt_acc != 625001500000 { return }
     // ── 1. FS I/O (100k lines / 5.53 MiB) ────────────────────────────────────
     cwd := process.cwd()?
     base := path.join(cwd, "_conduit_bench_tmp")
@@ -308,9 +347,41 @@ export func main() -> Void | KeyError | fs.FsError | process.ProcessError | cryp
     ms_http := ms_since(t_http)?
     if http_acc != 10125000 { return }
 
+    jwt_secret := "conduit_bench_jwt_secret_key_32b"
+    t_jwt := time.monotonic()
+    i = 0
+    var jwt_acc = 0
+    while i < 10000 {
+        tok := jwt.sign(BenchClaim(sub: "user", uid: i), jwt_secret)?
+        cl := jwt.verify<BenchClaim>(tok, jwt_secret)?
+        jwt_acc = jwt_acc + cl.uid
+        i = i + 1
+    }
+    ms_jwt := ms_since(t_jwt)?
+    if jwt_acc != 49995000 { return }
+
+    lru := cache.open("bench_lru", 4096)
+    lru.clear()?
+    defer cache.drop("bench_lru")
+    t_lru := time.monotonic()
+    i = 0
+    var cache_acc = 0
+    while i < 100000 {
+        k_set := "k" + (i % 8192).to_string()
+        lru.set(k_set, "v")?
+        k_get := "k" + ((i + 6144) % 8192).to_string()
+        if lru.get(k_get) != nil {
+            cache_acc = cache_acc + 1
+        }
+        i = i + 1
+    }
+    ms_cache := ms_since(t_lru)?
+    if cache_acc != 97905 { return }
+
     print("BENCH|vm_fib_35|" + ms_vm_fib.to_string())
     print("BENCH|vm_arith_10m|" + ms_vm_arith.to_string())
     print("BENCH|vm_map_100k|" + ms_vm_map.to_string())
+    print("BENCH|adt_switch_1m|" + ms_adt.to_string())
 
     print("BENCH|fs_write_text|" + ms_write_text.to_string())
     print("BENCH|fs_write_lines|" + ms_write_stream.to_string())
@@ -331,5 +402,7 @@ export func main() -> Void | KeyError | fs.FsError | process.ProcessError | cryp
     print("BENCH|csv_parse_20k|" + ms_csv.to_string())
     print("BENCH|url_parse_50k|" + ms_url.to_string())
     print("BENCH|http_router_50k|" + ms_http.to_string())
+    print("BENCH|jwt_hs256_10k|" + ms_jwt.to_string())
+    print("BENCH|cache_lru_100k|" + ms_cache.to_string())
     return
 }

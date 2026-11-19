@@ -75,6 +75,10 @@ impl<'a> JsonDecoder<'a> {
                 self.decode_map(plan, *val_plan, val_name, depth)
             }
             PlanNode::Struct(schema) => self.decode_struct(schema, plan, depth),
+            PlanNode::TaggedEnum {
+                type_name,
+                variants,
+            } => self.decode_tagged_enum(type_name, variants, plan, depth),
             PlanNode::Unavailable(id) => Err(JsonError::root(format!(
                 "Type 'Struct#{}' cannot be decoded from JSON",
                 id
@@ -310,11 +314,108 @@ impl<'a> JsonDecoder<'a> {
         }
     }
 
+    fn decode_tagged_enum(
+        &mut self,
+        type_name: &str,
+        variants: &[(String, CompiledStructDecodePlan)],
+        plan: &JsonDecodePlan,
+        depth: usize,
+    ) -> Result<Obj, JsonError> {
+        self.skip_ws();
+        if self.peek() != Some(b'{') {
+            return Err(self.wrong_kind(&format!("JSON object for '{}'", type_name), depth));
+        }
+        if depth >= MAX_JSON_DEPTH {
+            return Err(JsonError::root("Maximum JSON nesting depth (128) exceeded"));
+        }
+        let obj_start = self.pos;
+        self.pos += 1;
+
+        self.skip_ws();
+        if self.peek() == Some(b'}') {
+            return Err(JsonError::new(
+                join_field_path("", "type"),
+                format!("Missing discriminator field 'type' for enum '{}'", type_name),
+            ));
+        }
+
+        let tag: String;
+        loop {
+            self.skip_ws();
+            if self.peek() != Some(b'"') {
+                return Err(JsonError::root("Expected string key in JSON object"));
+            }
+            let key = self.parse_string_cow()?;
+            self.skip_ws();
+            if self.peek() != Some(b':') {
+                return Err(JsonError::new(
+                    join_field_path("", key.as_ref()),
+                    "Expected ':' after JSON object key",
+                ));
+            }
+            self.pos += 1;
+            if key.as_ref() == "type" {
+                self.skip_ws();
+                if self.peek() != Some(b'"') {
+                    return Err(err_at_field(
+                        "type",
+                        self.wrong_kind("JSON string", depth + 1),
+                    ));
+                }
+                tag = self
+                    .parse_string_cow()
+                    .map_err(|e| err_at_field("type", e))?
+                    .into_owned();
+                break;
+            }
+            self.skip_value(depth + 1)
+                .map_err(|e| err_at_field(key.as_ref(), e))?;
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => {
+                    self.pos += 1;
+                }
+                Some(b'}') => {
+                    return Err(JsonError::new(
+                        join_field_path("", "type"),
+                        format!("Missing discriminator field 'type' for enum '{}'", type_name),
+                    ));
+                }
+                _ => {
+                    return Err(JsonError::new(
+                        join_field_path("", key.as_ref()),
+                        "Expected ',' or '}' in JSON object",
+                    ));
+                }
+            }
+        }
+
+        let Some((_, variant_schema)) = variants.iter().find(|(vname, _)| vname == &tag) else {
+            return Err(JsonError::new(
+                join_field_path("", "type"),
+                format!("Unknown variant '{}' for enum '{}'", tag, type_name),
+            ));
+        };
+
+        self.pos = obj_start;
+        self.decode_struct_inner(variant_schema, plan, depth, true)
+    }
+
     fn decode_struct(
         &mut self,
         schema: &CompiledStructDecodePlan,
         plan: &JsonDecodePlan,
         depth: usize,
+    ) -> Result<Obj, JsonError> {
+        self.decode_struct_inner(schema, plan, depth, false)
+    }
+
+    fn decode_struct_inner(
+        &mut self,
+        schema: &CompiledStructDecodePlan,
+        plan: &JsonDecodePlan,
+        depth: usize,
+        allow_type_skip: bool,
     ) -> Result<Obj, JsonError> {
         self.skip_ws();
         if self.peek() != Some(b'{') {
@@ -340,64 +441,79 @@ impl<'a> JsonDecoder<'a> {
             let mut cursor = 0usize;
             loop {
                 self.skip_ws();
-                let field_idx = if !schema.has_duplicate_json_names && cursor < schema.fields.len()
-                {
-                    let qkc = &schema.fields[cursor].quoted_key_colon;
-                    if self.bytes[self.pos..].starts_with(qkc) {
-                        self.pos += qkc.len();
-                        let idx = cursor;
-                        cursor += 1;
-                        idx
-                    } else {
-                        self.parse_struct_key_slow(schema, &mut cursor, depth + 1)?
-                    }
-                } else {
-                    self.parse_struct_key_slow(schema, &mut cursor, depth + 1)?
-                };
-
-                if field_idx < 64 {
-                    seen_mask |= 1u64 << field_idx;
-                } else {
-                    seen_extra[field_idx] = true;
-                }
-
-                let field = &schema.fields[field_idx];
-                let field_res = match field.kind {
-                    FieldDecodeKind::Int(slot) => self.parse_i64(depth + 1).map(|v| {
-                        rec.set_scalar(slot as usize, v as u64);
-                    }),
-                    FieldDecodeKind::Float(slot) => self.parse_f64(depth + 1).map(|v| {
-                        rec.set_scalar(slot as usize, v.to_bits());
-                    }),
-                    FieldDecodeKind::Bool(slot) => self.parse_bool(depth + 1).map(|v| {
-                        rec.set_scalar(slot as usize, v as u64);
-                    }),
-                    FieldDecodeKind::Str(slot) => {
-                        self.parse_string_obj(depth + 1).map(|s| {
-                            rec.set_obj(slot as usize, s);
-                        })
-                    }
-                    FieldDecodeKind::OptStr(slot) => {
-                        self.skip_ws();
-                        if self.bytes[self.pos..].starts_with(b"null") {
-                            self.pos += 4;
-                            rec.set_obj(slot as usize, Obj::Empty);
-                            Ok(())
+                let field_idx_opt =
+                    if !schema.has_duplicate_json_names && cursor < schema.fields.len() {
+                        let qkc = &schema.fields[cursor].quoted_key_colon;
+                        if self.bytes[self.pos..].starts_with(qkc) {
+                            self.pos += qkc.len();
+                            let idx = cursor;
+                            cursor += 1;
+                            Some(idx)
                         } else {
+                            self.parse_struct_key_slow(
+                                schema,
+                                &mut cursor,
+                                depth + 1,
+                                allow_type_skip,
+                            )?
+                        }
+                    } else {
+                        self.parse_struct_key_slow(
+                            schema,
+                            &mut cursor,
+                            depth + 1,
+                            allow_type_skip,
+                        )?
+                    };
+
+                let err_field_name: &str = if let Some(field_idx) = field_idx_opt {
+                    if field_idx < 64 {
+                        seen_mask |= 1u64 << field_idx;
+                    } else {
+                        seen_extra[field_idx] = true;
+                    }
+
+                    let field = &schema.fields[field_idx];
+                    let field_res = match field.kind {
+                        FieldDecodeKind::Int(slot) => self.parse_i64(depth + 1).map(|v| {
+                            rec.set_scalar(slot as usize, v as u64);
+                        }),
+                        FieldDecodeKind::Float(slot) => self.parse_f64(depth + 1).map(|v| {
+                            rec.set_scalar(slot as usize, v.to_bits());
+                        }),
+                        FieldDecodeKind::Bool(slot) => self.parse_bool(depth + 1).map(|v| {
+                            rec.set_scalar(slot as usize, v as u64);
+                        }),
+                        FieldDecodeKind::Str(slot) => {
                             self.parse_string_obj(depth + 1).map(|s| {
                                 rec.set_obj(slot as usize, s);
                             })
                         }
+                        FieldDecodeKind::OptStr(slot) => {
+                            self.skip_ws();
+                            if self.bytes[self.pos..].starts_with(b"null") {
+                                self.pos += 4;
+                                rec.set_obj(slot as usize, Obj::Empty);
+                                Ok(())
+                            } else {
+                                self.parse_string_obj(depth + 1).map(|s| {
+                                    rec.set_obj(slot as usize, s);
+                                })
+                            }
+                        }
+                        FieldDecodeKind::Obj { slot, plan_idx } => {
+                            self.decode_node(plan, plan_idx, depth + 1).map(|obj| {
+                                rec.set_obj(slot as usize, obj);
+                            })
+                        }
+                    };
+                    if let Err(err) = field_res {
+                        return Err(err_at_field(&field.json_name, err));
                     }
-                    FieldDecodeKind::Obj { slot, plan_idx } => {
-                        self.decode_node(plan, plan_idx, depth + 1).map(|obj| {
-                            rec.set_obj(slot as usize, obj);
-                        })
-                    }
+                    field.json_name.as_str()
+                } else {
+                    "type"
                 };
-                if let Err(err) = field_res {
-                    return Err(err_at_field(&field.json_name, err));
-                }
 
                 self.skip_ws();
                 match self.peek() {
@@ -410,7 +526,7 @@ impl<'a> JsonDecoder<'a> {
                     }
                     _ => {
                         return Err(JsonError::new(
-                            join_field_path("", &field.json_name),
+                            join_field_path("", err_field_name),
                             "Expected ',' or '}' in JSON object",
                         ));
                     }
@@ -447,7 +563,8 @@ impl<'a> JsonDecoder<'a> {
         schema: &CompiledStructDecodePlan,
         cursor: &mut usize,
         depth: usize,
-    ) -> Result<usize, JsonError> {
+        allow_type_skip: bool,
+    ) -> Result<Option<usize>, JsonError> {
         if self.peek() != Some(b'"') {
             return Err(JsonError::root("Expected string key in JSON object"));
         }
@@ -461,9 +578,15 @@ impl<'a> JsonDecoder<'a> {
         }
         self.pos += 1;
 
+        if allow_type_skip && key.as_ref() == "type" {
+            self.skip_value(depth)
+                .map_err(|e| err_at_field("type", e))?;
+            return Ok(None);
+        }
+
         let found = find_field_index(schema, key.as_ref(), cursor);
         if let Some(idx) = found {
-            return Ok(idx);
+            return Ok(Some(idx));
         }
         self.skip_value(depth)
             .map_err(|e| err_at_field(key.as_ref(), e))?;

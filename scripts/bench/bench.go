@@ -2,6 +2,8 @@ package main
 
 import (
 	"bufio"
+	"container/list"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -18,6 +20,25 @@ import (
 	"strings"
 	"time"
 )
+
+type benchEvent interface{ isBenchEvent() }
+type evTick struct{}
+type evAdd struct{ a, b int64 }
+type evScale struct{ v, f int64 }
+
+func (evTick) isBenchEvent()  {}
+func (evAdd) isBenchEvent()   {}
+func (evScale) isBenchEvent() {}
+
+type benchClaim struct {
+	Sub string `json:"sub"`
+	UID int    `json:"uid"`
+}
+
+type lruEntry struct {
+	key string
+	val string
+}
 
 type Item struct {
 	ID    int    `json:"id"`
@@ -64,6 +85,34 @@ func main() {
 	}
 	msVMMap := msSince(t0)
 	if mapAcc < 0 {
+		return
+	}
+
+	t0 = time.Now()
+	var adtAcc int64
+	for i := int64(0); i < 1000000; i++ {
+		var ev benchEvent
+		switch i & 3 {
+		case 0:
+			ev = evTick{}
+		case 1:
+			ev = evAdd{a: i, b: 7}
+		case 2:
+			ev = evScale{v: i, f: 3}
+		default:
+			ev = evAdd{a: i, b: -2}
+		}
+		switch e := ev.(type) {
+		case evTick:
+			adtAcc += 1
+		case evAdd:
+			adtAcc += e.a + e.b
+		case evScale:
+			adtAcc += e.v * e.f
+		}
+	}
+	msAdt := msSince(t0)
+	if adtAcc != 625001500000 {
 		return
 	}
 
@@ -340,9 +389,85 @@ func main() {
 		return
 	}
 
+	jwtSecret := []byte("conduit_bench_jwt_secret_key_32b")
+	jwtHdr := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
+	t0 = time.Now()
+	jwtAcc := 0
+	for i := 0; i < 10000; i++ {
+		payBytes, _ := json.Marshal(benchClaim{Sub: "user", UID: i})
+		payB64 := base64.RawURLEncoding.EncodeToString(payBytes)
+		sigInput := jwtHdr + "." + payB64
+		mac := hmac.New(sha256.New, jwtSecret)
+		mac.Write([]byte(sigInput))
+		sigB64 := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+		tok := sigInput + "." + sigB64
+
+		parts := strings.Split(tok, ".")
+		if len(parts) != 3 {
+			return
+		}
+		vmac := hmac.New(sha256.New, jwtSecret)
+		vmac.Write([]byte(parts[0] + "." + parts[1]))
+		expectedSig := base64.RawURLEncoding.EncodeToString(vmac.Sum(nil))
+		if !hmac.Equal([]byte(parts[2]), []byte(expectedSig)) {
+			return
+		}
+		rawPay, err := base64.RawURLEncoding.DecodeString(parts[1])
+		if err != nil {
+			return
+		}
+		var cl benchClaim
+		if err := json.Unmarshal(rawPay, &cl); err != nil {
+			return
+		}
+		jwtAcc += cl.UID
+	}
+	msJwt := msSince(t0)
+	if jwtAcc != 49995000 {
+		return
+	}
+
+	lruList := list.New()
+	lruMap := make(map[string]*list.Element, 4096)
+	lruSet := func(k, v string) {
+		if el, ok := lruMap[k]; ok {
+			el.Value = lruEntry{key: k, val: v}
+			lruList.MoveToBack(el)
+			return
+		}
+		if len(lruMap) >= 4096 {
+			front := lruList.Front()
+			if front != nil {
+				delete(lruMap, front.Value.(lruEntry).key)
+				lruList.Remove(front)
+			}
+		}
+		lruMap[k] = lruList.PushBack(lruEntry{key: k, val: v})
+	}
+	lruGet := func(k string) (string, bool) {
+		if el, ok := lruMap[k]; ok {
+			lruList.MoveToBack(el)
+			return el.Value.(lruEntry).val, true
+		}
+		return "", false
+	}
+	t0 = time.Now()
+	cacheAcc := 0
+	for i := 0; i < 100000; i++ {
+		lruSet(fmt.Sprintf("k%d", i&8191), "v")
+		if _, ok := lruGet(fmt.Sprintf("k%d", (i+6144)&8191)); ok {
+			cacheAcc++
+		}
+	}
+	msCache := msSince(t0)
+	if cacheAcc != 97905 {
+		return
+	}
+
 	fmt.Printf("BENCH|vm_fib_35|%.3f\n", msVMFib)
 	fmt.Printf("BENCH|vm_arith_10m|%.3f\n", msVMArith)
 	fmt.Printf("BENCH|vm_map_100k|%.3f\n", msVMMap)
+	fmt.Printf("BENCH|adt_switch_1m|%.3f\n", msAdt)
 
 	fmt.Printf("BENCH|fs_write_text|%.3f\n", msWriteText)
 	fmt.Printf("BENCH|fs_write_lines|%.3f\n", msWriteStream)
@@ -363,4 +488,6 @@ func main() {
 	fmt.Printf("BENCH|csv_parse_20k|%.3f\n", msCsv)
 	fmt.Printf("BENCH|url_parse_50k|%.3f\n", msURL)
 	fmt.Printf("BENCH|http_router_50k|%.3f\n", msHTTP)
+	fmt.Printf("BENCH|jwt_hs256_10k|%.3f\n", msJwt)
+	fmt.Printf("BENCH|cache_lru_100k|%.3f\n", msCache)
 }

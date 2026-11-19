@@ -221,7 +221,9 @@ impl<'a> ModuleCompiler<'a> {
         lowerer.finalize_prealloc();
         lowerer.emit_upvalue_prologue(scalar_upvalues, obj_upvalues);
         lowerer.flush_hoisted_constants_if_outer()?;
+        lowerer.emit_defer_prologue()?;
         lowerer.lower_block_stmts(&body.stmts)?;
+        lowerer.emit_defer_epilogue()?;
         lowerer.ensure_trailing_return(return_ty);
 
         Ok(FunctionProto {
@@ -364,7 +366,17 @@ pub(crate) struct FnLowerer<'a, 'b> {
     pub scopes: Vec<HashMap<String, (VarSlot, Type)>>,
     pub loops: Vec<LoopPatch>,
     pub loop_depth: usize,
+    pub(crate) has_defer: bool,
+    pub(crate) defer_list_o: u16,
+    pub(crate) defer_ret_slot: Option<VarSlot>,
+    pub(crate) defer_rev_o: u16,
+    pub(crate) defer_idx_s: u16,
+    pub(crate) defer_id_s: u16,
+    pub(crate) defer_epilogue_jumps: Vec<usize>,
+    pub(crate) defer_sites: Vec<DeferSite>,
 }
+
+pub(crate) type DeferSite = (Block, Vec<HashMap<String, (VarSlot, Type)>>);
 
 impl<'a, 'b> FnLowerer<'a, 'b> {
     fn new(
@@ -430,6 +442,14 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             scopes: vec![init_scope],
             loops: Vec::new(),
             loop_depth: 0,
+            has_defer: false,
+            defer_list_o: 0,
+            defer_ret_slot: None,
+            defer_rev_o: 0,
+            defer_idx_s: 0,
+            defer_id_s: 0,
+            defer_epilogue_jumps: Vec::new(),
+            defer_sites: Vec::new(),
         }
     }
 
@@ -459,12 +479,108 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
     }
 
     fn finalize_prealloc(&mut self) {
+        if self.has_defer {
+            self.defer_list_o = self.alloc_local_o();
+            self.defer_rev_o = self.alloc_local_o();
+            self.defer_idx_s = self.alloc_local_s();
+            self.defer_id_s = self.alloc_local_s();
+            if self.return_ty != Type::Void {
+                let rty = self.return_ty.clone();
+                self.defer_ret_slot = Some(self.prealloc_slot_for_ty(&rty));
+            }
+        }
         self.local_s_end = self.next_local_s;
         self.local_o_end = self.next_local_o;
         self.temp_s = self.local_s_end;
         self.temp_o = self.local_o_end;
         self.max_s = self.local_s_end;
         self.max_o = self.local_o_end;
+    }
+
+    fn emit_defer_prologue(&mut self) -> Result<(), String> {
+        if !self.has_defer {
+            return Ok(());
+        }
+        self.ops.push(Op::NewListInt {
+            dst_obj: self.defer_list_o,
+            cap: 0,
+        });
+        if let Some(ret_slot) = self.defer_ret_slot
+            && !ret_slot.is_scalar
+            && Type::Void.is_assignable_to(&self.return_ty)
+        {
+            let idx = self.mc.intern_empty()?;
+            self.ops.push(Op::LoadConstObj {
+                dst_obj: ret_slot.reg,
+                idx,
+            });
+        }
+        Ok(())
+    }
+
+    fn emit_defer_epilogue(&mut self) -> Result<(), String> {
+        if !self.has_defer {
+            return Ok(());
+        }
+        let epilogue_pc = self.ops.len() as u32;
+        let jumps = std::mem::take(&mut self.defer_epilogue_jumps);
+        for j_pc in jumps {
+            patch_jump(&mut self.ops[j_pc], epilogue_pc);
+        }
+
+        self.has_defer = false;
+        self.ops.push(Op::ListReverse {
+            dst_obj: self.defer_rev_o,
+            list_obj: self.defer_list_o,
+        });
+        self.ops.push(Op::LoadImmInt {
+            dst: self.defer_idx_s,
+            imm: 0,
+        });
+        let loop_head = self.ops.len() as u32;
+        let exit_jump = self.ops.len();
+        self.ops.push(Op::ForListInt {
+            list_obj: self.defer_rev_o,
+            idx_s: self.defer_idx_s,
+            elem_s: self.defer_id_s,
+            exit_target: 0,
+        });
+
+        let saved_current_scopes = std::mem::take(&mut self.scopes);
+        let sites = std::mem::take(&mut self.defer_sites);
+        for (i, (block, site_scopes)) in sites.into_iter().enumerate() {
+            let cmp_s = self.alloc_temp_s();
+            self.ops.push(Op::EqIntImm {
+                dst: cmp_s,
+                a: self.defer_id_s,
+                imm: i as i16,
+            });
+            let next_j = self.ops.len();
+            self.ops.push(Op::JumpIfFalse {
+                cond: cmp_s,
+                target: 0,
+            });
+            self.scopes = site_scopes;
+            self.lower_block_stmts(&block.stmts)?;
+            self.reset_temps();
+            self.ops.push(Op::Jump { target: loop_head });
+            self.patch_here(next_j);
+        }
+        self.scopes = saved_current_scopes;
+        self.ops.push(Op::Jump { target: loop_head });
+        self.patch_here(exit_jump);
+
+        match self.defer_ret_slot {
+            None => self.ops.push(Op::ReturnVoid),
+            Some(slot) if slot.is_scalar => {
+                self.ops.push(Op::ReturnScalar { src: slot.reg });
+            }
+            Some(slot) => {
+                self.ops.push(Op::ReturnObj { src: slot.reg });
+            }
+        }
+        self.has_defer = true;
+        Ok(())
     }
 
     fn emit_upvalue_prologue(
@@ -676,6 +792,52 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 }
             }
             StmtKind::Return(opt) => {
+                if self.has_defer {
+                    if let Some(ret_slot) = self.defer_ret_slot {
+                        if let Some(expr) = opt {
+                            if ret_slot.is_scalar && expr.ty.is_scalar() {
+                                let r = self.lower_scalar(expr)?;
+                                if r != ret_slot.reg {
+                                    self.ops.push(Op::MoveScalar {
+                                        dst: ret_slot.reg,
+                                        src: r,
+                                    });
+                                }
+                            } else if !ret_slot.is_scalar {
+                                if expr.ty == Type::Void {
+                                    self.lower_expr_discard(expr)?;
+                                    let idx = self.mc.intern_empty()?;
+                                    self.ops.push(Op::LoadConstObj {
+                                        dst_obj: ret_slot.reg,
+                                        idx,
+                                    });
+                                } else {
+                                    let r = self.lower_obj(expr)?;
+                                    if r != ret_slot.reg {
+                                        self.ops.push(Op::MoveObj {
+                                            dst_obj: ret_slot.reg,
+                                            src: r,
+                                        });
+                                    }
+                                }
+                            } else {
+                                return Err("Return register kind mismatch in defer".to_string());
+                            }
+                        } else if !ret_slot.is_scalar {
+                            let idx = self.mc.intern_empty()?;
+                            self.ops.push(Op::LoadConstObj {
+                                dst_obj: ret_slot.reg,
+                                idx,
+                            });
+                        }
+                    } else if let Some(expr) = opt {
+                        self.lower_expr_discard(expr)?;
+                    }
+                    let j = self.ops.len();
+                    self.ops.push(Op::Jump { target: 0 });
+                    self.defer_epilogue_jumps.push(j);
+                    return Ok(());
+                }
                 if let Some(expr) = opt {
                     if self.return_ty.is_scalar() && expr.ty.is_scalar() {
                         let r = self.lower_scalar(expr)?;
@@ -743,6 +905,19 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 }
             }
             StmtKind::Switch { expr, cases } => self.lower_switch(expr, cases)?,
+            StmtKind::Defer(block) => {
+                let site_id = self.defer_sites.len();
+                self.defer_sites.push((block.clone(), self.scopes.clone()));
+                let id_s = self.alloc_temp_s();
+                self.ops.push(Op::LoadImmInt {
+                    dst: id_s,
+                    imm: site_id as i32,
+                });
+                self.ops.push(Op::ListAppendInt {
+                    list_obj: self.defer_list_o,
+                    val_s: id_s,
+                });
+            }
             StmtKind::Break => {
                 let pc = self.ops.len();
                 self.ops.push(Op::Jump { target: 0 });

@@ -31,6 +31,47 @@ for i in 0..<100_000 { mapAcc += vmM[i] ?? 0 }
 let msVmMap = msSince(tVm)
 if mapAcc < 0 { exit(1) }
 
+enum BenchEvent {
+    case tick
+    case add(Int, Int)
+    case scale(Int, Int)
+}
+
+struct BenchClaim: Codable {
+    let sub: String
+    let uid: Int
+}
+
+final class LruNode {
+    let key: String
+    var val: String
+    var prev: LruNode?
+    var next: LruNode?
+    init(key: String, val: String) {
+        self.key = key
+        self.val = val
+    }
+}
+
+tVm = DispatchTime.now().uptimeNanoseconds
+var adtAcc = 0
+for i in 0..<1_000_000 {
+    let ev: BenchEvent
+    switch i & 3 {
+    case 0: ev = .tick
+    case 1: ev = .add(i, 7)
+    case 2: ev = .scale(i, 3)
+    default: ev = .add(i, -2)
+    }
+    switch ev {
+    case .tick: adtAcc += 1
+    case let .add(a, b): adtAcc += a + b
+    case let .scale(v, f): adtAcc += v * f
+    }
+}
+let msAdt = msSince(tVm)
+if adtAcc != 625_001_500_000 { exit(1) }
+
 struct Item: Codable {
     let id: Int
     let user: String
@@ -266,9 +307,106 @@ for i in 0..<50000 {
 let msHttp = msSince(t0)
 if httpAcc != 10_125_000 { exit(1) }
 
+func b64urlEnc(_ data: Data) -> String {
+    return data.base64EncodedString()
+        .replacingOccurrences(of: "+", with: "-")
+        .replacingOccurrences(of: "/", with: "_")
+        .replacingOccurrences(of: "=", with: "")
+}
+func b64urlDec(_ str: String) -> Data? {
+    var b64 = str
+        .replacingOccurrences(of: "-", with: "+")
+        .replacingOccurrences(of: "_", with: "/")
+    let rem = b64.count % 4
+    if rem > 0 { b64 += String(repeating: "=", count: 4 - rem) }
+    return Data(base64Encoded: b64)
+}
+
+#if canImport(CryptoKit)
+let jwtKey = SymmetricKey(data: Data("conduit_bench_jwt_secret_key_32b".utf8))
+let jwtHdr = b64urlEnc(Data("{\"alg\":\"HS256\",\"typ\":\"JWT\"}".utf8))
+let jEnc = JSONEncoder()
+let jDec = JSONDecoder()
+t0 = DispatchTime.now().uptimeNanoseconds
+var jwtAcc = 0
+for i in 0..<10_000 {
+    let payData = try! jEnc.encode(BenchClaim(sub: "user", uid: i))
+    let sigInput = "\(jwtHdr).\(b64urlEnc(payData))"
+    let mac = HMAC<SHA256>.authenticationCode(for: Data(sigInput.utf8), using: jwtKey)
+    let sigB64 = b64urlEnc(Data(mac))
+    let tok = "\(sigInput).\(sigB64)"
+
+    let parts = tok.split(separator: ".")
+    if parts.count != 3 { exit(1) }
+    let vInput = Data("\(parts[0]).\(parts[1])".utf8)
+    guard let sigBytes = b64urlDec(String(parts[2])),
+          HMAC<SHA256>.isValidAuthenticationCode(sigBytes, authenticating: vInput, using: jwtKey),
+          let rawPay = b64urlDec(String(parts[1])) else { exit(1) }
+    let cl = try! jDec.decode(BenchClaim.self, from: rawPay)
+    jwtAcc += cl.uid
+}
+let msJwt = msSince(t0)
+if jwtAcc != 49_995_000 { exit(1) }
+#endif
+
+var lruMap: [String: LruNode] = Dictionary(minimumCapacity: 4096)
+var lruHead: LruNode? = nil
+var lruTail: LruNode? = nil
+
+func lruDetach(_ node: LruNode) {
+    let p = node.prev
+    let n = node.next
+    if let p = p { p.next = n } else { lruHead = n }
+    if let n = n { n.prev = p } else { lruTail = p }
+    node.prev = nil
+    node.next = nil
+}
+
+func lruPushBack(_ node: LruNode) {
+    node.prev = lruTail
+    node.next = nil
+    if let t = lruTail { t.next = node } else { lruHead = node }
+    lruTail = node
+}
+
+func lruSet(_ k: String, _ v: String) {
+    if let node = lruMap[k] {
+        node.val = v
+        lruDetach(node)
+        lruPushBack(node)
+        return
+    }
+    if lruMap.count >= 4096, let oldest = lruHead {
+        lruDetach(oldest)
+        lruMap.removeValue(forKey: oldest.key)
+    }
+    let node = LruNode(key: k, val: v)
+    lruPushBack(node)
+    lruMap[k] = node
+}
+
+func lruGet(_ k: String) -> String? {
+    guard let node = lruMap[k] else { return nil }
+    lruDetach(node)
+    lruPushBack(node)
+    return node.val
+}
+
+t0 = DispatchTime.now().uptimeNanoseconds
+var cacheAcc = 0
+for i in 0..<100_000 {
+    lruSet("k\(i & 8191)", "v")
+    if lruGet("k\((i + 6144) & 8191)") != nil {
+        cacheAcc += 1
+    }
+}
+let msCache = msSince(t0)
+if cacheAcc != 97905 { exit(1) }
+
 print(String(format: "BENCH|vm_fib_35|%.3f", msVmFib))
 print(String(format: "BENCH|vm_arith_10m|%.3f", msVmArith))
 print(String(format: "BENCH|vm_map_100k|%.3f", msVmMap))
+print(String(format: "BENCH|adt_switch_1m|%.3f", msAdt))
 
 print(String(format: "BENCH|fs_write_text|%.3f", msWriteText))
 print(String(format: "BENCH|fs_write_lines|%.3f", msWriteStream))
@@ -290,3 +428,7 @@ print(String(format: "BENCH|pipeline_1m|%.3f", msPipe))
 print(String(format: "BENCH|pipeline_float_1m|%.3f", msFPipe))
 print(String(format: "BENCH|url_parse_50k|%.3f", msUrl))
 print(String(format: "BENCH|http_router_50k|%.3f", msHttp))
+#if canImport(CryptoKit)
+print(String(format: "BENCH|jwt_hs256_10k|%.3f", msJwt))
+#endif
+print(String(format: "BENCH|cache_lru_100k|%.3f", msCache))

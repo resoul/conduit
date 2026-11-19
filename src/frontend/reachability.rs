@@ -217,6 +217,9 @@ fn collect_block_refs(
                 collect_expr_refs(e, checked, struct_fields, scopes, out);
             }
             StmtKind::Return(None) | StmtKind::Break | StmtKind::Continue => {}
+            StmtKind::Defer(block) => {
+                collect_block_refs(block, checked, struct_fields, scopes, out);
+            }
             StmtKind::If {
                 condition,
                 then_block,
@@ -393,6 +396,20 @@ fn collect_validated_type_refs<'a>(
                 }
             }
         }
+        Type::DataEnum(ename) => {
+            if !visited.insert(ename.as_str()) {
+                return;
+            }
+            if let Some(dvars) = checked.data_enums.get(ename) {
+                for dv in dvars {
+                    if let Some(&sid) = checked.struct_by_name.get(&dv.struct_name) {
+                        for rf in &checked.structs[sid].fields {
+                            collect_validated_type_refs(&rf.ty, checked, struct_fields, visited, out);
+                        }
+                    }
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -422,9 +439,15 @@ pub(crate) fn expand_program_aliases(
                 }
                 expand_block_aliases(body, aliases)?;
             }
+            ItemKind::Enum { variants, .. } => {
+                for v in variants {
+                    for f in &mut v.fields {
+                        expand_type_expr(&mut f.ty, aliases, 0)?;
+                    }
+                }
+            }
             ItemKind::TypeAlias { .. }
             | ItemKind::Const { .. }
-            | ItemKind::Enum { .. }
             | ItemKind::Import { .. }
             | ItemKind::ExportList { .. }
             | ItemKind::Migration { .. } => {}
@@ -500,6 +523,7 @@ fn expand_block_aliases(
             }
             StmtKind::Return(Some(e)) => expand_expr_aliases(e, aliases)?,
             StmtKind::Return(None) | StmtKind::Break | StmtKind::Continue => {}
+            StmtKind::Defer(block) => expand_block_aliases(block, aliases)?,
             StmtKind::If {
                 condition,
                 then_block,

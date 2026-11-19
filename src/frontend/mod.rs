@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use ast::{ItemKind, Program};
 use check::{CheckedProgram, check_program, check_program_with_roots};
 use lexer::Lexer;
-use linker::link_imports;
+use linker::{link_imports, link_imports_with_paths};
 use parser::Parser;
 
 use crate::ir::Module;
@@ -72,6 +72,7 @@ fn collect_file_imports(
     overrides: &HashMap<std::path::PathBuf, String>,
     seen: &mut HashSet<String>,
     out: &mut HashMap<String, String>,
+    out_paths: &mut HashMap<String, String>,
 ) -> Result<(), String> {
     for item in &prog.items {
         let ItemKind::Import { path: imp, .. } = &item.kind else {
@@ -82,9 +83,11 @@ fn collect_file_imports(
         }
         let target = resolve_import_file(cur_dir, root_dir, imp)?;
         let src = read_with_overrides(&target, overrides)?;
-        let sub_prog = parse_source(&src)?;
+        let sub_prog =
+            parse_source(&src).map_err(|e| crate::diagnostics::tag_file_error(&target, e))?;
         let sub_dir = target.parent().unwrap_or(cur_dir);
-        collect_file_imports(&sub_prog, sub_dir, root_dir, overrides, seen, out)?;
+        collect_file_imports(&sub_prog, sub_dir, root_dir, overrides, seen, out, out_paths)?;
+        out_paths.insert(imp.clone(), target.display().to_string());
         out.insert(imp.clone(), src);
     }
     Ok(())
@@ -102,12 +105,25 @@ pub fn check_file_with_overrides(
     let mut program = parse_source(&src)?;
     let root_dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let mut owned_mods = HashMap::new();
+    let mut owned_paths = HashMap::new();
     let mut seen = HashSet::new();
-    collect_file_imports(&program, root_dir, root_dir, overrides, &mut seen, &mut owned_mods)?;
+    collect_file_imports(
+        &program,
+        root_dir,
+        root_dir,
+        overrides,
+        &mut seen,
+        &mut owned_mods,
+        &mut owned_paths,
+    )?;
     if !owned_mods.is_empty() {
         let mod_refs: HashMap<&str, &str> =
             owned_mods.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        link_imports(&mut program, &mod_refs)?;
+        let mod_path_refs: HashMap<&str, String> = owned_paths
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.clone()))
+            .collect();
+        link_imports_with_paths(&mut program, &mod_refs, &mod_path_refs)?;
     }
     let checked = check_program(&mut program)?;
     Ok((program, checked))
