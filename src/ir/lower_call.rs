@@ -8,10 +8,13 @@ use crate::ir::lower::FnLowerer;
 use crate::ir::lower_loops::{collect_free_vars, patch_jump};
 use crate::ir::lower_native::elem_tag_for;
 use crate::ir::{CallableRef, ElemKind, PipelinePlan, PipelineStage, RecordDesc};
+use crate::native::time::{
+    TIME_DAY, TIME_HOUR, TIME_MINUTE, TIME_MONTH, TIME_SECOND, TIME_WEEKDAY, TIME_YEAR,
+};
 use crate::vm::opcode::{
-    EXT_FLOAT_CEIL, EXT_FLOAT_MATH, EXT_INT_MATH, EXT_LIST_IS_EMPTY, EXT_MAP_CONTAINS_KEY,
-    EXT_MAP_FROM, EXT_MAP_SET, EXT_PIPELINE_REDUCE, EXT_PRINT_OBJ, EXT_PRINT_SCALAR,
-    EXT_STR_IS_EMPTY, EXT_STR_PRED, Op,
+    EXT_ASSERT, EXT_FLOAT_CEIL, EXT_FLOAT_MATH, EXT_INT_MATH, EXT_LIST_IS_EMPTY,
+    EXT_MAP_CONTAINS_KEY, EXT_MAP_FROM, EXT_MAP_SET, EXT_PIPELINE_REDUCE, EXT_PRINT_OBJ,
+    EXT_PRINT_SCALAR, EXT_STR_IS_EMPTY, EXT_STR_PRED, EXT_TIME_OP, Op,
 };
 
 impl<'a, 'b> FnLowerer<'a, 'b> {
@@ -97,18 +100,89 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             }
         }
         if let ExprKind::Ident(name) = &callee.kind
-            && name == "print"
             && self.lookup_local(name).is_none()
         {
-            if args[0].ty.is_scalar() {
-                let src = self.lower_scalar(&args[0])?;
-                let aux = elem_tag_for(&args[0].ty);
-                self.ops.push(Op::ExtOp { kind: EXT_PRINT_SCALAR, aux, a: src, b: 0, c: 0 });
-            } else {
-                let src = self.lower_obj(&args[0])?;
-                self.ops.push(Op::ExtOp { kind: EXT_PRINT_OBJ, aux: 0, a: src, b: 0, c: 0 });
+            match name.as_str() {
+                "print" => {
+                    if args[0].ty.is_scalar() {
+                        let src = self.lower_scalar(&args[0])?;
+                        let aux = elem_tag_for(&args[0].ty);
+                        self.ops.push(Op::ExtOp { kind: EXT_PRINT_SCALAR, aux, a: src, b: 0, c: 0 });
+                    } else {
+                        let src = self.lower_obj(&args[0])?;
+                        self.ops.push(Op::ExtOp { kind: EXT_PRINT_OBJ, aux: 0, a: src, b: 0, c: 0 });
+                    }
+                    return Ok(());
+                }
+                "assert" => {
+                    let line = expr.span.line.min(u16::MAX as usize) as u16;
+                    let cond = self.lower_scalar(&args[0])?;
+                    if args.len() == 2 {
+                        let msg = self.lower_obj(&args[1])?;
+                        self.ops.push(Op::ExtOp {
+                            kind: EXT_ASSERT,
+                            aux: 1 << 3,
+                            a: cond,
+                            b: msg,
+                            c: line,
+                        });
+                    } else {
+                        self.ops.push(Op::ExtOp {
+                            kind: EXT_ASSERT,
+                            aux: 0,
+                            a: cond,
+                            b: line,
+                            c: 0,
+                        });
+                    }
+                    return Ok(());
+                }
+                "fail" => {
+                    let line = expr.span.line.min(u16::MAX as usize) as u16;
+                    let msg = self.lower_obj(&args[0])?;
+                    self.ops.push(Op::ExtOp {
+                        kind: EXT_ASSERT,
+                        aux: 2 << 3,
+                        a: msg,
+                        b: line,
+                        c: 0,
+                    });
+                    return Ok(());
+                }
+                "assert_eq" | "assert_ne" => {
+                    let line = expr.span.line.min(u16::MAX as usize) as u16;
+                    let is_ne = name == "assert_ne";
+                    let has_msg = args.len() == 3;
+                    let op_kind: u8 = match (is_ne, has_msg) {
+                        (false, false) => 3,
+                        (false, true) => 4,
+                        (true, false) => 5,
+                        (true, true) => 6,
+                    };
+                    let (a_reg, b_reg, val_tag) = if args[0].ty.is_scalar()
+                        && args[1].ty.is_scalar()
+                        && elem_tag_for(&args[0].ty) == elem_tag_for(&args[1].ty)
+                    {
+                        (
+                            self.lower_scalar(&args[0])?,
+                            self.lower_scalar(&args[1])?,
+                            elem_tag_for(&args[0].ty),
+                        )
+                    } else {
+                        (self.lower_obj(&args[0])?, self.lower_obj(&args[1])?, 0)
+                    };
+                    let c_val = if has_msg { self.lower_obj(&args[2])? } else { line };
+                    self.ops.push(Op::ExtOp {
+                        kind: EXT_ASSERT,
+                        aux: (op_kind << 3) | (val_tag & 0x07),
+                        a: a_reg,
+                        b: b_reg,
+                        c: c_val,
+                    });
+                    return Ok(());
+                }
+                _ => {}
             }
-            return Ok(());
         }
         if let Type::Function { return_type, .. } = &callee.ty
             && (return_type.is_scalar() || return_type.is_obj())
@@ -136,6 +210,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             "cdt.csv" => self.lower_csv_call(sym, args, named_args),
             "cdt.math" => self.lower_math_call(sym, args),
             "cdt.cron" if sym == "validate" => self.lower_cron_validate(&args[0]),
+            "cdt.cache" if sym == "drop" => self.lower_cache_drop(&args[0]),
             other => Err(format!("Unsupported scalar native call '{}.{}'", other, sym)),
         }
     }
@@ -164,6 +239,10 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             "cdt.http" => self.lower_http_call(sym, type_args, args, named_args),
             "cdt.db" => self.lower_db_call(sym, type_args, args, named_args),
             "cdt.cron" => self.lower_cron_call(sym, type_args, args, named_args),
+            "cdt.jwt" => self.lower_jwt_call(sym, type_args, args, named_args),
+            "cdt.lock" => self.lower_lock_call(sym, args, named_args),
+            "cdt.cache" => self.lower_cache_call(sym, args, named_args),
+            "cdt.redis" => self.lower_redis_call(sym, args, named_args),
             other => Err(format!("Unsupported native call '{}.{}'", other, sym)),
         }
     }
@@ -342,7 +421,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 }
             }
             (Type::Custom(tid), _)
-                if matches!(&tid.module, ModuleId::Native(m) if m == "cdt.fs" || m == "cdt.http" || m == "cdt.db" || m == "cdt.cron") =>
+                if matches!(&tid.module, ModuleId::Native(m) if m == "cdt.fs" || m == "cdt.http" || m == "cdt.db" || m == "cdt.cron" || m == "cdt.lock" || m == "cdt.redis") =>
             {
                 self.lower_native_method_obj(tid, target, method, &[], args)?;
                 Ok(())
@@ -525,6 +604,42 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 if matches!(&tid.module, ModuleId::Native(m) if m == "cdt.cron") =>
             {
                 self.lower_cron_is_running(target)
+            }
+            (Type::Custom(tid), "is_held")
+                if matches!(&tid.module, ModuleId::Native(m) if m == "cdt.lock") =>
+            {
+                self.lower_lock_scalar_method(target, method)
+            }
+            (Type::Custom(tid), "has" | "len" | "prune")
+                if matches!(&tid.module, ModuleId::Native(m) if m == "cdt.cache") =>
+            {
+                self.lower_cache_scalar_method(target, method, args)
+            }
+            (
+                Type::Custom(tid),
+                "year" | "month" | "day" | "hour" | "minute" | "second" | "weekday",
+            ) if matches!(&tid.module, ModuleId::Native(m) if m == "cdt.time")
+                && tid.name == "Timestamp" =>
+            {
+                let aux = match method {
+                    "year" => TIME_YEAR,
+                    "month" => TIME_MONTH,
+                    "day" => TIME_DAY,
+                    "hour" => TIME_HOUR,
+                    "minute" => TIME_MINUTE,
+                    "second" => TIME_SECOND,
+                    _ => TIME_WEEKDAY,
+                };
+                let b = self.lower_obj(target)?;
+                let dst_s = self.alloc_temp_s();
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_TIME_OP,
+                    aux,
+                    a: dst_s,
+                    b,
+                    c: 0,
+                });
+                Ok(dst_s)
             }
             _ => Err(format!("Unsupported scalar method '.{}()'", method)),
         }

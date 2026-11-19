@@ -1,0 +1,139 @@
+import * as cache from "cdt.cache"
+import * as fs from "cdt.fs"
+import * as http from "cdt.http"
+import * as json from "cdt.json"
+import * as jwt from "cdt.jwt"
+import * as lock from "cdt.lock"
+import * as path from "cdt.path"
+import * as process from "cdt.process"
+import { Claims, TokenReply, build_auth_router, setup_state } from "./main"
+
+test "auth_api login validation, JWT auth middleware, and rate limiting" {
+    pid := process.pid()
+    dir := path.join("/tmp", "conduit_auth_api_test1_{pid}")
+    fs.mkdir_all(dir)?
+    setup_state(dir, 2)?
+
+    r := build_auth_router()
+    empty := Map<String, String>()
+
+    // Validation error on bad email/password
+    bad_req := r.dispatch(http.Request(
+        method: "POST",
+        path: "/auth/login",
+        body: "{\"email\":\"bad\",\"password\":\"123\"}",
+        headers: empty,
+        query: empty,
+        params: empty,
+    ))
+    assert_eq(bad_req.status, 422)
+
+    // Unauthenticated call returns 401
+    unauth := r.dispatch(http.Request(method: "GET", path: "/api/me", body: "", headers: empty, query: empty, params: empty))
+    assert_eq(unauth.status, 401)
+
+    // Valid login returns JWT token
+    login_ok := r.dispatch(http.Request(
+        method: "POST",
+        path: "/auth/login",
+        body: "{\"email\":\"alice@conduit.dev\",\"password\":\"hunter2\",\"role\":\"admin\"}",
+        headers: empty,
+        query: empty,
+        params: empty,
+    ))
+    assert_eq(login_ok.status, 200)
+    reply := json.decode<TokenReply>(login_ok.body)?
+    claims := jwt.verify<Claims>(reply.token, "dev-conduit-jwt-secret")?
+    assert_eq(claims.sub, "alice@conduit.dev")
+    assert_eq(claims.role, "admin")
+
+    // Protected route with valid JWT succeeds
+    auth_h := Map.from([("Authorization", "Bearer {reply.token}")])
+    me := r.dispatch(http.Request(method: "GET", path: "/api/me", body: "", headers: auth_h, query: empty, params: empty))
+    assert_eq(me.status, 200)
+    assert(me.body.contains("\"user\":\"alice@conduit.dev\""))
+
+    // Typed AuditNote endpoint writes locked audit log and WAL
+    note := r.dispatch(http.Request(
+        method: "POST",
+        path: "/api/notes",
+        body: "{\"text\":\"audit entry 1\"}",
+        headers: auth_h,
+        query: empty,
+        params: empty,
+    ))
+    assert_eq(note.status, 200)
+    audit_txt := fs.read_text(path.join(dir, "audit.log"))?
+    assert(audit_txt.contains("audit entry 1"))
+
+    // Second login allowed (limit=2), third hits 429 rate_limited
+    login_2 := r.dispatch(http.Request(
+        method: "POST",
+        path: "/auth/login",
+        body: "{\"email\":\"bob@conduit.dev\",\"password\":\"hunter2\"}",
+        headers: empty,
+        query: empty,
+        params: empty,
+    ))
+    assert_eq(login_2.status, 200)
+    login_3 := r.dispatch(http.Request(
+        method: "POST",
+        path: "/auth/login",
+        body: "{\"email\":\"cy@conduit.dev\",\"password\":\"hunter2\"}",
+        headers: empty,
+        query: empty,
+        params: empty,
+    ))
+    assert_eq(login_3.status, 429)
+
+    _d := cache.drop("auth_api_wal")
+    fs.remove(dir)?
+}
+
+test "auth_api WAL replay, compact, snapshot, and OS file lock contention" {
+    pid := process.pid()
+    dir := path.join("/tmp", "conduit_auth_api_test2_{pid}")
+    fs.mkdir_all(dir)?
+
+    wal_path := path.join(dir, "sessions.wal")
+    snap_path := path.join(dir, "sessions.snap.json")
+    w1 := cache.open_file("auth_test_wal", wal_path)?
+    w1.set("k1", "v1")?
+    w1.set("k2", "v2")?
+    _removed := w1.del("k1")?
+    saved := w1.save(snap_path)?
+    assert_eq(saved, 1)
+    _drop1 := cache.drop("auth_test_wal")
+
+    w2 := cache.open_file("auth_test_wal", wal_path)?
+    assert_eq(w2.get("k1"), nil)
+    assert_eq(w2.get("k2") ?? "", "v2")
+    live := w2.compact()?
+    assert_eq(live, 1)
+    _drop2 := cache.drop("auth_test_wal")
+
+    snap := cache.open("auth_test_snap")
+    loaded := snap.load(snap_path)?
+    assert_eq(loaded, 1)
+    assert_eq(snap.get("k2") ?? "", "v2")
+    _drop3 := cache.drop("auth_test_snap")
+
+    // Advisory OS file lock contention check
+    lpath := path.join(dir, "state.lock")
+    g := lock.file_acquire(lpath)?
+    assert(g.is_held())
+    var busy = false
+    switch lock.file_try(lpath, () => 1) {
+        case lock.LockError(e):
+            busy = e.kind == "busy"
+        case Int(_):
+            busy = false
+    }
+    assert(busy)
+    g.release()
+    assert(!g.is_held())
+    res := lock.file_try(lpath, () => 99)?
+    assert_eq(res, 99)
+
+    fs.remove(dir)?
+}

@@ -164,7 +164,38 @@ fn compile_field_rule(
                 }
                 Ok(CompiledValidationRule::Email)
             }
+            "not_empty" => {
+                if !ann.args.is_empty() {
+                    return Err("@validation.not_empty takes no arguments".to_string());
+                }
+                if !matches!(field_ty, Type::String | Type::List(_) | Type::Map(_, _)) {
+                    return Err(format!(
+                        "Field type '{}' is not compatible with '@validation.not_empty' (expected String, List, or Map)",
+                        field_ty
+                    ));
+                }
+                Ok(CompiledValidationRule::NotEmpty)
+            }
+            "url" | "uuid" => {
+                if !ann.args.is_empty() {
+                    return Err(format!("@validation.{} takes no arguments", bname));
+                }
+                if *field_ty != Type::String {
+                    return Err(format!(
+                        "Field type '{}' is not compatible with '@validation.{}' (expected String)",
+                        field_ty, bname
+                    ));
+                }
+                Ok(if bname == "url" {
+                    CompiledValidationRule::Url
+                } else {
+                    CompiledValidationRule::Uuid
+                })
+            }
             "min" | "max" => compile_bound_rule(bname, &ann.args, field_ty),
+            "min_len" | "max_len" => compile_len_rule(bname, &ann.args, field_ty),
+            "range" => compile_range_rule(&ann.args, field_ty),
+            "one_of" => compile_one_of_rule(&ann.args, field_ty),
             other => Err(format!("'cdt.validation.{}' is not a validator", other)),
         };
     }
@@ -208,6 +239,22 @@ fn compile_field_rule(
     })
 }
 
+fn eval_const_int(expr: &Expr) -> Option<i64> {
+    match &expr.kind {
+        ExprKind::Int(n) => Some(*n),
+        ExprKind::Unary { op: UnaryOp::Neg, expr: inner } => eval_const_int(inner)?.checked_neg(),
+        _ => None,
+    }
+}
+
+fn eval_const_float(expr: &Expr) -> Option<f64> {
+    match &expr.kind {
+        ExprKind::Float(v) => Some(*v),
+        ExprKind::Unary { op: UnaryOp::Neg, expr: inner } => eval_const_float(inner).map(|v| -v),
+        _ => None,
+    }
+}
+
 fn compile_bound_rule(
     kind: &str,
     args: &[Expr],
@@ -218,35 +265,121 @@ fn compile_bound_rule(
     }
     let is_min = kind == "min";
     match field_ty {
-        Type::Int => match args[0].kind {
-            ExprKind::Int(n) => Ok(if is_min {
+        Type::Int => match eval_const_int(&args[0]) {
+            Some(n) => Ok(if is_min {
                 CompiledValidationRule::MinInt(n)
             } else {
                 CompiledValidationRule::MaxInt(n)
             }),
-            _ => Err(format!("@validation.{} on Int expects an Int literal", kind)),
+            None => Err(format!("@validation.{} on Int expects an Int literal", kind)),
         },
-        Type::Float => match args[0].kind {
-            ExprKind::Float(v) => Ok(if is_min {
+        Type::Float => match eval_const_float(&args[0]) {
+            Some(v) => Ok(if is_min {
                 CompiledValidationRule::MinFloat(v)
             } else {
                 CompiledValidationRule::MaxFloat(v)
             }),
-            _ => Err(format!("@validation.{} on Float expects a Float literal", kind)),
+            None => Err(format!("@validation.{} on Float expects a Float literal", kind)),
         },
-        Type::String | Type::List(_) | Type::Map(_, _) => match args[0].kind {
-            ExprKind::Int(n) => Ok(if is_min {
+        Type::String | Type::List(_) | Type::Map(_, _) => match eval_const_int(&args[0]) {
+            Some(n) => Ok(if is_min {
                 CompiledValidationRule::MinObj(n)
             } else {
                 CompiledValidationRule::MaxObj(n)
             }),
-            _ => Err(format!("@validation.{} length bound expects an Int literal", kind)),
+            None => Err(format!("@validation.{} length bound expects an Int literal", kind)),
         },
         other => Err(format!(
             "Field type '{}' is not compatible with validator '@validation.{}'",
             other, kind
         )),
     }
+}
+
+fn compile_len_rule(
+    kind: &str,
+    args: &[Expr],
+    field_ty: &Type,
+) -> Result<CompiledValidationRule, String> {
+    if args.len() != 1 {
+        return Err(format!("@validation.{} expects 1 length argument", kind));
+    }
+    if !matches!(field_ty, Type::String | Type::List(_) | Type::Map(_, _)) {
+        return Err(format!(
+            "Field type '{}' is not compatible with '@validation.{}' (expected String, List, or Map)",
+            field_ty, kind
+        ));
+    }
+    let Some(n) = eval_const_int(&args[0]) else {
+        return Err(format!("@validation.{} length bound expects an Int literal", kind));
+    };
+    if n < 0 {
+        return Err(format!("@validation.{} length bound cannot be negative", kind));
+    }
+    Ok(if kind == "min_len" {
+        CompiledValidationRule::MinObj(n)
+    } else {
+        CompiledValidationRule::MaxObj(n)
+    })
+}
+
+fn compile_range_rule(args: &[Expr], field_ty: &Type) -> Result<CompiledValidationRule, String> {
+    if args.len() != 2 {
+        return Err("@validation.range expects 2 arguments: (min, max)".to_string());
+    }
+    match field_ty {
+        Type::Int => {
+            let (Some(lo), Some(hi)) = (eval_const_int(&args[0]), eval_const_int(&args[1])) else {
+                return Err("@validation.range on Int expects two Int literals".to_string());
+            };
+            if lo > hi {
+                return Err(format!(
+                    "@validation.range lower bound {} cannot exceed upper bound {}",
+                    lo, hi
+                ));
+            }
+            Ok(CompiledValidationRule::RangeInt(lo, hi))
+        }
+        Type::Float => {
+            let (Some(lo), Some(hi)) = (eval_const_float(&args[0]), eval_const_float(&args[1])) else {
+                return Err("@validation.range on Float expects two Float literals".to_string());
+            };
+            if !lo.is_finite() || !hi.is_finite() {
+                return Err("@validation.range requires finite Float bounds".to_string());
+            }
+            if lo > hi {
+                return Err(format!(
+                    "@validation.range lower bound {} cannot exceed upper bound {}",
+                    lo, hi
+                ));
+            }
+            Ok(CompiledValidationRule::RangeFloat(lo, hi))
+        }
+        other => Err(format!(
+            "Field type '{}' is not compatible with '@validation.range' (expected Int or Float)",
+            other
+        )),
+    }
+}
+
+fn compile_one_of_rule(args: &[Expr], field_ty: &Type) -> Result<CompiledValidationRule, String> {
+    if *field_ty != Type::String {
+        return Err(format!(
+            "Field type '{}' is not compatible with '@validation.one_of' (expected String)",
+            field_ty
+        ));
+    }
+    if args.is_empty() {
+        return Err("@validation.one_of requires at least 1 String literal argument".to_string());
+    }
+    let mut values = Vec::with_capacity(args.len());
+    for arg in args {
+        let ExprKind::String(s) = &arg.kind else {
+            return Err("@validation.one_of expects String literal arguments".to_string());
+        };
+        values.push(s.clone());
+    }
+    Ok(CompiledValidationRule::OneOf(values))
 }
 
 fn push_const_validator_arg(

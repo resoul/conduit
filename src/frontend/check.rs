@@ -219,6 +219,24 @@ pub fn check_program_with_roots(
             }
         }
     }
+    let mut seen_test_names = HashSet::new();
+    for item in &mut program.items {
+        if let ItemKind::Test { name, body } = &mut item.kind {
+            if !seen_test_names.insert(name.clone()) {
+                return Err(format!(
+                    "[{}:{}] Duplicate test name '{}'",
+                    item.span.line, item.span.col, name
+                ));
+            }
+            let mut tc = Checker {
+                checked: &mut checked,
+                scopes: vec![HashMap::new()],
+                current_return: Type::Void,
+                loop_depth: 0,
+            };
+            tc.check_block(body)?;
+        }
+    }
     if !checked.pending_mono_items.is_empty() {
         let extra = std::mem::take(&mut checked.pending_mono_items);
         program.items.extend(extra);

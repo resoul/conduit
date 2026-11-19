@@ -3,7 +3,10 @@ use std::io::Write as _;
 use crate::native::{
     FieldSlot, JsonError, ScalarKind, StructSchema, err_at_field, err_at_index, find_schema,
 };
-use crate::vm::value::{ListStorage, MapKey, MapVal, Obj, StructData};
+use crate::vm::value::{
+    ListStorage, MapKey, MapVal, Obj, SCHEMA_BOXED_BOOL, SCHEMA_BOXED_FLOAT, SCHEMA_BOXED_INT,
+    StructData,
+};
 
 #[inline]
 pub(crate) fn write_escaped_bytes(s: &str, out: &mut Vec<u8>) {
@@ -127,7 +130,16 @@ pub fn encode_obj(val: &Obj, schemas: &[StructSchema], out: &mut Vec<u8>) -> Res
         Obj::Empty => out.extend_from_slice(b"null"),
         Obj::Str(s) => write_escaped_bytes(s, out),
         Obj::List(storage) => encode_list(storage, schemas, out)?,
-        Obj::Record(rec) => encode_struct(rec, schemas, out)?,
+        Obj::Record(rec) => match rec.schema_id {
+            SCHEMA_BOXED_INT => write_i64(out, rec.inline_scalars[0] as i64),
+            SCHEMA_BOXED_FLOAT => write_f64(out, f64::from_bits(rec.inline_scalars[0]))?,
+            SCHEMA_BOXED_BOOL => out.extend_from_slice(if rec.inline_scalars[0] != 0 {
+                b"true"
+            } else {
+                b"false"
+            }),
+            _ => encode_struct(rec, schemas, out)?,
+        },
         Obj::Map(map) => {
             out.push(b'{');
             for (index, (key, entry_val)) in map.entries().iter().enumerate() {

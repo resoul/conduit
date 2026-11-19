@@ -98,10 +98,15 @@ conduit run time_demo.cdt
 | Function | Signature | Description |
 | :--- | :--- | :--- |
 | `elapsed` | `elapsed(start: time.Instant) -> time.Duration \| time.TimeError` | Calculates the duration elapsed since the given monotonic instant |
+| `format_iso` | `format_iso(ts: time.Timestamp) -> String \| time.TimeError` | Formats a UTC timestamp in RFC 3339 / ISO 8601 (`YYYY-MM-DDTHH:MM:SSZ`) |
+| `from_unix` | `from_unix(secs: Int) -> time.Timestamp` | Creates a `Timestamp` from Unix epoch seconds (UTC) |
+| `from_unix_millis` | `from_unix_millis(ms: Int) -> time.Timestamp` | Creates a `Timestamp` from Unix epoch milliseconds (UTC) |
 | `milliseconds` | `milliseconds(value: Int) -> time.Duration \| time.TimeError` | Creates a duration from the given number of milliseconds |
 | `monotonic` | `monotonic() -> time.Instant` | Reads the current monotonic clock instant |
 | `now` | `now() -> time.TimeError \| time.Timestamp` | Reads the current system clock time |
+| `parse_iso` | `parse_iso(s: String) -> time.Timestamp \| time.TimeError` | Parses `YYYY-MM-DD` or RFC 3339 / ISO 8601 timestamps (`Z` or `+/-HH:MM`) |
 | `seconds` | `seconds(value: Int) -> time.Duration \| time.TimeError` | Creates a duration from the given number of seconds |
+| `sleep` | `sleep(ms: Int) -> Void \| time.TimeError` | Sleeps the current thread for `ms` milliseconds |
 
 ---
 
@@ -112,7 +117,18 @@ conduit run time_demo.cdt
 | `Duration` | `milliseconds` | `milliseconds() -> Int \| time.TimeError` | Returns the number of full milliseconds in the duration |
 | `Duration` | `nanoseconds` | `nanoseconds() -> Int \| time.TimeError` | Returns the number of full nanoseconds in the duration |
 | `Duration` | `seconds` | `seconds() -> Int \| time.TimeError` | Returns the number of full seconds in the duration |
+| `Timestamp` | `add` | `add(dur: time.Duration) -> time.Timestamp \| time.TimeError` | Returns a new timestamp shifted forward by `dur` |
+| `Timestamp` | `day` | `day() -> Int` | UTC day of month (`1..31`) |
+| `Timestamp` | `diff` | `diff(other: time.Timestamp) -> time.Duration \| time.TimeError` | Returns `self - other` duration (`TimeError` if `self < other`) |
+| `Timestamp` | `hour` | `hour() -> Int` | UTC hour (`0..23`) |
+| `Timestamp` | `minute` | `minute() -> Int` | UTC minute (`0..59`) |
+| `Timestamp` | `month` | `month() -> Int` | UTC month (`1..12`) |
+| `Timestamp` | `second` | `second() -> Int` | UTC second (`0..59`) |
+| `Timestamp` | `sub` | `sub(dur: time.Duration) -> time.Timestamp \| time.TimeError` | Returns a new timestamp shifted backward by `dur` |
+| `Timestamp` | `to_iso` | `to_iso() -> String \| time.TimeError` | Formats the timestamp as UTC RFC 3339 / ISO 8601 |
 | `Timestamp` | `unix_milliseconds` | `unix_milliseconds() -> Int \| time.TimeError` | Returns Unix timestamp in milliseconds (UTC). Rounded down for values before epoch. |
 | `Timestamp` | `unix_seconds` | `unix_seconds() -> Int \| time.TimeError` | Returns Unix timestamp in seconds (UTC). Rounded down for values before epoch. |
+| `Timestamp` | `weekday` | `weekday() -> Int` | UTC ISO weekday (`1` = Monday .. `7` = Sunday) |
+| `Timestamp` | `year` | `year() -> Int` | UTC calendar year |
 <!-- END GENERATED -->
 

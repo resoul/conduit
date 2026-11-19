@@ -94,6 +94,10 @@ impl<'a> Checker<'a> {
             "cdt.http" => self.check_http_call(sym, type_args, args, named_args),
             "cdt.db" => self.check_db_call(sym, type_args, args, named_args),
             "cdt.cron" => self.check_cron_call(sym, type_args, args, named_args),
+            "cdt.jwt" => self.check_jwt_call(sym, type_args, args, named_args),
+            "cdt.lock" => self.check_lock_call(sym, type_args, args, named_args),
+            "cdt.cache" => self.check_cache_call(sym, type_args, args, named_args),
+            "cdt.redis" => self.check_redis_call(sym, type_args, args, named_args),
             other => Err(format!("Unknown native module '{}'", other)),
         }
     }
@@ -134,6 +138,81 @@ impl<'a> Checker<'a> {
                     self.check_expr(&mut args[0], None)?;
                     if args[0].ty == Type::Void {
                         return Err("Cannot print Void".to_string());
+                    }
+                    return Ok(Type::Void);
+                }
+                "assert" => {
+                    if !type_args.is_empty()
+                        || !named_args.is_empty()
+                        || !(1..=2).contains(&args.len())
+                    {
+                        return Err(
+                            "assert() expects 1 or 2 positional arguments: (cond, message?)"
+                                .to_string(),
+                        );
+                    }
+                    self.check_expr(&mut args[0], Some(&Type::Bool))?;
+                    if args[0].ty != Type::Bool {
+                        return Err(format!("assert() condition must be Bool, got {}", args[0].ty));
+                    }
+                    if args.len() == 2 {
+                        self.check_expr(&mut args[1], Some(&Type::String))?;
+                        if args[1].ty != Type::String {
+                            return Err(format!(
+                                "assert() message must be String, got {}",
+                                args[1].ty
+                            ));
+                        }
+                    }
+                    return Ok(Type::Void);
+                }
+                "fail" => {
+                    if !type_args.is_empty() || !named_args.is_empty() || args.len() != 1 {
+                        return Err("fail() expects 1 String argument".to_string());
+                    }
+                    self.check_expr(&mut args[0], Some(&Type::String))?;
+                    if args[0].ty != Type::String {
+                        return Err(format!("fail() message must be String, got {}", args[0].ty));
+                    }
+                    return Ok(Type::Void);
+                }
+                "assert_eq" | "assert_ne" => {
+                    if !type_args.is_empty()
+                        || !named_args.is_empty()
+                        || !(2..=3).contains(&args.len())
+                    {
+                        return Err(format!(
+                            "{}() expects 2 or 3 positional arguments: (actual, expected, message?)",
+                            name
+                        ));
+                    }
+                    self.check_expr(&mut args[0], None)?;
+                    let first_ty = args[0].ty.clone();
+                    self.check_expr(&mut args[1], Some(&first_ty))?;
+                    if matches!(args[0].kind, ExprKind::List(ref elems) if elems.is_empty())
+                        && matches!(args[1].ty, Type::List(_))
+                    {
+                        args[0].ty = args[1].ty.clone();
+                    }
+                    if args[0].ty == Type::Void || args[1].ty == Type::Void {
+                        return Err(format!("Cannot compare Void in {}()", name));
+                    }
+                    if !args[0].ty.is_assignable_to(&args[1].ty)
+                        && !args[1].ty.is_assignable_to(&args[0].ty)
+                    {
+                        return Err(format!(
+                            "{}() operands must have compatible types, got {} and {}",
+                            name, args[0].ty, args[1].ty
+                        ));
+                    }
+                    if args.len() == 3 {
+                        self.check_expr(&mut args[2], Some(&Type::String))?;
+                        if args[2].ty != Type::String {
+                            return Err(format!(
+                                "{}() message must be String, got {}",
+                                name, args[2].ty
+                            ));
+                        }
                     }
                     return Ok(Type::Void);
                 }

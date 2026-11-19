@@ -243,6 +243,14 @@ pub const SCHEMA_HTTP_BINARY_RESPONSE: u32 = 0xFFFF_0048;
 pub const SCHEMA_DB_CONN: u32 = 0xFFFF_0049;
 pub const SCHEMA_DB_PARAM: u32 = 0xFFFF_004A;
 pub const SCHEMA_CRON_SCHEDULER: u32 = 0xFFFF_004B;
+pub const SCHEMA_JWT_ERROR: u32 = 0xFFFF_003F;
+pub const SCHEMA_LOCK_ERROR: u32 = 0xFFFF_004C;
+pub const SCHEMA_CACHE_ERROR: u32 = 0xFFFF_004D;
+pub const SCHEMA_REDIS_ERROR: u32 = 0xFFFF_004E;
+pub const SCHEMA_LOCK_GUARD: u32 = 0xFFFF_004F;
+pub const SCHEMA_CACHE_HANDLE: u32 = 0xFFFF_0050;
+pub const SCHEMA_REDIS_CLIENT: u32 = 0xFFFF_0051;
+pub const SCHEMA_REDIS_LOCK: u32 = 0xFFFF_0052;
 
 #[inline]
 pub fn is_builtin_error_schema(schema_id: u32) -> bool {
@@ -266,6 +274,10 @@ pub fn is_builtin_error_schema(schema_id: u32) -> bool {
             | SCHEMA_HTTP_ERROR
             | SCHEMA_DB_ERROR
             | SCHEMA_CRON_ERROR
+            | SCHEMA_JWT_ERROR
+            | SCHEMA_LOCK_ERROR
+            | SCHEMA_CACHE_ERROR
+            | SCHEMA_REDIS_ERROR
     )
 }
 
@@ -716,6 +728,10 @@ impl Obj {
                 | SCHEMA_HTTP_ERROR
                 | SCHEMA_DB_ERROR
                 | SCHEMA_CRON_ERROR
+                | SCHEMA_JWT_ERROR
+                | SCHEMA_LOCK_ERROR
+                | SCHEMA_CACHE_ERROR
+                | SCHEMA_REDIS_ERROR
                     if rec.inline_objs.len() >= 2 =>
                 {
                     rec.inline_objs[1].format_obj()

@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 use crate::native::mysql::{MysqlConn, parse_mysql_url};
 use crate::native::pg::{PgConn, parse_pg_url};
-use crate::native::{FieldSlot, JsonType, ScalarKind, StructSchema};
+use crate::native::{CompiledStructField, FieldSlot, JsonType, ScalarKind, StructSchema};
 use crate::vm::string::VmString;
 use crate::vm::value::{
-    ListStorage, MapKey, MapVal, Obj, OrderedMap, SCHEMA_DB_CONN, SCHEMA_DB_ERROR,
-    SCHEMA_DB_PARAM, StructData,
+    ListStorage, MapKey, MapVal, Obj, OrderedMap, SCHEMA_BOXED_BOOL, SCHEMA_BOXED_FLOAT,
+    SCHEMA_BOXED_INT, SCHEMA_DB_CONN, SCHEMA_DB_ERROR, SCHEMA_DB_PARAM, StructData,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -462,6 +462,49 @@ pub fn build_drop_table_sql(model: &crate::ir::DbModelMeta) -> String {
     format!("DROP TABLE IF EXISTS {}", model.table_name)
 }
 
+fn field_value_to_cell(
+    schema: &StructSchema,
+    f: &CompiledStructField,
+    rec: &StructData,
+    is_auto: bool,
+    skip_zero_auto: bool,
+    op_name: &str,
+) -> Result<Option<Cell>, String> {
+    match f.slot {
+        FieldSlot::Scalar { kind, slot } => {
+            let raw = rec.get_scalar(slot as usize);
+            match kind {
+                ScalarKind::Int => {
+                    let iv = raw as i64;
+                    if skip_zero_auto && is_auto && iv == 0 {
+                        return Ok(None);
+                    }
+                    Ok(Some(Cell::Int(iv)))
+                }
+                ScalarKind::Float => Ok(Some(Cell::Float(f64::from_bits(raw)))),
+                ScalarKind::Bool => Ok(Some(Cell::Bool(raw != 0))),
+            }
+        }
+        FieldSlot::Obj { slot, .. } => match rec.get_obj(slot as usize) {
+            Obj::Empty => Ok(Some(Cell::Null)),
+            Obj::Str(s) => Ok(Some(Cell::Text(s.as_str().to_string()))),
+            Obj::Record(b) if b.schema_id == SCHEMA_BOXED_INT => {
+                Ok(Some(Cell::Int(b.get_scalar(0) as i64)))
+            }
+            Obj::Record(b) if b.schema_id == SCHEMA_BOXED_FLOAT => {
+                Ok(Some(Cell::Float(f64::from_bits(b.get_scalar(0)))))
+            }
+            Obj::Record(b) if b.schema_id == SCHEMA_BOXED_BOOL => {
+                Ok(Some(Cell::Bool(b.get_scalar(0) != 0)))
+            }
+            _ => Err(format!(
+                "Unsupported field '{}.{}' in db.{}()",
+                schema.type_name, f.name, op_name
+            )),
+        },
+    }
+}
+
 pub fn build_insert_and_cells(
     model: &crate::ir::DbModelMeta,
     schema: &StructSchema,
@@ -474,29 +517,8 @@ pub fn build_insert_and_cells(
         let Some(f) = schema.fields.iter().find(|f| f.name == col.field_name) else {
             continue;
         };
-        let cell = match f.slot {
-            FieldSlot::Scalar { kind, slot } => {
-                let raw = rec.get_scalar(slot as usize);
-                match kind {
-                    ScalarKind::Int => {
-                        let iv = raw as i64;
-                        if col.is_auto && iv == 0 {
-                            continue;
-                        }
-                        Cell::Int(iv)
-                    }
-                    ScalarKind::Float => Cell::Float(f64::from_bits(raw)),
-                    ScalarKind::Bool => Cell::Bool(raw != 0),
-                }
-            }
-            FieldSlot::Obj { slot, .. } => {
-                let o = rec.get_obj(slot as usize);
-                match o {
-                    Obj::Empty => Cell::Null,
-                    Obj::Str(s) => Cell::Text(s.as_str().to_string()),
-                    _ => return Err(format!("Unsupported field '{}.{}' in db.insert()", schema.type_name, f.name)),
-                }
-            }
+        let Some(cell) = field_value_to_cell(schema, f, rec, col.is_auto, true, "insert")? else {
+            continue;
         };
         cols.push(col.col_name.clone());
         placeholders.push("?");
@@ -509,6 +531,84 @@ pub fn build_insert_and_cells(
         placeholders.join(", ")
     );
     Ok((sql, cells))
+}
+
+pub fn build_update_and_cells(
+    model: &crate::ir::DbModelMeta,
+    schema: &StructSchema,
+    rec: &StructData,
+) -> Result<(String, Vec<Cell>), String> {
+    let pk = pk_column_name(model)?;
+    let mut assignments = Vec::new();
+    let mut cells = Vec::new();
+    let mut pk_cell = None;
+    for col in &model.columns {
+        let Some(f) = schema.fields.iter().find(|f| f.name == col.field_name) else {
+            continue;
+        };
+        let Some(cell) = field_value_to_cell(schema, f, rec, col.is_auto, false, "update")? else {
+            continue;
+        };
+        if col.col_name == pk {
+            pk_cell = Some(cell);
+        } else {
+            assignments.push(format!("{} = ?", col.col_name));
+            cells.push(cell);
+        }
+    }
+    let Some(pk_val) = pk_cell else {
+        return Err(format!(
+            "Model '{}' is missing primary key column '{}'",
+            schema.type_name, pk
+        ));
+    };
+    if assignments.is_empty() {
+        return Err(format!(
+            "Model '{}' has no non-primary-key columns to update",
+            schema.type_name
+        ));
+    }
+    cells.push(pk_val);
+    let sql = format!(
+        "UPDATE {} SET {} WHERE {} = ?",
+        model.table_name,
+        assignments.join(", "),
+        pk
+    );
+    Ok((sql, cells))
+}
+
+pub fn build_count_sql(model: &crate::ir::DbModelMeta) -> String {
+    format!("SELECT COUNT(*) FROM {}", model.table_name)
+}
+
+pub fn build_find_by_sql(model: &crate::ir::DbModelMeta, column: &str) -> Result<String, String> {
+    let target_col = model
+        .columns
+        .iter()
+        .find(|c| c.col_name == column || c.field_name == column)
+        .ok_or_else(|| {
+            format!(
+                "Unknown column '{}' for table '{}'",
+                column, model.table_name
+            )
+        })?;
+    let cols: Vec<&str> = model.columns.iter().map(|c| c.col_name.as_str()).collect();
+    Ok(format!(
+        "SELECT {} FROM {} WHERE {} = ?",
+        cols.join(", "),
+        model.table_name,
+        target_col.col_name
+    ))
+}
+
+pub fn extract_count_cell(qr: &QueryResult) -> Result<i64, String> {
+    let cell = qr
+        .rows
+        .first()
+        .and_then(|r| r.first())
+        .ok_or_else(|| "COUNT(*) query returned no rows".to_string())?;
+    cell_to_int(cell)
 }
 
 pub fn build_select_all_sql(model: &crate::ir::DbModelMeta) -> String {
@@ -546,7 +646,6 @@ pub fn build_delete_sql(model: &crate::ir::DbModelMeta) -> Result<String, String
 }
 
 pub fn any_obj_to_cell(obj: &Obj) -> Result<Cell, String> {
-    use crate::vm::value::{SCHEMA_BOXED_BOOL, SCHEMA_BOXED_FLOAT, SCHEMA_BOXED_INT};
     match obj {
         Obj::Record(rec) if rec.schema_id == SCHEMA_BOXED_INT => {
             Ok(Cell::Int(rec.get_scalar(0) as i64))
@@ -559,6 +658,6 @@ pub fn any_obj_to_cell(obj: &Obj) -> Result<Cell, String> {
         }
         Obj::Str(s) => Ok(Cell::Text(s.as_str().to_string())),
         Obj::Empty => Ok(Cell::Null),
-        _ => Err("Expected Int, Float, Bool, or String key for db.find()/delete()".to_string()),
+        _ => Err("Expected Int, Float, Bool, or String key for db.find()/find_by()/delete()".to_string()),
     }
 }

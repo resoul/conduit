@@ -2,6 +2,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process;
 
+mod test_runner;
 mod watch;
 
 use conduit::benchmarks;
@@ -104,6 +105,7 @@ fn main() {
         Some("check") => run_check_cmd(args.get(1)),
         Some("disasm") => run_disasm_cmd(args.get(1)),
         Some("run") => run_exec_cmd(&args[1..]),
+        Some("test") => test_runner::run_test_cmd(&args[1..]),
         Some("watch") => watch::run_watch_cmd(&args[1..]),
         Some("fmt") => run_fmt_cmd(&args[1..]),
         Some("db") => run_db_cmd(&args[1..]),
@@ -119,12 +121,12 @@ fn main() {
         }
         Some("--help" | "-h" | "help") => {
             println!(
-                "Conduit v{}\n\nUsage:\n  conduit bench [--filter <pat>] [--strict]\n  conduit build <file.cdt> [-o <output>]\n  conduit check <file.cdt>\n  conduit cron <list|print|run> <file.cdt> [job]\n  conduit db <migrate|rollback|status> <file.cdt> [--url <dsn>] [--steps <n>] [--dry-run]\n  conduit disasm <file.cdt>\n  conduit fmt <file_or_dir> [--check]\n  conduit run <file.cdt> [-- args...]\n  conduit watch <file.cdt> [-- args...]\n  conduit lsp\n  conduit --version, -V\n  conduit --help, -h",
+                "Conduit v{}\n\nUsage:\n  conduit bench [--filter <pat>] [--strict]\n  conduit build <file.cdt> [-o <output>]\n  conduit check <file.cdt>\n  conduit cron <list|print|run> <file.cdt> [job]\n  conduit db <migrate|rollback|status> <file.cdt> [--url <dsn>] [--steps <n>] [--dry-run]\n  conduit disasm <file.cdt>\n  conduit fmt <file_or_dir> [--check]\n  conduit run <file.cdt> [-- args...]\n  conduit test [file_or_dir] [--filter <pat>] [--fail-fast]\n  conduit watch <file.cdt> [-- args...]\n  conduit lsp\n  conduit --version, -V\n  conduit --help, -h",
                 env!("CARGO_PKG_VERSION")
             );
         }
         Some(cmd) => {
-            eprintln!("Unknown command '{}'. Usage: conduit <bench|build|check|cron|db|disasm|fmt|run|watch|lsp> ...", cmd);
+            eprintln!("Unknown command '{}'. Usage: conduit <bench|build|check|cron|db|disasm|fmt|run|test|watch|lsp> ...", cmd);
             process::exit(2);
         }
     }

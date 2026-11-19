@@ -1,0 +1,65 @@
+import * as crypto from "cdt.crypto"
+import * as env from "cdt.env"
+import * as lock from "cdt.lock"
+import * as redis from "cdt.redis"
+import * as time from "cdt.time"
+import * as validation from "cdt.validation"
+
+export struct Job {
+    id: String @validation.uuid
+    kind: String @validation.one_of("email", "webhook", "report")
+    created_at: String @validation.not_empty
+}
+
+export func make_job(kind: String) -> Job | time.TimeError | validation.ValidationError {
+    now := time.now()?
+    ts := now.to_iso()?
+    raw := Job(id: crypto.uuid_v4(), kind: kind, created_at: ts)
+    return validation.check(raw)?
+}
+
+func enqueue_job(r: redis.Client, job: Job) -> Int | redis.RedisError {
+    _qlen := r.rpush("jobs:queue", job.id)?
+    _added := r.sadd("jobs:kinds", job.kind)?
+    _hset := r.hset("jobs:status", job.id, "queued")?
+    queued := r.lrange("jobs:queue", 0, -1)?
+    return queued.len()
+}
+
+export func main() -> Void | redis.RedisError | lock.LockError | time.TimeError | validation.ValidationError {
+    url := env.get("REDIS_URL") ?? "redis://:conduit_redis_secret@127.0.0.1:16379/0"
+    r := redis.connect(url)?
+    pong := r.ping()?
+    print("Redis connected: {pong}")
+
+    job := make_job("email")?
+    r.set_json("job:latest", job, 300)?
+    loaded := r.get_json<Job>("job:latest")?
+    switch loaded {
+        case Job(j):
+            print("Stored JSON job id={j.id} kind={j.kind}")
+        case Nil:
+            print("Job not found")
+    }
+
+    // Queue + Set + Hash helpers under in-process mutex
+    q_count := lock.with("worker:enqueue", () => enqueue_job(r, job))?
+    print("Queue length: {q_count}")
+
+    // Re-entrant distributed lock (Lua-verified unlock)
+    processed := r.with_lock("lock:worker:batch", 5000, () => r.incr("jobs:processed"))?
+    print("Processed batch counter under distributed lock: {processed}")
+
+    // Manual distributed lock + extend + unlock
+    switch r.lock("lock:worker:manual", 3000) {
+        case redis.Lock(lk):
+            _ext := lk.extend(6000)?
+            _un := lk.unlock()?
+        case Nil:
+            print("Manual lock already held")
+        case redis.RedisError(e):
+            return e
+    }
+
+    r.close()
+}

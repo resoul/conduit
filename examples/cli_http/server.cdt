@@ -1,5 +1,4 @@
 import * as http from "cdt.http"
-import * as json from "cdt.json"
 import { EncodeError } from "cdt.json"
 
 struct ItemPatch {
@@ -7,20 +6,25 @@ struct ItemPatch {
     status: String
 }
 
+struct UserReply {
+    user_id: String
+}
+
+struct StatusReply {
+    status: String
+}
+
 func check_admin_auth(req: http.Request) -> http.Response? {
-    if req.path.starts_with("/admin") {
-        token := req.headers.get("authorization") ?? ""
-        if token != "Bearer secret" {
-            return http.response(401, "unauthorized")
-        }
+    token := req.header("Authorization") ?? ""
+    if token != "Bearer secret" {
+        return http.response(401, "unauthorized")
     }
     return nil
 }
 
-func add_cors_headers(_req: http.Request, resp: http.Response) -> http.Response {
+func add_powered_by(_req: http.Request, resp: http.Response) -> http.Response {
     hdrs := resp.headers
     hdrs.set("x-powered-by", "conduit")
-    hdrs.set("access-control-allow-origin", "*")
     return http.response_with(resp.status, resp.body, hdrs)
 }
 
@@ -29,8 +33,8 @@ func home_handler(_req: http.Request) -> http.Response {
 }
 
 func get_user_handler(req: http.Request) -> http.Response {
-    id := req.params.get("id") ?? "unknown"
-    return http.json("{\"user_id\":\"" + id + "\"}")
+    id := req.param("id") ?? "unknown"
+    return http.ok_json(UserReply(user_id: id))
 }
 
 func echo_handler(req: http.Request) -> http.Response {
@@ -38,18 +42,12 @@ func echo_handler(req: http.Request) -> http.Response {
 }
 
 func patch_item_handler(req: http.Request) -> http.Response {
-    id := req.params.get("id") ?? "0"
-    payload := ItemPatch(id: id, status: "updated")
-    switch json.encode(payload) {
-        case String(s):
-            return http.json(s)
-        case EncodeError(e):
-            return http.response(500, e.message)
-    }
+    id := req.param("id") ?? "0"
+    return http.ok_json(ItemPatch(id: id, status: "updated"))
 }
 
 func options_item_handler(_req: http.Request) -> http.Response {
-    return http.response(204, "")
+    return http.no_content()
 }
 
 func health_handler(req: http.Request) -> http.Response {
@@ -57,19 +55,22 @@ func health_handler(req: http.Request) -> http.Response {
 }
 
 func admin_stats_handler(_req: http.Request) -> http.Response {
-    return http.json("{\"status\":\"ok\"}")
+    return http.ok_json(StatusReply(status: "ok"))
 }
 
 export router DemoApi "CdtCurl demo HTTP router" {
-    before check_admin_auth
-    after add_cors_headers
+    cors "*"
+    after add_powered_by
     get "/" => home_handler
     get "/users/:id" => get_user_handler
     post "/echo" => echo_handler
     patch "/items/:id" => patch_item_handler
     options "/items/:id" => options_item_handler
     any "/health" => health_handler
-    get "/admin/stats" => admin_stats_handler
+    group "/admin" {
+        before check_admin_auth
+        get "/stats" => admin_stats_handler
+    }
 }
 
 export func build_demo_router() -> http.Router {
@@ -83,8 +84,7 @@ export func build_demo_router() -> http.Router {
 
 export func run_self_test() -> Void {
     r := build_demo_router()
-    empty := Map.from([("x", "1")])
-    empty.remove("x")
+    empty := Map<String, String>()
 
     r_home := r.dispatch(http.Request(method: "GET", path: "/", body: "", headers: empty, query: empty, params: empty))
     r_user := r.dispatch(http.Request(method: "GET", path: "/users/42", body: "", headers: empty, query: empty, params: empty))
@@ -94,14 +94,15 @@ export func run_self_test() -> Void {
         method: "GET",
         path: "/admin/stats",
         body: "",
-        headers: Map.from([("authorization", "Bearer secret")]),
+        headers: Map.from([("Authorization", "Bearer secret")]),
         query: empty,
         params: empty,
     ))
     powered := r_auth.headers.get("x-powered-by") ?? ""
+    cors_hdr := r_user.headers.get("access-control-allow-origin") ?? ""
 
     print("GET /: {r_home.status} -> {r_home.body}")
-    print("GET /users/42: {r_user.status} -> {r_user.body}")
+    print("GET /users/42: {r_user.status} -> {r_user.body} [cors={cors_hdr}]")
     print("PATCH /items/9: {r_patch.status} -> {r_patch.body}")
     print("GET /admin/stats (no auth): {r_unauth.status} -> {r_unauth.body}")
     print("GET /admin/stats (auth): {r_auth.status} -> {r_auth.body} [x-powered-by={powered}]")

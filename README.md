@@ -60,6 +60,9 @@ conduit check main.cdt
 # Run a Conduit program
 conduit run main.cdt
 
+# Run built-in tests in .cdt files
+conduit test
+
 # Watch and auto-reload on .cdt changes
 conduit watch main.cdt
 
@@ -83,15 +86,29 @@ conduit db status main.cdt --url postgres://conduit:secret@127.0.0.1:5432/app
 
 For syntax guides, language rules, and standard library references, see the documentation:
 
-- **Online Book:** [https://resoul.github.io/conduit/](https://resoul.github.io/conduit/)
+- **Online Documentation:** [https://resoul.github.io/conduit/](https://resoul.github.io/conduit/)
 - **Documentation Sources:** [docs/src/introduction.md](docs/src/introduction.md)
   - [Types & Records (`Float`, Generics, Optionals)](docs/src/language/types.md)
   - [Functions, Closures & Generics](docs/src/language/functions.md)
   - [Collections (`[T]` & `Map<K, V>`)](docs/src/language/collections.md)
   - [Errors & Unions](docs/src/language/errors.md)
   - [Modules & Privacy](docs/src/language/modules.md)
-- **Build Locally:** `mdbook build docs`
-- **Local Live Preview:** `mdbook serve docs` (opens at `http://localhost:3000`)
+
+### Run the Documentation Locally
+
+Requires Node.js 20 or newer. From the repository root, install dependencies and start the live preview:
+
+```bash
+npm ci
+npm run docs:dev
+```
+
+VitePress prints the local URL; it is usually `http://localhost:5173/conduit/`. To build and preview the production version:
+
+```bash
+npm run docs:build
+npm run docs:preview
+```
 
 ## Editor Support
 

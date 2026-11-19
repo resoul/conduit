@@ -2,12 +2,14 @@ import * as db from "cdt.db"
 import { text } from "cdt.db"
 import * as crypto from "cdt.crypto"
 import * as env from "cdt.env"
+import * as time from "cdt.time"
+import * as validation from "cdt.validation"
 
 @db.table("users")
-struct User {
+export struct User {
     id: Int @db.pk @db.auto = 0
-    email: String @db.unique @db.index
-    pw_hash: String
+    email: String @db.unique @db.index @validation.email
+    pw_hash: String @validation.not_empty
     active: Bool = true
     bio: String? = nil
 }
@@ -26,21 +28,53 @@ migration 2 "seed_admin" {
     }
 }
 
-export func main() -> Void | db.DbError | crypto.CryptoError | env.EnvError {
+export func main() -> Void | db.DbError | crypto.CryptoError | env.EnvError | validation.ValidationError | time.TimeError {
     dsn := env.require("DATABASE_URL")?
     conn := db.connect(dsn)?
     applied := conn.migrate()?
 
     d := conn.dialect()
-    print("Connected to {d}, applied {applied} migration(s)")
+    now := time.now()?
+    ts := now.to_iso()?
+    print("[{ts}] Connected to {d}, applied {applied} migration(s)")
 
     pw_hash := crypto.hash_password("hunter2")?
-    conn.insert<User>(User(email: "alice@example.com", pw_hash: pw_hash))?
+    alice := validation.check(User(email: "alice@example.com", pw_hash: pw_hash))?
+    conn.insert<User>(alice)?
+
+    // Demonstrate find_by<T>, update<T>, and query_one<T>
+    matches := conn.find_by<User>("email", "alice@example.com")?
+    switch matches.first() {
+        case User(found):
+            _updated := conn.update<User>(User(
+                id: found.id,
+                email: found.email,
+                pw_hash: found.pw_hash,
+                active: found.active,
+                bio: "Updated via conn.update<User>",
+            ))?
+        case Nil:
+    }
+
+    one := conn.query_one<User>(
+        "SELECT id, email, pw_hash, active, bio FROM users WHERE email = ?",
+        [text("alice@example.com")],
+    )?
+    switch one {
+        case User(u):
+            ubio := u.bio ?? ""
+            print("query_one<User>: email={u.email} bio={ubio}")
+        case Nil:
+            print("query_one<User>: not found")
+    }
 
     // Demonstrate transaction rollback
     conn.begin()?
     conn.insert<User>(User(email: "temp@example.com", pw_hash: "x", active: false))?
     conn.rollback()?
+
+    total := conn.count<User>()?
+    print("Total users in table: {total}")
 
     users := conn.all<User>()?
     for u in users {

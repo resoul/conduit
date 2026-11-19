@@ -20,12 +20,18 @@ pub const NATIVE_MODULES: &[NativeModuleSpec] = &[
     },
     NativeModuleSpec {
         name: "cdt.time",
-        fns: &["now", "monotonic", "elapsed", "seconds", "milliseconds"],
+        fns: &[
+            "now", "monotonic", "elapsed", "seconds", "milliseconds", "sleep", "from_unix",
+            "from_unix_millis", "parse_iso", "format_iso",
+        ],
         types: &["Timestamp", "Instant", "Duration", "TimeError"],
     },
     NativeModuleSpec {
         name: "cdt.validation",
-        fns: &["min", "max", "email", "check"],
+        fns: &[
+            "min", "max", "email", "check", "min_len", "max_len", "not_empty", "range",
+            "one_of", "url", "uuid",
+        ],
         types: &["Issue", "Violation", "ValidationError"],
     },
     NativeModuleSpec {
@@ -110,6 +116,38 @@ pub const NATIVE_MODULES: &[NativeModuleSpec] = &[
         name: "cdt.cron",
         fns: &["run", "start", "run_once", "validate"],
         types: &["Scheduler", "CronError"],
+    },
+    NativeModuleSpec {
+        name: "cdt.jwt",
+        fns: &["sign", "sign_alg", "verify", "verify_alg", "decode_unverified"],
+        types: &["JwtError"],
+    },
+    NativeModuleSpec {
+        name: "cdt.lock",
+        fns: &[
+            "with",
+            "try_with",
+            "read",
+            "write",
+            "file",
+            "file_try",
+            "file_shared",
+            "acquire",
+            "try_acquire",
+            "file_acquire",
+            "file_try_acquire",
+        ],
+        types: &["Guard", "LockError"],
+    },
+    NativeModuleSpec {
+        name: "cdt.cache",
+        fns: &["open", "open_file", "drop"],
+        types: &["Cache", "CacheError"],
+    },
+    NativeModuleSpec {
+        name: "cdt.redis",
+        fns: &["connect"],
+        types: &["Client", "Lock", "RedisError"],
     },
 ];
 
@@ -317,6 +355,10 @@ pub(crate) fn is_error_type(ty: &Type, checked: &CheckedProgram) -> bool {
             "cdt.http" => name == "HttpError",
             "cdt.db" => name == "DbError",
             "cdt.cron" => name == "CronError",
+            "cdt.jwt" => name == "JwtError",
+            "cdt.lock" => name == "LockError",
+            "cdt.cache" => name == "CacheError",
+            "cdt.redis" => name == "RedisError",
             _ => false,
         },
         Type::Custom(TypeId {
@@ -450,6 +492,16 @@ pub(crate) fn native_member_field(tid: &TypeId, field: &str) -> Result<(Type, u1
         ("cdt.db", "DbError", "code") => Ok((Type::String, 2)),
         ("cdt.cron", "CronError", "kind") => Ok((Type::String, 0)),
         ("cdt.cron", "CronError", "message") => Ok((Type::String, 1)),
+        ("cdt.jwt", "JwtError", "kind") => Ok((Type::String, 0)),
+        ("cdt.jwt", "JwtError", "message") => Ok((Type::String, 1)),
+        ("cdt.lock", "LockError", "kind") => Ok((Type::String, 0)),
+        ("cdt.lock", "LockError", "message") => Ok((Type::String, 1)),
+        ("cdt.cache", "CacheError", "kind") => Ok((Type::String, 0)),
+        ("cdt.cache", "CacheError", "message") => Ok((Type::String, 1)),
+        ("cdt.redis", "RedisError", "kind") => Ok((Type::String, 0)),
+        ("cdt.redis", "RedisError", "message") => Ok((Type::String, 1)),
+        ("cdt.redis", "Lock", "key") => Ok((Type::String, 0)),
+        ("cdt.redis", "Lock", "token") => Ok((Type::String, 1)),
         _ => Err(format!("Type '{}' has no field '{}'", tid, field)),
     }
 }
@@ -528,6 +580,46 @@ impl<'a> Checker<'a> {
                 }
                 Ok(Type::union(vec![dur, terr]))
             }
+            "sleep" => {
+                if args.len() != 1 {
+                    return Err("time.sleep(ms) expects 1 Int argument".to_string());
+                }
+                self.check_expr(&mut args[0], Some(&Type::Int))?;
+                if !args[0].ty.is_int() {
+                    return Err(format!("time.sleep expects Int milliseconds, got {}", args[0].ty));
+                }
+                Ok(Type::union(vec![Type::Void, terr]))
+            }
+            "from_unix" | "from_unix_millis" => {
+                if args.len() != 1 {
+                    return Err(format!("time.{}(value) expects 1 Int argument", func));
+                }
+                self.check_expr(&mut args[0], Some(&Type::Int))?;
+                if !args[0].ty.is_int() {
+                    return Err(format!("time.{} expects Int, got {}", func, args[0].ty));
+                }
+                Ok(ts)
+            }
+            "parse_iso" => {
+                if args.len() != 1 {
+                    return Err("time.parse_iso(s) expects 1 String argument".to_string());
+                }
+                self.check_expr(&mut args[0], Some(&Type::String))?;
+                if args[0].ty != Type::String {
+                    return Err(format!("time.parse_iso expects String, got {}", args[0].ty));
+                }
+                Ok(Type::union(vec![ts, terr]))
+            }
+            "format_iso" => {
+                if args.len() != 1 {
+                    return Err("time.format_iso(ts) expects 1 time.Timestamp argument".to_string());
+                }
+                self.check_expr(&mut args[0], Some(&ts))?;
+                if args[0].ty != ts {
+                    return Err(format!("time.format_iso expects time.Timestamp, got {}", args[0].ty));
+                }
+                Ok(Type::union(vec![Type::String, terr]))
+            }
             other => Err(format!("Unknown cdt.time symbol '{}'", other)),
         }
     }
@@ -566,13 +658,99 @@ impl<'a> Checker<'a> {
                 named_args,
                 violation,
             ),
-            "email" => {
+            "email" | "url" | "uuid" => {
                 if !named_args.is_empty() || args.len() != 1 {
-                    return Err("validation.email(val) expects 1 String argument".to_string());
+                    return Err(format!("validation.{}(val) expects 1 String argument", func));
                 }
                 self.check_expr(&mut args[0], Some(&Type::String))?;
                 if args[0].ty != Type::String {
-                    return Err(format!("validation.email expects String, got {}", args[0].ty));
+                    return Err(format!("validation.{} expects String, got {}", func, args[0].ty));
+                }
+                Ok(Type::union(vec![Type::Void, issue]))
+            }
+            "not_empty" => {
+                if !named_args.is_empty() || args.len() != 1 {
+                    return Err("validation.not_empty(val) expects 1 argument".to_string());
+                }
+                self.check_expr(&mut args[0], None)?;
+                if !matches!(args[0].ty, Type::String | Type::List(_) | Type::Map(_, _)) {
+                    return Err(format!(
+                        "Unsupported type {} for validation.not_empty (expected String, List, or Map)",
+                        args[0].ty
+                    ));
+                }
+                Ok(Type::union(vec![Type::Void, issue]))
+            }
+            "min_len" | "max_len" => {
+                if !named_args.is_empty() || args.len() != 2 {
+                    return Err(format!("validation.{}(val, len) expects 2 arguments", func));
+                }
+                let (v_slice, b_slice) = args.split_at_mut(1);
+                self.check_expr(&mut v_slice[0], None)?;
+                if !matches!(v_slice[0].ty, Type::String | Type::List(_) | Type::Map(_, _)) {
+                    return Err(format!(
+                        "Unsupported type {} for validation.{} (expected String, List, or Map)",
+                        v_slice[0].ty, func
+                    ));
+                }
+                self.check_expr(&mut b_slice[0], Some(&Type::Int))?;
+                if !b_slice[0].ty.is_int() {
+                    return Err(format!(
+                        "validation.{} expects Int length bound, got {}",
+                        func, b_slice[0].ty
+                    ));
+                }
+                Ok(Type::union(vec![Type::Void, issue]))
+            }
+            "range" => {
+                if !named_args.is_empty() || args.len() != 3 {
+                    return Err("validation.range(val, min, max) expects 3 arguments".to_string());
+                }
+                let (head, rest) = args.split_at_mut(1);
+                let (lo_s, hi_s) = rest.split_at_mut(1);
+                self.check_expr(&mut head[0], None)?;
+                if !head[0].ty.is_int() && !head[0].ty.is_float() {
+                    return Err(format!(
+                        "validation.range expects Int or Float value, got {}",
+                        head[0].ty
+                    ));
+                }
+                let bound_ty = head[0].ty.clone();
+                self.check_expr(&mut lo_s[0], Some(&bound_ty))?;
+                if lo_s[0].ty != bound_ty {
+                    return Err(format!(
+                        "validation.range expected {} min bound, got {}",
+                        bound_ty, lo_s[0].ty
+                    ));
+                }
+                self.check_expr(&mut hi_s[0], Some(&bound_ty))?;
+                if hi_s[0].ty != bound_ty {
+                    return Err(format!(
+                        "validation.range expected {} max bound, got {}",
+                        bound_ty, hi_s[0].ty
+                    ));
+                }
+                Ok(Type::union(vec![Type::Void, issue]))
+            }
+            "one_of" => {
+                if !named_args.is_empty() || args.len() != 2 {
+                    return Err("validation.one_of(val, allowed) expects 2 arguments".to_string());
+                }
+                let (v_slice, a_slice) = args.split_at_mut(1);
+                self.check_expr(&mut v_slice[0], Some(&Type::String))?;
+                if v_slice[0].ty != Type::String {
+                    return Err(format!(
+                        "validation.one_of expects String value, got {}",
+                        v_slice[0].ty
+                    ));
+                }
+                let list_str_ty = Type::List(Box::new(Type::String));
+                self.check_expr(&mut a_slice[0], Some(&list_str_ty))?;
+                if a_slice[0].ty != list_str_ty {
+                    return Err(format!(
+                        "validation.one_of expects [String] allowed list, got {}",
+                        a_slice[0].ty
+                    ));
                 }
                 Ok(Type::union(vec![Type::Void, issue]))
             }
@@ -763,6 +941,18 @@ impl<'a> Checker<'a> {
                 }
                 self.check_cron_method(&tid.name, method, args)
             }
+            (ModuleId::Native(ref m), _, _) if m == "cdt.lock" => {
+                if !type_args.is_empty() {
+                    return Err(format!("Method '.{}()' does not accept type arguments", method));
+                }
+                self.check_lock_method(&tid.name, method, args)
+            }
+            (ModuleId::Native(ref m), _, _) if m == "cdt.cache" => {
+                self.check_cache_method(&tid.name, method, type_args, args)
+            }
+            (ModuleId::Native(ref m), _, _) if m == "cdt.redis" => {
+                self.check_redis_method(&tid.name, method, type_args, args)
+            }
             (ModuleId::Native(ref m), "Timestamp", "unix_seconds" | "unix_milliseconds")
                 if m == "cdt.time" =>
             {
@@ -770,6 +960,46 @@ impl<'a> Checker<'a> {
                     return Err(format!("Timestamp.{}() takes 0 arguments", method));
                 }
                 Ok(Type::union(vec![Type::Int, terr]))
+            }
+            (ModuleId::Native(ref m), "Timestamp", "to_iso") if m == "cdt.time" => {
+                if !args.is_empty() {
+                    return Err("Timestamp.to_iso() takes 0 arguments".to_string());
+                }
+                Ok(Type::union(vec![Type::String, terr]))
+            }
+            (
+                ModuleId::Native(ref m),
+                "Timestamp",
+                "year" | "month" | "day" | "hour" | "minute" | "second" | "weekday",
+            ) if m == "cdt.time" => {
+                if !args.is_empty() {
+                    return Err(format!("Timestamp.{}() takes 0 arguments", method));
+                }
+                Ok(Type::Int)
+            }
+            (ModuleId::Native(ref m), "Timestamp", "add" | "sub") if m == "cdt.time" => {
+                let dur = Type::Custom(TypeId::native("cdt.time", "Duration"));
+                let ts = Type::Custom(TypeId::native("cdt.time", "Timestamp"));
+                if args.len() != 1 {
+                    return Err(format!("Timestamp.{}(dur) expects 1 Duration argument", method));
+                }
+                self.check_expr(&mut args[0], Some(&dur))?;
+                if args[0].ty != dur {
+                    return Err(format!("Timestamp.{} expects time.Duration, got {}", method, args[0].ty));
+                }
+                Ok(Type::union(vec![ts, terr]))
+            }
+            (ModuleId::Native(ref m), "Timestamp", "diff") if m == "cdt.time" => {
+                let dur = Type::Custom(TypeId::native("cdt.time", "Duration"));
+                let ts = Type::Custom(TypeId::native("cdt.time", "Timestamp"));
+                if args.len() != 1 {
+                    return Err("Timestamp.diff(other) expects 1 Timestamp argument".to_string());
+                }
+                self.check_expr(&mut args[0], Some(&ts))?;
+                if args[0].ty != ts {
+                    return Err(format!("Timestamp.diff expects time.Timestamp, got {}", args[0].ty));
+                }
+                Ok(Type::union(vec![dur, terr]))
             }
             (ModuleId::Native(ref m), "Duration", "seconds" | "milliseconds" | "nanoseconds")
                 if m == "cdt.time" =>

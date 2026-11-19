@@ -2,6 +2,7 @@ pub mod ast;
 pub mod check;
 pub(crate) mod check_call;
 pub(crate) mod check_cli;
+pub(crate) mod check_ext;
 pub(crate) mod check_fs;
 pub(crate) mod check_native;
 pub(crate) mod check_sys;

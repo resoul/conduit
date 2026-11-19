@@ -10,6 +10,7 @@ The `conduit` CLI provides tools for checking, compiling, executing, disassembli
 | :--- | :--- | :--- |
 | `conduit build` | `<file.cdt> [-o <output>]` | Compiles and bundles the program (including relative imports) into a standalone executable. |
 | `conduit run` | `<file.cdt>` | Type-checks, compiles to bytecode, and executes `main()` in the VM. |
+| `conduit test` | `[file_or_dir] [--filter <pat>] [--fail-fast]` | Discovers and runs `test "<name>" { ... }` blocks in `.cdt` files. |
 | `conduit watch` | `<file.cdt> [args...]` | Watches `.cdt` files and automatically recompiles and restarts on changes. |
 | `conduit lsp` | None | Starts the stdio Language Server (diagnostics, hover, definition, symbols, rename, formatting, completion) for IDEs. |
 | `conduit fmt` | `<file_or_dir> [--check]` | Formats `.cdt` source files (or checks formatting with `--check`). |
@@ -87,3 +88,13 @@ conduit cron print main.cdt
 ```
 
 Lists declared `schedule` jobs, runs a single job immediately, or prints ready-to-paste `crontab` lines to `stdout` without modifying the host system.
+
+### Running Tests (`conduit test`)
+
+```bash
+conduit test
+conduit test math_test.cdt
+conduit test tests/ --filter auth --fail-fast
+```
+
+Executes top-level `test "<name>" { ... }` blocks in isolated VM instances using built-in `assert`, `assert_eq`, `assert_ne`, and `fail` assertions, and returns a non-zero exit code if any test fails or fails to compile.

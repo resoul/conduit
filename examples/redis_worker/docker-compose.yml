@@ -1,0 +1,11 @@
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--requirepass", "conduit_redis_secret"]
+    ports:
+      - "16379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "conduit_redis_secret", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 10

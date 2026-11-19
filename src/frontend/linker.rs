@@ -53,7 +53,10 @@ fn collect_local_defs(items: &[Item]) -> HashSet<String> {
             | ItemKind::Error { name, .. } => {
                 defs.insert(name.clone());
             }
-            ItemKind::Import { .. } | ItemKind::ExportList { .. } | ItemKind::Migration { .. } => {}
+            ItemKind::Import { .. }
+            | ItemKind::ExportList { .. }
+            | ItemKind::Migration { .. }
+            | ItemKind::Test { .. } => {}
         }
     }
     defs
@@ -71,7 +74,10 @@ fn rename_item_decl(item: &mut Item, rename: &HashMap<String, String>) {
                 *name = new_name.clone();
             }
         }
-        ItemKind::Import { .. } | ItemKind::ExportList { .. } | ItemKind::Migration { .. } => {}
+        ItemKind::Import { .. }
+        | ItemKind::ExportList { .. }
+        | ItemKind::Migration { .. }
+        | ItemKind::Test { .. } => {}
     }
 }
 
@@ -248,11 +254,16 @@ fn load_module(
                         exports.insert(spec.alias.clone(), resolved.clone());
                     }
                 }
-                ItemKind::Import { .. } | ItemKind::Migration { .. } => {}
+                ItemKind::Import { .. }
+                | ItemKind::Migration { .. }
+                | ItemKind::Test { .. } => {}
             }
         }
     }
 
+    mod_prog
+        .items
+        .retain(|it| !matches!(it.kind, ItemKind::Test { .. }));
     env.sym_map.extend(local_to_global.clone());
     rewrite_items(&mut mod_prog.items, &env)?;
 
@@ -328,7 +339,14 @@ fn rewrite_items(items: &mut [Item], env: &RewriteEnv) -> Result<(), String> {
                         for a in &mut ann.args {
                             rewrite_expr(a, env, &mut empty_scopes)?;
                         }
-                        if ann.target == "json" {
+                        if matches!(
+                            ann.target.as_str(),
+                            "json" | "env" | "flag" | "opt" | "arg" | "rest" | "cmd" | "group"
+                        ) || ann.target.starts_with("db.")
+                            || ann.target.starts_with("cli.")
+                            || ann.target.starts_with("router.")
+                            || ann.target.starts_with("schedule.")
+                        {
                             continue;
                         }
                         if let Some((ns, member)) = ann.target.split_once('.') {
@@ -381,6 +399,10 @@ fn rewrite_items(items: &mut [Item], env: &RewriteEnv) -> Result<(), String> {
                 rewrite_block_stmts(up, env, &mut up_scopes)?;
                 let mut down_scopes = vec![HashSet::from(["db".to_string()])];
                 rewrite_block_stmts(down, env, &mut down_scopes)?;
+            }
+            ItemKind::Test { body, .. } => {
+                let mut scopes = Vec::new();
+                rewrite_block_stmts(body, env, &mut scopes)?;
             }
             ItemKind::Enum { .. } | ItemKind::Import { .. } => {}
         }

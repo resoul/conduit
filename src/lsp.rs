@@ -349,6 +349,7 @@ fn handle_document_symbol(msg: &str, id: &str, documents: &HashMap<String, Strin
             ItemKind::TypeAlias { name, .. } => (name.as_str(), 5u8),
             ItemKind::Const { name, .. } => (name.as_str(), 14u8),
             ItemKind::Enum { name, .. } => (name.as_str(), 10u8),
+            ItemKind::Test { name, .. } => (name.as_str(), 12u8),
             _ => continue,
         };
         let line = item.span.line.saturating_sub(1);

@@ -322,6 +322,15 @@ fn encode_val_rule(w: &mut Writer, rule: &CompiledValidationRule) -> Result<(), 
             w.list(extra_scalars, |w, &s| { w.u64(s); Ok(()) })?;
             w.list(extra_objs, encode_obj_const)?;
         }
+        CompiledValidationRule::NotEmpty => w.u8(8),
+        CompiledValidationRule::Url => w.u8(9),
+        CompiledValidationRule::Uuid => w.u8(10),
+        CompiledValidationRule::OneOf(vals) => {
+            w.u8(11);
+            w.list(vals, |w, s| { w.str(s); Ok(()) })?;
+        }
+        CompiledValidationRule::RangeInt(lo, hi) => { w.u8(12); w.i64(*lo); w.i64(*hi); }
+        CompiledValidationRule::RangeFloat(lo, hi) => { w.u8(13); w.f64(*lo); w.f64(*hi); }
     }
     Ok(())
 }
@@ -343,6 +352,12 @@ fn decode_val_rule(r: &mut Reader<'_>) -> Result<CompiledValidationRule, String>
             extra_scalars: r.vec(Reader::u64)?,
             extra_objs: r.vec(decode_obj_const)?,
         },
+        8 => CompiledValidationRule::NotEmpty,
+        9 => CompiledValidationRule::Url,
+        10 => CompiledValidationRule::Uuid,
+        11 => CompiledValidationRule::OneOf(r.vec(Reader::str)?),
+        12 => CompiledValidationRule::RangeInt(r.i64()?, r.i64()?),
+        13 => CompiledValidationRule::RangeFloat(r.f64()?, r.f64()?),
         tag => return Err(format!("Invalid ValidationRule tag {} in bundle", tag)),
     })
 }

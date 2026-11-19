@@ -60,6 +60,7 @@ func main() -> Void | db.DbError {
 | :--- | :--- | :--- |
 | `exec` | `(sql: String, params?: [Param]) -> Int \| DbError` | Executes a statement and returns affected row count |
 | `query<T>` | `(sql: String, params?: [Param]) -> [T] \| DbError` | Executes a query and decodes rows into structs `T` |
+| `query_one<T>` | `(sql: String, params?: [Param]) -> T? \| DbError` | Executes a query and decodes the first row as `T?` (`nil` if empty) |
 | `query_rows` | `(sql: String, params?: [Param]) -> [Map<String, Any>] \| DbError` | Executes a query and returns dynamic row maps |
 | `begin` | `() -> Void \| DbError` | Begins a transaction |
 | `commit` | `() -> Void \| DbError` | Commits the active transaction |
@@ -71,8 +72,11 @@ func main() -> Void | db.DbError {
 | `create_table<T>` | `() -> Void \| DbError` | Creates table & indexes from `@db.*` struct model `T` |
 | `drop_table<T>` | `() -> Void \| DbError` | Executes `DROP TABLE IF EXISTS` for model `T` |
 | `insert<T>` | `(row: T) -> Int \| DbError` | Inserts struct `T` (omits `@db.auto` field if `0`) |
+| `update<T>` | `(row: T) -> Int \| DbError` | Updates non-PK columns of `T` matching `@db.pk` (or `id`), returns affected count |
+| `count<T>` | `() -> Int \| DbError` | Returns total row count (`SELECT COUNT(*)`) for model `T`'s table |
 | `all<T>` | `() -> [T] \| DbError` | Selects all rows from model `T`'s table |
 | `find<T>` | `(id: Any) -> T? \| DbError` | Finds a row by `@db.pk` (or `id`) |
+| `find_by<T>` | `(column: String, value: Any) -> [T] \| DbError` | Queries rows where validated model column matches `value` |
 | `delete<T>` | `(id: Any) -> Int \| DbError` | Deletes a row by `@db.pk` (or `id`) |
 
 ## Table & Model Schemas (`@db.*`)

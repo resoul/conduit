@@ -290,6 +290,12 @@
           "match": "(?<!\\.)\\b(group)\\b(?=\\s+\")"
         },
         {
+          "match": "^\\s*(test)\\b(?=\\s+\")",
+          "captures": {
+            "1": { "name": "keyword.other.dsl.block.conduit" }
+          }
+        },
+        {
           "name": "keyword.other.dsl.clause.conduit",
           "match": "(?<!\\.)\\b(up|down)\\b(?=\\s*\\{)"
         },
@@ -351,7 +357,7 @@
       "patterns": [
         {
           "name": "support.function.builtin.conduit",
-          "match": "(?<!\\.)\\b(print|map|filter|reduce)\\b(?=\\s*\\()"
+          "match": "(?<!\\.)\\b(print|map|filter|reduce|assert|assert_eq|assert_ne|fail)\\b(?=\\s*\\()"
         },
         {
           "match": "\\b([a-z_][a-zA-Z0-9_]*)(?=\\s*(?:<[^>\\n]+>\\s*)?\\()",

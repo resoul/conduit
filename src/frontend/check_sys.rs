@@ -1348,25 +1348,30 @@ impl Checker<'_> {
                 self.check_sql_and_opt_params("exec", args)?;
                 Ok(Type::union(vec![Type::Int, db_err]))
             }
-            "query" => {
+            "query" | "query_one" => {
                 if type_args.len() != 1 {
-                    return Err("Connection.query<T>(sql, params?) expects 1 type argument".to_string());
+                    return Err(format!("Connection.{}<T>(sql, params?) expects 1 type argument", method));
                 }
                 let target_ty = self.checked.resolve_type_mut(&type_args[0])?;
                 let Type::Custom(tid) = &target_ty else {
                     return Err(format!(
-                        "Connection.query<T>() requires a struct type, got {}",
-                        target_ty
+                        "Connection.{}<T>() requires a struct type, got {}",
+                        method, target_ty
                     ));
                 };
                 if tid.module != ModuleId::Program || !self.checked.struct_by_name.contains_key(&tid.name) {
                     return Err(format!(
-                        "Connection.query<T>() requires a program struct type, got {}",
-                        target_ty
+                        "Connection.{}<T>() requires a program struct type, got {}",
+                        method, target_ty
                     ));
                 }
-                self.check_sql_and_opt_params("query", args)?;
-                Ok(Type::union(vec![Type::List(Box::new(target_ty)), db_err]))
+                self.check_sql_and_opt_params(method, args)?;
+                let ok_ty = if method == "query_one" {
+                    Type::Optional(Box::new(target_ty))
+                } else {
+                    Type::List(Box::new(target_ty))
+                };
+                Ok(Type::union(vec![ok_ty, db_err]))
             }
             "query_rows" => {
                 if !type_args.is_empty() {
@@ -1481,6 +1486,61 @@ impl Checker<'_> {
                 ensure_db_model_plan(self.checked, &tid.name)?;
                 self.check_expr(&mut args[0], None)?;
                 Ok(Type::union(vec![Type::Int, db_err]))
+            }
+            "update" => {
+                if type_args.len() != 1 || args.len() != 1 {
+                    return Err("Connection.update<T>(row: T) expects 1 type argument and 1 argument".to_string());
+                }
+                let target_ty = self.checked.resolve_type_mut(&type_args[0])?;
+                let Type::Custom(tid) = &target_ty else {
+                    return Err(format!("Connection.update<T>() requires a struct type, got {}", target_ty));
+                };
+                if tid.module != ModuleId::Program || !self.checked.struct_by_name.contains_key(&tid.name) {
+                    return Err(format!("Connection.update<T>() requires a program struct type, got {}", target_ty));
+                }
+                ensure_db_model_plan(self.checked, &tid.name)?;
+                self.check_expr(&mut args[0], Some(&target_ty))?;
+                if !args[0].ty.is_assignable_to(&target_ty) {
+                    return Err(format!("Connection.update<{}> expects {}, got {}", tid.name, target_ty, args[0].ty));
+                }
+                Ok(Type::union(vec![Type::Int, db_err]))
+            }
+            "count" => {
+                if type_args.len() != 1 || !args.is_empty() {
+                    return Err("Connection.count<T>() expects 1 type argument and 0 arguments".to_string());
+                }
+                let target_ty = self.checked.resolve_type_mut(&type_args[0])?;
+                let Type::Custom(tid) = &target_ty else {
+                    return Err(format!("Connection.count<T>() requires a struct type, got {}", target_ty));
+                };
+                if tid.module != ModuleId::Program || !self.checked.struct_by_name.contains_key(&tid.name) {
+                    return Err(format!("Connection.count<T>() requires a program struct type, got {}", target_ty));
+                }
+                ensure_db_model_plan(self.checked, &tid.name)?;
+                Ok(Type::union(vec![Type::Int, db_err]))
+            }
+            "find_by" => {
+                if type_args.len() != 1 || args.len() != 2 {
+                    return Err("Connection.find_by<T>(column, value) expects 1 type argument and 2 arguments".to_string());
+                }
+                let target_ty = self.checked.resolve_type_mut(&type_args[0])?;
+                let Type::Custom(tid) = &target_ty else {
+                    return Err(format!("Connection.find_by<T>() requires a struct type, got {}", target_ty));
+                };
+                if tid.module != ModuleId::Program || !self.checked.struct_by_name.contains_key(&tid.name) {
+                    return Err(format!("Connection.find_by<T>() requires a program struct type, got {}", target_ty));
+                }
+                ensure_db_model_plan(self.checked, &tid.name)?;
+                let (c_slice, v_slice) = args.split_at_mut(1);
+                self.check_expr(&mut c_slice[0], Some(&Type::String))?;
+                if c_slice[0].ty != Type::String {
+                    return Err(format!(
+                        "Connection.find_by<T> column must be String, got {}",
+                        c_slice[0].ty
+                    ));
+                }
+                self.check_expr(&mut v_slice[0], None)?;
+                Ok(Type::union(vec![Type::List(Box::new(target_ty)), db_err]))
             }
             other => Err(format!("db.Connection has no method '.{}()'", other)),
         }

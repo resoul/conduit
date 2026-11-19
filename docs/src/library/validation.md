@@ -126,6 +126,24 @@ Output:
 #### `email(value: String) -> Void | validation.Issue`
 - Validates that a string conforms to basic email format (non-empty local part, single `@`, and valid domain with dot).
 
+#### `not_empty(value) -> Void | validation.Issue`
+- Validates that a `String` has non-whitespace characters (`trim().is_empty() == false`) or that a `List` / `Map` has at least one element. Usable as `@validation.not_empty`.
+
+#### `min_len(value, n: Int) -> Void | validation.Issue` / `max_len(value, n: Int) -> Void | validation.Issue`
+- Validates minimum / maximum character length (`String`) or element count (`List` / `Map`). Usable as `@validation.min_len(n)` / `@validation.max_len(n)`.
+
+#### `range(value, min, max) -> Void | validation.Issue`
+- Inclusive range check for `Int` or finite `Float`. Supports negative literals in annotations (`@validation.range(-10, 10)`).
+
+#### `one_of(value: String, allowed: [String]) -> Void | validation.Issue`
+- Validates that a `String` equals one of the listed choices. In annotations, pass variadic literals: `@validation.one_of("admin", "user", "guest")`.
+
+#### `url(value: String) -> Void | validation.Issue`
+- Validates that a string is a valid HTTP/HTTPS URL with non-empty authority host. Usable as `@validation.url`.
+
+#### `uuid(value: String) -> Void | validation.Issue`
+- Validates canonical 36-character UUID format (`8-4-4-4-12` ASCII hex). Usable as `@validation.uuid`.
+
 #### `check(value: T) -> T | validation.ValidationError`
 - Performs explicit recursive validation of a value against all declared field annotations.
 

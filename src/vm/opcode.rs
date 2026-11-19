@@ -163,6 +163,12 @@ pub const EXT_LIST_AGG: u8 = 40;
 pub const EXT_HTTP_OP: u8 = 41;
 pub const EXT_DB_OP: u8 = 42;
 pub const EXT_CRON_OP: u8 = 43;
+pub const EXT_ASSERT: u8 = 44;
+pub const EXT_TIME_OP: u8 = 45;
+pub const EXT_JWT_OP: u8 = 46;
+pub const EXT_LOCK_OP: u8 = 47;
+pub const EXT_CACHE_OP: u8 = 48;
+pub const EXT_REDIS_OP: u8 = 49;
 
 #[cfg(test)]
 mod tests {

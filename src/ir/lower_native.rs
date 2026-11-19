@@ -23,27 +23,29 @@ use crate::native::path::{
 use crate::native::process::{
     PROC_CWD, PROC_EXIT, PROC_PID, PROC_RUN, PROC_SET_CWD, PROC_STATUS,
 };
-use crate::native::time::TimeOpKind;
+use crate::native::time::{TIME_ADD, TIME_DIFF, TIME_SUB, TimeOpKind};
 use crate::native::url::{URL_DECODE, URL_DECODE_QUERY, URL_ENCODE, URL_ENCODE_QUERY, URL_PARSE};
 use crate::native::validation::ValOpKind;
 use crate::vm::opcode::{
     EXT_CLI_HELP, EXT_CLI_PARSE, EXT_CLI_PARSE_ARGS, EXT_CRYPTO_OP, EXT_ENV_ARGS, EXT_ENV_GET,
     EXT_ENV_LOAD, EXT_ENV_REQUIRE, EXT_FS_BINARY, EXT_FS_UNARY, EXT_LIST_FIRST, EXT_LIST_LAST,
     EXT_LIST_SORT, EXT_MAP_ENTRIES, EXT_MAP_GET, EXT_MAP_KEYS, EXT_MAP_REMOVE, EXT_MAP_VALUES,
-    EXT_PATH_OP, EXT_PROCESS_OP, EXT_STR_SPLIT, EXT_STR_TO_FLOAT, EXT_STR_TO_INT, EXT_URL_OP,
-    EXT_CSV_OP, EXT_DB_OP, EXT_CRON_OP, EXT_MATH_OP, EXT_LOG_OP, EXT_HTTP_OP, Op,
+    EXT_PATH_OP, EXT_PROCESS_OP, EXT_STR_SPLIT, EXT_STR_TO_FLOAT, EXT_STR_TO_INT, EXT_TIME_OP,
+    EXT_URL_OP, EXT_CSV_OP, EXT_DB_OP, EXT_CRON_OP, EXT_MATH_OP, EXT_LOG_OP, EXT_HTTP_OP, Op,
 };
 use crate::vm::value::{
-    SCHEMA_BOXED_BOOL, SCHEMA_BOXED_FLOAT, SCHEMA_BOXED_INT, SCHEMA_CLI_ERROR,
-    SCHEMA_CRYPTO_ERROR, SCHEMA_CSV_ERROR, SCHEMA_CRON_ERROR, SCHEMA_DB_ERROR, SCHEMA_DB_PARAM, SCHEMA_EMPTY_TAG,
-    SCHEMA_ENV_ERROR, SCHEMA_FS_ERROR, SCHEMA_FS_READER,
-    SCHEMA_FS_WRITER, SCHEMA_HTTP_BINARY_RESPONSE, SCHEMA_HTTP_ERROR, SCHEMA_HTTP_REQUEST,
-    SCHEMA_HTTP_RESPONSE, SCHEMA_HTTP_ROUTER, SCHEMA_INDEX_ERROR, SCHEMA_JSON_DECODE_ERROR,
-    SCHEMA_JSON_ENCODE_ERROR,
-    SCHEMA_KEY_ERROR, SCHEMA_LIST_TAG, SCHEMA_MAP_TAG, SCHEMA_PARSE_ERROR, SCHEMA_PROCESS_ERROR,
-    SCHEMA_PROCESS_OUTPUT, SCHEMA_STR_TAG, SCHEMA_TIME_DURATION, SCHEMA_TIME_ERROR,
-    SCHEMA_TIME_INSTANT, SCHEMA_TIME_TIMESTAMP, SCHEMA_URL, SCHEMA_URL_ERROR,
-    SCHEMA_VALIDATION_ERROR, SCHEMA_VALIDATION_ISSUE, SCHEMA_VALIDATION_VIOLATION,
+    SCHEMA_BOXED_BOOL, SCHEMA_BOXED_FLOAT, SCHEMA_BOXED_INT, SCHEMA_CACHE_ERROR,
+    SCHEMA_CACHE_HANDLE, SCHEMA_CLI_ERROR, SCHEMA_CRON_ERROR, SCHEMA_CRON_SCHEDULER,
+    SCHEMA_CRYPTO_ERROR, SCHEMA_CSV_ERROR, SCHEMA_DB_CONN, SCHEMA_DB_ERROR, SCHEMA_DB_PARAM,
+    SCHEMA_EMPTY_TAG, SCHEMA_ENV_ERROR, SCHEMA_FS_ERROR, SCHEMA_FS_READER, SCHEMA_FS_WRITER,
+    SCHEMA_HTTP_BINARY_RESPONSE, SCHEMA_HTTP_ERROR, SCHEMA_HTTP_REQUEST, SCHEMA_HTTP_RESPONSE,
+    SCHEMA_HTTP_ROUTER, SCHEMA_INDEX_ERROR, SCHEMA_JSON_DECODE_ERROR, SCHEMA_JSON_ENCODE_ERROR,
+    SCHEMA_JWT_ERROR, SCHEMA_KEY_ERROR, SCHEMA_LIST_TAG, SCHEMA_LOCK_ERROR, SCHEMA_LOCK_GUARD,
+    SCHEMA_MAP_TAG, SCHEMA_PARSE_ERROR, SCHEMA_PROCESS_ERROR, SCHEMA_PROCESS_OUTPUT,
+    SCHEMA_REDIS_CLIENT, SCHEMA_REDIS_ERROR, SCHEMA_REDIS_LOCK, SCHEMA_STR_TAG,
+    SCHEMA_TIME_DURATION, SCHEMA_TIME_ERROR, SCHEMA_TIME_INSTANT, SCHEMA_TIME_TIMESTAMP,
+    SCHEMA_URL, SCHEMA_URL_ERROR, SCHEMA_VALIDATION_ERROR, SCHEMA_VALIDATION_ISSUE,
+    SCHEMA_VALIDATION_VIOLATION,
 };
 
 #[inline]
@@ -100,6 +102,19 @@ pub(crate) fn type_tag_for_switch(ty: &Type, checked: &CheckedProgram) -> Result
                 ("cdt.http", "Response") => Ok(SCHEMA_HTTP_RESPONSE),
                 ("cdt.http", "BinaryResponse") => Ok(SCHEMA_HTTP_BINARY_RESPONSE),
                 ("cdt.http", "Router") => Ok(SCHEMA_HTTP_ROUTER),
+                ("cdt.db", "DbError") => Ok(SCHEMA_DB_ERROR),
+                ("cdt.db", "Connection") => Ok(SCHEMA_DB_CONN),
+                ("cdt.db", "Param") => Ok(SCHEMA_DB_PARAM),
+                ("cdt.cron", "CronError") => Ok(SCHEMA_CRON_ERROR),
+                ("cdt.cron", "Scheduler") => Ok(SCHEMA_CRON_SCHEDULER),
+                ("cdt.jwt", "JwtError") => Ok(SCHEMA_JWT_ERROR),
+                ("cdt.lock", "LockError") => Ok(SCHEMA_LOCK_ERROR),
+                ("cdt.lock", "Guard") => Ok(SCHEMA_LOCK_GUARD),
+                ("cdt.cache", "CacheError") => Ok(SCHEMA_CACHE_ERROR),
+                ("cdt.cache", "Cache") => Ok(SCHEMA_CACHE_HANDLE),
+                ("cdt.redis", "RedisError") => Ok(SCHEMA_REDIS_ERROR),
+                ("cdt.redis", "Client") => Ok(SCHEMA_REDIS_CLIENT),
+                ("cdt.redis", "Lock") => Ok(SCHEMA_REDIS_LOCK),
                 _ => Err(format!("Unsupported native type '{}' in switch pattern", tid)),
             },
             _ => Err(format!("Unsupported type '{}' in switch pattern", tid)),
@@ -154,11 +169,32 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 });
                 Ok(dst_obj)
             }
-            "milliseconds" => {
+            "milliseconds" | "sleep" | "from_unix" | "from_unix_millis" => {
+                let kind = match sym {
+                    "sleep" => TimeOpKind::Sleep,
+                    "from_unix" => TimeOpKind::FromUnix,
+                    "from_unix_millis" => TimeOpKind::FromUnixMillis,
+                    _ => TimeOpKind::Milliseconds,
+                };
                 let arg_reg = self.lower_scalar(&args[0])?;
                 let dst_obj = self.alloc_temp_o();
                 self.ops.push(Op::TimeOp {
-                    kind: TimeOpKind::Milliseconds as u8,
+                    kind: kind as u8,
+                    dst_obj,
+                    arg_reg,
+                });
+                Ok(dst_obj)
+            }
+            "parse_iso" | "format_iso" => {
+                let kind = if sym == "parse_iso" {
+                    TimeOpKind::ParseIso
+                } else {
+                    TimeOpKind::FormatIso
+                };
+                let arg_reg = self.lower_obj(&args[0])?;
+                let dst_obj = self.alloc_temp_o();
+                self.ops.push(Op::TimeOp {
+                    kind: kind as u8,
                     dst_obj,
                     arg_reg,
                 });
@@ -176,14 +212,74 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
         named_args: &[NamedArg],
     ) -> Result<u16, String> {
         match sym {
-            "email" => {
+            "email" | "url" | "uuid" | "not_empty" => {
+                let kind = match sym {
+                    "email" => ValOpKind::Email,
+                    "url" => ValOpKind::Url,
+                    "uuid" => ValOpKind::Uuid,
+                    _ => ValOpKind::NotEmpty,
+                };
                 let a_reg = self.lower_obj(&args[0])?;
                 let dst_obj = self.alloc_temp_o();
                 self.ops.push(Op::ValidationOp {
-                    kind: ValOpKind::Email as u8,
+                    kind: kind as u8,
                     dst_obj,
                     a_reg,
                     b_reg: 0,
+                });
+                Ok(dst_obj)
+            }
+            "min_len" | "max_len" => {
+                let kind = if sym == "min_len" {
+                    ValOpKind::MinObj
+                } else {
+                    ValOpKind::MaxObj
+                };
+                let a_reg = self.lower_obj(&args[0])?;
+                let b_reg = self.lower_scalar(&args[1])?;
+                let dst_obj = self.alloc_temp_o();
+                self.ops.push(Op::ValidationOp {
+                    kind: kind as u8,
+                    dst_obj,
+                    a_reg,
+                    b_reg,
+                });
+                Ok(dst_obj)
+            }
+            "one_of" => {
+                let a_reg = self.lower_obj(&args[0])?;
+                let b_reg = self.lower_obj(&args[1])?;
+                let dst_obj = self.alloc_temp_o();
+                self.ops.push(Op::ValidationOp {
+                    kind: ValOpKind::OneOf as u8,
+                    dst_obj,
+                    a_reg,
+                    b_reg,
+                });
+                Ok(dst_obj)
+            }
+            "range" => {
+                let a_reg = self.lower_scalar(&args[0])?;
+                let lo_reg = self.lower_scalar(&args[1])?;
+                let hi_reg = self.lower_scalar(&args[2])?;
+                let desc_idx = self.mc.intern_record_desc(RecordDesc {
+                    schema_id: SCHEMA_VALIDATION_ISSUE,
+                    scalar_regs: Box::new([lo_reg, hi_reg]),
+                    obj_regs: Box::new([]),
+                })?;
+                let b_reg = self.alloc_temp_o();
+                self.ops.push(Op::NewRecord { dst_obj: b_reg, desc_idx });
+                let kind = if args[0].ty.is_float() {
+                    ValOpKind::RangeFloat
+                } else {
+                    ValOpKind::RangeInt
+                };
+                let dst_obj = self.alloc_temp_o();
+                self.ops.push(Op::ValidationOp {
+                    kind: kind as u8,
+                    dst_obj,
+                    a_reg,
+                    b_reg,
                 });
                 Ok(dst_obj)
             }
@@ -489,7 +585,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
         }
     }
 
-    fn lower_native_record(
+    pub(crate) fn lower_native_record(
         &mut self,
         schema_id: u32,
         fields: &[&str],
@@ -1554,12 +1650,52 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
         {
             return self.lower_cron_method(&tid.name, target, method);
         }
+        if let ModuleId::Native(m) = &tid.module
+            && m == "cdt.lock"
+        {
+            return self.lower_lock_method(&tid.name, target, method);
+        }
+        if let ModuleId::Native(m) = &tid.module
+            && m == "cdt.cache"
+        {
+            return self.lower_cache_method(&tid.name, target, method, type_args, args);
+        }
+        if let ModuleId::Native(m) = &tid.module
+            && m == "cdt.redis"
+        {
+            return self.lower_redis_method(&tid.name, target, method, type_args, args);
+        }
+        if let ModuleId::Native(m) = &tid.module
+            && m == "cdt.time"
+            && tid.name == "Timestamp"
+            && matches!(method, "add" | "sub" | "diff")
+        {
+            let aux = match method {
+                "add" => TIME_ADD,
+                "sub" => TIME_SUB,
+                _ => TIME_DIFF,
+            };
+            let b = self.lower_obj(target)?;
+            let c = self.lower_obj(&args[0])?;
+            let a = self.alloc_temp_o();
+            self.ops.push(Op::ExtOp {
+                kind: EXT_TIME_OP,
+                aux,
+                a,
+                b,
+                c,
+            });
+            return Ok(a);
+        }
         let kind = match (&tid.module, tid.name.as_str(), method) {
             (ModuleId::Native(m), "Timestamp", "unix_seconds") if m == "cdt.time" => {
                 TimeOpKind::UnixSeconds
             }
             (ModuleId::Native(m), "Timestamp", "unix_milliseconds") if m == "cdt.time" => {
                 TimeOpKind::UnixMilliseconds
+            }
+            (ModuleId::Native(m), "Timestamp", "to_iso") if m == "cdt.time" => {
+                TimeOpKind::FormatIso
             }
             (ModuleId::Native(m), "Duration", "seconds") if m == "cdt.time" => TimeOpKind::DurSeconds,
             (ModuleId::Native(m), "Duration", "milliseconds") if m == "cdt.time" => {
@@ -2171,16 +2307,17 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 });
                 Ok(dst_obj)
             }
-            "query" => {
+            "query" | "query_one" => {
                 let target_ty = self.mc.resolve_type(&type_args[0])?;
                 let Type::Custom(tid) = target_ty else {
-                    return Err("Connection.query<T> expects a struct type".to_string());
+                    return Err(format!("Connection.{}<T> expects a struct type", method));
                 };
                 let sid = self.mc.checked.struct_by_name[&tid.name] as i64;
                 let packed = self.pack_db_query_args(Some(sid), args)?;
+                let aux = if method == "query_one" { DB_QUERY_ONE } else { DB_QUERY_TYPED };
                 self.ops.push(Op::ExtOp {
                     kind: EXT_DB_OP,
-                    aux: DB_QUERY_TYPED,
+                    aux,
                     a: dst_obj,
                     b: conn_reg,
                     c: packed,
@@ -2215,11 +2352,12 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 });
                 Ok(dst_obj)
             }
-            "create_table" | "drop_table" | "all" => {
+            "create_table" | "drop_table" | "all" | "count" => {
                 let model_idx = self.resolve_db_model_idx(&type_args[0])?;
                 let aux = match method {
                     "create_table" => DB_CREATE_TABLE,
                     "drop_table" => DB_DROP_TABLE,
+                    "count" => DB_COUNT,
                     _ => DB_ALL,
                 };
                 self.ops.push(Op::ExtOp {
@@ -2231,17 +2369,40 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 });
                 Ok(dst_obj)
             }
-            "insert" | "find" | "delete" => {
+            "insert" | "update" | "find" | "delete" => {
                 let model_idx = self.resolve_db_model_idx(&type_args[0])?;
                 let packed = self.pack_db_model_arg(model_idx, &args[0])?;
                 let aux = match method {
                     "insert" => DB_INSERT,
+                    "update" => DB_UPDATE,
                     "find" => DB_FIND,
                     _ => DB_DELETE,
                 };
                 self.ops.push(Op::ExtOp {
                     kind: EXT_DB_OP,
                     aux,
+                    a: dst_obj,
+                    b: conn_reg,
+                    c: packed,
+                });
+                Ok(dst_obj)
+            }
+            "find_by" => {
+                let model_idx = self.resolve_db_model_idx(&type_args[0])?;
+                let col_reg = self.lower_obj(&args[0])?;
+                let val_reg = self.lower_obj(&args[1])?;
+                let m_reg = self.alloc_temp_s();
+                self.load_int_into(m_reg, model_idx as i64)?;
+                let desc_idx = self.mc.intern_record_desc(RecordDesc {
+                    schema_id: SCHEMA_DB_PARAM,
+                    scalar_regs: Box::new([m_reg]),
+                    obj_regs: Box::new([col_reg, val_reg]),
+                })?;
+                let packed = self.alloc_temp_o();
+                self.ops.push(Op::NewRecord { dst_obj: packed, desc_idx });
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_DB_OP,
+                    aux: DB_FIND_BY,
                     a: dst_obj,
                     b: conn_reg,
                     c: packed,

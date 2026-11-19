@@ -1,0 +1,34 @@
+import * as db from "cdt.db"
+import * as crypto from "cdt.crypto"
+import * as validation from "cdt.validation"
+import { User } from "./main"
+
+test "db_service generates PostgreSQL and MySQL DDL for User" {
+    pg := db.ddl<User>("postgres")
+    my := db.ddl<User>("mysql")
+    assert(pg.contains("CREATE TABLE IF NOT EXISTS users"))
+    assert(pg.contains("BIGSERIAL PRIMARY KEY"))
+    assert(my.contains("AUTO_INCREMENT PRIMARY KEY"))
+}
+
+test "db_service User model validation checks email and non-empty hash" {
+    ok := validation.check(User(email: "alice@example.com", pw_hash: "hashed"))?
+    assert_eq(ok.email, "alice@example.com")
+
+    var saw_err = false
+    switch validation.check(User(email: "not-an-email", pw_hash: " ")) {
+        case validation.ValidationError(err):
+            saw_err = err.issues.len() == 2
+        case User(_):
+            saw_err = false
+    }
+    assert(saw_err)
+}
+
+test "db_service crypto password hashing and constant time comparison" {
+    hashed := crypto.hash_password("hunter2")?
+    assert(crypto.verify_password("hunter2", hashed))
+    assert(!crypto.verify_password("wrong", hashed))
+    assert(crypto.constant_time_eq("abc", "abc"))
+    assert(!crypto.constant_time_eq("abc", "abd"))
+}

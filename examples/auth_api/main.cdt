@@ -1,0 +1,318 @@
+import * as cache from "cdt.cache"
+import * as cron from "cdt.cron"
+import * as env from "cdt.env"
+import * as fs from "cdt.fs"
+import * as http from "cdt.http"
+import * as jwt from "cdt.jwt"
+import * as lock from "cdt.lock"
+import * as path from "cdt.path"
+import * as process from "cdt.process"
+import * as time from "cdt.time"
+import * as validation from "cdt.validation"
+
+export struct LoginRequest {
+    email: String @validation.email
+    password: String @validation.min_len(6)
+    role: String? @validation.one_of("admin", "member") = nil
+}
+
+export struct Claims {
+    sub: String
+    role: String
+    iat: Int? = nil
+    exp: Int? = nil
+}
+
+export struct AuditNote {
+    text: String @validation.not_empty @validation.max_len(120)
+}
+
+export struct TokenReply {
+    token: String
+    expires_in: Int
+}
+
+export struct MeReply {
+    user: String
+    role: String
+    profile: String
+}
+
+export struct NoteReply {
+    saved: Bool
+    timestamp: String
+}
+
+export struct ErrReply {
+    code: String
+}
+
+func jwt_secret() -> String {
+    return env.get("JWT_SECRET") ?? "dev-conduit-jwt-secret"
+}
+
+func active_work_dir() -> String {
+    cfg := cache.open("auth_api_state")
+    return cfg.get("dir") ?? "/tmp/conduit_auth_api_live"
+}
+
+func max_login_attempts() -> Int {
+    cfg := cache.open("auth_api_state")
+    raw := cfg.get("rate_limit") ?? "10"
+    switch raw.to_int() {
+        case Int(n):
+            return n
+        case ParseError(_):
+            return 10
+    }
+}
+
+func extract_bearer(req: http.Request) -> String? {
+    hdr := req.header("Authorization") ?? ""
+    if !hdr.starts_with("Bearer ") {
+        return nil
+    }
+    tok := hdr.replace("Bearer ", "")
+    if tok.is_empty() {
+        return nil
+    }
+    return tok
+}
+
+func require_jwt(req: http.Request) -> http.Response? {
+    tok := extract_bearer(req) ?? ""
+    if tok.is_empty() {
+        return http.status_json(401, ErrReply(code: "missing_bearer_token"))
+    }
+    switch jwt.verify<Claims>(tok, jwt_secret()) {
+        case Claims(_):
+            return nil
+        case jwt.JwtError(_):
+            return http.status_json(401, ErrReply(code: "invalid_or_expired_token"))
+    }
+}
+
+func login_handler(_req: http.Request, body: LoginRequest) -> http.Response {
+    rl := cache.open("auth_api_rate", 1000)
+    limit := max_login_attempts()
+    switch rl.incr("rate:login", 1, 60000) {
+        case Int(hits):
+            if hits > limit {
+                return http.status_json(429, ErrReply(code: "rate_limited"))
+            }
+        case cache.CacheError(e):
+            return http.status_json(500, ErrReply(code: e.message))
+    }
+
+    role := body.role ?? "member"
+    switch jwt.sign(Claims(sub: body.email, role: role), jwt_secret(), 3600) {
+        case String(tok):
+            return http.ok_json(TokenReply(token: tok, expires_in: 3600))
+        case jwt.JwtError(e):
+            return http.status_json(500, ErrReply(code: e.message))
+    }
+}
+
+func me_handler(req: http.Request) -> http.Response {
+    tok := extract_bearer(req) ?? ""
+    switch jwt.verify<Claims>(tok, jwt_secret()) {
+        case Claims(claims):
+            profiles := cache.open("auth_api_profiles", 500)
+            p_key := "profile:{claims.sub}"
+            prof_res := profiles.get_or_set(p_key, 30000, () => "plan=pro;verified=true")
+            switch prof_res {
+                case String(prof):
+                    return http.ok_json(MeReply(user: claims.sub, role: claims.role, profile: prof))
+                case cache.CacheError(e):
+                    return http.status_json(500, ErrReply(code: e.message))
+            }
+        case jwt.JwtError(_):
+            return http.status_json(401, ErrReply(code: "invalid_or_expired_token"))
+    }
+}
+
+func note_handler(_req: http.Request, body: AuditNote) -> http.Response {
+    var ts = "1970-01-01T00:00:00Z"
+    switch time.now() {
+        case time.Timestamp(t):
+            switch t.to_iso() {
+                case String(iso):
+                    ts = iso
+                case time.TimeError(_):
+            }
+        case time.TimeError(_):
+    }
+
+    dir := active_work_dir()
+    if !fs.exists(dir) {
+        switch fs.mkdir_all(dir) {
+            case fs.FsError(e):
+                return http.status_json(500, ErrReply(code: e.message))
+            case Void:
+        }
+    }
+    lock_file := path.join(dir, "audit.lock")
+    audit_file := path.join(dir, "audit.log")
+    line := "[{ts}] {body.text}\n"
+    switch lock.file(lock_file, () => fs.append_text(audit_file, line)) {
+        case lock.LockError(e):
+            return http.status_json(500, ErrReply(code: e.message))
+        case Void:
+        case fs.FsError(e):
+            return http.status_json(500, ErrReply(code: e.message))
+    }
+
+    wal_path := path.join(dir, "sessions.wal")
+    switch cache.open_file("auth_api_wal", wal_path) {
+        case cache.Cache(w):
+            switch w.set("last_note", body.text, 60000) {
+                case cache.CacheError(e):
+                    return http.status_json(500, ErrReply(code: e.message))
+                case Void:
+            }
+        case cache.CacheError(e):
+            return http.status_json(500, ErrReply(code: e.message))
+    }
+
+    return http.ok_json(NoteReply(saved: true, timestamp: ts))
+}
+
+func compact_sessions() -> Void | cache.CacheError {
+    dir := active_work_dir()
+    wal_path := path.join(dir, "sessions.wal")
+    if !fs.exists(wal_path) {
+        return
+    }
+    w := cache.open_file("auth_api_wal", wal_path)?
+    _live := w.compact()?
+    return
+}
+
+export router AuthApi "JWT + Cache + File Lock Auth API" {
+    cors "*"
+    post "/auth/login" => login_handler
+    group "/api" {
+        before require_jwt
+        get "/me" => me_handler
+        post "/notes" => note_handler
+    }
+}
+
+export schedule Maintenance {
+    interval 60s => compact_sessions
+}
+
+export func build_auth_router() -> http.Router {
+    return http.build<AuthApi>()
+}
+
+export func setup_state(work_dir: String, limit: Int) -> Void | cache.CacheError {
+    cfg := cache.open("auth_api_state")
+    cfg.set("dir", work_dir)?
+    limit_str := limit.to_string()
+    cfg.set("rate_limit", limit_str)?
+    cache.open("auth_api_rate", 1000).clear()?
+    cache.open("auth_api_profiles", 500).clear()?
+    _dropped := cache.drop("auth_api_wal")
+    return
+}
+
+export func run_self_test() -> Void | fs.FsError | cache.CacheError | jwt.JwtError {
+    pid := process.pid()
+    dir := path.join("/tmp", "conduit_auth_api_self_{pid}")
+    let_clean := fs.remove(dir)
+    switch let_clean {
+        case fs.FsError(_):
+        case Void:
+    }
+    fs.mkdir_all(dir)?
+    setup_state(dir, 5)?
+
+    r := build_auth_router()
+    empty := Map<String, String>()
+
+    // 1. Validation contract rejects bad email (422)
+    r_bad := r.dispatch(http.Request(
+        method: "POST",
+        path: "/auth/login",
+        body: "{\"email\":\"not-email\",\"password\":\"secret123\"}",
+        headers: empty,
+        query: empty,
+        params: empty,
+    ))
+    print("POST /auth/login (invalid): status={r_bad.status}")
+
+    // 2. Unauthenticated call rejected (401)
+    r_unauth := r.dispatch(http.Request(method: "GET", path: "/api/me", body: "", headers: empty, query: empty, params: empty))
+    print("GET /api/me (no token): status={r_unauth.status}")
+
+    // 3. Valid login issues HS256 JWT
+    r_login := r.dispatch(http.Request(
+        method: "POST",
+        path: "/auth/login",
+        body: "{\"email\":\"ada@conduit.dev\",\"password\":\"hunter2\",\"role\":\"admin\"}",
+        headers: empty,
+        query: empty,
+        params: empty,
+    ))
+    print("POST /auth/login (valid): status={r_login.status}")
+
+    // 4. Re-issue / verify JWT and hit /api/me + /api/notes
+    tok := jwt.sign(Claims(sub: "ada@conduit.dev", role: "admin"), jwt_secret(), 3600)?
+    auth_h := Map.from([("Authorization", "Bearer {tok}")])
+
+    r_me := r.dispatch(http.Request(method: "GET", path: "/api/me", body: "", headers: auth_h, query: empty, params: empty))
+    print("GET /api/me (authed): status={r_me.status} body={r_me.body}")
+
+    r_note := r.dispatch(http.Request(
+        method: "POST",
+        path: "/api/notes",
+        body: "{\"text\":\"rotated keys cleanly\"}",
+        headers: auth_h,
+        query: empty,
+        params: empty,
+    ))
+    print("POST /api/notes: status={r_note.status} body={r_note.body}")
+
+    // 5. WAL reload + Snapshot save/load + Cron validation check
+    wal_path := path.join(dir, "sessions.wal")
+    snap_path := path.join(dir, "sessions.snap.json")
+    w := cache.open_file("auth_api_wal", wal_path)?
+    saved := w.save(snap_path)?
+    _dropped := cache.drop("auth_api_wal")
+
+    w_reloaded := cache.open_file("auth_api_wal", wal_path)?
+    live := w_reloaded.compact()?
+    note_val := w_reloaded.get("last_note") ?? ""
+
+    snap_dst := cache.open("auth_api_snap_check")
+    loaded := snap_dst.load(snap_path)?
+    cron_ok := cron.validate("*/5 * * * *")
+    print("WAL+Snapshot+Cron: saved={saved} loaded={loaded} compact_live={live} note={note_val} cron_ok={cron_ok}")
+
+    _d1 := cache.drop("auth_api_wal")
+    _d2 := cache.drop("auth_api_snap_check")
+    fs.remove(dir)?
+    return
+}
+
+export func main() -> Void | fs.FsError | cache.CacheError | jwt.JwtError | http.HttpError {
+    args := env.args()
+    var i = 0
+    while i < args.len() {
+        switch args.get(i) {
+            case String(arg):
+                if arg == "serve" {
+                    addr := env.get("BIND_ADDR") ?? "127.0.0.1:8080"
+                    setup_state("/tmp/conduit_auth_api_live", 100)?
+                    print("AuthApi listening on http://{addr}")
+                    http.serve<AuthApi>(addr)?
+                    return
+                }
+            case _:
+        }
+        i = i + 1
+    }
+    run_self_test()?
+    return
+}

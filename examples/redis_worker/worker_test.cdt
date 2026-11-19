@@ -1,0 +1,35 @@
+import * as redis from "cdt.redis"
+import * as lock from "cdt.lock"
+import * as validation from "cdt.validation"
+import { Job, make_job } from "./main"
+
+test "redis_worker Job validation accepts UUID and allowed kind" {
+    job := make_job("webhook")?
+    assert_eq(job.kind, "webhook")
+    assert(job.created_at.ends_with("Z"))
+
+    var bad_err = false
+    switch validation.check(Job(id: "not-a-uuid", kind: "sms", created_at: " ")) {
+        case validation.ValidationError(err):
+            bad_err = err.issues.len() == 3
+        case Job(_):
+            bad_err = false
+    }
+    assert(bad_err)
+}
+
+test "redis_worker rejects invalid Redis URL cleanly" {
+    var err_kind = ""
+    switch redis.connect("http://127.0.0.1:6379") {
+        case redis.RedisError(e):
+            err_kind = e.kind
+        case redis.Client(_):
+            err_kind = "unexpected"
+    }
+    assert_eq(err_kind, "invalid_url")
+}
+
+test "redis_worker in-process lock guards batch step" {
+    v := lock.with("worker:local", () => 100 + 23)?
+    assert_eq(v, 123)
+}

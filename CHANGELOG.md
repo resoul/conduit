@@ -5,6 +5,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
+## [Unreleased]
+
+### Added
+
+* **Built-in `.cdt` Test Runner (`conduit test`, `test "..." { ... }`)**:
+  * Added top-level `test "<name>" { ... }` declarations across AST, parser, linker (stripping tests from imported modules), reachability tree-shaking, typechecker (with duplicate test name rejection and `?` propagation without error return annotations), IR lowering (`TestSpec`), and LSP document symbols (`src/frontend/{ast,parser,linker,reachability,check}.rs`, `src/ir/{mod,lower}.rs`, `src/lsp.rs`).
+  * Added prelude assertion builtins `assert(cond, msg?)`, `assert_eq(actual, expected, msg?)`, `assert_ne(actual, unexpected, msg?)`, and `fail(msg)` backed by `EXT_ASSERT` (`src/frontend/check_call.rs`, `src/ir/lower_call.rs`, `src/vm/opcode.rs`, `src/vm/exec_map.rs`), plus LSP docs and TextMate / VitePress Shiki highlighting.
+  * Added `conduit test [file_or_dir] [--filter <pat>] [--fail-fast]` CLI test runner (`src/test_runner.rs`, `src/main.rs`) with unit and CLI integration tests (`cdt_test_blocks_assertions_try_and_tree_shaking`, `cli_test_runner_pass_fail_filter_and_dir_discovery`).
+* **`cdt.validation`, `cdt.db`, and `cdt.time` Enhancements**:
+  * Extended `cdt.validation` with `not_empty`, `min_len`, `max_len`, `range`, `one_of`, `url`, and `uuid` (both `@validation.*` annotations including negative bounds and direct `validation.*()` calls, with bundle roundtrip support in `src/ir/bundle.rs`).
+  * Extended `cdt.db` `Connection` with `update<T>(row)`, `count<T>()`, `find_by<T>(column, value)` (schema-validated column lookup), `query_one<T>(sql, params?)`, and optional boxed scalar field support in `insert<T>`/`update<T>`.
+  * Extended `cdt.time` with `time.sleep(ms)`, `from_unix`, `from_unix_millis`, `parse_iso`, `format_iso`, and UTC calendar/arithmetic `Timestamp` methods (`.to_iso()`, `.add()`, `.sub()`, `.diff()`, `.year()`, `.month()`, `.day()`, `.hour()`, `.minute()`, `.second()`, `.weekday()`).
+* **Zero-Dependency `cdt.jwt`, `cdt.lock`, `cdt.cache`, and `cdt.redis` Standard Library Modules**:
+  * Added `cdt.jwt` (`src/native/jwt.rs`, `src/vm/exec_jwt.rs`, `EXT_JWT_OP`) with pure-Rust FIPS 180-4 SHA-512/HMAC-SHA512 & HMAC-SHA256, strict unpadded Base64URL, constant-time verification (`sign`, `sign_alg`, `verify<T>`, `verify_alg<T>`, `decode_unverified<T>`), `alg: none` rejection, and `iat`/`exp`/`nbf` validation.
+  * Added `cdt.lock` (`src/native/lock.rs`, `src/vm/exec_lock.rs`, `EXT_LOCK_OP`) with process-wide named mutexes (`with`, `try_with`, `acquire`, `try_acquire`), writer-fair RWLocks (`read`, `write`), inter-process OS advisory file locks (`file`, `file_try`, `file_shared`, `file_acquire`, `file_try_acquire`), and `Guard` (`.release()`, `.is_held()`).
+  * Added `cdt.cache` (`src/native/cache.rs`, `src/vm/exec_cache.rs`, `EXT_CACHE_OP`) with process-wide thread-safe TTL + O(log N) LRU stores (`open`, `open_file`, `drop`), stampede-safe `get_or_set`, atomic `incr` rate limiting, JSON helpers, atomic Snapshot `save`/`load`, and WAL/AOL persistence with `compact()`.
+  * Added `cdt.redis` (`src/native/redis.rs`, `src/vm/exec_redis.rs`, `EXT_REDIS_OP`) with zero-dependency RESP2 TCP wire protocol (`redis://[:pass@]host[:port][/db]`), KV/JSON/Hash/List/Set/raw `cmd` operations, and Lua-verified distributed locks (`lock`, `unlock`, `extend`, `with_lock`).
+
+### Changed
+
+* **Documentation Site (VitePress)**:
+  * Migrated the documentation build and GitHub Pages artifact from mdBook to VitePress while keeping Markdown pages under `docs/src`; added a home page, sidebar navigation, local search, and Conduit syntax highlighting through the existing TextMate grammar.
+  * Added npm scripts for local development, production builds, and previewing the built site; documented the workflow in `README.md`.
+
 ## [0.3.2] - 2026-11-19
 
 ### Added

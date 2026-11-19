@@ -156,6 +156,28 @@ impl<'a> ModuleCompiler<'a> {
             }
         }
         self.module.migrations.sort_by_key(|m| m.version);
+        let mut test_idx = 0usize;
+        for item in &program.items {
+            if let ItemKind::Test { name, body } = &item.kind {
+                let test_proto = self.lower_function(
+                    &format!("__cdt_test_{}", test_idx),
+                    &[],
+                    &[],
+                    &Type::Void,
+                    body,
+                    &[],
+                    &[],
+                )?;
+                let func_id = self.module.functions.len() as u32;
+                self.module.functions.push(test_proto);
+                self.module.tests.push(crate::ir::TestSpec {
+                    name: name.clone(),
+                    func_id,
+                    line: item.span.line,
+                });
+                test_idx += 1;
+            }
+        }
         self.module.db_models = self.checked.db_model_plans.clone();
         for (sched_name, entries) in &self.checked.cron_schedule_plans {
             let mut jobs = Vec::with_capacity(entries.len());

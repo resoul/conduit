@@ -45,14 +45,15 @@ use crate::native::cli::{exec_cli_parse, format_cli_help};
 use crate::native::env::{exec_env_load, make_env_error};
 use crate::vm::exec_union::list_get_or_index;
 use crate::vm::opcode::{
-    EXT_CLI_HELP, EXT_CLI_PARSE, EXT_CLI_PARSE_ARGS, EXT_CRYPTO_OP, EXT_ENV_ARGS, EXT_ENV_GET,
-    EXT_ENV_LOAD, EXT_ENV_REQUIRE, EXT_FLOAT_CEIL, EXT_FLOAT_MATH, EXT_FS_BINARY, EXT_FS_UNARY,
-    EXT_INT_MATH, EXT_LIST_FIRST, EXT_LIST_IS_EMPTY, EXT_LIST_LAST, EXT_LIST_SORT,
-    EXT_MAP_CONTAINS_KEY, EXT_MAP_ENTRIES, EXT_MAP_FROM, EXT_MAP_GET, EXT_MAP_INDEX, EXT_MAP_KEYS,
-    EXT_MAP_REMOVE, EXT_MAP_SET, EXT_MAP_VALUES, EXT_PATH_OP, EXT_PIPELINE_REDUCE, EXT_PRINT_OBJ,
-    EXT_PRINT_SCALAR, EXT_PROCESS_OP, EXT_STR_IS_EMPTY, EXT_STR_PRED, EXT_STR_SPLIT,
-    EXT_STR_TO_FLOAT, EXT_STR_TO_INT, EXT_URL_OP, EXT_CSV_OP, EXT_DB_OP, EXT_CRON_OP, EXT_MATH_OP, EXT_LOG_OP,
-    EXT_LIST_AGG, EXT_HTTP_OP,
+    EXT_ASSERT, EXT_CACHE_OP, EXT_CLI_HELP, EXT_CLI_PARSE, EXT_CLI_PARSE_ARGS, EXT_CRON_OP,
+    EXT_CRYPTO_OP, EXT_CSV_OP, EXT_DB_OP, EXT_ENV_ARGS, EXT_ENV_GET, EXT_ENV_LOAD,
+    EXT_ENV_REQUIRE, EXT_FLOAT_CEIL, EXT_FLOAT_MATH, EXT_FS_BINARY, EXT_FS_UNARY, EXT_HTTP_OP,
+    EXT_INT_MATH, EXT_JWT_OP, EXT_LIST_AGG, EXT_LIST_FIRST, EXT_LIST_IS_EMPTY, EXT_LIST_LAST,
+    EXT_LIST_SORT, EXT_LOCK_OP, EXT_LOG_OP, EXT_MAP_CONTAINS_KEY, EXT_MAP_ENTRIES, EXT_MAP_FROM,
+    EXT_MAP_GET, EXT_MAP_INDEX, EXT_MAP_KEYS, EXT_MAP_REMOVE, EXT_MAP_SET, EXT_MAP_VALUES,
+    EXT_MATH_OP, EXT_PATH_OP, EXT_PIPELINE_REDUCE, EXT_PRINT_OBJ, EXT_PRINT_SCALAR, EXT_PROCESS_OP,
+    EXT_REDIS_OP, EXT_STR_IS_EMPTY, EXT_STR_PRED, EXT_STR_SPLIT, EXT_STR_TO_FLOAT, EXT_STR_TO_INT,
+    EXT_TIME_OP, EXT_URL_OP,
 };
 use crate::vm::value::{
     ListStorage, MapKey, MapVal, Obj, OrderedMap, SCHEMA_BOXED_BOOL, SCHEMA_BOXED_FLOAT,
@@ -363,6 +364,18 @@ impl Vm {
             EXT_CRON_OP => {
                 self.exec_cron_op(module, s_base, o_base, aux, a, b, c)?;
             }
+            EXT_JWT_OP => {
+                self.exec_jwt_op(module, s_base, o_base, aux, a, b, c)?;
+            }
+            EXT_LOCK_OP => {
+                self.exec_lock_op(module, s_base, o_base, s_top, o_top, aux, a, b, c)?;
+            }
+            EXT_CACHE_OP => {
+                self.exec_cache_op(module, s_base, o_base, s_top, o_top, aux, a, b, c)?;
+            }
+            EXT_REDIS_OP => {
+                self.exec_redis_op(module, s_base, o_base, s_top, o_top, aux, a, b, c)?;
+            }
             EXT_STR_TO_INT => {
                 let Obj::Str(s) = &self.objs[o_base + b as usize] else {
                     return Err(err_msg("Expected String in to_int()"));
@@ -506,6 +519,77 @@ impl Vm {
                 }
                 self.objs[o_base + a as usize] = Obj::Map(Arc::new(map));
             }
+            EXT_ASSERT => {
+                let op_kind = aux >> 3;
+                let val_tag = aux & 0x07;
+                match op_kind {
+                    0 => {
+                        if self.scalars[s_base + a as usize] == 0 {
+                            return Err(err_msg(&format!("Assertion failed (line {})", b)));
+                        }
+                    }
+                    1 => {
+                        if self.scalars[s_base + a as usize] == 0 {
+                            let msg = self.objs[o_base + b as usize].format_obj();
+                            return Err(err_msg(&format!("Assertion failed (line {}): {}", c, msg)));
+                        }
+                    }
+                    2 => {
+                        let msg = self.objs[o_base + a as usize].format_obj();
+                        return Err(err_msg(&format!("Test failed (line {}): {}", b, msg)));
+                    }
+                    3..=6 => {
+                        let is_ne = op_kind >= 5;
+                        let has_msg = op_kind == 4 || op_kind == 6;
+                        let (eq, lhs_str, rhs_str) = match val_tag {
+                            1 => {
+                                let l = self.scalars[s_base + a as usize] as i64;
+                                let r = self.scalars[s_base + b as usize] as i64;
+                                (l == r, l.to_string(), r.to_string())
+                            }
+                            2 => {
+                                let l = f64::from_bits(self.scalars[s_base + a as usize]);
+                                let r = f64::from_bits(self.scalars[s_base + b as usize]);
+                                (l == r, format_float(l), format_float(r))
+                            }
+                            3 => {
+                                let l = self.scalars[s_base + a as usize] != 0;
+                                let r = self.scalars[s_base + b as usize] != 0;
+                                (l == r, l.to_string(), r.to_string())
+                            }
+                            _ => {
+                                let l = &self.objs[o_base + a as usize];
+                                let r = &self.objs[o_base + b as usize];
+                                (l == r, format_assert_val(l), format_assert_val(r))
+                            }
+                        };
+                        let failed = if is_ne { eq } else { !eq };
+                        if failed {
+                            let header = if has_msg {
+                                let msg = self.objs[o_base + c as usize].format_obj();
+                                format!("Assertion failed: {}", msg)
+                            } else if is_ne {
+                                format!("Assertion failed (line {}): assert_ne", c)
+                            } else {
+                                format!("Assertion failed (line {}): assert_eq", c)
+                            };
+                            let detail = if is_ne {
+                                format!("{}\n  both equal: {}", header, lhs_str)
+                            } else {
+                                format!(
+                                    "{}\n  actual:   {}\n  expected: {}",
+                                    header, lhs_str, rhs_str
+                                )
+                            };
+                            return Err(err_msg(&detail));
+                        }
+                    }
+                    _ => return Err(err_msg(&format!("Invalid assert sub-op {}", op_kind))),
+                }
+            }
+            EXT_TIME_OP => {
+                self.exec_time_ext_op(s_base, o_base, aux, a, b, c)?;
+            }
             _ => return Err(err_msg(&format!("Invalid ExtOp kind {}", kind))),
         }
         Ok(())
@@ -631,6 +715,38 @@ fn obj_to_map_key(obj: &Obj, k_tag: u8) -> Result<MapKey, RuntimeError> {
         }
         (0, Obj::Str(s)) => Ok(MapKey::Str(Arc::clone(s))),
         _ => Err(err_msg("Map.from() key type mismatch at runtime")),
+    }
+}
+
+fn format_assert_val(obj: &Obj) -> String {
+    match obj {
+        Obj::Str(s) => format!("{:?}", s.as_str()),
+        Obj::List(ListStorage::Obj(v)) => {
+            let parts: Vec<String> = v.iter().map(format_assert_val).collect();
+            format!("[{}]", parts.join(", "))
+        }
+        Obj::Map(m) => {
+            let parts: Vec<String> = m
+                .entries
+                .iter()
+                .map(|(k, v)| {
+                    let ks = match k {
+                        MapKey::Int(i) => i.to_string(),
+                        MapKey::Bool(b) => b.to_string(),
+                        MapKey::Str(s) => format!("{:?}", s.as_str()),
+                    };
+                    let vs = match v {
+                        MapVal::Scalar(bits) => (*bits as i64).to_string(),
+                        MapVal::Float(f) => format_float(*f),
+                        MapVal::Bool(b) => b.to_string(),
+                        MapVal::Obj(o) => format_assert_val(o),
+                    };
+                    format!("{}: {}", ks, vs)
+                })
+                .collect();
+            format!("{{{}}}", parts.join(", "))
+        }
+        _ => obj.format_obj(),
     }
 }
 

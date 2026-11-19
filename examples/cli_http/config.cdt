@@ -5,9 +5,9 @@ export const DEFAULT_MIN_SCORE: Int = 50
 export const DEFAULT_TAG = "starter"
 
 export struct AppConfig {
-    app_env: String @env("APP_ENV") = "dev"
-    min_score: Int @env("MIN_SCORE") @validation.min(0) = DEFAULT_MIN_SCORE
-    tag: String @env("APP_TAG") = DEFAULT_TAG
+    app_env: String @env("APP_ENV") @validation.one_of("dev", "staging", "prod") = "dev"
+    min_score: Int @env("MIN_SCORE") @validation.range(0, 1000) = DEFAULT_MIN_SCORE
+    tag: String @env("APP_TAG") @validation.not_empty @validation.max_len(32) = DEFAULT_TAG
 }
 
 export func load_config() -> AppConfig | env.EnvError | validation.ValidationError {

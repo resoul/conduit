@@ -166,3 +166,118 @@ fn cli_build_and_exec_standalone_binary() {
     let stdout = String::from_utf8_lossy(&run_out.stdout);
     assert!(stdout.contains("standalone-ok"));
 }
+
+#[test]
+fn cli_test_runner_pass_fail_filter_and_dir_discovery() {
+    let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("conduit_test_suite_{}_{}", std::process::id(), n));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+
+    let helper_path = dir.join("helper.cdt");
+    fs::write(
+        &helper_path,
+        r#"
+export func triple(x: Int) -> Int {
+    return x * 3
+}
+test "helper passes" {
+    assert_eq(triple(4), 12)
+}
+"#,
+    )
+    .unwrap();
+
+    let app_test_path = dir.join("app_test.cdt");
+    fs::write(
+        &app_test_path,
+        r#"
+import { triple } from "./helper"
+
+test "alpha math" {
+    assert_eq(triple(5), 15)
+}
+
+test "beta fail" {
+    assert_eq(1 + 1, 3)
+}
+
+test "gamma after fail" {
+    assert(true)
+}
+"#,
+    )
+    .unwrap();
+
+    // 1. Single file with --filter passes when failing test is filtered out.
+    let filter_out = Command::new(conduit_bin())
+        .args(["test", app_test_path.to_str().unwrap(), "--filter", "alpha"])
+        .output()
+        .unwrap();
+    assert!(
+        filter_out.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&filter_out.stdout),
+        String::from_utf8_lossy(&filter_out.stderr)
+    );
+    let filter_stdout = String::from_utf8_lossy(&filter_out.stdout);
+    assert!(filter_stdout.contains("PASS  alpha math"), "{filter_stdout}");
+    assert!(filter_stdout.contains("1 passed; 0 failed; 2 filtered out"), "{filter_stdout}");
+
+    // 2. Single failing file without filter exits 1 and runs all tests.
+    let fail_out = Command::new(conduit_bin())
+        .args(["test", app_test_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!fail_out.status.success());
+    let fail_stdout = String::from_utf8_lossy(&fail_out.stdout);
+    assert!(fail_stdout.contains("FAIL  beta fail"), "{fail_stdout}");
+    assert!(fail_stdout.contains("actual:   2"), "{fail_stdout}");
+    assert!(fail_stdout.contains("expected: 3"), "{fail_stdout}");
+    assert!(fail_stdout.contains("PASS  gamma after fail"), "{fail_stdout}");
+    assert!(fail_stdout.contains("2 passed; 1 failed"), "{fail_stdout}");
+
+    // 3. --fail-fast stops after first failure before running gamma.
+    let ff_out = Command::new(conduit_bin())
+        .args(["test", app_test_path.to_str().unwrap(), "--fail-fast"])
+        .output()
+        .unwrap();
+    assert!(!ff_out.status.success());
+    let ff_stdout = String::from_utf8_lossy(&ff_out.stdout);
+    assert!(ff_stdout.contains("FAIL  beta fail"), "{ff_stdout}");
+    assert!(!ff_stdout.contains("gamma after fail"), "{ff_stdout}");
+    assert!(ff_stdout.contains("1 passed; 1 failed"), "{ff_stdout}");
+
+    // 4. Directory discovery finds both files cleanly when passing.
+    fs::write(
+        &app_test_path,
+        "import { triple } from \"./helper\"\ntest \"app ok\" { assert_eq(triple(5), 15) }\n",
+    )
+    .unwrap();
+    let dir_out = Command::new(conduit_bin())
+        .args(["test", dir.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        dir_out.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&dir_out.stdout),
+        String::from_utf8_lossy(&dir_out.stderr)
+    );
+    let dir_stdout = String::from_utf8_lossy(&dir_out.stdout);
+    assert!(dir_stdout.contains("PASS  app ok"), "{dir_stdout}");
+    assert!(dir_stdout.contains("PASS  helper passes"), "{dir_stdout}");
+    assert!(dir_stdout.contains("2 passed; 0 failed; 0 filtered out"), "{dir_stdout}");
+
+    // 5. Importing ./helper from a single test file does NOT execute helper's inline test.
+    let solo_out = Command::new(conduit_bin())
+        .args(["test", app_test_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(solo_out.status.success());
+    let solo_stdout = String::from_utf8_lossy(&solo_out.stdout);
+    assert!(!solo_stdout.contains("helper passes"), "{solo_stdout}");
+    assert!(solo_stdout.contains("1 passed; 0 failed"), "{solo_stdout}");
+
+    let _ = fs::remove_dir_all(&dir);
+}

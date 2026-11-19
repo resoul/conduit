@@ -1,15 +1,16 @@
 # Conduit Unified HTTP Client & Server Demo (`cdt-curl`)
 
-A full-featured, zero-dependency HTTP/1.1 CLI client, router server, and Conduit stdlib showcase (`cdt.http`, `cdt.cli`, `cdt.env`, `cdt.fs`, `cdt.json`, `cdt.url`, `cdt.validation`, `cdt.time`, `cdt.log`, `|>` pipelines, `const`, `enum`, multi-module imports, and Docker `FROM scratch`).
+A full-featured, zero-dependency HTTP/1.1 CLI client, router server, and Conduit stdlib showcase (`cdt.http`, `cdt.cli`, `cdt.env`, `cdt.fs`, `cdt.json`, `cdt.url`, `cdt.validation` extended rules, `cdt.time`, `cdt.log`, `|>` pipelines, `cors`, `group`, `conduit test`, and Docker `FROM scratch`).
 
 ## Local Usage
 
 ```bash
 cd examples/cli_http
 
-# Format & type-check
+# Format, type-check & run built-in tests
 conduit fmt .
 conduit check main.cdt
+conduit test .
 
 # HTTP router & middleware self-test
 conduit run main.cdt -- self-test

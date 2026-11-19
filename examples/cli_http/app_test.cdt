@@ -1,0 +1,52 @@
+import * as http from "cdt.http"
+import { load_config } from "./config"
+import { process_events } from "./pipeline"
+import { build_demo_router } from "./server"
+
+test "cli_http default config validation passes" {
+    cfg := load_config()?
+    assert_eq(cfg.app_env, "dev")
+    assert_eq(cfg.min_score, 50)
+    assert_eq(cfg.tag, "starter")
+}
+
+test "cli_http events pipeline filters and classifies tier" {
+    raw := "[{\"id\":1,\"user\":\"ada\",\"score\":120},{\"id\":2,\"user\":\"bob\",\"score\":30},{\"id\":3,\"user\":\"cy\",\"score\":90}]"
+    out := process_events(raw, "prod", "v1", 50)?
+    assert(out.contains("\"kept\":2"))
+    assert(out.contains("\"total_score\":210"))
+    assert(out.contains("\"max_score\":120"))
+    assert(out.contains("\"tier\":\"high\""))
+}
+
+test "cli_http router cors group middleware and routes" {
+    r := build_demo_router()
+    empty := Map<String, String>()
+
+    r_opt := r.dispatch(http.Request(method: "OPTIONS", path: "/users/42", body: "", headers: empty, query: empty, params: empty))
+    assert_eq(r_opt.status, 204)
+
+    r_user := r.dispatch(http.Request(method: "GET", path: "/users/42", body: "", headers: empty, query: empty, params: empty))
+    assert_eq(r_user.status, 200)
+    assert(r_user.body.contains("\"user_id\":\"42\""))
+    assert_eq(r_user.headers.get("access-control-allow-origin") ?? "", "*")
+    assert_eq(r_user.headers.get("x-powered-by") ?? "", "conduit")
+
+    r_patch := r.dispatch(http.Request(method: "PATCH", path: "/items/9", body: "", headers: empty, query: empty, params: empty))
+    assert_eq(r_patch.status, 200)
+    assert(r_patch.body.contains("\"status\":\"updated\""))
+
+    r_unauth := r.dispatch(http.Request(method: "GET", path: "/admin/stats", body: "", headers: empty, query: empty, params: empty))
+    assert_eq(r_unauth.status, 401)
+
+    r_auth := r.dispatch(http.Request(
+        method: "GET",
+        path: "/admin/stats",
+        body: "",
+        headers: Map.from([("authorization", "Bearer secret")]),
+        query: empty,
+        params: empty,
+    ))
+    assert_eq(r_auth.status, 200)
+    assert(r_auth.body.contains("\"status\":\"ok\""))
+}

@@ -79,9 +79,9 @@ impl<'a> JsonDecoder<'a> {
                 "Type 'Struct#{}' cannot be decoded from JSON",
                 id
             ))),
-            PlanNode::Int | PlanNode::Float | PlanNode::Bool => Err(JsonError::root(
-                "Root scalar target requires a wrapper Struct, List, or Map",
-            )),
+            PlanNode::Int => self.parse_i64(depth).map(Obj::boxed_int),
+            PlanNode::Float => self.parse_f64(depth).map(|v| Obj::boxed_float(v.to_bits())),
+            PlanNode::Bool => self.parse_bool(depth).map(Obj::boxed_bool),
         }
     }
 

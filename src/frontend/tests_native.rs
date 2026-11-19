@@ -1713,3 +1713,913 @@ fn cdt_http_groups_static_cors_helpers_e2e() {
         Obj::str(r#"204:*|401|200:{"id":"42","q":"fast"}|204|301:/new|200:static-hello|404"#)
     );
 }
+
+#[test]
+fn cdt_test_blocks_assertions_try_and_tree_shaking() {
+    let pass_src = r#"
+    import * as json from "cdt.json"
+
+    enum Color { Red, Green }
+
+    struct Point {
+        x: Int
+        y: Int
+    }
+
+    func private_add(a: Int, b: Int) -> Int {
+        return a + b
+    }
+
+    test "assertions and try" {
+        test := 40
+        assert(test + 2 == 42)
+        assert(true, "should pass")
+        assert_eq(private_add(20, 22), 42)
+        assert_eq(1.5 + 2.5, 4.0)
+        assert_eq(true, true)
+        assert_eq("hello", "he" + "llo")
+        assert_eq(Point(x: 1, y: 2), Point(x: 1, y: 2))
+        assert_eq([1, 2, 3], [1, 2, 3])
+        var empty_ints: [Int] = []
+        assert_eq([], empty_ints)
+        m1 := Map<String, Int>()
+        m1.set("a", 7)
+        m2 := Map.from([("a", 7)])
+        assert_eq(m1, m2)
+        assert_eq(Color.Green, Color.Green)
+        var opt: Int? = 9
+        assert_eq(opt, 9)
+        var none_val: Int? = nil
+        assert_eq(none_val, nil)
+        assert_ne(10, 20)
+        assert_ne("a", "b")
+
+        p := json.decode<Point>("{\"x\":3,\"y\":4}")?
+        assert_eq(p.x + p.y, 7)
+        return
+    }
+    "#;
+    let module = compile_source(pass_src).unwrap();
+    assert_eq!(module.tests.len(), 1);
+    assert_eq!(module.tests[0].name, "assertions and try");
+    let mut vm = Vm::new();
+    vm.call(&module, module.tests[0].func_id, &[], &[]).unwrap();
+
+    // Failure diagnostics for assert, assert_eq, assert_ne, fail, and ? propagation.
+    let fail_src = r#"
+    import * as json from "cdt.json"
+    struct Point { x: Int }
+
+    test "fail assert" {
+        assert(false)
+    }
+    test "fail assert msg" {
+        assert(1 > 2, "math broke")
+    }
+    test "fail eq" {
+        assert_eq("abc", "xyz")
+    }
+    test "fail eq msg" {
+        m := Map.from([("k", 1)])
+        n := Map.from([("k", 2)])
+        assert_eq(m, n, "map mismatch")
+    }
+    test "fail ne" {
+        assert_ne(42, 42)
+    }
+    test "fail explicit" {
+        fail("kaboom")
+    }
+    test "fail try" {
+        _p := json.decode<Point>("{bad json")?
+    }
+    "#;
+    let fail_mod = compile_source(fail_src).unwrap();
+    assert_eq!(fail_mod.tests.len(), 7);
+    let run_fail = |idx: usize| -> String {
+        let mut fvm = Vm::new();
+        fvm.call(&fail_mod, fail_mod.tests[idx].func_id, &[], &[])
+            .unwrap_err()
+            .to_string()
+    };
+    assert!(run_fail(0).contains("Assertion failed (line "));
+    assert!(run_fail(1).contains("math broke"));
+    let eq_err = run_fail(2);
+    assert!(eq_err.contains("actual:   \"abc\"") && eq_err.contains("expected: \"xyz\""), "{eq_err}");
+    let map_err = run_fail(3);
+    assert!(
+        map_err.contains("map mismatch")
+            && map_err.contains("{\"k\": 1}")
+            && map_err.contains("{\"k\": 2}"),
+        "{map_err}"
+    );
+    let ne_err = run_fail(4);
+    assert!(ne_err.contains("both equal: 42"), "{ne_err}");
+    assert!(run_fail(5).contains("kaboom"));
+    let _ = run_fail(6);
+
+    // Reject duplicate test names and `export test`.
+    let dup_err = compile_source("test \"same\" {}\ntest \"same\" {}\n").unwrap_err();
+    assert!(dup_err.contains("Duplicate test name 'same'"), "{dup_err}");
+    let exp_err = compile_source("export test \"bad\" {}\n").unwrap_err();
+    assert!(exp_err.contains("'export' cannot be applied to 'test'"), "{exp_err}");
+
+    // Imported modules' `test` blocks must be stripped and not included in root `module.tests`.
+    let mut mods = HashMap::new();
+    mods.insert(
+        "./lib",
+        "export func double(x: Int) -> Int { return x * 2 }\ntest \"lib test\" { fail(\"should not run\") }\n",
+    );
+    let root_src = "import { double } from \"./lib\"\ntest \"root test\" { assert_eq(double(6), 12) }\n";
+    let linked_mod = compile_with_modules(root_src, &mods).unwrap();
+    assert_eq!(linked_mod.tests.len(), 1);
+    assert_eq!(linked_mod.tests[0].name, "root test");
+    let mut lvm = Vm::new();
+    lvm.call(&linked_mod, linked_mod.tests[0].func_id, &[], &[]).unwrap();
+}
+
+#[test]
+fn cdt_validation_extended_rules_and_bundle_e2e() {
+    let src = r#"
+    import * as validation from "cdt.validation"
+    import * as http from "cdt.http"
+
+    struct AccountInput {
+        id: String @validation.uuid
+        role: String @validation.one_of("admin", "user")
+        homepage: String @validation.url
+        name: String @validation.not_empty @validation.min_len(2) @validation.max_len(12)
+        score: Int @validation.range(-10, 10)
+        ratio: Float @validation.range(-1.5, 1.5)
+        tags: [String] @validation.not_empty @validation.max_len(3)
+    }
+
+    func create_acc(_req: http.Request, body: AccountInput) -> http.Response {
+        return http.ok_json(body)
+    }
+
+    router Api {
+        post "/accounts" => create_acc
+    }
+
+    export func run() -> String {
+        ok_acc := AccountInput(
+            id: "550e8400-e29b-41d4-a716-446655440000",
+            role: "admin",
+            homepage: "https://conduit-lang.org/docs?v=1",
+            name: "Alice",
+            score: -5,
+            ratio: 0.75,
+            tags: ["core"],
+        )
+        var ok_res = ""
+        switch validation.check(ok_acc) {
+            case AccountInput(a): ok_res = "ok:{a.name}"
+            case validation.ValidationError(e): ok_res = "unexpected:{e.issues.len()}"
+        }
+
+        bad_acc := AccountInput(
+            id: "not-a-uuid",
+            role: "root",
+            homepage: "ftp://example.com",
+            name: " ",
+            score: -11,
+            ratio: 2.0,
+            tags: [],
+        )
+        var bad_codes = ""
+        switch validation.check(bad_acc) {
+            case AccountInput(_): bad_codes = "unexpected"
+            case validation.ValidationError(err):
+                for v in err.issues {
+                    if bad_codes == "" {
+                        bad_codes = "{v.path}={v.code}"
+                    } else {
+                        bad_codes = "{bad_codes},{v.path}={v.code}"
+                    }
+                }
+        }
+        over_acc := AccountInput(
+            id: "550e8400-e29b-41d4-a716-446655440000",
+            role: "user",
+            homepage: "https://example.com",
+            name: "name_over_twelve_chars",
+            score: 0,
+            ratio: 0.0,
+            tags: ["a", "b", "c", "d"],
+        )
+        switch validation.check(over_acc) {
+            case AccountInput(_): bad_codes = "{bad_codes},unexpected_over"
+            case validation.ValidationError(err2):
+                for v in err2.issues {
+                    bad_codes = "{bad_codes},{v.path}={v.code}"
+                }
+        }
+
+        d_ok := validation.uuid("550e8400-e29b-41d4-a716-446655440000") == nil
+            && validation.url("http://localhost:8080/api") == nil
+            && validation.one_of("user", ["admin", "user"]) == nil
+            && validation.not_empty("hi") == nil
+            && validation.min_len("abc", 3) == nil
+            && validation.max_len("abc", 3) == nil
+            && validation.range(-5, -10, 10) == nil
+            && validation.range(0.5, -1.0, 1.0) == nil
+
+        d_fail := validation.uuid("bad") != nil
+            && validation.url("not a url") != nil
+            && validation.one_of("guest", ["admin", "user"]) != nil
+            && validation.not_empty("   ") != nil
+            && validation.min_len("a", 2) != nil
+            && validation.max_len("abcd", 2) != nil
+            && validation.range(11, -10, 10) != nil
+            && validation.range(2.0, 0.0, 1.0) != nil
+
+        r := http.build<Api>()
+        bad_http := r.dispatch(http.Request(
+            method: "POST",
+            path: "/accounts",
+            body: "{\"id\":\"bad\",\"role\":\"owner\",\"homepage\":\"nope\",\"name\":\"\",\"score\":99,\"ratio\":9.0,\"tags\":[]}",
+            headers: Map<String, String>(),
+            query: Map<String, String>(),
+            params: Map<String, String>(),
+        ))
+        return "{ok_res}|{d_ok}:{d_fail}|{bad_http.status}|{bad_codes}"
+    }
+    "#;
+    let module = compile_source(src).unwrap();
+    let fid = module.func_id("run").unwrap();
+    let bundle = crate::ir::bundle::encode_bundle(&module, fid, crate::ir::bundle::RET_OBJ).unwrap();
+    let (decoded, entry, _) = crate::ir::bundle::decode_bundle(&bundle).unwrap();
+
+    for m in [&module, &decoded] {
+        let f = if std::ptr::eq(m, &module) { fid } else { entry };
+        let mut vm = Vm::new();
+        let Obj::Str(s) = vm.call_obj(m, f, &[], &[]).unwrap() else {
+            panic!("expected String output");
+        };
+        let out = s.as_str();
+        assert!(
+            out.starts_with("ok:Alice|true:true|422|"),
+            "unexpected result: {out}"
+        );
+        for expected in [
+            "id=uuid",
+            "role=one_of",
+            "homepage=url",
+            "name=not_empty",
+            "name=min",
+            "name=max",
+            "score=range",
+            "ratio=range",
+            "tags=not_empty",
+            "tags=max",
+        ] {
+            assert!(out.contains(expected), "missing '{expected}' in {out}");
+        }
+    }
+}
+
+#[test]
+fn cdt_time_iso_calendar_arithmetic_and_sleep_e2e() {
+    let src = r#"
+    import * as time from "cdt.time"
+
+    export func run() -> String | time.TimeError {
+        epoch := time.from_unix(0)
+        pre := time.from_unix_millis(-500)
+        pre_iso := pre.to_iso()?
+        pre_s := pre.unix_seconds()?
+
+        ts := time.parse_iso("2024-02-29T14:35:09.25Z")?
+        tz := time.parse_iso("2024-02-29T16:35:09+02:00")?
+        day_only := time.parse_iso("2026-11-19")?
+
+        y := ts.year()
+        mo := ts.month()
+        d := ts.day()
+        h := ts.hour()
+        mi := ts.minute()
+        sec := ts.second()
+        wd := ts.weekday()
+
+        later := ts.add(time.seconds(3661)?)?
+        back := later.sub(time.milliseconds(1000)?)?
+        delta := later.diff(ts)?
+        delta_s := delta.seconds()?
+
+        var bad_leap = false
+        switch time.parse_iso("2023-02-29T00:00:00Z") {
+            case time.TimeError(_): bad_leap = true
+            case time.Timestamp(_): bad_leap = false
+        }
+        var bad_diff = false
+        switch ts.diff(later) {
+            case time.TimeError(_): bad_diff = true
+            case time.Duration(_): bad_diff = false
+        }
+
+        time.sleep(1)?
+        var bad_sleep = false
+        switch time.sleep(-5) {
+            case time.TimeError(_): bad_sleep = true
+            case Void: bad_sleep = false
+        }
+
+        epoch_iso := time.format_iso(epoch)?
+        ts_iso := ts.to_iso()?
+        tz_iso := tz.to_iso()?
+        day_iso := day_only.to_iso()?
+        back_iso := back.to_iso()?
+
+        return "{epoch_iso}|{pre_iso}:{pre_s}|{ts_iso}|{tz_iso}|{day_iso}|{y}-{mo}-{d} {h}:{mi}:{sec} wd={wd}|{back_iso}|{delta_s}|{bad_leap}:{bad_diff}:{bad_sleep}"
+    }
+    "#;
+    let module = compile_source(src).unwrap();
+    let mut vm = Vm::new();
+    let out = vm
+        .call_obj(&module, module.func_id("run").unwrap(), &[], &[])
+        .unwrap();
+    assert_eq!(
+        out,
+        Obj::str(
+            "1970-01-01T00:00:00Z|1969-12-31T23:59:59.5Z:-1|2024-02-29T14:35:09.25Z|2024-02-29T14:35:09Z|2026-11-19T00:00:00Z|2024-2-29 14:35:9 wd=4|2024-02-29T15:36:09.25Z|3661|true:true:true"
+        )
+    );
+}
+
+#[test]
+fn cdt_db_extended_crud_sql_and_check_e2e() {
+    use crate::native::db::{
+        Cell, Column, QueryResult, build_count_sql, build_find_by_sql, build_update_and_cells,
+        extract_count_cell,
+    };
+
+    let src = r#"
+    import * as db from "cdt.db"
+
+    @db.table("accounts")
+    struct Account {
+        id: Int @db.pk @db.auto = 0
+        email: String @db.unique
+        age: Int? = nil
+    }
+
+    export func exercise(conn: db.Connection) -> Void | db.DbError {
+        _u := conn.update<Account>(Account(id: 7, email: "a@b.com", age: 30))?
+        _c := conn.count<Account>()?
+        _found := conn.find_by<Account>("email", "a@b.com")?
+        _one := conn.query_one<Account>("SELECT id, email, age FROM accounts WHERE id = ?", [db.int(7)])?
+        return
+    }
+    "#;
+    let module = compile_source(src).unwrap();
+    let fid = module.func_id("exercise").unwrap();
+    let bundle = crate::ir::bundle::encode_bundle(&module, fid, crate::ir::bundle::RET_OBJ).unwrap();
+    let (decoded, _, _) = crate::ir::bundle::decode_bundle(&bundle).unwrap();
+    decoded.validate().unwrap();
+
+    let model = &decoded.db_models[0];
+    let schema = decoded
+        .struct_schemas
+        .iter()
+        .find(|s| s.schema_id == model.schema_id)
+        .unwrap();
+
+    let mut rec = crate::vm::value::StructData::new(schema.schema_id, schema.scalar_len, schema.obj_len);
+    rec.set_scalar(0, 7);
+    rec.set_obj(0, Obj::str("updated@example.com"));
+    rec.set_obj(1, Obj::boxed_int(42));
+
+    let (upd_sql, upd_cells) = build_update_and_cells(model, schema, &rec).unwrap();
+    assert_eq!(upd_sql, "UPDATE accounts SET email = ?, age = ? WHERE id = ?");
+    assert_eq!(
+        upd_cells,
+        vec![
+            Cell::Text("updated@example.com".to_string()),
+            Cell::Int(42),
+            Cell::Int(7)
+        ]
+    );
+
+    assert_eq!(build_count_sql(model), "SELECT COUNT(*) FROM accounts");
+    assert_eq!(
+        build_find_by_sql(model, "email").unwrap(),
+        "SELECT id, email, age FROM accounts WHERE email = ?"
+    );
+    assert!(
+        build_find_by_sql(model, "email = '' OR 1=1").is_err(),
+        "must reject non-model columns to prevent SQL injection"
+    );
+
+    let qr = QueryResult {
+        columns: vec![Column { name: "count".to_string(), is_bool: false }],
+        rows: vec![vec![Cell::Int(9)]],
+    };
+    assert_eq!(extract_count_cell(&qr).unwrap(), 9);
+}
+
+#[test]
+fn cdt_jwt_sign_verify_hs256_hs512_expiry_and_bundle_e2e() {
+    let src = r#"
+    import * as jwt from "cdt.jwt"
+    import * as time from "cdt.time"
+
+    struct Claims {
+        sub: String
+        role: String
+        iat: Int? = nil
+        exp: Int? = nil
+        nbf: Int? = nil
+    }
+
+    export func run() -> String | jwt.JwtError {
+        secret := "s3cr3t-hmac-key"
+        tok256 := jwt.sign(Claims(sub: "u42", role: "admin"), secret, 3600)?
+        c256 := jwt.verify<Claims>(tok256, secret)?
+        has_exp := c256.exp != nil && c256.iat != nil
+
+        tok512 := jwt.sign_alg("HS512", Claims(sub: "u99", role: "ops"), secret, 120)?
+        c512 := jwt.verify_alg<Claims>("HS512", tok512, secret)?
+
+        var bad_sig = ""
+        switch jwt.verify<Claims>(tok256, "wrong-secret") {
+            case jwt.JwtError(e): bad_sig = e.kind
+            case Claims(_): bad_sig = "unexpected"
+        }
+
+        var alg_mismatch = ""
+        switch jwt.verify_alg<Claims>("HS512", tok256, secret) {
+            case jwt.JwtError(e): alg_mismatch = e.kind
+            case Claims(_): alg_mismatch = "unexpected"
+        }
+
+        // alg: none attack token
+        none_tok := "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiJ1MSIsInJvbGUiOiJhZG1pbiJ9.sig"
+        var bad_none = ""
+        switch jwt.verify<Claims>(none_tok, secret) {
+            case jwt.JwtError(e): bad_none = e.kind
+            case Claims(_): bad_none = "unexpected"
+        }
+
+        now_ts := time.now()
+        var now_s = 1800000000
+        switch now_ts {
+            case time.Timestamp(t):
+                switch t.unix_seconds() {
+                    case Int(s): now_s = s
+                    case time.TimeError(_):
+                }
+            case time.TimeError(_):
+        }
+
+        exp_tok := jwt.sign(Claims(sub: "old", role: "user", exp: now_s - 5), secret)?
+        var exp_kind = ""
+        switch jwt.verify<Claims>(exp_tok, secret) {
+            case jwt.JwtError(e): exp_kind = e.kind
+            case Claims(_): exp_kind = "unexpected"
+        }
+        leeway_ok := jwt.verify<Claims>(exp_tok, secret, 20)?
+
+        nbf_tok := jwt.sign(Claims(sub: "future", role: "user", nbf: now_s + 600), secret)?
+        var nbf_kind = ""
+        switch jwt.verify<Claims>(nbf_tok, secret) {
+            case jwt.JwtError(e): nbf_kind = e.kind
+            case Claims(_): nbf_kind = "unexpected"
+        }
+
+        unverified := jwt.decode_unverified<Claims>(tok512)?
+
+        s1 := c256.sub
+        r1 := c256.role
+        s2 := c512.sub
+        s_lw := leeway_ok.sub
+        s_uv := unverified.sub
+        return "{s1}:{r1}:{has_exp}|{s2}|{bad_sig}:{alg_mismatch}:{bad_none}|{exp_kind}:{s_lw}|{nbf_kind}|{s_uv}"
+    }
+    "#;
+    let module = compile_source(src).unwrap();
+    let fid = module.func_id("run").unwrap();
+    let bundle = crate::ir::bundle::encode_bundle(&module, fid, crate::ir::bundle::RET_OBJ).unwrap();
+    let (decoded, entry, _) = crate::ir::bundle::decode_bundle(&bundle).unwrap();
+    decoded.validate().unwrap();
+
+    for m in [&module, &decoded] {
+        let f = if std::ptr::eq(m, &module) { fid } else { entry };
+        let mut vm = Vm::new();
+        let out = vm.call_obj(m, f, &[], &[]).unwrap();
+        assert_eq!(
+            out,
+            Obj::str("u42:admin:true|u99|invalid_signature:unsupported_alg:unsupported_alg|expired:old|not_before|u99")
+        );
+    }
+}
+
+#[test]
+fn cdt_lock_inprocess_rwlock_file_and_guards_e2e() {
+    let dir = std::env::temp_dir().join(format!("conduit_lock_e2e_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let lock_file = dir.join("shared.lock");
+    let data_file = dir.join("audit.log");
+    let lock_path = lock_file.to_str().unwrap().replace('\\', "/");
+    let data_path = data_file.to_str().unwrap().replace('\\', "/");
+
+    let src = format!(
+        r#"
+    import * as lock from "cdt.lock"
+    import * as fs from "cdt.fs"
+
+    error StepError {{
+        msg: String
+    }}
+
+    func fail_inside() -> Int | StepError {{
+        return StepError(msg: "boom")
+    }}
+
+    export func run(do_busy_check: Bool) -> String | lock.LockError | fs.FsError {{
+        n := lock.with("m1", () => 21 * 2)?
+        s := lock.with("m1", () => "ok")?
+
+        inner_err := lock.with("m_err", () => fail_inside())
+        var saw_step_err = false
+        switch inner_err {{
+            case StepError(_): saw_step_err = true
+            case Int(_): saw_step_err = false
+            case lock.LockError(_): saw_step_err = false
+        }}
+        // Mutex must be unlocked even though inner callback returned an error value
+        after_err := lock.try_with("m_err", 0, () => 99)?
+
+        r_val := lock.read("rw1", () => 10)?
+        w_val := lock.write("rw1", () => 20)?
+
+        // Scoped OS file lock + audit log append
+        lock.file("{lock_path}", () => fs.write_text("{data_path}", "line1\n"))?
+        log_txt := fs.read_text("{data_path}")?
+
+        // Manual file guard contention check
+        fg := lock.file_acquire("{lock_path}")?
+        held1 := fg.is_held()
+        var try_busy = ""
+        if do_busy_check {{
+            switch lock.file_try("{lock_path}", () => 1) {{
+                case lock.LockError(e): try_busy = e.kind
+                case Int(_): try_busy = "unexpected"
+            }}
+        }}
+        fg.release()
+        held2 := fg.is_held()
+        after_rel := lock.file_try("{lock_path}", () => 77)?
+
+        shared_ok := lock.file_shared("{lock_path}", () => "shared")?
+
+        // Manual mutex guard check
+        mg := lock.acquire("manual_m")
+        m_held1 := mg.is_held()
+        var m_busy = ""
+        switch lock.try_with("manual_m", 0, () => 1) {{
+            case lock.LockError(e): m_busy = e.kind
+            case Int(_): m_busy = "unexpected"
+        }}
+        var m_timeout = ""
+        switch lock.try_with("manual_m", 15, () => 1) {{
+            case lock.LockError(e): m_timeout = e.kind
+            case Int(_): m_timeout = "unexpected"
+        }}
+        mg.release()
+        m_held2 := mg.is_held()
+        m_after := lock.try_with("manual_m", 0, () => 5)?
+
+        return "{{n}}:{{s}}|{{saw_step_err}}:{{after_err}}|{{r_val}}:{{w_val}}|{{log_txt}}|{{held1}}:{{try_busy}}:{{held2}}:{{after_rel}}:{{shared_ok}}|{{m_held1}}:{{m_busy}}:{{m_timeout}}:{{m_held2}}:{{m_after}}"
+    }}
+    "#
+    );
+
+    let module = compile_source(&src).unwrap();
+    let fid = module.func_id("run").unwrap();
+    let bundle = crate::ir::bundle::encode_bundle(&module, fid, crate::ir::bundle::RET_OBJ).unwrap();
+    let (decoded, entry, _) = crate::ir::bundle::decode_bundle(&bundle).unwrap();
+    decoded.validate().unwrap();
+
+    for m in [&module, &decoded] {
+        let f = if std::ptr::eq(m, &module) { fid } else { entry };
+        let mut vm = Vm::new();
+        let out = vm.call_obj(m, f, &[1], &[]).unwrap();
+        assert_eq!(
+            out,
+            Obj::str("42:ok|true:99|10:20|line1\n|true:busy:false:77:shared|true:busy:timeout:false:5")
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cdt_cache_lru_ttl_json_stampede_snapshot_and_wal_e2e() {
+    let dir = std::env::temp_dir().join(format!("conduit_cache_e2e_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let snap_path = dir.join("snap.json").to_str().unwrap().replace('\\', "/");
+    let wal_path = dir.join("store.wal").to_str().unwrap().replace('\\', "/");
+
+    let src_writer = r#"
+    import * as cache from "cdt.cache"
+    import * as time from "cdt.time"
+
+    struct Profile {
+        name: String
+        level: Int
+    }
+
+    error FetchError {
+        msg: String
+    }
+
+    func compute_ok(calls: cache.Cache) -> String {
+        _n := calls.incr("calls", 1)
+        return "computed-v1"
+    }
+
+    func compute_fail(calls: cache.Cache) -> String | FetchError {
+        _n := calls.incr("fail_calls", 1)
+        return FetchError(msg: "db down")
+    }
+
+    export func phase1() -> String | cache.CacheError | time.TimeError {
+        // LRU eviction + touch order with max_entries = 2
+        lru := cache.open("lru_shared", 2)
+        lru.set("a", "1")?
+        lru.set("b", "2")?
+        _touch := lru.get("a")
+        lru.set("c", "3")?
+        b_evicted := lru.get("b") == nil
+
+        // JSON helpers & incr fixed window
+        c := cache.open("app_shared")
+        c.set_json("prof", Profile(name: "Ada", level: 9), 5000)?
+        p := c.get_json<Profile>("prof")?
+        var pname = ""
+        switch p {
+            case Profile(pr): pname = pr.name
+            case Nil: pname = "nil"
+        }
+
+        // TTL expiration
+        c.set("short", "alive", 30)?
+        has_before := c.has("short")
+        rem := c.ttl("short") ?? -99
+        rem_ok := rem >= 0
+        c.set("perm", "forever")?
+        perm_ttl := c.ttl("perm") ?? -99
+        time.sleep(45)?
+        expired_gone := c.get("short") == nil && !c.has("short")
+        var missing_ttl_nil = false
+        switch c.ttl("short") {
+            case Nil: missing_ttl_nil = true
+            case Int(_): missing_ttl_nil = false
+        }
+
+        // Rate limiter incr
+        h1 := c.incr("rate:u1", 1, 5000)?
+        h2 := c.incr("rate:u1", 4, 5000)?
+
+        // Stampede-safe get_or_set (hit avoids re-running, errors are not cached)
+        metrics := cache.open("metrics_ctr")
+        v1 := c.get_or_set("cfg", 5000, () => compute_ok(metrics))?
+        v2 := c.get_or_set("cfg", 5000, () => compute_ok(metrics))?
+        call_count := metrics.get("calls") ?? "0"
+
+        f1 := c.get_or_set("bad_cfg", 5000, () => compute_fail(metrics))
+        var f1_err = false
+        switch f1 {
+            case FetchError(_): f1_err = true
+            case String(_): f1_err = false
+            case cache.CacheError(_): f1_err = false
+        }
+        // Must retry because FetchError was not cached
+        v_ok := c.get_or_set("bad_cfg", 5000, () => compute_ok(metrics))?
+        call_count2 := metrics.get("calls") ?? "0"
+
+        return "{b_evicted}|{pname}|{has_before}:{rem_ok}:{perm_ttl}:{expired_gone}:{missing_ttl_nil}|{h1}:{h2}|{v1}:{v2}:{call_count}:{f1_err}:{v_ok}:{call_count2}"
+    }
+    "#;
+
+    let src_reader_persist = format!(
+        r#"
+    import * as cache from "cdt.cache"
+    import * as time from "cdt.time"
+
+    export func phase2() -> String | cache.CacheError | time.TimeError {{
+        // Verify process-wide cache sharing from phase1 (separate VM!)
+        lru2 := cache.open("lru_shared")
+        a_val := lru2.get("a") ?? "missing"
+        c_val := lru2.get("c") ?? "missing"
+
+        // Snapshot save/load (dropping expired items on load)
+        snap_src := cache.open("snap_src")
+        snap_src.set("keep", "yes")?
+        snap_src.set("drop_me", "soon", 20)?
+        saved := snap_src.save("{snap_path}")?
+        time.sleep(35)?
+        snap_dst := cache.open("snap_dst")
+        loaded := snap_dst.load("{snap_path}")?
+        keep_val := snap_dst.get("keep") ?? "missing"
+        drop_gone := snap_dst.get("drop_me") == nil
+
+        // WAL persistence + drop + reopen + compact + reopen
+        w1 := cache.open_file("wal_c", "{wal_path}")?
+        w1.set("k1", "v1")?
+        w1.set("k2", "v2")?
+        w1.del("k1")?
+        cnt := w1.incr("seq", 5)?
+        _dropped := cache.drop("wal_c")
+
+        w2 := cache.open_file("wal_c", "{wal_path}")?
+        k1_after := w2.get("k1") == nil
+        k2_after := w2.get("k2") ?? ""
+        seq_after := w2.get("seq") ?? ""
+        live := w2.compact()?
+        _dropped2 := cache.drop("wal_c")
+
+        w3 := cache.open_file("wal_c", "{wal_path}")?
+        k2_compact := w3.get("k2") ?? ""
+        w3_keys := w3.keys("k")
+        key_len := w3_keys.len()
+
+        return "{{a_val}}:{{c_val}}|{{saved}}:{{loaded}}:{{keep_val}}:{{drop_gone}}|{{cnt}}:{{k1_after}}:{{k2_after}}:{{seq_after}}:{{live}}:{{k2_compact}}:{{key_len}}"
+    }}
+    "#
+    );
+
+    let m1 = compile_source(src_writer).unwrap();
+    let mut vm1 = Vm::new();
+    let out1 = vm1.call_obj(&m1, m1.func_id("phase1").unwrap(), &[], &[]).unwrap();
+    assert_eq!(
+        out1,
+        Obj::str("true|Ada|true:true:-1:true:true|1:5|computed-v1:computed-v1:1:true:computed-v1:2")
+    );
+
+    let m2 = compile_source(&src_reader_persist).unwrap();
+    let fid2 = m2.func_id("phase2").unwrap();
+    let bundle = crate::ir::bundle::encode_bundle(&m2, fid2, crate::ir::bundle::RET_OBJ).unwrap();
+    let (decoded, entry, _) = crate::ir::bundle::decode_bundle(&bundle).unwrap();
+    decoded.validate().unwrap();
+
+    let mut vm2 = Vm::new();
+    let out2 = vm2.call_obj(&decoded, entry, &[], &[]).unwrap();
+    assert_eq!(
+        out2,
+        Obj::str("1:3|2:1:yes:true|5:true:v2:5:2:v2:1")
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cdt_redis_resp2_commands_json_and_distributed_locks_e2e() {
+    let src = r#"
+    import * as redis from "cdt.redis"
+
+    struct Item {
+        id: Int
+        name: String
+    }
+
+    error WorkError {
+        reason: String
+    }
+
+    export func run() -> String | redis.RedisError {
+        var bad_url = ""
+        switch redis.connect("http://127.0.0.1:6379") {
+            case redis.RedisError(e): bad_url = e.kind
+            case redis.Client(_): bad_url = "unexpected"
+        }
+
+        // First connect initializes shared mock server on host `e2e_redis` with pass `topsecret`
+        r1 := redis.connect("redis-mock://:topsecret@e2e_redis:6379/2")?
+        r2 := redis.connect("redis-mock://:topsecret@e2e_redis:6379/2")?
+
+        var bad_auth = ""
+        switch redis.connect("redis-mock://:wrong@e2e_redis:6379/2") {
+            case redis.RedisError(e): bad_auth = e.kind
+            case redis.Client(_): bad_auth = "unexpected"
+        }
+
+        pong := r1.ping()?
+        r1.set("hello", "world")?
+        g1 := r1.get("hello") ?? ""
+        g_miss := r1.get("absent") == nil
+        r1.set_ex("exp_k", "val", 60)?
+        t_exp := r1.ttl("exp_k")?
+        t_exp_pos := t_exp > 0
+
+        nx1 := r1.set_nx("hello", "overwrite")?
+        nx2 := r1.set_nx("nx_fresh", "yes", 30)?
+        ex1 := r1.exists("hello")?
+        d1 := r1.del("hello")?
+        ex2 := r1.exists("hello")?
+
+        c1 := r1.incr("cnt")?
+        c2 := r1.incr_by("cnt", 4)?
+        c3 := r1.decr("cnt")?
+        ks := r1.keys("cnt*")?
+        k_len := ks.len()
+
+        r1.set_json("item:1", Item(id: 7, name: "bolt"), 60)?
+        loaded := r1.get_json<Item>("item:1")?
+        var item_name = ""
+        switch loaded {
+            case Item(it): item_name = it.name
+            case Nil: item_name = "nil"
+        }
+
+        // Hash
+        hs := r1.hset("user:1", "name", "Alice")?
+        hg := r1.hget("user:1", "name") ?? ""
+        hm := r1.hgetall("user:1")?
+        hm_val := hm.get("name") ?? ""
+        hd := r1.hdel("user:1", "name")?
+
+        // List
+        _l1 := r1.lpush("q", "a")?
+        _l2 := r1.rpush("q", "b")?
+        lr := r1.lrange("q", 0, -1)?
+        lr_len := lr.len()
+        lp := r1.lpop("q") ?? ""
+        rp := r1.rpop("q") ?? ""
+
+        // Set
+        sa := r1.sadd("tags", "rust")?
+        sm := r1.sismember("tags", "rust")?
+        smems := r1.smembers("tags")?
+        sm_len := smems.len()
+        sr := r1.srem("tags", "rust")?
+
+        // Raw command
+        var raw_pong = ""
+        switch r1.cmd(["PING", "hi"]) {
+            case String(s): raw_pong = s
+            case Nil: raw_pong = "nil"
+            case redis.RedisError(e): return e
+        }
+
+        // Distributed locks across two clients
+        lk_opt := r1.lock("job:1", 5000)
+        var lk_acquired = false
+        var lk_busy_on_r2 = false
+        var lk_ext = false
+        var lk_un1 = false
+        var lk_un2 = false
+        switch lk_opt {
+            case redis.Lock(lk):
+                lk_acquired = true
+                switch r2.lock("job:1", 5000) {
+                    case Nil: lk_busy_on_r2 = true
+                    case redis.Lock(_): lk_busy_on_r2 = false
+                    case redis.RedisError(e): return e
+                }
+                lk_ext = lk.extend(8000)?
+                lk_un1 = lk.unlock()?
+                lk_un2 = lk.unlock()?
+            case Nil:
+            case redis.RedisError(e): return e
+        }
+        // Re-acquirable by r2 after unlock
+        var re_acq = false
+        switch r2.lock("job:1", 5000) {
+            case redis.Lock(lk2):
+                re_acq = r2.unlock(lk2)?
+            case Nil:
+            case redis.RedisError(e): return e
+        }
+
+        // Re-entrant `with_lock` calling `r1.incr(...)` on same Client without self-deadlock
+        wl_n := r1.with_lock("job:wl", 5000, () => r1.incr("wl_cnt"))?
+        var after_wl = false
+        switch r2.lock("job:wl", 1000) {
+            case redis.Lock(lk3):
+                after_wl = lk3.unlock()?
+            case Nil:
+            case redis.RedisError(e): return e
+        }
+
+        r1.close()
+        r2.close()
+        return "{bad_url}:{bad_auth}:{pong}|{g1}:{g_miss}:{t_exp_pos}:{nx1}:{nx2}:{ex1}:{d1}:{ex2}|{c1}:{c2}:{c3}:{k_len}:{item_name}|{hs}:{hg}:{hm_val}:{hd}|{lr_len}:{lp}:{rp}|{sa}:{sm}:{sm_len}:{sr}:{raw_pong}|{lk_acquired}:{lk_busy_on_r2}:{lk_ext}:{lk_un1}:{lk_un2}:{re_acq}|{wl_n}:{after_wl}"
+    }
+    "#;
+
+    let module = compile_source(src).unwrap();
+    let fid = module.func_id("run").unwrap();
+    let bundle = crate::ir::bundle::encode_bundle(&module, fid, crate::ir::bundle::RET_OBJ).unwrap();
+    let (decoded, entry, _) = crate::ir::bundle::decode_bundle(&bundle).unwrap();
+    decoded.validate().unwrap();
+
+    // Execute decoded bundle in a clean VM (each run hits the same mock host, incr advances)
+    let mut vm = Vm::new();
+    let out = vm.call_obj(&decoded, entry, &[], &[]).unwrap();
+    assert_eq!(
+        out,
+        Obj::str("invalid_url:auth:PONG|world:true:true:false:true:true:true:false|1:5:4:1:bolt|true:Alice:Alice:true|2:a:b|true:true:1:true:hi|true:true:true:true:false:true|1:true")
+    );
+}

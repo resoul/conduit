@@ -1,10 +1,12 @@
 use std::sync::Arc;
 
 use crate::ir::Module;
+use crate::native::url::url_parse;
 use crate::vm::exec_cold::err_msg;
+use crate::vm::string::VmString;
 use crate::vm::value::{
     ListStorage, Obj, SCHEMA_BOXED_BOOL, SCHEMA_BOXED_FLOAT, SCHEMA_BOXED_INT, SCHEMA_EMPTY_TAG,
-    SCHEMA_LIST_TAG, SCHEMA_MAP_TAG, SCHEMA_STR_TAG, SCHEMA_VALIDATION_ERROR,
+    SCHEMA_LIST_TAG, SCHEMA_MAP_TAG, SCHEMA_STR_TAG, SCHEMA_URL, SCHEMA_VALIDATION_ERROR,
     SCHEMA_VALIDATION_ISSUE, SCHEMA_VALIDATION_VIOLATION, StructData, is_builtin_error_schema,
 };
 use crate::vm::{ExecResult, RuntimeError, Vm};
@@ -21,6 +23,12 @@ pub enum ValOpKind {
     MaxObj = 6,
     MinDyn = 7,
     MaxDyn = 8,
+    NotEmpty = 9,
+    Url = 10,
+    Uuid = 11,
+    OneOf = 12,
+    RangeInt = 13,
+    RangeFloat = 14,
 }
 
 impl ValOpKind {
@@ -35,6 +43,12 @@ impl ValOpKind {
             6 => Some(Self::MaxObj),
             7 => Some(Self::MinDyn),
             8 => Some(Self::MaxDyn),
+            9 => Some(Self::NotEmpty),
+            10 => Some(Self::Url),
+            11 => Some(Self::Uuid),
+            12 => Some(Self::OneOf),
+            13 => Some(Self::RangeInt),
+            14 => Some(Self::RangeFloat),
             _ => None,
         }
     }
@@ -49,6 +63,12 @@ pub enum CompiledValidationRule {
     MinObj(i64),
     MaxObj(i64),
     Email,
+    NotEmpty,
+    Url,
+    Uuid,
+    OneOf(Vec<String>),
+    RangeInt(i64, i64),
+    RangeFloat(f64, f64),
     UserFunc {
         func_name: String,
         func_id: u32,
@@ -199,6 +219,144 @@ fn check_email_obj(obj: &Obj) -> Obj {
     }
 }
 
+pub fn validate_url_str(s: &str) -> bool {
+    if s.is_empty() || s.bytes().any(|b| b.is_ascii_whitespace() || b.is_ascii_control()) {
+        return false;
+    }
+    let has_http_scheme = s.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("http://"))
+        || s.get(..8).is_some_and(|p| p.eq_ignore_ascii_case("https://"));
+    if !has_http_scheme {
+        return false;
+    }
+    matches!(
+        url_parse(&Arc::new(VmString::from(s))),
+        Obj::Record(rec) if rec.schema_id == SCHEMA_URL
+    )
+}
+
+pub fn validate_uuid_str(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 36 {
+        return false;
+    }
+    for (i, &ch) in b.iter().enumerate() {
+        if matches!(i, 8 | 13 | 18 | 23) {
+            if ch != b'-' {
+                return false;
+            }
+        } else if !ch.is_ascii_hexdigit() {
+            return false;
+        }
+    }
+    true
+}
+
+fn check_not_empty_obj(obj: &Obj) -> Obj {
+    match obj {
+        Obj::Str(s) => {
+            if s.trim().is_empty() {
+                make_issue("not_empty", "Value cannot be empty")
+            } else {
+                Obj::Empty
+            }
+        }
+        Obj::List(l) => {
+            if l.is_empty() {
+                make_issue("not_empty", "List cannot be empty")
+            } else {
+                Obj::Empty
+            }
+        }
+        Obj::Map(m) => {
+            if m.is_empty() {
+                make_issue("not_empty", "Map cannot be empty")
+            } else {
+                Obj::Empty
+            }
+        }
+        _ => make_issue("not_empty.type", "Unsupported type for not_empty validator"),
+    }
+}
+
+fn check_url_obj(obj: &Obj) -> Obj {
+    match obj {
+        Obj::Str(s) => {
+            if validate_url_str(s) {
+                Obj::Empty
+            } else {
+                make_issue("url", "Invalid HTTP/HTTPS URL format")
+            }
+        }
+        _ => make_issue("url.type", "Expected String argument for url validator"),
+    }
+}
+
+fn check_uuid_obj(obj: &Obj) -> Obj {
+    match obj {
+        Obj::Str(s) => {
+            if validate_uuid_str(s) {
+                Obj::Empty
+            } else {
+                make_issue("uuid", "Invalid UUID format")
+            }
+        }
+        _ => make_issue("uuid.type", "Expected String argument for uuid validator"),
+    }
+}
+
+fn check_one_of_str(s: &str, allowed: &[String]) -> Obj {
+    if allowed.iter().any(|item| item == s) {
+        Obj::Empty
+    } else {
+        make_issue("one_of", format!("Value '{}' must be one of [{}]", s, allowed.join(", ")))
+    }
+}
+
+fn check_one_of_obj(val: &Obj, allowed_obj: &Obj) -> Obj {
+    let Obj::Str(s) = val else {
+        return make_issue("one_of.type", "Expected String value for one_of validator");
+    };
+    let Obj::List(ListStorage::Obj(items)) = allowed_obj else {
+        return make_issue("one_of.args", "Expected [String] allowed list for one_of validator");
+    };
+    let mut allowed = Vec::with_capacity(items.len());
+    for item in items.iter() {
+        let Obj::Str(st) = item else {
+            return make_issue("one_of.args", "Allowed values for one_of must be Strings");
+        };
+        if st.as_str() == s.as_str() {
+            return Obj::Empty;
+        }
+        allowed.push(st.as_str());
+    }
+    make_issue("one_of", format!("Value '{}' must be one of [{}]", s.as_str(), allowed.join(", ")))
+}
+
+fn check_int_range(val: i64, lo: i64, hi: i64) -> Obj {
+    if lo > hi {
+        return make_issue("range.invalid_bound", format!("Range minimum {} exceeds maximum {}", lo, hi));
+    }
+    if val < lo || val > hi {
+        make_issue("range", format!("Value {} must be between {} and {}", val, lo, hi))
+    } else {
+        Obj::Empty
+    }
+}
+
+fn check_float_range(val: f64, lo: f64, hi: f64) -> Obj {
+    if !val.is_finite() || !lo.is_finite() || !hi.is_finite() {
+        return make_issue("range.non_finite", "Range validator requires finite Float value and bounds");
+    }
+    if lo > hi {
+        return make_issue("range.invalid_bound", format!("Range minimum {} exceeds maximum {}", lo, hi));
+    }
+    if val < lo || val > hi {
+        make_issue("range", format!("Value {} must be between {} and {}", val, lo, hi))
+    } else {
+        Obj::Empty
+    }
+}
+
 fn check_dyn_bound(val: &Obj, bound: &Obj, is_min: bool) -> Obj {
     let code = if is_min { "min" } else { "max" };
     let bound_int = match bound {
@@ -285,6 +443,33 @@ impl Vm {
                 &self.objs[o_base + b_reg as usize],
                 false,
             ),
+            ValOpKind::NotEmpty => check_not_empty_obj(&self.objs[o_base + a_reg as usize]),
+            ValOpKind::Url => check_url_obj(&self.objs[o_base + a_reg as usize]),
+            ValOpKind::Uuid => check_uuid_obj(&self.objs[o_base + a_reg as usize]),
+            ValOpKind::OneOf => check_one_of_obj(
+                &self.objs[o_base + a_reg as usize],
+                &self.objs[o_base + b_reg as usize],
+            ),
+            ValOpKind::RangeInt => {
+                let Obj::Record(bounds) = &self.objs[o_base + b_reg as usize] else {
+                    return Err(err_msg("Expected packed Int range bounds"));
+                };
+                check_int_range(
+                    self.scalars[s_base + a_reg as usize] as i64,
+                    bounds.get_scalar(0) as i64,
+                    bounds.get_scalar(1) as i64,
+                )
+            }
+            ValOpKind::RangeFloat => {
+                let Obj::Record(bounds) = &self.objs[o_base + b_reg as usize] else {
+                    return Err(err_msg("Expected packed Float range bounds"));
+                };
+                check_float_range(
+                    f64::from_bits(self.scalars[s_base + a_reg as usize]),
+                    f64::from_bits(bounds.get_scalar(0)),
+                    f64::from_bits(bounds.get_scalar(1)),
+                )
+            }
         };
         self.objs[o_base + dst_obj as usize] = out;
         Ok(())
@@ -502,6 +687,10 @@ impl Vm {
             CompiledValidationRule::MaxFloat(b) => {
                 Ok(check_float_bound(f64::from_bits(s_val), *b, false))
             }
+            CompiledValidationRule::RangeInt(lo, hi) => Ok(check_int_range(s_val as i64, *lo, *hi)),
+            CompiledValidationRule::RangeFloat(lo, hi) => {
+                Ok(check_float_range(f64::from_bits(s_val), *lo, *hi))
+            }
             CompiledValidationRule::UserFunc {
                 func_id,
                 first_param_is_scalar,
@@ -536,6 +725,13 @@ impl Vm {
     ) -> Result<Obj, RuntimeError> {
         match rule {
             CompiledValidationRule::Email => Ok(check_email_obj(obj_val)),
+            CompiledValidationRule::NotEmpty => Ok(check_not_empty_obj(obj_val)),
+            CompiledValidationRule::Url => Ok(check_url_obj(obj_val)),
+            CompiledValidationRule::Uuid => Ok(check_uuid_obj(obj_val)),
+            CompiledValidationRule::OneOf(allowed) => match obj_val {
+                Obj::Str(s) => Ok(check_one_of_str(s.as_str(), allowed)),
+                _ => Ok(make_issue("one_of.type", "Expected String argument for one_of validator")),
+            },
             CompiledValidationRule::MinObj(b) => Ok(check_obj_len_bound(obj_val, *b, true)),
             CompiledValidationRule::MaxObj(b) => Ok(check_obj_len_bound(obj_val, *b, false)),
             CompiledValidationRule::UserFunc {

@@ -189,6 +189,7 @@ impl Parser {
             TokenKind::Ident(kw) if kw == "router" => self.parse_router_item(is_exported),
             TokenKind::Ident(kw) if kw == "schedule" => self.parse_schedule_item(is_exported),
             TokenKind::Ident(kw) if kw == "migration" => self.parse_migration_item(),
+            TokenKind::Ident(kw) if kw == "test" => self.parse_test_item(is_exported, export_span),
             TokenKind::KwImport => {
                 if is_exported {
                     return Err(ParserError {
@@ -330,6 +331,39 @@ impl Parser {
                 up,
                 down,
             },
+            start_span,
+            false,
+        ))
+    }
+
+    fn parse_test_item(
+        &mut self,
+        is_exported: bool,
+        export_span: Option<Span>,
+    ) -> Result<Item, ParserError> {
+        let start_span = self.bump().span; // consume 'test'
+        if is_exported {
+            return Err(ParserError {
+                message: "'export' cannot be applied to 'test'".to_string(),
+                span: export_span.unwrap_or(start_span),
+            });
+        }
+        let name_tok = self.peek().clone();
+        let name = match name_tok.kind {
+            TokenKind::String(s) if !s.is_empty() => {
+                self.bump();
+                s
+            }
+            _ => {
+                return Err(ParserError {
+                    message: "Expected non-empty test name string after 'test'".to_string(),
+                    span: name_tok.span,
+                });
+            }
+        };
+        let body = self.parse_block()?;
+        Ok(Item::new_exported(
+            ItemKind::Test { name, body },
             start_span,
             false,
         ))

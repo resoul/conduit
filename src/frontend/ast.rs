@@ -281,6 +281,10 @@ pub enum ItemKind {
         up: Block,
         down: Block,
     },
+    Test {
+        name: String,
+        body: Block,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

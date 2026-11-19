@@ -1,6 +1,14 @@
-# Conduit Database & Migrations Demo (`cdt.db` + `cdt.crypto`)
+# Conduit Database & Migrations Demo (`cdt.db` + `cdt.validation` + `cdt.crypto`)
 
-Demonstrates zero-dependency PostgreSQL and MySQL connectivity (`cdt.db`), dialect-aware declarative `migration` blocks, transactions, typed `query<User>`, PBKDF2-SHA256 password hashing (`cdt.crypto`), and the `conduit db` CLI.
+Demonstrates zero-dependency PostgreSQL and MySQL connectivity (`cdt.db`), `@db.*` + `@validation.*` schema models (`create_table`, `insert`, `update`, `count`, `find_by`, `query_one`, `all`), dialect-aware declarative `migration` blocks, transactions, PBKDF2-SHA256 password hashing (`cdt.crypto`), UTC ISO timestamps (`cdt.time`), `conduit test`, and the `conduit db` CLI.
+
+## Offline Checks & Tests
+
+```bash
+cd examples/db_service
+conduit check main.cdt
+conduit test .
+```
 
 ## PostgreSQL & MariaDB / MySQL via Docker
 

@@ -134,6 +134,15 @@ pub fn shake_unreachable_funcs(
                     queue.push_back(target);
                 }
             }
+        } else if let ItemKind::Test { body, .. } = &item.kind {
+            let mut scopes = Vec::new();
+            let mut refs = Vec::new();
+            collect_block_refs(body, checked, &struct_fields, &mut scopes, &mut refs);
+            for target in refs {
+                if reachable.insert(target.clone()) {
+                    queue.push_back(target);
+                }
+            }
         }
     }
 
@@ -419,6 +428,7 @@ pub(crate) fn expand_program_aliases(
             | ItemKind::Import { .. }
             | ItemKind::ExportList { .. }
             | ItemKind::Migration { .. } => {}
+            ItemKind::Test { body, .. } => expand_block_aliases(body, aliases)?,
         }
     }
     Ok(())

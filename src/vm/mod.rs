@@ -1,10 +1,14 @@
 pub mod exec;
+pub(crate) mod exec_cache;
 pub(crate) mod exec_cold;
 pub mod exec_cron;
 pub mod exec_db;
 pub(crate) mod exec_fs;
 pub(crate) mod exec_http;
+pub(crate) mod exec_jwt;
+pub(crate) mod exec_lock;
 pub(crate) mod exec_map;
+pub(crate) mod exec_redis;
 pub(crate) mod exec_sys;
 pub(crate) mod exec_union;
 pub mod opcode;
@@ -141,6 +145,50 @@ impl Vm {
         let id = self.host.db_conns.len();
         self.host.db_conns.push(Some(conn));
         Ok(id)
+    }
+
+    pub(crate) fn invoke_zero_arg_cb(
+        &mut self,
+        module: &Module,
+        s_top: usize,
+        o_top: usize,
+        cb: &Obj,
+        ret_tag: u8,
+    ) -> Result<Obj, RuntimeError> {
+        let (func_id, has_closure) = match cb {
+            Obj::Func(fid) => (*fid, false),
+            Obj::Closure(cd) => (cd.func_id, true),
+            _ => return Err(exec_cold::err_msg("Expected callback function")),
+        };
+        let closure_slot = if has_closure {
+            self.ensure_capacity(s_top, o_top + 1);
+            self.objs[o_top] = cb.clone();
+            o_top
+        } else {
+            usize::MAX
+        };
+        let child_s = s_top;
+        let child_o = if has_closure { o_top + 1 } else { o_top };
+        let func = &module.functions[func_id as usize];
+        let used_objs = (func.num_objs as usize).max(1);
+        self.ensure_capacity(
+            child_s + func.num_scalars.max(1) as usize,
+            child_o + used_objs,
+        );
+        let res = self.exec_from(module, func_id, child_s, child_o, closure_slot);
+        self.clear_obj_range(child_o, used_objs);
+        if has_closure {
+            self.objs[o_top] = Obj::Empty;
+        }
+        match res? {
+            ExecResult::Void => Ok(Obj::Empty),
+            ExecResult::Obj(o) => Ok(o),
+            ExecResult::Scalar(bits) => Ok(match ret_tag {
+                2 => Obj::boxed_float(bits),
+                3 => Obj::boxed_bool(bits != 0),
+                _ => Obj::boxed_int(bits as i64),
+            }),
+        }
     }
 
     pub fn call_scalar(

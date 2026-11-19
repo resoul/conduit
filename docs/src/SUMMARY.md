@@ -36,6 +36,10 @@
 - [cdt.http](library/http.md)
 - [cdt.db](library/db.md)
 - [cdt.cron](library/cron.md)
+- [cdt.jwt](library/jwt.md)
+- [cdt.lock](library/lock.md)
+- [cdt.cache](library/cache.md)
+- [cdt.redis](library/redis.md)
 
 # Practical Guides
 - [Working with Errors](guides/working-with-errors.md)

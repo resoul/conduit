@@ -2,6 +2,7 @@ pub mod bundle;
 pub mod lower;
 pub(crate) mod lower_call;
 pub(crate) mod lower_expr;
+pub(crate) mod lower_ext;
 pub(crate) mod lower_loops;
 pub(crate) mod lower_native;
 pub(crate) mod lower_prealloc;
@@ -9,12 +10,13 @@ pub(crate) mod lower_prealloc;
 use std::fmt::Write;
 
 use crate::vm::opcode::{
-    EXT_CLI_HELP, EXT_CLI_PARSE, EXT_CLI_PARSE_ARGS, EXT_ENV_ARGS, EXT_ENV_GET, EXT_ENV_LOAD,
-    EXT_ENV_REQUIRE, EXT_FLOAT_CEIL, EXT_FLOAT_MATH, EXT_FS_BINARY, EXT_FS_UNARY, EXT_INT_MATH, EXT_LIST_FIRST,
-    EXT_LIST_IS_EMPTY, EXT_LIST_LAST, EXT_LIST_SORT, EXT_MAP_CONTAINS_KEY, EXT_MAP_ENTRIES,
-    EXT_MAP_FROM, EXT_MAP_GET, EXT_MAP_INDEX, EXT_MAP_KEYS, EXT_MAP_REMOVE, EXT_MAP_SET,
-    EXT_MAP_VALUES, EXT_PRINT_OBJ, EXT_PRINT_SCALAR, EXT_STR_IS_EMPTY, EXT_STR_PRED, EXT_STR_SPLIT,
-    EXT_STR_TO_FLOAT, EXT_STR_TO_INT, Op,
+    EXT_ASSERT, EXT_CACHE_OP, EXT_CLI_HELP, EXT_CLI_PARSE, EXT_CLI_PARSE_ARGS, EXT_ENV_ARGS,
+    EXT_ENV_GET, EXT_ENV_LOAD, EXT_ENV_REQUIRE, EXT_FLOAT_CEIL, EXT_FLOAT_MATH, EXT_FS_BINARY,
+    EXT_FS_UNARY, EXT_INT_MATH, EXT_JWT_OP, EXT_LIST_FIRST, EXT_LIST_IS_EMPTY, EXT_LIST_LAST,
+    EXT_LIST_SORT, EXT_LOCK_OP, EXT_MAP_CONTAINS_KEY, EXT_MAP_ENTRIES, EXT_MAP_FROM, EXT_MAP_GET,
+    EXT_MAP_INDEX, EXT_MAP_KEYS, EXT_MAP_REMOVE, EXT_MAP_SET, EXT_MAP_VALUES, EXT_PRINT_OBJ,
+    EXT_PRINT_SCALAR, EXT_REDIS_OP, EXT_STR_IS_EMPTY, EXT_STR_PRED, EXT_STR_SPLIT,
+    EXT_STR_TO_FLOAT, EXT_STR_TO_INT, EXT_TIME_OP, Op,
 };
 use crate::vm::value::Obj;
 
@@ -115,6 +117,13 @@ pub struct SchedulePlan {
     pub jobs: Vec<CronJobSpec>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestSpec {
+    pub name: String,
+    pub func_id: u32,
+    pub line: usize,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct Module {
     pub functions: Vec<FunctionProto>,
@@ -132,6 +141,7 @@ pub struct Module {
     pub migrations: Vec<MigrationPlan>,
     pub db_models: Vec<DbModelMeta>,
     pub schedules: Vec<SchedulePlan>,
+    pub tests: Vec<TestSpec>,
 }
 
 impl Module {
@@ -583,7 +593,10 @@ impl Module {
                             ) => {}
                             Some(
                                 crate::native::time::TimeOpKind::Seconds
-                                | crate::native::time::TimeOpKind::Milliseconds,
+                                | crate::native::time::TimeOpKind::Milliseconds
+                                | crate::native::time::TimeOpKind::Sleep
+                                | crate::native::time::TimeOpKind::FromUnix
+                                | crate::native::time::TimeOpKind::FromUnixMillis,
                             ) => check_s(arg_reg, &ctx)?,
                             Some(_) => check_o(arg_reg, &ctx)?,
                             None => return Err(format!("{}: invalid TimeOp kind {}", ctx, kind)),
@@ -597,7 +610,12 @@ impl Module {
                     } => {
                         check_o(dst_obj, &ctx)?;
                         match crate::native::validation::ValOpKind::from_u8(kind) {
-                            Some(crate::native::validation::ValOpKind::Email) => {
+                            Some(
+                                crate::native::validation::ValOpKind::Email
+                                | crate::native::validation::ValOpKind::NotEmpty
+                                | crate::native::validation::ValOpKind::Url
+                                | crate::native::validation::ValOpKind::Uuid,
+                            ) => {
                                 check_o(a_reg, &ctx)?;
                             }
                             Some(
@@ -617,8 +635,16 @@ impl Module {
                                 check_s(b_reg, &ctx)?;
                             }
                             Some(
+                                crate::native::validation::ValOpKind::RangeInt
+                                | crate::native::validation::ValOpKind::RangeFloat,
+                            ) => {
+                                check_s(a_reg, &ctx)?;
+                                check_o(b_reg, &ctx)?;
+                            }
+                            Some(
                                 crate::native::validation::ValOpKind::MinDyn
-                                | crate::native::validation::ValOpKind::MaxDyn,
+                                | crate::native::validation::ValOpKind::MaxDyn
+                                | crate::native::validation::ValOpKind::OneOf,
                             ) => {
                                 check_o(a_reg, &ctx)?;
                                 check_o(b_reg, &ctx)?;
@@ -909,7 +935,7 @@ impl Module {
                                     check_o(a, &ctx)?;
                                     check_s(b, &ctx)?;
                                 }
-                                7 | 8 | 15 => {
+                                7 | 8 | 15 | 26 => {
                                     check_o(a, &ctx)?;
                                     check_o(b, &ctx)?;
                                     check_o(c, &ctx)?;
@@ -918,14 +944,14 @@ impl Module {
                                     check_s(a, &ctx)?;
                                     check_o(b, &ctx)?;
                                 }
-                                16 | 17 | 19 => {
+                                16 | 17 | 19 | 24 => {
                                     check_o(a, &ctx)?;
                                     check_o(b, &ctx)?;
                                     if (c as usize) >= self.db_models.len() {
                                         return Err(format!("db model_idx {} out of bounds", c));
                                     }
                                 }
-                                18 | 20 | 21 => {
+                                18 | 20 | 21 | 23 | 25 => {
                                     check_o(a, &ctx)?;
                                     check_o(b, &ctx)?;
                                     check_o(c, &ctx)?;
@@ -962,6 +988,110 @@ impl Module {
                                 }
                                 _ => return Err(format!("Invalid cron aux {}", aux)),
                             },
+                            EXT_ASSERT => {
+                                let op_kind = aux >> 3;
+                                let val_tag = aux & 0x07;
+                                match op_kind {
+                                    0 => check_s(a, &ctx)?,
+                                    1 => {
+                                        check_s(a, &ctx)?;
+                                        check_o(b, &ctx)?;
+                                    }
+                                    2 => check_o(a, &ctx)?,
+                                    3 | 5 => {
+                                        check_tag(val_tag, a)?;
+                                        check_tag(val_tag, b)?;
+                                    }
+                                    4 | 6 => {
+                                        check_tag(val_tag, a)?;
+                                        check_tag(val_tag, b)?;
+                                        check_o(c, &ctx)?;
+                                    }
+                                    _ => return Err(format!("Invalid assert aux {}", aux)),
+                                }
+                            }
+                            EXT_TIME_OP => match aux {
+                                0..=2 => {
+                                    check_o(a, &ctx)?;
+                                    check_o(b, &ctx)?;
+                                    check_o(c, &ctx)?;
+                                }
+                                3..=9 => {
+                                    check_s(a, &ctx)?;
+                                    check_o(b, &ctx)?;
+                                }
+                                _ => return Err(format!("Invalid time aux {}", aux)),
+                            },
+                            EXT_JWT_OP => match aux {
+                                0 | 1 => {
+                                    check_o(a, &ctx)?;
+                                    check_o(b, &ctx)?;
+                                }
+                                2 => {
+                                    check_o(a, &ctx)?;
+                                    check_o(b, &ctx)?;
+                                    if (c as usize) >= self.json_plans.len() {
+                                        return Err(format!("jwt json_plan {} out of bounds", c));
+                                    }
+                                }
+                                _ => return Err(format!("Invalid jwt aux {}", aux)),
+                            },
+                            EXT_LOCK_OP => match aux {
+                                0..=7 | 9 | 10 => {
+                                    check_o(a, &ctx)?;
+                                    check_o(b, &ctx)?;
+                                }
+                                8 => {
+                                    check_o(a, &ctx)?;
+                                    check_o(b, &ctx)?;
+                                    check_s(c, &ctx)?;
+                                }
+                                11 => check_o(b, &ctx)?,
+                                12 => {
+                                    check_s(a, &ctx)?;
+                                    check_o(b, &ctx)?;
+                                }
+                                _ => return Err(format!("Invalid lock aux {}", aux)),
+                            },
+                            EXT_CACHE_OP => match aux {
+                                0 => {
+                                    check_o(a, &ctx)?;
+                                    check_o(b, &ctx)?;
+                                    check_s(c, &ctx)?;
+                                }
+                                1 | 14 | 18 => {
+                                    check_o(a, &ctx)?;
+                                    check_o(b, &ctx)?;
+                                }
+                                2 | 12 | 15 => {
+                                    check_s(a, &ctx)?;
+                                    check_o(b, &ctx)?;
+                                }
+                                3..=9 | 11 | 13 | 16 | 17 => {
+                                    check_o(a, &ctx)?;
+                                    check_o(b, &ctx)?;
+                                    check_o(c, &ctx)?;
+                                }
+                                10 => {
+                                    check_s(a, &ctx)?;
+                                    check_o(b, &ctx)?;
+                                    check_o(c, &ctx)?;
+                                }
+                                _ => return Err(format!("Invalid cache aux {}", aux)),
+                            },
+                            EXT_REDIS_OP => match aux {
+                                0 | 1 => {
+                                    check_o(a, &ctx)?;
+                                    check_o(b, &ctx)?;
+                                }
+                                3 => check_o(b, &ctx)?,
+                                2 | 4..=34 => {
+                                    check_o(a, &ctx)?;
+                                    check_o(b, &ctx)?;
+                                    check_o(c, &ctx)?;
+                                }
+                                _ => return Err(format!("Invalid redis aux {}", aux)),
+                            },
                             _ => return Err(format!("Invalid ExtOp kind {}", kind)),
                         }
                     }
@@ -983,6 +1113,11 @@ impl Module {
                         sched.name, job.name
                     ));
                 }
+            }
+        }
+        for test in &self.tests {
+            if (test.func_id as usize) >= self.functions.len() {
+                return Err(format!("Test '{}' func_id out of bounds", test.name));
             }
         }
         Ok(())
