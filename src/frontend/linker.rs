@@ -4,25 +4,7 @@ use crate::frontend::ast::*;
 use crate::frontend::parse_source;
 
 fn is_native_module(path: &str) -> bool {
-    matches!(
-        path,
-        "cdt.json"
-            | "cdt.time"
-            | "cdt.validation"
-            | "cdt.env"
-            | "cdt.cli"
-            | "cdt.fs"
-            | "cdt.path"
-            | "cdt.process"
-            | "cdt.crypto"
-            | "cdt.url"
-            | "cdt.csv"
-            | "cdt.math"
-            | "cdt.log"
-            | "cdt.http"
-            | "cdt.db"
-            | "cdt.cron"
-    )
+    crate::frontend::check_native::is_native_module(path)
 }
 
 struct LinkState<'a> {

@@ -321,7 +321,7 @@ impl Vm {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn validate_dyn_val(
+    pub(crate) fn validate_dyn_val(
         &mut self,
         module: &Module,
         scratch_s: usize,

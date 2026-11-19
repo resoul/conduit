@@ -14,7 +14,7 @@ Conduit is designed with explicit control flow, strict types, and composable sta
 - **Errors as Values**: Functions return explicit union types (`T | Error`), inspected via exhaustive `switch` or propagated via `?`—zero exceptions.
 - **Strict Numbers (`Int` & `Float`)**: 64-bit integers (`Int`) and IEEE 754 floats (`Float`) never mix implicitly; conversions (`.to_float()`, `.floor()`, `.ceil()`, `.round()`, `.to_string()`) are always explicit.
 - **Explicit Schema Validation**: Mark validators with `[#validator]`, attach `@rule` / `@module.rule(...)` annotations to fields, and execute recursive checks explicitly via `validation.check()`.
-- **Standard Library (`cdt.*`)**: Built-in host-native modules for HTTP (`cdt.http`), SQL databases (`cdt.db`), JSON (`cdt.json`), schema validation (`cdt.validation`), time (`cdt.time`), environment config (`cdt.env`), CLI parsing & dispatch (`cdt.cli`), filesystem (`cdt.fs`), paths (`cdt.path`), processes (`cdt.process`), crypto (`cdt.crypto`), URLs (`cdt.url`), CSV (`cdt.csv`), math (`cdt.math`), and logging (`cdt.log`).
+- **Standard Library (`cdt.*`)**: Built-in host-native modules for HTTP (`cdt.http`), SQL databases (`cdt.db`), cron scheduling (`cdt.cron`), JSON (`cdt.json`), schema validation (`cdt.validation`), time (`cdt.time`), environment config (`cdt.env`), CLI parsing & dispatch (`cdt.cli`), filesystem (`cdt.fs`), paths (`cdt.path`), processes (`cdt.process`), crypto (`cdt.crypto`), URLs (`cdt.url`), CSV (`cdt.csv`), math (`cdt.math`), and logging (`cdt.log`).
 
 ## Standard Library
 
@@ -33,7 +33,7 @@ Conduit is designed with explicit control flow, strict types, and composable sta
 | `cdt.csv` | RFC 4180 CSV parser and serializer (`parse`, `parse_records`, `stringify`) | [cdt.csv](docs/src/library/csv.md) |
 | `cdt.math` | Floating-point math functions (`sqrt`, `pow`, `sin`, `cos`, `ln`, `floor`, `ceil`, `round`, `hypot`) and constants | [cdt.math](docs/src/library/math.md) |
 | `cdt.log` | Leveled `stderr` logger with optional structured JSON lines | [cdt.log](docs/src/library/log.md) |
-| `cdt.http` | Zero-dependency HTTP/1.1 client (`http.get`, `post`, `request_timeout`, `get_bytes`, `https://` via `curl`), declarative `router { ... }`, multi-threaded `Router`, middleware, and graceful shutdown | [cdt.http](docs/src/library/http.md) |
+| `cdt.http` | Zero-dependency HTTP/1.1 client (`http.get`, `get_json<T>`, `post`, `post_json`, `request_timeout`, `get_bytes`, `https://` via `curl`), declarative `router { ... }` (`group`, `static`, `cors`, typed JSON validation contracts), multi-threaded `Router`, and graceful shutdown | [cdt.http](docs/src/library/http.md) |
 | `cdt.db` | Zero-dependency PostgreSQL and MySQL wire-protocol drivers (`connect`, `exec`, `query<T>`, `@db.*` models, transactions) and declarative `migration`s | [cdt.db](docs/src/library/db.md) |
 | `cdt.cron` | Zero-dependency declarative `schedule` blocks, 5-field UTC cron & interval scheduler (`cron.run<T>`, `cron.start<T>`) | [cdt.cron](docs/src/library/cron.md) |
 
@@ -95,7 +95,7 @@ For syntax guides, language rules, and standard library references, see the docu
 
 ## Editor Support
 
-Conduit provides a TextMate syntax grammar (`editors/textmate`) and a built-in Language Server (`conduit lsp`) for JetBrains (RustRover + LSP4IJ), Antigravity, and VS Code. See [editors/README.md](editors/README.md) for setup instructions.
+Conduit provides a TextMate syntax grammar (`editors/textmate`) with the bundled **Conduit PhpStorm Dark** theme and a built-in Language Server (`conduit lsp`) for JetBrains (PhpStorm, RustRover + LSP4IJ), Antigravity, and VS Code. See [editors/README.md](editors/README.md) for setup instructions.
 
 ## Changelog
 

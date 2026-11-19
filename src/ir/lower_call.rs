@@ -71,11 +71,11 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             if let ExprKind::Ident(alias) = &target.kind
                 && self.lookup_local(alias).is_none()
             {
-                if self.mc.checked.process_aliases.contains(alias) {
+                if self.mc.checked.is_native_alias(alias, "cdt.process") {
                     let _ = self.lower_process_call(field, args, named_args)?;
                     return Ok(());
                 }
-                if self.mc.checked.log_aliases.contains(alias) {
+                if self.mc.checked.is_native_alias(alias, "cdt.log") {
                     let _ = self.lower_log_call(field, args)?;
                     return Ok(());
                 }
@@ -85,13 +85,13 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
         if let ExprKind::Ident(name) = &callee.kind
             && self.lookup_local(name).is_none()
         {
-            if let Some(sym) = self.mc.checked.process_direct_fns.get(name) {
-                let sym = sym.clone();
+            if let Some(sym) = self.mc.checked.native_direct_fn(name, "cdt.process") {
+                let sym = sym.to_string();
                 let _ = self.lower_process_call(&sym, args, named_args)?;
                 return Ok(());
             }
-            if let Some(sym) = self.mc.checked.log_direct_fns.get(name) {
-                let sym = sym.clone();
+            if let Some(sym) = self.mc.checked.native_direct_fn(name, "cdt.log") {
+                let sym = sym.to_string();
                 let _ = self.lower_log_call(&sym, args)?;
                 return Ok(());
             }
@@ -120,6 +120,54 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
         Ok(())
     }
 
+    fn lower_native_scalar_call(
+        &mut self,
+        mod_name: &str,
+        sym: &str,
+        args: &[Expr],
+        named_args: &[NamedArg],
+    ) -> Result<u16, String> {
+        match mod_name {
+            "cdt.fs" => self.lower_fs_call(sym, args, named_args),
+            "cdt.path" => self.lower_path_call(sym, args),
+            "cdt.process" => self.lower_process_call(sym, args, named_args),
+            "cdt.crypto" => self.lower_crypto_call(sym, args, named_args),
+            "cdt.url" => self.lower_url_call(sym, args, named_args),
+            "cdt.csv" => self.lower_csv_call(sym, args, named_args),
+            "cdt.math" => self.lower_math_call(sym, args),
+            "cdt.cron" if sym == "validate" => self.lower_cron_validate(&args[0]),
+            other => Err(format!("Unsupported scalar native call '{}.{}'", other, sym)),
+        }
+    }
+
+    fn lower_native_obj_call(
+        &mut self,
+        mod_name: &str,
+        sym: &str,
+        type_args: &[TypeExpr],
+        args: &[Expr],
+        named_args: &[NamedArg],
+    ) -> Result<u16, String> {
+        match mod_name {
+            "cdt.json" => self.lower_json_call(sym, type_args, args),
+            "cdt.time" => self.lower_time_call(sym, args, named_args),
+            "cdt.validation" => self.lower_validation_call(sym, args, named_args),
+            "cdt.env" => self.lower_env_call(sym, type_args, args, named_args),
+            "cdt.cli" => self.lower_cli_call(sym, type_args, args, named_args),
+            "cdt.fs" => self.lower_fs_call(sym, args, named_args),
+            "cdt.path" => self.lower_path_call(sym, args),
+            "cdt.process" => self.lower_process_call(sym, args, named_args),
+            "cdt.crypto" => self.lower_crypto_call(sym, args, named_args),
+            "cdt.url" => self.lower_url_call(sym, args, named_args),
+            "cdt.csv" => self.lower_csv_call(sym, args, named_args),
+            "cdt.log" => self.lower_log_call(sym, args),
+            "cdt.http" => self.lower_http_call(sym, type_args, args, named_args),
+            "cdt.db" => self.lower_db_call(sym, type_args, args, named_args),
+            "cdt.cron" => self.lower_cron_call(sym, type_args, args, named_args),
+            other => Err(format!("Unsupported native call '{}.{}'", other, sym)),
+        }
+    }
+
     pub(crate) fn lower_call_scalar(&mut self, expr: &Expr) -> Result<u16, String> {
         let ExprKind::Call { callee, args, named_args, .. } = &expr.kind else {
             return Err("Expected call".to_string());
@@ -130,68 +178,18 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
         if let ExprKind::Member { target, field } = &callee.kind {
             if let ExprKind::Ident(alias) = &target.kind
                 && self.lookup_local(alias).is_none()
+                && let Some(&mod_name) = self.mc.checked.native_aliases.get(alias)
             {
-                if self.mc.checked.fs_aliases.contains(alias) {
-                    return self.lower_fs_call(field, args, named_args);
-                }
-                if self.mc.checked.path_aliases.contains(alias) {
-                    return self.lower_path_call(field, args);
-                }
-                if self.mc.checked.process_aliases.contains(alias) {
-                    return self.lower_process_call(field, args, named_args);
-                }
-                if self.mc.checked.crypto_aliases.contains(alias) {
-                    return self.lower_crypto_call(field, args, named_args);
-                }
-                if self.mc.checked.url_aliases.contains(alias) {
-                    return self.lower_url_call(field, args, named_args);
-                }
-                if self.mc.checked.csv_aliases.contains(alias) {
-                    return self.lower_csv_call(field, args, named_args);
-                }
-                if self.mc.checked.path_aliases.contains(alias) {
-                    return self.lower_path_call(field, args);
-                }
-                if self.mc.checked.process_aliases.contains(alias) {
-                    return self.lower_process_call(field, args, named_args);
-                }
-                if self.mc.checked.math_aliases.contains(alias) {
-                    return self.lower_math_call(field, args);
-                }
-                if self.mc.checked.cron_aliases.contains(alias) && field == "validate" {
-                    return self.lower_cron_validate(&args[0]);
-                }
+                return self.lower_native_scalar_call(mod_name, field, args, named_args);
             }
             return self.lower_scalar_method(target, field, args);
         }
         if let ExprKind::Ident(name) = &callee.kind
             && self.lookup_local(name).is_none()
+            && let Some(&(mod_name, ref sym)) = self.mc.checked.native_direct_fns.get(name)
         {
-            if let Some(sym) = self.mc.checked.cron_direct_fns.get(name)
-                && sym == "validate"
-            {
-                return self.lower_cron_validate(&args[0]);
-            }
-            if let Some(sym) = self.mc.checked.fs_direct_fns.get(name) {
-                let sym = sym.clone();
-                return self.lower_fs_call(&sym, args, named_args);
-            }
-            if let Some(sym) = self.mc.checked.path_direct_fns.get(name) {
-                let sym = sym.clone();
-                return self.lower_path_call(&sym, args);
-            }
-            if let Some(sym) = self.mc.checked.process_direct_fns.get(name) {
-                let sym = sym.clone();
-                return self.lower_process_call(&sym, args, named_args);
-            }
-            if let Some(sym) = self.mc.checked.math_direct_fns.get(name) {
-                let sym = sym.clone();
-                return self.lower_math_call(&sym, args);
-            }
-            if let Some(sym) = self.mc.checked.crypto_direct_fns.get(name) {
-                let sym = sym.clone();
-                return self.lower_crypto_call(&sym, args, named_args);
-            }
+            let sym = sym.clone();
+            return self.lower_native_scalar_call(mod_name, &sym, args, named_args);
         }
         if let ExprKind::Ident(fn_name) = &callee.kind
             && self.lookup_local(fn_name).is_none()
@@ -243,50 +241,8 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                     });
                     return Ok(dst_obj);
                 }
-                if self.mc.checked.json_aliases.contains(alias) {
-                    return self.lower_json_call(field, type_args, args);
-                }
-                if self.mc.checked.time_aliases.contains(alias) {
-                    return self.lower_time_call(field, args, named_args);
-                }
-                if self.mc.checked.val_aliases.contains(alias) {
-                    return self.lower_validation_call(field, args, named_args);
-                }
-                if self.mc.checked.env_aliases.contains(alias) {
-                    return self.lower_env_call(field, type_args, args, named_args);
-                }
-                if self.mc.checked.cli_aliases.contains(alias) {
-                    return self.lower_cli_call(field, type_args, args, named_args);
-                }
-                if self.mc.checked.fs_aliases.contains(alias) {
-                    return self.lower_fs_call(field, args, named_args);
-                }
-                if self.mc.checked.path_aliases.contains(alias) {
-                    return self.lower_path_call(field, args);
-                }
-                if self.mc.checked.process_aliases.contains(alias) {
-                    return self.lower_process_call(field, args, named_args);
-                }
-                if self.mc.checked.crypto_aliases.contains(alias) {
-                    return self.lower_crypto_call(field, args, named_args);
-                }
-                if self.mc.checked.url_aliases.contains(alias) {
-                    return self.lower_url_call(field, args, named_args);
-                }
-                if self.mc.checked.csv_aliases.contains(alias) {
-                    return self.lower_csv_call(field, args, named_args);
-                }
-                if self.mc.checked.log_aliases.contains(alias) {
-                    return self.lower_log_call(field, args);
-                }
-                if self.mc.checked.http_aliases.contains(alias) {
-                    return self.lower_http_call(field, type_args, args, named_args);
-                }
-                if self.mc.checked.db_aliases.contains(alias) {
-                    return self.lower_db_call(field, type_args, args, named_args);
-                }
-                if self.mc.checked.cron_aliases.contains(alias) {
-                    return self.lower_cron_call(field, type_args, args, named_args);
+                if let Some(&mod_name) = self.mc.checked.native_aliases.get(alias) {
+                    return self.lower_native_obj_call(mod_name, field, type_args, args, named_args);
                 }
             }
             if let Some(reg) = self.lower_builtin_obj_method(target, field, args)? {
@@ -302,113 +258,15 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
         if let ExprKind::Ident(name) = &callee.kind
             && self.lookup_local(name).is_none()
         {
-            if let Some(method) = self.mc.checked.json_direct_fns.get(name) {
-                let method = method.clone();
-                return self.lower_json_call(&method, type_args, args);
-            }
-            if let Some(sym) = self.mc.checked.time_direct_fns.get(name) {
+            if let Some(&(mod_name, ref sym)) = self
+                .mc
+                .checked
+                .native_direct_fns
+                .get(name)
+                .or_else(|| self.mc.checked.native_direct_types.get(name))
+            {
                 let sym = sym.clone();
-                return self.lower_time_call(&sym, args, named_args);
-            }
-            if let Some(sym) = self.mc.checked.time_direct_types.get(name) {
-                let sym = sym.clone();
-                return self.lower_time_call(&sym, args, named_args);
-            }
-            if let Some(sym) = self.mc.checked.val_direct_fns.get(name) {
-                let sym = sym.clone();
-                return self.lower_validation_call(&sym, args, named_args);
-            }
-            if let Some(sym) = self.mc.checked.val_direct_types.get(name) {
-                let sym = sym.clone();
-                return self.lower_validation_call(&sym, args, named_args);
-            }
-            if let Some(sym) = self.mc.checked.env_direct_fns.get(name) {
-                let sym = sym.clone();
-                return self.lower_env_call(&sym, type_args, args, named_args);
-            }
-            if let Some(sym) = self.mc.checked.env_direct_types.get(name) {
-                let sym = sym.clone();
-                return self.lower_env_call(&sym, type_args, args, named_args);
-            }
-            if let Some(sym) = self.mc.checked.cli_direct_fns.get(name) {
-                let sym = sym.clone();
-                return self.lower_cli_call(&sym, type_args, args, named_args);
-            }
-            if let Some(sym) = self.mc.checked.cli_direct_types.get(name) {
-                let sym = sym.clone();
-                return self.lower_cli_call(&sym, type_args, args, named_args);
-            }
-            if let Some(sym) = self.mc.checked.fs_direct_fns.get(name) {
-                let sym = sym.clone();
-                return self.lower_fs_call(&sym, args, named_args);
-            }
-            if let Some(sym) = self.mc.checked.fs_direct_types.get(name) {
-                let sym = sym.clone();
-                return self.lower_fs_call(&sym, args, named_args);
-            }
-            if let Some(sym) = self.mc.checked.path_direct_fns.get(name) {
-                let sym = sym.clone();
-                return self.lower_path_call(&sym, args);
-            }
-            if let Some(sym) = self.mc.checked.process_direct_fns.get(name) {
-                let sym = sym.clone();
-                return self.lower_process_call(&sym, args, named_args);
-            }
-            if let Some(sym) = self.mc.checked.process_direct_types.get(name) {
-                let sym = sym.clone();
-                return self.lower_process_call(&sym, args, named_args);
-            }
-            if let Some(sym) = self.mc.checked.crypto_direct_fns.get(name) {
-                let sym = sym.clone();
-                return self.lower_crypto_call(&sym, args, named_args);
-            }
-            if let Some(sym) = self.mc.checked.crypto_direct_types.get(name) {
-                let sym = sym.clone();
-                return self.lower_crypto_call(&sym, args, named_args);
-            }
-            if let Some(sym) = self.mc.checked.url_direct_fns.get(name) {
-                let sym = sym.clone();
-                return self.lower_url_call(&sym, args, named_args);
-            }
-            if let Some(sym) = self.mc.checked.url_direct_types.get(name) {
-                let sym = sym.clone();
-                return self.lower_url_call(&sym, args, named_args);
-            }
-            if let Some(sym) = self.mc.checked.csv_direct_fns.get(name) {
-                let sym = sym.clone();
-                return self.lower_csv_call(&sym, args, named_args);
-            }
-            if let Some(sym) = self.mc.checked.csv_direct_types.get(name) {
-                let sym = sym.clone();
-                return self.lower_csv_call(&sym, args, named_args);
-            }
-            if let Some(sym) = self.mc.checked.log_direct_fns.get(name) {
-                let sym = sym.clone();
-                return self.lower_log_call(&sym, args);
-            }
-            if let Some(sym) = self.mc.checked.http_direct_fns.get(name) {
-                let sym = sym.clone();
-                return self.lower_http_call(&sym, type_args, args, named_args);
-            }
-            if let Some(sym) = self.mc.checked.http_direct_types.get(name) {
-                let sym = sym.clone();
-                return self.lower_http_call(&sym, type_args, args, named_args);
-            }
-            if let Some(sym) = self.mc.checked.db_direct_fns.get(name) {
-                let sym = sym.clone();
-                return self.lower_db_call(&sym, type_args, args, named_args);
-            }
-            if let Some(sym) = self.mc.checked.db_direct_types.get(name) {
-                let sym = sym.clone();
-                return self.lower_db_call(&sym, type_args, args, named_args);
-            }
-            if let Some(sym) = self.mc.checked.cron_direct_fns.get(name) {
-                let sym = sym.clone();
-                return self.lower_cron_call(&sym, type_args, args, named_args);
-            }
-            if let Some(sym) = self.mc.checked.cron_direct_types.get(name) {
-                let sym = sym.clone();
-                return self.lower_cron_call(&sym, type_args, args, named_args);
+                return self.lower_native_obj_call(mod_name, &sym, type_args, args, named_args);
             }
             if name == "Map" {
                 let dst_obj = self.alloc_temp_o();

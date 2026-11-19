@@ -36,6 +36,10 @@ pub struct CliDispatchRoute {
 pub enum HttpRouterDeclKind {
     Before,
     After,
+    GroupBefore(String),
+    GroupAfter(String),
+    Static(String, String),
+    Cors(String),
     Route(String, String),
 }
 
@@ -51,6 +55,7 @@ pub struct CronScheduleEntry {
 pub struct HttpRouterDeclEntry {
     pub kind: HttpRouterDeclKind,
     pub handler_name: String,
+    pub body_struct: Option<String>,
 }
 
 #[derive(Debug)]
@@ -60,56 +65,14 @@ pub struct CheckedProgram {
     pub funcs: Vec<FuncSig>,
     pub func_by_name: HashMap<String, u32>,
     pub struct_schemas: Vec<StructSchema>,
-    pub json_aliases: HashSet<String>,
-    pub json_direct_fns: HashMap<String, String>,
-    pub json_direct_types: HashMap<String, String>,
-    pub time_aliases: HashSet<String>,
-    pub time_direct_fns: HashMap<String, String>,
-    pub time_direct_types: HashMap<String, String>,
-    pub val_aliases: HashSet<String>,
-    pub val_direct_fns: HashMap<String, String>,
-    pub val_direct_types: HashMap<String, String>,
-    pub env_aliases: HashSet<String>,
-    pub env_direct_fns: HashMap<String, String>,
-    pub env_direct_types: HashMap<String, String>,
+    pub native_aliases: HashMap<String, &'static str>,
+    pub native_direct_fns: HashMap<String, (&'static str, String)>,
+    pub native_direct_types: HashMap<String, (&'static str, String)>,
     pub env_plans: Vec<crate::native::env::EnvLoadPlan>,
-    pub cli_aliases: HashSet<String>,
-    pub cli_direct_fns: HashMap<String, String>,
-    pub cli_direct_types: HashMap<String, String>,
     pub cli_plans: Vec<(String, crate::native::cli::CliPlan)>,
     pub cli_dispatches: Vec<(String, Vec<CliDispatchRoute>)>,
-    pub fs_aliases: HashSet<String>,
-    pub fs_direct_fns: HashMap<String, String>,
-    pub fs_direct_types: HashMap<String, String>,
-    pub path_aliases: HashSet<String>,
-    pub path_direct_fns: HashMap<String, String>,
-    pub process_aliases: HashSet<String>,
-    pub process_direct_fns: HashMap<String, String>,
-    pub process_direct_types: HashMap<String, String>,
-    pub crypto_aliases: HashSet<String>,
-    pub crypto_direct_fns: HashMap<String, String>,
-    pub crypto_direct_types: HashMap<String, String>,
-    pub url_aliases: HashSet<String>,
-    pub url_direct_fns: HashMap<String, String>,
-    pub url_direct_types: HashMap<String, String>,
-    pub csv_aliases: HashSet<String>,
-    pub csv_direct_fns: HashMap<String, String>,
-    pub csv_direct_types: HashMap<String, String>,
-    pub math_aliases: HashSet<String>,
-    pub math_direct_fns: HashMap<String, String>,
-    pub log_aliases: HashSet<String>,
-    pub log_direct_fns: HashMap<String, String>,
-    pub http_aliases: HashSet<String>,
-    pub http_direct_fns: HashMap<String, String>,
-    pub http_direct_types: HashMap<String, String>,
     pub http_router_plans: Vec<(String, Vec<HttpRouterDeclEntry>)>,
-    pub db_aliases: HashSet<String>,
-    pub db_direct_fns: HashMap<String, String>,
-    pub db_direct_types: HashMap<String, String>,
     pub db_model_plans: Vec<crate::ir::DbModelMeta>,
-    pub cron_aliases: HashSet<String>,
-    pub cron_direct_fns: HashMap<String, String>,
-    pub cron_direct_types: HashMap<String, String>,
     pub cron_schedule_plans: Vec<(String, Vec<CronScheduleEntry>)>,
     pub struct_abouts: HashMap<String, String>,
     pub validator_funcs: HashSet<String>,
@@ -132,6 +95,25 @@ impl CheckedProgram {
         let empty = HashSet::new();
         resolve_type_expr_with_scope(te, self, &empty)
     }
+
+    pub fn is_native_alias(&self, alias: &str, module: &str) -> bool {
+        self.native_aliases.get(alias).copied() == Some(module)
+    }
+
+    pub fn native_direct_fn(&self, name: &str, module: &str) -> Option<&str> {
+        self.native_direct_fns
+            .get(name)
+            .filter(|(m, _)| *m == module)
+            .map(|(_, sym)| sym.as_str())
+    }
+}
+
+fn with_span(span: crate::frontend::lexer::Span, err: String) -> String {
+    if err.starts_with('[') || span.line == 0 {
+        err
+    } else {
+        format!("[{}:{}] {}", span.line, span.col, err)
+    }
 }
 
 pub fn check_program(program: &mut Program) -> Result<CheckedProgram, String> {
@@ -148,56 +130,14 @@ pub fn check_program_with_roots(
         funcs: Vec::new(),
         func_by_name: HashMap::new(),
         struct_schemas: Vec::new(),
-        json_aliases: HashSet::from(["json".to_string()]),
-        json_direct_fns: HashMap::new(),
-        json_direct_types: HashMap::new(),
-        time_aliases: HashSet::new(),
-        time_direct_fns: HashMap::new(),
-        time_direct_types: HashMap::new(),
-        val_aliases: HashSet::new(),
-        val_direct_fns: HashMap::new(),
-        val_direct_types: HashMap::new(),
-        env_aliases: HashSet::new(),
-        env_direct_fns: HashMap::new(),
-        env_direct_types: HashMap::new(),
+        native_aliases: HashMap::from([("json".to_string(), "cdt.json")]),
+        native_direct_fns: HashMap::new(),
+        native_direct_types: HashMap::new(),
         env_plans: Vec::new(),
-        cli_aliases: HashSet::new(),
-        cli_direct_fns: HashMap::new(),
-        cli_direct_types: HashMap::new(),
         cli_plans: Vec::new(),
         cli_dispatches: Vec::new(),
-        fs_aliases: HashSet::new(),
-        fs_direct_fns: HashMap::new(),
-        fs_direct_types: HashMap::new(),
-        path_aliases: HashSet::new(),
-        path_direct_fns: HashMap::new(),
-        process_aliases: HashSet::new(),
-        process_direct_fns: HashMap::new(),
-        process_direct_types: HashMap::new(),
-        crypto_aliases: HashSet::new(),
-        crypto_direct_fns: HashMap::new(),
-        crypto_direct_types: HashMap::new(),
-        url_aliases: HashSet::new(),
-        url_direct_fns: HashMap::new(),
-        url_direct_types: HashMap::new(),
-        csv_aliases: HashSet::new(),
-        csv_direct_fns: HashMap::new(),
-        csv_direct_types: HashMap::new(),
-        math_aliases: HashSet::new(),
-        math_direct_fns: HashMap::new(),
-        log_aliases: HashSet::new(),
-        log_direct_fns: HashMap::new(),
-        http_aliases: HashSet::new(),
-        http_direct_fns: HashMap::new(),
-        http_direct_types: HashMap::new(),
         http_router_plans: Vec::new(),
-        db_aliases: HashSet::new(),
-        db_direct_fns: HashMap::new(),
-        db_direct_types: HashMap::new(),
         db_model_plans: Vec::new(),
-        cron_aliases: HashSet::new(),
-        cron_direct_fns: HashMap::new(),
-        cron_direct_types: HashMap::new(),
         cron_schedule_plans: Vec::new(),
         struct_abouts: HashMap::new(),
         validator_funcs: HashSet::new(),
@@ -291,8 +231,6 @@ pub fn check_program_with_roots(
     });
 
     build_validation_plans(program, &mut checked)?;
-    shake_unreachable_funcs(program, &mut checked, explicit_roots)?;
-    finalize_validation_plan_func_ids(&mut checked);
     let schedule_names: Vec<String> = checked
         .structs
         .iter()
@@ -317,6 +255,8 @@ pub fn check_program_with_roots(
     for mname in db_model_names {
         crate::frontend::check_sys::ensure_db_model_plan(&mut checked, &mname)?;
     }
+    shake_unreachable_funcs(program, &mut checked, explicit_roots)?;
+    finalize_validation_plan_func_ids(&mut checked);
     Ok(checked)
 }
 
@@ -425,6 +365,11 @@ impl<'a> Checker<'a> {
     }
 
     pub(crate) fn check_stmt(&mut self, stmt: &mut Stmt) -> Result<(), String> {
+        let span = stmt.span;
+        self.check_stmt_inner(stmt).map_err(|e| with_span(span, e))
+    }
+
+    fn check_stmt_inner(&mut self, stmt: &mut Stmt) -> Result<(), String> {
         match &mut stmt.kind {
             StmtKind::Define { name, value } => {
                 self.check_expr(value, None)?;
@@ -628,6 +573,11 @@ impl<'a> Checker<'a> {
     }
 
     pub(crate) fn check_expr(&mut self, expr: &mut Expr, expected: Option<&Type>) -> Result<(), String> {
+        let span = expr.span;
+        self.check_expr_inner(expr, expected).map_err(|e| with_span(span, e))
+    }
+
+    fn check_expr_inner(&mut self, expr: &mut Expr, expected: Option<&Type>) -> Result<(), String> {
         let mut const_inline: Option<ExprKind> = None;
         let ty = match &mut expr.kind {
             ExprKind::Int(_) => Type::Int,
@@ -658,7 +608,7 @@ impl<'a> Checker<'a> {
                         "Generic function '{}' cannot be used as a first-class value",
                         name
                     ));
-                } else if self.checked.val_direct_fns.get(name).map(String::as_str) == Some("email") {
+                } else if self.checked.native_direct_fn(name, "cdt.validation") == Some("email") {
                     validator_email_fn_ty()
                 } else {
                     return Err(format!("Undefined identifier '{}'", name));
@@ -745,7 +695,7 @@ impl<'a> Checker<'a> {
                     Type::Enum(ename.clone())
                 } else if let ExprKind::Ident(alias) = &target.kind
                     && self.lookup(alias).is_none()
-                    && self.checked.val_aliases.contains(alias)
+                    && self.checked.is_native_alias(alias, "cdt.validation")
                     && field == "email"
                 {
                     target.ty = Type::Void;

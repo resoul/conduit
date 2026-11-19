@@ -82,10 +82,8 @@ Annotate a `struct` with `@db.table("name")` and fields with `@db.pk`, `@db.auto
 ```conduit
 @db.table("users")
 struct User {
-    @db.pk @db.auto
-    id: Int
-    @db.unique @db.index
-    email: String
+    id: Int @db.pk @db.auto
+    email: String @db.unique @db.index
     active: Bool = true
     bio: String?
 }

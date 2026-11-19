@@ -791,7 +791,7 @@ fn cdt_fs_write_lines_roundtrip_and_closed_writer() {
     .unwrap();
     let (module, _, _) = crate::ir::bundle::decode_bundle(&bytes).unwrap();
     let path_obj = Obj::str(path.to_string_lossy().into_owned());
-    let lines = vec![
+    let lines = [
         "hello".to_string(),
         String::new(),
         "Привет 🌍".to_string(),
@@ -817,7 +817,7 @@ fn cdt_fs_write_lines_roundtrip_and_closed_writer() {
     assert_eq!(shared.as_ref(), &lines.iter().map(Obj::str).collect::<Vec<_>>());
 
     assert_eq!(
-        vm.call_obj(&module, module.func_id("append").unwrap(), &[], &[path_obj.clone()])
+        vm.call_obj(&module, module.func_id("append").unwrap(), &[], std::slice::from_ref(&path_obj))
             .unwrap(),
         Obj::Empty
     );
@@ -842,8 +842,8 @@ fn cdt_fs_write_lines_roundtrip_and_closed_writer() {
 
     // A read-only file descriptor makes the batch hit a real I/O error, even
     // though the writer handle is open. A tiny buffer forces the error now.
-    let id = vm.fs_writers.len();
-    vm.fs_writers.push(Some(std::io::BufWriter::with_capacity(
+    let id = vm.host.fs_writers.len();
+    vm.host.fs_writers.push(Some(std::io::BufWriter::with_capacity(
         1,
         std::fs::File::open(&path).unwrap(),
     )));
@@ -859,7 +859,7 @@ fn cdt_fs_write_lines_roundtrip_and_closed_writer() {
         )
         .unwrap();
     assert!(matches!(error, Obj::Record(ref rec) if rec.schema_id == crate::vm::value::SCHEMA_FS_ERROR));
-    vm.fs_writers[id] = None;
+    vm.host.fs_writers[id] = None;
     assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
     std::fs::remove_file(path).unwrap();
 }
@@ -912,7 +912,7 @@ fn cdt_fs_shared_lines_string_map_json_and_bundle_interop() {
     let mut module = compile_source(src).unwrap();
     let mut vm = Vm::new();
     assert_eq!(
-        vm.call_obj(&module, module.func_id("exercise").unwrap(), &[], &[lines.clone()]).unwrap(),
+        vm.call_obj(&module, module.func_id("exercise").unwrap(), &[], std::slice::from_ref(&lines)).unwrap(),
         Obj::str("2:11:9:true:42,alpha,beta:true:42:Beta:betaalpha")
     );
     let Obj::List(ListStorage::Obj(items)) = &lines else { panic!("expected lines") };
@@ -1478,16 +1478,11 @@ fn cdt_db_model_schemas_ddl_and_bundle_e2e() {
 
     @db.table("users")
     struct User {
-        @db.pk @db.auto
-        id: Int
-        @db.unique @db.index
-        email: String
-        @db.fk("orgs.id")
-        org_id: Int
-        @db.default("true")
-        active: Bool = true
-        @db.col("bio_text")
-        bio: String?
+        id: Int @db.pk @db.auto
+        email: String @db.unique @db.index
+        org_id: Int @db.fk("orgs.id")
+        active: Bool @db.default("true") = true
+        bio: String? @db.col("bio_text")
     }
 
     migration 1 "create_users" {
@@ -1568,4 +1563,153 @@ fn cdt_cron_schedule_interval_and_bundle_e2e() {
         .call_obj(&decoded_mod, decoded_mod.func_id("main").unwrap(), &[], &[])
         .unwrap();
     assert_eq!(out, Obj::str("true:false:true:false"));
+}
+
+#[test]
+fn cdt_http_typed_contract_validation_e2e() {
+    let src = r#"
+    import * as http from "cdt.http"
+    import * as validation from "cdt.validation"
+
+    [#validator]
+    func no_admin(v: String) -> Void | validation.Issue {
+        if v == "admin" {
+            return validation.Issue(code: "reserved", message: "reserved name")
+        }
+    }
+
+    struct CreateUser {
+        email: String @validation.email
+        name: String @validation.min(2) @no_admin
+    }
+
+    func create_user(req: http.Request, body: CreateUser) -> http.Response {
+        email := body.email
+        name := body.name
+        return http.response(201, "{name}<{email}>")
+    }
+
+    router Api {
+        post "/users" => create_user
+    }
+
+    export func main() -> String {
+        r := http.build<Api>()
+        r_ok := r.dispatch(http.Request(method: "POST", path: "/users", body: "{\"email\":\"alice@example.com\",\"name\":\"Alice\"}", headers: Map<String, String>(), query: Map<String, String>(), params: Map<String, String>()))
+        r_bad_json := r.dispatch(http.Request(method: "POST", path: "/users", body: "{broken", headers: Map<String, String>(), query: Map<String, String>(), params: Map<String, String>()))
+        r_bad_val := r.dispatch(http.Request(method: "POST", path: "/users", body: "{\"email\":\"bad\",\"name\":\"admin\"}", headers: Map<String, String>(), query: Map<String, String>(), params: Map<String, String>()))
+
+        s1 := r_ok.status
+        b1 := r_ok.body
+        s2 := r_bad_json.status
+        b2 := r_bad_json.body.contains("invalid_json")
+        s3 := r_bad_val.status
+        b3 := r_bad_val.body.contains("validation_failed") && r_bad_val.body.contains("reserved")
+        return "{s1}:{b1}|{s2}:{b2}|{s3}:{b3}"
+    }
+    "#;
+    let module = compile_source(src).unwrap();
+    let mut vm = Vm::new();
+    let out = vm
+        .call_obj(&module, module.func_id("main").unwrap(), &[], &[])
+        .unwrap();
+    assert_eq!(
+        out,
+        Obj::str("201:Alice<alice@example.com>|400:true|422:true")
+    );
+}
+
+#[test]
+fn cdt_http_groups_static_cors_helpers_e2e() {
+    let tmp = std::env::temp_dir().join(format!("conduit_static_test_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::write(tmp.join("hello.txt"), "static-hello").unwrap();
+    let dir_str = tmp.to_str().unwrap().replace('\\', "/");
+
+    let src = format!(
+        r#"
+    import * as http from "cdt.http"
+
+    struct Item {{
+        id: String
+        q: String
+    }}
+
+    func health(_req: http.Request) -> http.Response {{
+        return http.no_content()
+    }}
+
+    func require_auth(req: http.Request) -> http.Response? {{
+        tok := req.header("Authorization") ?? ""
+        if tok != "Bearer ok" {{
+            return http.status_json(401, Item(id: "0", q: "unauth"))
+        }}
+        return nil
+    }}
+
+    func get_item(req: http.Request) -> http.Response {{
+        id := req.param("id") ?? ""
+        q := req.query_param("q") ?? ""
+        return http.ok_json(Item(id: id, q: q))
+    }}
+
+    func go_new(_req: http.Request) -> http.Response {{
+        return http.redirect("/new", 301)
+    }}
+
+    router Api {{
+        cors "*"
+        static "/assets" => "{dir_str}"
+        get "/health" => health
+        get "/old" => go_new
+        group "/api/v1" {{
+            before require_auth
+            get "/items/:id" => get_item
+        }}
+    }}
+
+    export func main() -> String {{
+        r := http.build<Api>()
+        empty := Map<String, String>()
+
+        r_health := r.dispatch(http.Request(method: "GET", path: "/health", body: "", headers: empty, query: empty, params: empty))
+        r_unauth := r.dispatch(http.Request(method: "GET", path: "/api/v1/items/42", body: "", headers: empty, query: empty, params: empty))
+
+        auth_h := Map<String, String>()
+        auth_h.set("authorization", "Bearer ok")
+        q_map := Map<String, String>()
+        q_map.set("q", "fast")
+        r_ok := r.dispatch(http.Request(method: "GET", path: "/api/v1/items/42", body: "", headers: auth_h, query: q_map, params: empty))
+
+        r_opt := r.dispatch(http.Request(method: "OPTIONS", path: "/api/v1/items/42", body: "", headers: empty, query: empty, params: empty))
+        r_redir := r.dispatch(http.Request(method: "GET", path: "/old", body: "", headers: empty, query: empty, params: empty))
+        r_static := r.dispatch(http.Request(method: "GET", path: "/assets/hello.txt", body: "", headers: empty, query: empty, params: empty))
+        r_trav := r.dispatch(http.Request(method: "GET", path: "/assets/../hello.txt", body: "", headers: empty, query: empty, params: empty))
+
+        s1 := r_health.status
+        c1 := r_health.headers.get("access-control-allow-origin") ?? ""
+        s2 := r_unauth.status
+        s3 := r_ok.status
+        b3 := r_ok.body
+        s4 := r_opt.status
+        s5 := r_redir.status
+        loc := r_redir.headers.get("location") ?? ""
+        s6 := r_static.status
+        b6 := r_static.body
+        s7 := r_trav.status
+        return "{{s1}}:{{c1}}|{{s2}}|{{s3}}:{{b3}}|{{s4}}|{{s5}}:{{loc}}|{{s6}}:{{b6}}|{{s7}}"
+    }}
+    "#
+    );
+    let module = compile_source(&src).unwrap();
+    let mut vm = Vm::new();
+    let out = vm
+        .call_obj(&module, module.func_id("main").unwrap(), &[], &[])
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&tmp);
+    assert_eq!(
+        out,
+        Obj::str(r#"204:*|401|200:{"id":"42","q":"fast"}|204|301:/new|200:static-hello|404"#)
+    );
 }

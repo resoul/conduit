@@ -293,79 +293,7 @@ impl Parser {
         self.expect(&TokenKind::LBrace)?;
         let mut fields = Vec::new();
         let mut idx = 0usize;
-        while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
-            let tok = self.peek().clone();
-            let TokenKind::Ident(kw) = &tok.kind else {
-                return Err(ParserError {
-                    message: format!(
-                        "Expected 'before', 'after', 'get', 'post', 'put', 'delete', 'patch', 'options', 'head', or 'any' in router block, got '{:?}'",
-                        tok.kind
-                    ),
-                    span: tok.span,
-                });
-            };
-            let span = self.bump().span;
-            let ann = match kw.as_str() {
-                "before" | "after" => {
-                    let _ = self.match_token(&TokenKind::FatArrow);
-                    let (handler_name, hspan) = self.expect_ident()?;
-                    FieldAnnotation {
-                        target: format!("router.{}", kw),
-                        args: vec![Expr {
-                            kind: ExprKind::Ident(handler_name),
-                            ty: crate::frontend::types::Type::Void,
-                            span: hspan,
-                        }],
-                        span,
-                    }
-                }
-                "get" | "post" | "put" | "delete" | "patch" | "options" | "head" | "any" => {
-                    let pspan = self.peek().span;
-                    let Some(pat) = self.try_take_string() else {
-                        return Err(ParserError {
-                            message: format!("Expected route pattern string after '{}'", kw),
-                            span: pspan,
-                        });
-                    };
-                    self.expect(&TokenKind::FatArrow)?;
-                    let (handler_name, hspan) = self.expect_ident()?;
-                    FieldAnnotation {
-                        target: format!("router.{}", kw),
-                        args: vec![
-                            str_expr(pat, pspan),
-                            Expr {
-                                kind: ExprKind::Ident(handler_name),
-                                ty: crate::frontend::types::Type::Void,
-                                span: hspan,
-                            },
-                        ],
-                        span,
-                    }
-                }
-                other => {
-                    return Err(ParserError {
-                        message: format!(
-                            "Unknown router member '{}' (expected before, after, get, post, put, delete, patch, options, head, or any)",
-                            other
-                        ),
-                        span: tok.span,
-                    });
-                }
-            };
-            fields.push(FieldDef {
-                name: format!("__route_{}", idx),
-                json_name: None,
-                ty: TypeExpr::Named("Bool".to_string()),
-                annotations: vec![ann],
-                default: Some(Expr {
-                    kind: ExprKind::Bool(false),
-                    ty: crate::frontend::types::Type::Void,
-                    span,
-                }),
-                span,
-            });
-            idx += 1;
-        }
+        self.parse_router_body("", &mut fields, &mut idx)?;
         self.expect(&TokenKind::RBrace)?;
 
         let mut item = Item::new_exported(
@@ -379,6 +307,155 @@ impl Parser {
         );
         item.doc = about;
         Ok(item)
+    }
+
+    fn parse_router_body(
+        &mut self,
+        prefix: &str,
+        fields: &mut Vec<FieldDef>,
+        idx: &mut usize,
+    ) -> Result<(), ParserError> {
+        while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
+            let tok = self.peek().clone();
+            let TokenKind::Ident(kw) = &tok.kind else {
+                return Err(ParserError {
+                    message: format!(
+                        "Expected 'group', 'static', 'cors', 'before', 'after', 'get', 'post', 'put', 'delete', 'patch', 'options', 'head', or 'any' in router block, got '{:?}'",
+                        tok.kind
+                    ),
+                    span: tok.span,
+                });
+            };
+            let span = self.bump().span;
+            if kw == "group" {
+                let gspan = self.peek().span;
+                let Some(sub_prefix) = self.try_take_string() else {
+                    return Err(ParserError {
+                        message: "Expected path prefix string after 'group'".to_string(),
+                        span: gspan,
+                    });
+                };
+                let joined = join_route_prefix(prefix, &sub_prefix);
+                self.expect(&TokenKind::LBrace)?;
+                self.parse_router_body(&joined, fields, idx)?;
+                self.expect(&TokenKind::RBrace)?;
+                continue;
+            }
+            let ann = match kw.as_str() {
+                "before" | "after" => {
+                    let _ = self.match_token(&TokenKind::FatArrow);
+                    let (handler_name, hspan) = self.expect_ident()?;
+                    if prefix.is_empty() {
+                        FieldAnnotation {
+                            target: format!("router.{}", kw),
+                            args: vec![Expr {
+                                kind: ExprKind::Ident(handler_name),
+                                ty: crate::frontend::types::Type::Void,
+                                span: hspan,
+                            }],
+                            span,
+                        }
+                    } else {
+                        FieldAnnotation {
+                            target: format!("router.group_{}", kw),
+                            args: vec![
+                                str_expr(prefix.to_string(), span),
+                                Expr {
+                                    kind: ExprKind::Ident(handler_name),
+                                    ty: crate::frontend::types::Type::Void,
+                                    span: hspan,
+                                },
+                            ],
+                            span,
+                        }
+                    }
+                }
+                "static" => {
+                    let pspan = self.peek().span;
+                    let Some(url_pat) = self.try_take_string() else {
+                        return Err(ParserError {
+                            message: "Expected URL prefix string after 'static'".to_string(),
+                            span: pspan,
+                        });
+                    };
+                    self.expect(&TokenKind::FatArrow)?;
+                    let dspan = self.peek().span;
+                    let Some(dir_path) = self.try_take_string() else {
+                        return Err(ParserError {
+                            message: "Expected directory path string after '=>'".to_string(),
+                            span: dspan,
+                        });
+                    };
+                    let full_prefix = join_route_prefix(prefix, &url_pat);
+                    FieldAnnotation {
+                        target: "router.static".to_string(),
+                        args: vec![str_expr(full_prefix, pspan), str_expr(dir_path, dspan)],
+                        span,
+                    }
+                }
+                "cors" => {
+                    let ospan = self.peek().span;
+                    let Some(origin) = self.try_take_string() else {
+                        return Err(ParserError {
+                            message: "Expected origin string (e.g. \"*\") after 'cors'".to_string(),
+                            span: ospan,
+                        });
+                    };
+                    FieldAnnotation {
+                        target: "router.cors".to_string(),
+                        args: vec![str_expr(origin, ospan)],
+                        span,
+                    }
+                }
+                "get" | "post" | "put" | "delete" | "patch" | "options" | "head" | "any" => {
+                    let pspan = self.peek().span;
+                    let Some(pat) = self.try_take_string() else {
+                        return Err(ParserError {
+                            message: format!("Expected route pattern string after '{}'", kw),
+                            span: pspan,
+                        });
+                    };
+                    let full_pat = join_route_prefix(prefix, &pat);
+                    self.expect(&TokenKind::FatArrow)?;
+                    let (handler_name, hspan) = self.expect_ident()?;
+                    FieldAnnotation {
+                        target: format!("router.{}", kw),
+                        args: vec![
+                            str_expr(full_pat, pspan),
+                            Expr {
+                                kind: ExprKind::Ident(handler_name),
+                                ty: crate::frontend::types::Type::Void,
+                                span: hspan,
+                            },
+                        ],
+                        span,
+                    }
+                }
+                other => {
+                    return Err(ParserError {
+                        message: format!(
+                            "Unknown router member '{}' (expected group, static, cors, before, after, get, post, put, delete, patch, options, head, or any)",
+                            other
+                        ),
+                        span: tok.span,
+                    });
+                }
+            };
+            fields.push(FieldDef {
+                name: format!("__route_{}", *idx),
+                json_name: None,
+                ty: TypeExpr::Named("Bool".to_string()),
+                annotations: vec![ann],
+                default: Some(Expr {
+                    kind: ExprKind::Bool(false),
+                    ty: crate::frontend::types::Type::Void,
+                    span,
+                }),
+                span,
+            });
+            *idx += 1;
+        }
+        Ok(())
     }
 
     pub(super) fn parse_schedule_item(&mut self, is_exported: bool) -> Result<Item, ParserError> {
@@ -519,5 +596,21 @@ impl Parser {
         );
         item.doc = about;
         Ok(item)
+    }
+}
+
+fn join_route_prefix(prefix: &str, pat: &str) -> String {
+    let p = prefix.trim_end_matches('/');
+    let s = pat.trim_start_matches('/');
+    if p.is_empty() {
+        if s.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{}", s)
+        }
+    } else if s.is_empty() {
+        p.to_string()
+    } else {
+        format!("{}/{}", p, s)
     }
 }

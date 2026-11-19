@@ -221,7 +221,7 @@ mod tests {
         map.insert(owned, 2);
         assert_eq!(map.len(), 1);
         assert_eq!(map.get(&other), Some(&2));
-        let mut strings = vec![VmString::from("z"), other, VmString::from("a")];
+        let mut strings = [VmString::from("z"), other, VmString::from("a")];
         strings.sort();
         assert_eq!(
             strings.iter().map(|s| s.as_str()).collect::<Vec<_>>(),

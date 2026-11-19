@@ -128,8 +128,8 @@ impl Vm {
                 let url = self.sys_str(o_base, b, "db.connect()")?;
                 let res = match SqlConn::open(&url) {
                     Ok(conn) => {
-                        let id = self.db_conns.len();
-                        self.db_conns.push(Some(conn));
+                        let id = self.host.db_conns.len();
+                        self.host.db_conns.push(Some(conn));
                         make_db_conn(id as i64)
                     }
                     Err(e) => e.into_obj(),
@@ -160,7 +160,7 @@ impl Vm {
             }
             DB_DIALECT => {
                 let id = self.extract_db_handle(&self.objs[o_base + b as usize])?;
-                let name = match self.db_conns.get(id).and_then(|s| s.as_ref()) {
+                let name = match self.host.db_conns.get(id).and_then(|s| s.as_ref()) {
                     Some(c) => c.dialect().name(),
                     None => "closed",
                 };
@@ -169,6 +169,7 @@ impl Vm {
             DB_LAST_INSERT_ID => {
                 let id = self.extract_db_handle(&self.objs[o_base + b as usize])?;
                 let last_id = self
+                    .host
                     .db_conns
                     .get(id)
                     .and_then(|s| s.as_ref())
@@ -178,7 +179,7 @@ impl Vm {
             }
             DB_CLOSE => {
                 let id = self.extract_db_handle(&self.objs[o_base + b as usize])?;
-                if let Some(slot) = self.db_conns.get_mut(id)
+                if let Some(slot) = self.host.db_conns.get_mut(id)
                     && let Some(conn) = slot.take()
                 {
                     conn.close();
@@ -188,7 +189,7 @@ impl Vm {
             DB_EXEC => {
                 let id = self.extract_db_handle(&self.objs[o_base + b as usize])?;
                 let (sql, params, _) = self.extract_sql_and_params(&self.objs[o_base + c as usize])?;
-                let res = match self.db_conns.get(id).and_then(|s| s.as_ref()) {
+                let res = match self.host.db_conns.get(id).and_then(|s| s.as_ref()) {
                     Some(conn) => match conn.execute(&sql, &params) {
                         Ok(n) => Obj::boxed_int(n as i64),
                         Err(e) => e.into_obj(),
@@ -200,7 +201,7 @@ impl Vm {
             DB_QUERY_ROWS => {
                 let id = self.extract_db_handle(&self.objs[o_base + b as usize])?;
                 let (sql, params, _) = self.extract_sql_and_params(&self.objs[o_base + c as usize])?;
-                let res = match self.db_conns.get(id).and_then(|s| s.as_ref()) {
+                let res = match self.host.db_conns.get(id).and_then(|s| s.as_ref()) {
                     Some(conn) => match conn.query(&sql, &params) {
                         Ok(qr) => query_result_to_maps(&qr),
                         Err(e) => e.into_obj(),
@@ -216,7 +217,7 @@ impl Vm {
                 let schema = schema_idx
                     .and_then(|idx| module.struct_schemas.get(idx))
                     .ok_or_else(|| err_msg("Missing struct schema in db.query<T>()"))?;
-                let res = match self.db_conns.get(id).and_then(|s| s.as_ref()) {
+                let res = match self.host.db_conns.get(id).and_then(|s| s.as_ref()) {
                     Some(conn) => match conn.query(&sql, &params) {
                         Ok(qr) => match query_result_to_structs(&qr, schema) {
                             Ok(list) => list,
@@ -230,7 +231,7 @@ impl Vm {
             }
             DB_BEGIN | DB_COMMIT | DB_ROLLBACK => {
                 let id = self.extract_db_handle(&self.objs[o_base + b as usize])?;
-                let res = match self.db_conns.get(id).and_then(|s| s.as_ref()) {
+                let res = match self.host.db_conns.get(id).and_then(|s| s.as_ref()) {
                     Some(conn) => {
                         let r = match aux {
                             DB_BEGIN => conn.begin(),
@@ -280,7 +281,7 @@ impl Vm {
                     .iter()
                     .find(|s| s.schema_id == model.schema_id)
                     .ok_or_else(|| err_msg("Missing struct schema for db model op"))?;
-                let res = match self.db_conns.get(id).and_then(|s| s.as_ref()) {
+                let res = match self.host.db_conns.get(id).and_then(|s| s.as_ref()) {
                     Some(conn) => match aux {
                         DB_CREATE_TABLE => {
                             let sqls = build_create_table_sqls(model, schema, conn.dialect());
@@ -322,7 +323,7 @@ impl Vm {
                     .iter()
                     .find(|s| s.schema_id == model.schema_id)
                     .ok_or_else(|| err_msg("Missing struct schema for db model op"))?;
-                let res = match self.db_conns.get(id).and_then(|s| s.as_ref()) {
+                let res = match self.host.db_conns.get(id).and_then(|s| s.as_ref()) {
                     Some(conn) => match aux {
                         DB_INSERT => {
                             let Obj::Record(row_rec) = &arg_obj else {
@@ -466,7 +467,7 @@ fn now_millis() -> i64 {
 }
 
 fn db_conn_ref(vm: &Vm, cid: usize) -> Result<&SqlConn, DbErr> {
-    vm.db_conns
+    vm.host.db_conns
         .get(cid)
         .and_then(|s| s.as_ref())
         .ok_or_else(|| DbErr::new("closed", "Database connection is closed", ""))

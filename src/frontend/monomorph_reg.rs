@@ -263,13 +263,7 @@ pub(crate) fn register_program_types(
 
     for item in &program.items {
         if let ItemKind::Func { name, type_params, params, return_type, .. } = &item.kind {
-            if checked.json_direct_fns.contains_key(name)
-                || checked.time_direct_fns.contains_key(name)
-                || checked.val_direct_fns.contains_key(name)
-                || checked.env_direct_fns.contains_key(name)
-                || checked.cli_direct_fns.contains_key(name)
-                || checked.fs_direct_fns.contains_key(name)
-            {
+            if checked.native_direct_fns.contains_key(name) {
                 return Err(format!("Function '{}' conflicts with imported identifier", name));
             }
             if !type_params.is_empty() {

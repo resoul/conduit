@@ -1195,6 +1195,38 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                     c: 0,
                 });
                 for entry in entries {
+                    match entry.kind {
+                        HttpRouterDeclKind::Static(url_prefix, dir_path) => {
+                            let p_idx = self.mc.intern_str(&url_prefix)?;
+                            let p_o = self.alloc_temp_o();
+                            self.ops.push(Op::LoadConstObj { dst_obj: p_o, idx: p_idx });
+                            let d_idx = self.mc.intern_str(&dir_path)?;
+                            let d_o = self.alloc_temp_o();
+                            self.ops.push(Op::LoadConstObj { dst_obj: d_o, idx: d_idx });
+                            self.ops.push(Op::ExtOp {
+                                kind: EXT_HTTP_OP,
+                                aux: HTTP_ROUTE_STATIC,
+                                a: router_o,
+                                b: p_o,
+                                c: d_o,
+                            });
+                            continue;
+                        }
+                        HttpRouterDeclKind::Cors(origin) => {
+                            let o_idx = self.mc.intern_str(&origin)?;
+                            let o_reg = self.alloc_temp_o();
+                            self.ops.push(Op::LoadConstObj { dst_obj: o_reg, idx: o_idx });
+                            self.ops.push(Op::ExtOp {
+                                kind: EXT_HTTP_OP,
+                                aux: HTTP_ROUTE_CORS,
+                                a: router_o,
+                                b: o_reg,
+                                c: 0,
+                            });
+                            continue;
+                        }
+                        _ => {}
+                    }
                     let fid = *self
                         .mc
                         .checked
@@ -1225,6 +1257,31 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                                 c: 0,
                             });
                         }
+                        HttpRouterDeclKind::GroupBefore(prefix) => {
+                            let p_idx = self.mc.intern_str(&prefix)?;
+                            let p_o = self.alloc_temp_o();
+                            self.ops.push(Op::LoadConstObj { dst_obj: p_o, idx: p_idx });
+                            self.ops.push(Op::ExtOp {
+                                kind: EXT_HTTP_OP,
+                                aux: HTTP_ROUTE_GROUP_BEFORE,
+                                a: router_o,
+                                b: p_o,
+                                c: handler_o,
+                            });
+                        }
+                        HttpRouterDeclKind::GroupAfter(prefix) => {
+                            let p_idx = self.mc.intern_str(&prefix)?;
+                            let p_o = self.alloc_temp_o();
+                            self.ops.push(Op::LoadConstObj { dst_obj: p_o, idx: p_idx });
+                            self.ops.push(Op::ExtOp {
+                                kind: EXT_HTTP_OP,
+                                aux: HTTP_ROUTE_GROUP_AFTER,
+                                a: router_o,
+                                b: p_o,
+                                c: handler_o,
+                            });
+                        }
+                        HttpRouterDeclKind::Static(_, _) | HttpRouterDeclKind::Cors(_) => {}
                         HttpRouterDeclKind::Route(method, pat) => {
                             let pat_idx = self.mc.intern_str(&pat)?;
                             let pat_o = self.alloc_temp_o();
@@ -1240,6 +1297,19 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                                 b: pat_o,
                                 c: handler_o,
                             });
+                            if let Some(body_name) = &entry.body_struct {
+                                let sid = self.mc.checked.struct_by_name[body_name] as u32;
+                                let plan_idx = self
+                                    .mc
+                                    .add_json_decode_plan(&crate::native::JsonType::Struct(sid))?;
+                                self.ops.push(Op::ExtOp {
+                                    kind: EXT_HTTP_OP,
+                                    aux: HTTP_ROUTE_TYPED_BODY,
+                                    a: router_o,
+                                    b: 0,
+                                    c: plan_idx,
+                                });
+                            }
                         }
                     }
                 }
@@ -1258,6 +1328,113 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                     Ok(dst_o)
                 }
             }
+            "ok_json" => {
+                let b = self.lower_obj(&args[0])?;
+                let a = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_HTTP_OP,
+                    aux: HTTP_OK_JSON,
+                    a,
+                    b,
+                    c: 0,
+                });
+                Ok(a)
+            }
+            "status_json" => {
+                let b = self.lower_scalar(&args[0])?;
+                let c = self.lower_obj(&args[1])?;
+                let a = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_HTTP_OP,
+                    aux: HTTP_STATUS_JSON,
+                    a,
+                    b,
+                    c,
+                });
+                Ok(a)
+            }
+            "redirect" => {
+                let c = self.lower_obj(&args[0])?;
+                let b = if args.len() == 2 {
+                    self.lower_scalar(&args[1])?
+                } else {
+                    let r = self.alloc_temp_s();
+                    self.load_int_into(r, 302)?;
+                    r
+                };
+                let a = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_HTTP_OP,
+                    aux: HTTP_REDIRECT,
+                    a,
+                    b,
+                    c,
+                });
+                Ok(a)
+            }
+            "no_content" => {
+                let a = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_HTTP_OP,
+                    aux: HTTP_NO_CONTENT,
+                    a,
+                    b: 0,
+                    c: 0,
+                });
+                Ok(a)
+            }
+            "get_json" => {
+                let target_ty = self.mc.resolve_type(&type_args[0])?;
+                let json_ty = crate::frontend::check_native::type_to_json_type(
+                    &target_ty,
+                    &self.mc.checked.struct_by_name,
+                )
+                .ok_or_else(|| format!("Unsupported JSON type '{}' in http.get_json()", target_ty))?;
+                let plan_idx = self.mc.add_json_decode_plan(&json_ty)?;
+                let url_o = self.lower_obj(&args[0])?;
+                let query_o = if args.len() == 2 {
+                    self.lower_obj(&args[1])?
+                } else {
+                    let idx = self.mc.intern_empty()?;
+                    let r = self.alloc_temp_o();
+                    self.ops.push(Op::LoadConstObj { dst_obj: r, idx });
+                    r
+                };
+                let plan_s = self.alloc_temp_s();
+                self.load_int_into(plan_s, plan_idx as i64)?;
+                let desc_idx = self.mc.intern_record_desc(RecordDesc {
+                    schema_id: SCHEMA_HTTP_REQUEST,
+                    scalar_regs: Box::new([plan_s]),
+                    obj_regs: Box::new([url_o, query_o]),
+                })?;
+                let packed = self.alloc_temp_o();
+                self.ops.push(Op::NewRecord {
+                    dst_obj: packed,
+                    desc_idx,
+                });
+                let a = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_HTTP_OP,
+                    aux: HTTP_GET_JSON,
+                    a,
+                    b: packed,
+                    c: 0,
+                });
+                Ok(a)
+            }
+            "post_json" => {
+                let b = self.lower_obj(&args[0])?;
+                let c = self.lower_obj(&args[1])?;
+                let a = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_HTTP_OP,
+                    aux: HTTP_POST_JSON,
+                    a,
+                    b,
+                    c,
+                });
+                Ok(a)
+            }
             other => Err(format!("Unsupported cdt.http symbol '{}'", other)),
         }
     }
@@ -1272,6 +1449,23 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
         use crate::vm::exec_http::*;
         let router_o = self.lower_obj(target)?;
         match (type_name, method) {
+            ("Request", "header" | "param" | "query_param") => {
+                let aux = match method {
+                    "header" => HTTP_REQ_HEADER,
+                    "param" => HTTP_REQ_PARAM,
+                    _ => HTTP_REQ_QUERY_PARAM,
+                };
+                let name_o = self.lower_obj(&args[0])?;
+                let dst_o = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_HTTP_OP,
+                    aux,
+                    a: dst_o,
+                    b: router_o,
+                    c: name_o,
+                });
+                Ok(dst_o)
+            }
             (
                 "Router",
                 "get" | "post" | "put" | "delete" | "patch" | "options" | "head" | "any",

@@ -21,9 +21,9 @@ fn is_json_call_expr(expr: &Expr, checked: &CheckedProgram) -> bool {
     };
     match &callee.kind {
         ExprKind::Member { target, .. } => {
-            matches!(&target.kind, ExprKind::Ident(a) if checked.json_aliases.contains(a))
+            matches!(&target.kind, ExprKind::Ident(a) if checked.is_native_alias(a, "cdt.json"))
         }
-        ExprKind::Ident(name) => checked.json_direct_fns.contains_key(name),
+        ExprKind::Ident(name) => checked.native_direct_fn(name, "cdt.json").is_some(),
         _ => false,
     }
 }
@@ -202,7 +202,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                     self.ops.push(Op::LoadFuncObj { dst_obj, func_id: fid as u16 });
                     return Ok(dst_obj);
                 }
-                if self.mc.checked.val_direct_fns.get(name).map(String::as_str) == Some("email") {
+                if self.mc.checked.native_direct_fn(name, "cdt.validation") == Some("email") {
                     return self.lower_email_fn_val();
                 }
                 Err(format!("Undefined object identifier '{}'", name))
@@ -279,7 +279,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             ExprKind::Member { target, field } => {
                 if let ExprKind::Ident(alias) = &target.kind
                     && self.lookup_local(alias).is_none()
-                    && self.mc.checked.val_aliases.contains(alias)
+                    && self.mc.checked.is_native_alias(alias, "cdt.validation")
                     && field == "email"
                 {
                     return self.lower_email_fn_val();

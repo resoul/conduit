@@ -141,13 +141,13 @@ fn compile_field_rule(
     checked: &CheckedProgram,
 ) -> Result<CompiledValidationRule, String> {
     let builtin_name = if let Some((alias, sub)) = ann.target.split_once('.') {
-        if checked.val_aliases.contains(alias) {
+        if checked.is_native_alias(alias, "cdt.validation") {
             Some(sub)
         } else {
             return Err(format!("Unknown module '{}' in annotation '@{}'", alias, ann.target));
         }
     } else {
-        checked.val_direct_fns.get(&ann.target).map(String::as_str)
+        checked.native_direct_fn(&ann.target, "cdt.validation")
     };
 
     if let Some(bname) = builtin_name {

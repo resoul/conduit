@@ -31,6 +31,7 @@ pub struct RouteEntry {
     pub param_count: usize,
     pub segments: Vec<RouteSeg>,
     pub handler: Obj,
+    pub body_json_plan: Option<u16>,
 }
 
 impl RouteEntry {
@@ -57,6 +58,7 @@ impl RouteEntry {
             param_count,
             segments,
             handler,
+            body_json_plan: None,
         }
     }
 }
@@ -64,9 +66,66 @@ impl RouteEntry {
 #[derive(Debug, Default, Clone)]
 pub struct RouterState {
     pub routes: Vec<RouteEntry>,
-    pub before: Vec<Obj>,
-    pub after: Vec<Obj>,
+    pub before: Vec<(Option<Box<str>>, Obj)>,
+    pub after: Vec<(Option<Box<str>>, Obj)>,
+    pub statics: Vec<(Box<str>, Box<str>)>,
+    pub cors_origin: Option<Box<str>>,
     pub stop_flag: Arc<AtomicBool>,
+}
+
+#[inline]
+pub fn route_prefix_matches(prefix: &str, path: &str) -> bool {
+    let p = prefix.trim_end_matches('/');
+    if p.is_empty() {
+        return true;
+    }
+    path == p || (path.starts_with(p) && path.as_bytes().get(p.len()) == Some(&b'/'))
+}
+
+pub fn content_type_for_path(path: &std::path::Path) -> &'static str {
+    match path.extension().and_then(|e| e.to_str()).unwrap_or("") {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" => "application/javascript; charset=utf-8",
+        "json" => "application/json; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "txt" | "md" => "text/plain; charset=utf-8",
+        "woff2" => "font/woff2",
+        "wasm" => "application/wasm",
+        _ => "application/octet-stream",
+    }
+}
+
+pub fn try_serve_static(statics: &[(Box<str>, Box<str>)], method: &str, path: &str) -> Option<Obj> {
+    if method != "GET" && method != "HEAD" {
+        return None;
+    }
+    for (url_prefix, dir_path) in statics {
+        if !route_prefix_matches(url_prefix, path) {
+            continue;
+        }
+        let p = url_prefix.trim_end_matches('/');
+        let rel = path.strip_prefix(p).unwrap_or("").trim_start_matches('/');
+        if rel.is_empty() || rel.contains('\0') || rel.split('/').any(|seg| seg == ".." || seg == ".") {
+            return None;
+        }
+        let base_dir = std::fs::canonicalize(dir_path.as_ref()).ok()?;
+        let candidate = base_dir.join(rel);
+        let canon = std::fs::canonicalize(&candidate).ok()?;
+        if !canon.starts_with(&base_dir) || !canon.is_file() {
+            return None;
+        }
+        let bytes = std::fs::read(&canon).ok()?;
+        let body = String::from_utf8_lossy(&bytes).into_owned();
+        let ct = content_type_for_path(&canon);
+        return Some(make_response_obj(200, body, Some(ct)));
+    }
+    None
 }
 
 pub fn parse_pattern(pattern: &str) -> Vec<RouteSeg> {

@@ -72,17 +72,22 @@ pub enum ExecResult {
     Void,
 }
 
-pub struct Vm {
-    pub scalars: Vec<u64>,
-    pub objs: Vec<Obj>,
-    pub(crate) frames: Vec<CallFrame>,
-    pub script_args: Option<Vec<String>>,
+#[derive(Default)]
+pub(crate) struct VmHostState {
     pub(crate) fs_readers: Vec<Option<std::io::BufReader<std::fs::File>>>,
     pub(crate) fs_writers: Vec<Option<std::io::BufWriter<std::fs::File>>>,
     pub(crate) routers: Vec<crate::native::http::RouterState>,
     pub(crate) db_conns: Vec<Option<crate::native::db::SqlConn>>,
     pub(crate) cron_schedulers: Vec<Option<crate::native::cron::CronSchedulerState>>,
     pub(crate) cached_http_req: Option<(Arc<StructData>, Arc<StructData>)>,
+}
+
+pub struct Vm {
+    pub scalars: Vec<u64>,
+    pub objs: Vec<Obj>,
+    pub(crate) frames: Vec<CallFrame>,
+    pub script_args: Option<Vec<String>>,
+    pub(crate) host: Box<VmHostState>,
 }
 
 impl Vm {
@@ -92,12 +97,7 @@ impl Vm {
             objs: vec![Obj::Empty; 4096],
             frames: Vec::with_capacity(MAX_CALL_DEPTH),
             script_args: None,
-            fs_readers: Vec::new(),
-            fs_writers: Vec::new(),
-            routers: Vec::new(),
-            db_conns: Vec::new(),
-            cron_schedulers: Vec::new(),
-            cached_http_req: None,
+            host: Box::default(),
         }
     }
 
@@ -138,8 +138,8 @@ impl Vm {
 
     pub fn open_db(&mut self, url: &str) -> Result<usize, crate::native::db::DbErr> {
         let conn = crate::native::db::SqlConn::open(url)?;
-        let id = self.db_conns.len();
-        self.db_conns.push(Some(conn));
+        let id = self.host.db_conns.len();
+        self.host.db_conns.push(Some(conn));
         Ok(id)
     }
 

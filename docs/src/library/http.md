@@ -26,10 +26,16 @@ import * as http from "cdt.http"
 | `text` | `http.text(body: String) -> Response` | `200 OK` with `text/plain; charset=utf-8`. |
 | `html` | `http.html(body: String) -> Response` | `200 OK` with `text/html; charset=utf-8`. |
 | `json` | `http.json(body: String) -> Response` | `200 OK` with `application/json`. |
+| `ok_json` | `http.ok_json(val: T) -> Response` | Encodes `val` as JSON and returns `200 OK` (`application/json`). |
+| `status_json` | `http.status_json(status: Int, val: T) -> Response` | Encodes `val` as JSON with custom HTTP `status`. |
+| `redirect` | `http.redirect(url: String, status?: Int) -> Response` | Redirect response (`302` by default) with `location` header. |
+| `no_content` | `http.no_content() -> Response` | `204 No Content` empty response. |
 | `response` | `http.response(status: Int, body: String) -> Response` | Custom status code and body. |
 | `response_with` | `http.response_with(status: Int, body: String, headers: Map<String, String>) -> Response` | Custom status code, body, and headers. |
 | `get` | `http.get(url: String) -> Response \| HttpError` | Sends an HTTP `GET` request (follows up to 10 redirects; `http://` via `TcpStream`, `https://` via system `curl`). |
 | `post` | `http.post(url: String, body: String) -> Response \| HttpError` | Sends an HTTP `POST` request with `body`. |
+| `get_json` | `http.get_json<T>(url: String, query?: Map<String, String>) -> T \| HttpError` | Sends `GET` (`Accept: application/json`), appends optional URL-encoded `query`, and decodes JSON into `T`. |
+| `post_json` | `http.post_json(url: String, body: T) -> Response \| HttpError` | Encodes `body` as JSON and sends `POST` with `Content-Type: application/json`. |
 | `request` | `http.request(method: String, url: String, body: String, headers: Map<String, String>) -> Response \| HttpError` | Sends a custom HTTP request with method, body, and headers. |
 | `request_timeout` | `http.request_timeout(method: String, url: String, body: String, headers: Map<String, String>, timeout_ms: Int) -> Response \| HttpError` | Sends a custom HTTP request with an explicit timeout in milliseconds. |
 | `get_bytes` | `http.get_bytes(url: String) -> BinaryResponse \| HttpError` | Sends an HTTP `GET` request and returns raw byte list `[Int]` (`0..=255`). |
@@ -45,6 +51,21 @@ import * as http from "cdt.http"
 | `dispatch` | `r.dispatch(req: Request) -> Response` | Dispatches a `Request` in-memory (returns `404`/`405` automatically). |
 | `serve` | `r.serve(addr: String) -> Void \| HttpError` | Starts a blocking HTTP/1.1 server on `addr` (e.g. `"127.0.0.1:8080"`). |
 | `stop` | `r.stop() -> Void` | Signals `r.serve(...)` to stop accepting new connections and shut down gracefully after in-flight requests finish. |
+
+## `Request` Helper Methods
+
+| Method | Signature | Description |
+| :--- | :--- | :--- |
+| `header` | `req.header(name: String) -> String?` | Case-insensitive header lookup. |
+| `param` | `req.param(name: String) -> String?` | Route `:param` / `*wildcard` lookup. |
+| `query_param` | `req.query_param(name: String) -> String?` | Query-string parameter lookup. |
+
+## Declarative `router` DSL Features
+
+Inside `router Name { ... }`:
+- `group "/api/v1" { before auth; get "/users" => list_users }` — Route prefix grouping with local `before`/`after` middleware scoped to that prefix.
+- `static "/assets" => "./public"` — Serves static files with `Content-Type` detection and path-traversal protection.
+- `cors "*"` — Automatically handles `OPTIONS` preflight (`204`) and injects `access-control-allow-origin` on responses.
 
 ## Declarative `router` DSL Example
 
@@ -84,6 +105,33 @@ func main() -> Void {
     }
 }
 ```
+
+## Typed JSON & Validation Contracts
+
+A route handler in a declarative `router` block may take a second parameter `(req: http.Request, body: MyStruct) -> http.Response`:
+
+```conduit
+import * as http from "cdt.http"
+import * as validation from "cdt.validation"
+
+struct CreateUser {
+    email: String @validation.email
+    name: String @validation.min(2)
+}
+
+func create_user(req: http.Request, body: CreateUser) -> http.Response {
+    return http.response(201, "Created {body.name}")
+}
+
+router Api {
+    post "/users" => create_user
+}
+```
+
+When a request matches `/users`, the router automatically:
+1. Decodes `req.body` as `CreateUser` (returns `400 Bad Request` JSON `{"error":"invalid_json","message":...}` on parse/type error).
+2. Runs all `@validation.*` and custom `[#validator]` rules on `CreateUser` (returns `422 Unprocessable Entity` JSON `{"error":"validation_failed","issues":[...]}` on failure).
+3. Invokes `create_user(req, body)` with the validated struct.
 
 ## Imperative Example
 

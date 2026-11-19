@@ -1,0 +1,310 @@
+{
+  "$schema": "vscode://schemas/color-theme",
+  "name": "Conduit PhpStorm Dark",
+  "type": "dark",
+  "colors": {
+    "editor.background": "#1E1F22",
+    "editor.foreground": "#BCBEC4",
+    "editor.lineHighlightBackground": "#26282E",
+    "editor.selectionBackground": "#214283",
+    "editor.inactiveSelectionBackground": "#21428388",
+    "editorCursor.foreground": "#CED0D6",
+    "editorLineNumber.foreground": "#4E5157",
+    "editorLineNumber.activeForeground": "#A1A3AB",
+    "editorIndentGuide.background1": "#2F3136",
+    "editorIndentGuide.activeBackground1": "#4E5157",
+    "editorBracketMatch.background": "#3B514D",
+    "editorBracketMatch.border": "#546E7A",
+    "sideBar.background": "#2B2D30",
+    "sideBar.foreground": "#BCBEC4",
+    "sideBar.border": "#393B40",
+    "activityBar.background": "#2B2D30",
+    "activityBar.foreground": "#BCBEC4",
+    "activityBar.inactiveForeground": "#6F737A",
+    "activityBar.border": "#393B40",
+    "activityBarBadge.background": "#3574F0",
+    "titleBar.activeBackground": "#2B2D30",
+    "titleBar.activeForeground": "#BCBEC4",
+    "titleBar.border": "#393B40",
+    "statusBar.background": "#2B2D30",
+    "statusBar.foreground": "#BCBEC4",
+    "statusBar.border": "#393B40",
+    "statusBar.noFolderBackground": "#2B2D30",
+    "panel.background": "#2B2D30",
+    "panel.border": "#393B40",
+    "panelTitle.activeBorder": "#3574F0",
+    "panelTitle.activeForeground": "#DFE1E5",
+    "panelTitle.inactiveForeground": "#868A91",
+    "editorGroupHeader.tabsBackground": "#2B2D30",
+    "editorGroup.border": "#393B40",
+    "tab.activeBackground": "#1E1F22",
+    "tab.inactiveBackground": "#2B2D30",
+    "tab.activeForeground": "#DFE1E5",
+    "tab.inactiveForeground": "#868A91",
+    "tab.activeBorderTop": "#3574F0",
+    "tab.border": "#393B40",
+    "list.activeSelectionBackground": "#2E436E",
+    "list.activeSelectionForeground": "#DFE1E5",
+    "list.hoverBackground": "#2E3138",
+    "list.inactiveSelectionBackground": "#393B40",
+    "focusBorder": "#3574F0",
+    "input.background": "#1E1F22",
+    "input.border": "#4E5157",
+    "input.foreground": "#BCBEC4",
+    "dropdown.background": "#2B2D30",
+    "dropdown.border": "#4E5157",
+    "editorWidget.background": "#2B2D30",
+    "editorWidget.border": "#43454A",
+    "editorSuggestWidget.selectedBackground": "#2E436E",
+    "terminal.background": "#1E1F22",
+    "terminal.foreground": "#BCBEC4"
+  },
+  "tokenColors": [
+    {
+      "name": "Comments",
+      "scope": [
+        "comment",
+        "comment.line.double-slash.conduit"
+      ],
+      "settings": {
+        "foreground": "#7A7E85",
+        "fontStyle": "italic"
+      }
+    },
+    {
+      "name": "Doc comments",
+      "scope": [
+        "comment.line.documentation",
+        "comment.line.documentation.conduit"
+      ],
+      "settings": {
+        "foreground": "#5F826B",
+        "fontStyle": "italic"
+      }
+    },
+    {
+      "name": "Keywords, storage, booleans, nil",
+      "scope": [
+        "keyword",
+        "storage.type",
+        "storage.modifier",
+        "constant.language",
+        "keyword.control.flow.conduit",
+        "keyword.control.import.conduit",
+        "storage.type.conduit",
+        "storage.type.function.conduit",
+        "storage.type.struct.conduit",
+        "storage.type.const.conduit",
+        "constant.language.boolean.conduit",
+        "constant.language.nil.conduit"
+      ],
+      "settings": {
+        "foreground": "#CF8E6D"
+      }
+    },
+    {
+      "name": "Conduit declarative DSL blocks",
+      "scope": [
+        "keyword.other.dsl.block.conduit"
+      ],
+      "settings": {
+        "foreground": "#CF8E6D",
+        "fontStyle": "bold"
+      }
+    },
+    {
+      "name": "Conduit declarative DSL clauses",
+      "scope": [
+        "keyword.other.dsl.clause.conduit"
+      ],
+      "settings": {
+        "foreground": "#E0966C"
+      }
+    },
+    {
+      "name": "Conduit HTTP route verbs",
+      "scope": [
+        "keyword.other.http-method.conduit"
+      ],
+      "settings": {
+        "foreground": "#2AACB8",
+        "fontStyle": "bold"
+      }
+    },
+    {
+      "name": "Strings",
+      "scope": [
+        "string",
+        "string.quoted.double.conduit",
+        "punctuation.definition.string.begin.conduit",
+        "punctuation.definition.string.end.conduit"
+      ],
+      "settings": {
+        "foreground": "#6AAB73"
+      }
+    },
+    {
+      "name": "String escapes and interpolation braces",
+      "scope": [
+        "constant.character.escape",
+        "constant.character.escape.conduit",
+        "punctuation.section.interpolation.begin.conduit",
+        "punctuation.section.interpolation.end.conduit"
+      ],
+      "settings": {
+        "foreground": "#CF8E6D"
+      }
+    },
+    {
+      "name": "Numbers",
+      "scope": [
+        "constant.numeric",
+        "constant.numeric.conduit"
+      ],
+      "settings": {
+        "foreground": "#2AACB8"
+      }
+    },
+    {
+      "name": "Annotations and field tags",
+      "scope": [
+        "entity.other.attribute-name",
+        "entity.other.attribute-name.db.conduit",
+        "entity.other.attribute-name.env.conduit",
+        "entity.other.attribute-name.marker.conduit",
+        "entity.other.attribute-name.conduit",
+        "string.quoted.other.field-tag.conduit"
+      ],
+      "settings": {
+        "foreground": "#B3AE60"
+      }
+    },
+    {
+      "name": "Validation annotations",
+      "scope": [
+        "entity.other.attribute-name.validation.conduit"
+      ],
+      "settings": {
+        "foreground": "#D5B778"
+      }
+    },
+    {
+      "name": "Function declarations",
+      "scope": [
+        "entity.name.function",
+        "entity.name.function.conduit",
+        "entity.name.function.handler.conduit"
+      ],
+      "settings": {
+        "foreground": "#56A8F5"
+      }
+    },
+    {
+      "name": "Function and method calls",
+      "scope": [
+        "entity.name.function.call.conduit",
+        "meta.function-call"
+      ],
+      "settings": {
+        "foreground": "#FFC66D"
+      }
+    },
+    {
+      "name": "Builtin functions",
+      "scope": [
+        "support.function",
+        "support.function.builtin.conduit"
+      ],
+      "settings": {
+        "foreground": "#FFC66D"
+      }
+    },
+    {
+      "name": "Types",
+      "scope": [
+        "support.type",
+        "storage.type.primitive.conduit",
+        "support.type.conduit",
+        "entity.name.type",
+        "entity.name.type.declaration.conduit",
+        "entity.name.type.conduit",
+        "entity.name.class"
+      ],
+      "settings": {
+        "foreground": "#6FAFBD"
+      }
+    },
+    {
+      "name": "Error types",
+      "scope": [
+        "entity.name.tag.error.conduit"
+      ],
+      "settings": {
+        "foreground": "#D5B778"
+      }
+    },
+    {
+      "name": "Struct fields and properties",
+      "scope": [
+        "variable.other.property",
+        "variable.other.property.conduit",
+        "variable.other.member"
+      ],
+      "settings": {
+        "foreground": "#C77DBB"
+      }
+    },
+    {
+      "name": "Constants",
+      "scope": [
+        "variable.other.constant",
+        "constant.other.conduit"
+      ],
+      "settings": {
+        "foreground": "#C77DBB",
+        "fontStyle": "italic"
+      }
+    },
+    {
+      "name": "Variables",
+      "scope": [
+        "variable",
+        "variable.other.conduit"
+      ],
+      "settings": {
+        "foreground": "#BCBEC4"
+      }
+    },
+    {
+      "name": "Arrow and pipeline operators",
+      "scope": [
+        "keyword.control.arrow.conduit",
+        "keyword.operator.arrow.conduit"
+      ],
+      "settings": {
+        "foreground": "#CF8E6D"
+      }
+    },
+    {
+      "name": "Error handling operators",
+      "scope": [
+        "keyword.operator.error-handling.conduit"
+      ],
+      "settings": {
+        "foreground": "#E0966C"
+      }
+    },
+    {
+      "name": "Standard operators",
+      "scope": [
+        "keyword.operator",
+        "keyword.operator.assignment.conduit",
+        "keyword.operator.comparison.conduit",
+        "keyword.operator.arithmetic.conduit"
+      ],
+      "settings": {
+        "foreground": "#BCBEC4"
+      }
+    }
+  ]
+}

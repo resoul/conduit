@@ -821,6 +821,75 @@ impl Checker<'_> {
                 }
                 Ok(Type::union(vec![bin_resp_ty, http_err]))
             }
+            "ok_json" => {
+                if !type_args.is_empty() || args.len() != 1 || !named_args.is_empty() {
+                    return Err("http.ok_json(val) expects 1 argument".to_string());
+                }
+                self.check_expr(&mut args[0], None)?;
+                Ok(resp_ty)
+            }
+            "status_json" => {
+                if !type_args.is_empty() || args.len() != 2 || !named_args.is_empty() {
+                    return Err("http.status_json(status, val) expects 2 arguments".to_string());
+                }
+                self.check_expr(&mut args[0], Some(&Type::Int))?;
+                if args[0].ty != Type::Int {
+                    return Err(format!("http.status_json status expects Int, got {}", args[0].ty));
+                }
+                self.check_expr(&mut args[1], None)?;
+                Ok(resp_ty)
+            }
+            "redirect" => {
+                if !type_args.is_empty() || !(1..=2).contains(&args.len()) || !named_args.is_empty() {
+                    return Err("http.redirect(url, status?) expects 1 or 2 arguments".to_string());
+                }
+                self.check_expr(&mut args[0], Some(&Type::String))?;
+                if args[0].ty != Type::String {
+                    return Err(format!("http.redirect url expects String, got {}", args[0].ty));
+                }
+                if args.len() == 2 {
+                    self.check_expr(&mut args[1], Some(&Type::Int))?;
+                    if args[1].ty != Type::Int {
+                        return Err(format!("http.redirect status expects Int, got {}", args[1].ty));
+                    }
+                }
+                Ok(resp_ty)
+            }
+            "no_content" => {
+                if !type_args.is_empty() || !args.is_empty() || !named_args.is_empty() {
+                    return Err("http.no_content() takes 0 arguments".to_string());
+                }
+                Ok(resp_ty)
+            }
+            "get_json" => {
+                if type_args.len() != 1 || !(1..=2).contains(&args.len()) || !named_args.is_empty() {
+                    return Err("http.get_json<T>(url, query?) expects 1 type argument and 1 or 2 arguments".to_string());
+                }
+                let target_ty = self.checked.resolve_type_mut(&type_args[0])?;
+                self.check_expr(&mut args[0], Some(&Type::String))?;
+                if args[0].ty != Type::String {
+                    return Err(format!("http.get_json url expects String, got {}", args[0].ty));
+                }
+                if args.len() == 2 {
+                    let q_ty = Type::Map(Box::new(Type::String), Box::new(Type::String));
+                    self.check_expr(&mut args[1], Some(&q_ty))?;
+                    if args[1].ty != q_ty {
+                        return Err(format!("http.get_json query expects Map<String, String>, got {}", args[1].ty));
+                    }
+                }
+                Ok(Type::union(vec![target_ty, http_err]))
+            }
+            "post_json" => {
+                if !type_args.is_empty() || args.len() != 2 || !named_args.is_empty() {
+                    return Err("http.post_json(url, body) expects 2 arguments".to_string());
+                }
+                self.check_expr(&mut args[0], Some(&Type::String))?;
+                if args[0].ty != Type::String {
+                    return Err(format!("http.post_json url expects String, got {}", args[0].ty));
+                }
+                self.check_expr(&mut args[1], None)?;
+                Ok(Type::union(vec![resp_ty, http_err]))
+            }
             other => Err(format!("Unknown cdt.http symbol '{}'", other)),
         }
     }
@@ -861,6 +930,16 @@ impl Checker<'_> {
                     ));
                 }
                 Ok(Type::Void)
+            }
+            ("Request", "header" | "param" | "query_param") => {
+                if args.len() != 1 {
+                    return Err(format!("Request.{}(name: String) expects 1 argument", method));
+                }
+                self.check_expr(&mut args[0], Some(&Type::String))?;
+                if args[0].ty != Type::String {
+                    return Err(format!("Request.{}() expects String, got {}", method, args[0].ty));
+                }
+                Ok(Type::Optional(Box::new(Type::String)))
             }
             ("Router", "before") => {
                 if args.len() != 1 {
@@ -985,6 +1064,7 @@ fn ensure_http_router_plan(
                 entries.push(HttpRouterDeclEntry {
                     kind: HttpRouterDeclKind::Before,
                     handler_name: handler_name.clone(),
+                    body_struct: None,
                 });
             }
             "router.after" => {
@@ -1008,6 +1088,80 @@ fn ensure_http_router_plan(
                 entries.push(HttpRouterDeclEntry {
                     kind: HttpRouterDeclKind::After,
                     handler_name: handler_name.clone(),
+                    body_struct: None,
+                });
+            }
+            "router.group_before" => {
+                let Some(Expr { kind: ExprKind::String(prefix), .. }) = ann.args.first() else {
+                    return Err(format!("Invalid group before prefix in router '{}'", router_name));
+                };
+                let Some(Expr { kind: ExprKind::Ident(handler_name), .. }) = ann.args.get(1) else {
+                    return Err(format!("Invalid group before handler in router '{}'", router_name));
+                };
+                let fid = *checked.func_by_name.get(handler_name).ok_or_else(|| {
+                    format!("Unknown handler '{}' in router '{}'", handler_name, router_name)
+                })?;
+                let sig = &checked.funcs[fid as usize];
+                if sig.params.len() != 1 || sig.params[0] != *req_ty || sig.return_type != opt_resp {
+                    return Err(format!(
+                        "router '{}' group '{}' before handler '{}' must have signature (http.Request) -> http.Response?",
+                        router_name, prefix, handler_name
+                    ));
+                }
+                entries.push(HttpRouterDeclEntry {
+                    kind: HttpRouterDeclKind::GroupBefore(prefix.clone()),
+                    handler_name: handler_name.clone(),
+                    body_struct: None,
+                });
+            }
+            "router.group_after" => {
+                let Some(Expr { kind: ExprKind::String(prefix), .. }) = ann.args.first() else {
+                    return Err(format!("Invalid group after prefix in router '{}'", router_name));
+                };
+                let Some(Expr { kind: ExprKind::Ident(handler_name), .. }) = ann.args.get(1) else {
+                    return Err(format!("Invalid group after handler in router '{}'", router_name));
+                };
+                let fid = *checked.func_by_name.get(handler_name).ok_or_else(|| {
+                    format!("Unknown handler '{}' in router '{}'", handler_name, router_name)
+                })?;
+                let sig = &checked.funcs[fid as usize];
+                if sig.params.len() != 2
+                    || sig.params[0] != *req_ty
+                    || sig.params[1] != *resp_ty
+                    || sig.return_type != *resp_ty
+                {
+                    return Err(format!(
+                        "router '{}' group '{}' after handler '{}' must have signature (http.Request, http.Response) -> http.Response",
+                        router_name, prefix, handler_name
+                    ));
+                }
+                entries.push(HttpRouterDeclEntry {
+                    kind: HttpRouterDeclKind::GroupAfter(prefix.clone()),
+                    handler_name: handler_name.clone(),
+                    body_struct: None,
+                });
+            }
+            "router.static" => {
+                let Some(Expr { kind: ExprKind::String(url_prefix), .. }) = ann.args.first() else {
+                    return Err(format!("Invalid static URL prefix in router '{}'", router_name));
+                };
+                let Some(Expr { kind: ExprKind::String(dir_path), .. }) = ann.args.get(1) else {
+                    return Err(format!("Invalid static directory in router '{}'", router_name));
+                };
+                entries.push(HttpRouterDeclEntry {
+                    kind: HttpRouterDeclKind::Static(url_prefix.clone(), dir_path.clone()),
+                    handler_name: String::new(),
+                    body_struct: None,
+                });
+            }
+            "router.cors" => {
+                let Some(Expr { kind: ExprKind::String(origin), .. }) = ann.args.first() else {
+                    return Err(format!("Invalid cors origin in router '{}'", router_name));
+                };
+                entries.push(HttpRouterDeclEntry {
+                    kind: HttpRouterDeclKind::Cors(origin.clone()),
+                    handler_name: String::new(),
+                    body_struct: None,
                 });
             }
             tag => {
@@ -1024,18 +1178,32 @@ fn ensure_http_router_plan(
                     format!("Unknown handler '{}' in router '{}'", handler_name, router_name)
                 })?;
                 let sig = &checked.funcs[fid as usize];
-                if sig.params.len() != 1 || sig.params[0] != *req_ty || sig.return_type != *resp_ty {
+                let body_struct = if sig.params.len() == 1
+                    && sig.params[0] == *req_ty
+                    && sig.return_type == *resp_ty
+                {
+                    None
+                } else if sig.params.len() == 2
+                    && sig.params[0] == *req_ty
+                    && sig.return_type == *resp_ty
+                    && let Type::Custom(tid) = &sig.params[1]
+                    && tid.module == ModuleId::Program
+                    && checked.struct_by_name.contains_key(&tid.name)
+                {
+                    Some(tid.name.clone())
+                } else {
                     return Err(format!(
-                        "router '{}' route '{} {}' handler '{}' must have signature (http.Request) -> http.Response",
+                        "router '{}' route '{} {}' handler '{}' must have signature (http.Request) -> http.Response or (http.Request, BodyStruct) -> http.Response",
                         router_name,
                         method.to_ascii_uppercase(),
                         pat,
                         handler_name
                     ));
-                }
+                };
                 entries.push(HttpRouterDeclEntry {
                     kind: HttpRouterDeclKind::Route(method.to_string(), pat.clone()),
                     handler_name: handler_name.clone(),
+                    body_struct,
                 });
             }
         }
@@ -1421,6 +1589,22 @@ impl Checker<'_> {
     }
 }
 
+fn validate_sql_ident(ident: &str, ctx: &str) -> Result<(), String> {
+    let mut chars = ident.chars();
+    let Some(first) = chars.next() else {
+        return Err(format!("Empty SQL identifier in {}", ctx));
+    };
+    if !(first.is_ascii_alphabetic() || first == '_')
+        || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(format!(
+            "Invalid SQL identifier '{}' in {} (allowed: [a-zA-Z_][a-zA-Z0-9_]*)",
+            ident, ctx
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn ensure_db_model_plan(checked: &mut CheckedProgram, struct_name: &str) -> Result<(), String> {
     let sid = *checked
         .struct_by_name
@@ -1434,6 +1618,7 @@ pub(crate) fn ensure_db_model_plan(checked: &mut CheckedProgram, struct_name: &s
         .db_table
         .clone()
         .unwrap_or_else(|| struct_name.to_ascii_lowercase());
+    validate_sql_ident(&table_name, &format!("@db.table on '{}'", struct_name))?;
     let mut columns = Vec::with_capacity(st.fields.len());
     for f in &st.fields {
         let base_ty = match &f.ty {
@@ -1471,12 +1656,19 @@ pub(crate) fn ensure_db_model_plan(checked: &mut CheckedProgram, struct_name: &s
                     let [Expr { kind: ExprKind::String(s), .. }] = ann.args.as_slice() else {
                         return Err(format!("@db.col(...) on '{}.{}' expects 1 String", struct_name, f.name));
                     };
+                    validate_sql_ident(s, &format!("@db.col on '{}.{}'", struct_name, f.name))?;
                     col_name = s.clone();
                 }
                 "db.default" => {
                     let [Expr { kind: ExprKind::String(s), .. }] = ann.args.as_slice() else {
                         return Err(format!("@db.default(...) on '{}.{}' expects 1 String", struct_name, f.name));
                     };
+                    if s.contains(';') || s.contains("--") || s.contains("/*") {
+                        return Err(format!(
+                            "Unsafe SQL default '{}' in @db.default on '{}.{}'",
+                            s, struct_name, f.name
+                        ));
+                    }
                     default_sql = Some(s.clone());
                 }
                 "db.fk" => {
@@ -1486,6 +1678,8 @@ pub(crate) fn ensure_db_model_plan(checked: &mut CheckedProgram, struct_name: &s
                     let Some((t, c)) = s.split_once('.') else {
                         return Err(format!("@db.fk(\"{}\") on '{}.{}' must be 'table.column'", s, struct_name, f.name));
                     };
+                    validate_sql_ident(t, &format!("@db.fk table on '{}.{}'", struct_name, f.name))?;
+                    validate_sql_ident(c, &format!("@db.fk column on '{}.{}'", struct_name, f.name))?;
                     fk = Some((t.to_string(), c.to_string()));
                 }
                 other => {

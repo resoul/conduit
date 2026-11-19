@@ -5,15 +5,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
-## [Unreleased]
+## [0.3.2] - 2026-11-19
 
 ### Added
 
 * **`cdt.db` Table & Model Schemas (`@db.*`)**:
   * Added `@db.table("name")` struct annotation and field annotations (`@db.pk`, `@db.auto`, `@db.unique`, `@db.index`, `@db.col`, `@db.default`, `@db.fk`, supporting both leading and trailing field placement in `src/frontend/parser.rs`) with `DbModelMeta` bundle serialization (`src/ir/bundle.rs`).
-  * Added `db.ddl<T>(dialect)` and `Connection` model methods `.create_table<T>()`, `.drop_table<T>()`, `.insert<T>(row)`, `.all<T>()`, `.find<T>(id)`, `.delete<T>(id)` (`src/native/db.rs`, `src/vm/exec_db.rs`, `cdt_db_model_schemas_ddl_and_bundle_e2e`), and updated `examples/db_service/main.cdt`.
+  * Added `db.ddl<T>(dialect)`, `Connection` model methods (`.create_table<T>()`, `.drop_table<T>()`, `.insert<T>(row)`, `.all<T>()`, `.find<T>(id)`, `.delete<T>(id)`), and corresponding `db.*` helpers for `migration` blocks (`db.create_table<T>()`, `db.drop_table<T>()`, `db.insert<T>()`, `db.all<T>()`, `db.find<T>()`, `db.delete<T>()`) (`src/native/db.rs`, `src/vm/exec_db.rs`, `cdt_db_model_schemas_ddl_and_bundle_e2e`), and updated `examples/db_service/main.cdt`.
 * **`cdt.cron` Declarative `schedule` & Scheduler**:
   * Added top-level `schedule Name { every "*/5 * * * *" => fn; interval 10s => fn }` syntax (`src/frontend/parser_cli.rs`, `src/frontend/check_sys.rs`, `src/frontend/reachability.rs`), compile-time 5-field UTC cron validation, isolated per-job VM execution with overlap protection (`src/native/cron.rs`, `src/vm/exec_cron.rs`, `EXT_CRON_OP`), `cron.run<T>()`, `cron.start<T>()`, `cron.run_once<T>()`, `cron.validate()`, `Scheduler` (`.stop()`, `.is_running()`), `conduit cron <list|print|run>` CLI commands, `docs/src/library/cron.md`, LSP docs, and TextMate highlighting (`cdt_cron_schedule_interval_and_bundle_e2e`).
+* **Typed HTTP Router Contracts (`router` + `struct` + `@validation.*`) & HTTP Ergonomics**:
+  * Route handlers in `router Name { ... }` now accept `(http.Request, BodyStruct) -> http.Response` in addition to `(http.Request) -> http.Response` (`src/frontend/check_sys.rs`, `src/frontend/reachability.rs`, `src/ir/lower_native.rs`, `src/vm/exec_http.rs`). The router automatically decodes JSON (`400 Bad Request` on invalid JSON) and runs all `@validation.*` / `[#validator]` rules (`422 Unprocessable Entity` with `issues` JSON) before invoking the handler (`cdt_http_typed_contract_validation_e2e`).
+  * Added `group "/prefix" { before ...; after ...; ... }` scoped middleware, `static "/prefix" => "./dir"` static file serving (with path-traversal protection and `Content-Type` detection), and `cors "<origin>"` (preflight `OPTIONS` + `access-control-allow-origin`) inside `router` blocks (`cdt_http_groups_static_cors_helpers_e2e`).
+  * Added `http.ok_json(val)`, `http.status_json(status, val)`, `http.redirect(url, status?)`, `http.no_content()`, `req.header(name)` (case-insensitive), `req.param(name)`, `req.query_param(name)`, `http.get_json<T>(url, query?)`, and `http.post_json(url, body)`.
+* **Editor Support & JetBrains PhpStorm Dark Theme**:
+  * Upgraded `editors/textmate/conduit.tmLanguage.json` to a modular repository-based TextMate grammar (fixing `func` declarations, separating DSL/HTTP/annotation/property/constant scopes, restricting string interpolation highlighting to `{ident.field}`, and supporting backtick field tags) and added `editors/textmate/language-configuration.json`.
+  * Added the bundled **Conduit PhpStorm Dark** VS Code / Antigravity color theme (`editors/textmate/themes/conduit-phpstorm-dark.json`) and standalone `.cdt`-only preset (`editors/textmate/phpstorm-token-colors.json`).
+* **CLI Integration Test Suite (`tests/cli_e2e.rs`)**:
+  * Added end-to-end binary tests covering `conduit check` (`[line:col]` error coordinates & SQL identifier validation), `conduit run` (`cdt.db` + `cdt.crypto`), `conduit cron list|print|run`, and `conduit build` standalone executables.
+
+### Changed
+
+* **Unified Native Module Registry & Compile-Time Safety**:
+  * Replaced ~35 per-module `*_aliases`/`*_direct_fns`/`*_direct_types` maps in `CheckedProgram` and duplicate `is_native_module` lists with a single `NATIVE_MODULES` table (`src/frontend/check_native.rs`, `src/frontend/check.rs`, `src/frontend/check_call.rs`, `src/ir/lower_call.rs`).
+  * Attached `[line:col]` spans to typechecker statement/expression errors (`src/frontend/check.rs`), enabling exact diagnostic positions in both CLI and `conduit lsp`.
+  * Added strict `[a-zA-Z_][a-zA-Z0-9_]*` SQL identifier validation for `@db.table`, `@db.col`, `@db.fk`, and unsafe-token checks for `@db.default`, and removed non-test `.unwrap()` calls in `src/ir/bundle.rs`, `src/native/pg.rs`, and `src/native/mysql.rs`.
+* **VM Memory Layout (`Box<VmHostState>`)**:
+  * Boxed cold host-resource tables (`fs_readers`, `fs_writers`, `routers`, `db_conns`, `cron_schedulers`) inside `Box<VmHostState>` (`src/vm/mod.rs`) to keep the `Vm` struct compact in cache.
+* **Documentation & Release Metadata**:
+  * Updated `README.md`, `docs/src/getting-started/{installation,editors}.md`, `docs/src/library/{db,http,cron}.md`, `docs/theme/conduit-highlight.js`, `editors/README.md`, and bumped crate/editor versions to `0.3.2`.
 
 ## [0.3.1] - 2026-11-18
 

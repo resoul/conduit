@@ -8,7 +8,8 @@ use crate::native::http::{
     MatchedParams, ReadHttpError, RouteEntry, RouterState, http_client_bytes_request,
     http_client_request, http_client_request_with_timeout, lookup_route, make_http_error,
     make_request_obj, make_response_obj, make_response_with_body_obj, make_router_obj,
-    read_http_request, reader_writer_pair, write_error_response, write_http_response_ext,
+    read_http_request, reader_writer_pair, route_prefix_matches, try_serve_static,
+    write_error_response, write_http_response_ext,
 };
 use crate::vm::exec_cold::err_msg;
 use crate::vm::value::{
@@ -16,6 +17,22 @@ use crate::vm::value::{
     SCHEMA_HTTP_ROUTER, SMALL_MAP_LIMIT, StructData,
 };
 use crate::vm::{ExecResult, RuntimeError, Vm};
+
+fn json_escape_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
 
 pub const HTTP_TEXT: u8 = 0;
 pub const HTTP_HTML: u8 = 1;
@@ -41,6 +58,20 @@ pub const HTTP_ROUTE_AFTER: u8 = 20;
 pub const HTTP_GET_BYTES: u8 = 21;
 pub const HTTP_REQUEST_BYTES: u8 = 22;
 pub const HTTP_STOP: u8 = 23;
+pub const HTTP_ROUTE_TYPED_BODY: u8 = 24;
+pub const HTTP_ROUTE_GROUP_BEFORE: u8 = 25;
+pub const HTTP_ROUTE_GROUP_AFTER: u8 = 26;
+pub const HTTP_ROUTE_STATIC: u8 = 27;
+pub const HTTP_ROUTE_CORS: u8 = 28;
+pub const HTTP_OK_JSON: u8 = 29;
+pub const HTTP_STATUS_JSON: u8 = 30;
+pub const HTTP_REDIRECT: u8 = 31;
+pub const HTTP_NO_CONTENT: u8 = 32;
+pub const HTTP_REQ_HEADER: u8 = 33;
+pub const HTTP_REQ_PARAM: u8 = 34;
+pub const HTTP_REQ_QUERY_PARAM: u8 = 35;
+pub const HTTP_GET_JSON: u8 = 36;
+pub const HTTP_POST_JSON: u8 = 37;
 
 #[inline]
 fn populate_ordered_map_from_params(map: &mut OrderedMap, params: MatchedParams) {
@@ -142,7 +173,7 @@ impl Vm {
             return Err(err_msg("Expected Router"));
         }
         let id = rec.get_scalar(0) as usize;
-        if id >= self.routers.len() {
+        if id >= self.host.routers.len() {
             return Err(err_msg("Invalid Router handle"));
         }
         Ok(id)
@@ -178,20 +209,66 @@ impl Vm {
         router_id: usize,
         mut req_obj: Obj,
     ) -> Result<Obj, RuntimeError> {
-        let before_len = self.routers[router_id].before.len();
-        let mut resp = None;
-        for idx in 0..before_len {
-            let hook = self.routers[router_id].before[idx].clone();
-            let out = self.invoke_http_fn(
-                module,
-                s_top,
-                o_top,
-                &hook,
-                std::slice::from_ref(&req_obj),
-            )?;
-            if out != Obj::Empty {
-                resp = Some(out);
-                break;
+        let (req_method, req_path) = match &req_obj {
+            Obj::Record(rec) if rec.schema_id == SCHEMA_HTTP_REQUEST => {
+                let m = match rec.get_obj(0) {
+                    Obj::Str(s) => s.as_str().to_string(),
+                    _ => "GET".to_string(),
+                };
+                let p = match rec.get_obj(1) {
+                    Obj::Str(s) => s.as_str().to_string(),
+                    _ => "/".to_string(),
+                };
+                (m, p)
+            }
+            _ => return Err(err_msg("Expected Request")),
+        };
+
+        let cors_origin = self.host.routers[router_id].cors_origin.clone();
+        let mut resp = if req_method == "OPTIONS"
+            && cors_origin.is_some()
+            && lookup_route(&self.host.routers[router_id].routes, &req_method, &req_path).is_err()
+        {
+            let mut hdrs = OrderedMap::with_capacity(3);
+            hdrs.set(
+                MapKey::Str(Arc::new("access-control-allow-methods".into())),
+                MapVal::Obj(Obj::str("GET, POST, PUT, PATCH, DELETE, OPTIONS")),
+            );
+            hdrs.set(
+                MapKey::Str(Arc::new("access-control-allow-headers".into())),
+                MapVal::Obj(Obj::str("Content-Type, Authorization")),
+            );
+            let mut s = StructData::new(SCHEMA_HTTP_RESPONSE, 1, 2);
+            s.set_scalar(0, 204);
+            s.set_obj(0, Obj::str(""));
+            s.set_obj(1, Obj::Map(Arc::new(hdrs)));
+            Some(Obj::Record(Arc::new(s)))
+        } else {
+            None
+        };
+        if resp.is_none() {
+            let before_len = self.host.routers[router_id].before.len();
+            for idx in 0..before_len {
+                let hook = {
+                    let (prefix, h) = &self.host.routers[router_id].before[idx];
+                    if let Some(p) = prefix
+                        && !route_prefix_matches(p, &req_path)
+                    {
+                        continue;
+                    }
+                    h.clone()
+                };
+                let out = self.invoke_http_fn(
+                    module,
+                    s_top,
+                    o_top,
+                    &hook,
+                    std::slice::from_ref(&req_obj),
+                )?;
+                if out != Obj::Empty {
+                    resp = Some(out);
+                    break;
+                }
             }
         }
 
@@ -200,36 +277,25 @@ impl Vm {
             Some(r) => r,
             None => {
                 let matched = {
-                    let Obj::Record(rec) = &req_obj else {
-                        return Err(err_msg("Expected Request"));
-                    };
-                    if rec.schema_id != SCHEMA_HTTP_REQUEST {
-                        return Err(err_msg("Expected Request"));
-                    }
-                    let method = match rec.get_obj(0) {
-                        Obj::Str(s) => s.as_str(),
-                        _ => "GET",
-                    };
-                    let path = match rec.get_obj(1) {
-                        Obj::Str(s) => s.as_str(),
-                        _ => "/",
-                    };
-                    let routes = &self.routers[router_id].routes;
-                    match lookup_route(routes, method, path) {
-                        Ok((entry, params)) => Ok((entry.handler.clone(), params)),
+                    let routes = &self.host.routers[router_id].routes;
+                    match lookup_route(routes, &req_method, &req_path) {
+                        Ok((entry, params)) => {
+                            Ok((entry.handler.clone(), entry.body_json_plan, params))
+                        }
                         Err(status) => Err(status),
                     }
                 };
                 match matched {
-                    Ok((handler, MatchedParams::None)) => self.invoke_http_fn(
+                    Ok((handler, body_plan, MatchedParams::None)) => self.invoke_http_route_handler(
                         module,
                         s_top,
                         o_top,
                         &handler,
-                        std::slice::from_ref(&req_obj),
+                        body_plan,
+                        &req_obj,
                     )?,
-                    Ok((handler, matched_params)) => {
-                        let mut cached = self.cached_http_req.take();
+                    Ok((handler, body_plan, matched_params)) => {
+                        let mut cached = self.host.cached_http_req.take();
                         let Obj::Record(ref mut rec_arc) = req_obj else {
                             return Err(err_msg("Expected Request"));
                         };
@@ -253,23 +319,43 @@ impl Vm {
                             }
                         }
                         cached_to_restore = cached;
-                        self.invoke_http_fn(
+                        self.invoke_http_route_handler(
                             module,
                             s_top,
                             o_top,
                             &handler,
-                            std::slice::from_ref(&req_obj),
+                            body_plan,
+                            &req_obj,
                         )?
                     }
-                    Err(405) => make_response_obj(405, "Method Not Allowed", Some("text/plain; charset=utf-8")),
-                    Err(_) => make_response_obj(404, "Not Found", Some("text/plain; charset=utf-8")),
+                    Err(status) => {
+                        if let Some(static_resp) = try_serve_static(
+                            &self.host.routers[router_id].statics,
+                            &req_method,
+                            &req_path,
+                        ) {
+                            static_resp
+                        } else if status == 405 {
+                            make_response_obj(405, "Method Not Allowed", Some("text/plain; charset=utf-8"))
+                        } else {
+                            make_response_obj(404, "Not Found", Some("text/plain; charset=utf-8"))
+                        }
+                    }
                 }
             }
         };
 
-        let after_len = self.routers[router_id].after.len();
+        let after_len = self.host.routers[router_id].after.len();
         for idx in 0..after_len {
-            let hook = self.routers[router_id].after[idx].clone();
+            let hook = {
+                let (prefix, h) = &self.host.routers[router_id].after[idx];
+                if let Some(p) = prefix
+                    && !route_prefix_matches(p, &req_path)
+                {
+                    continue;
+                }
+                h.clone()
+            };
             resp = self.invoke_http_fn(
                 module,
                 s_top,
@@ -278,10 +364,97 @@ impl Vm {
                 &[req_obj.clone(), resp],
             )?;
         }
+        if let Some(origin) = cors_origin
+            && let Obj::Record(ref mut rec_arc) = resp
+            && rec_arc.schema_id == SCHEMA_HTTP_RESPONSE
+        {
+            let rec_mut = Arc::make_mut(rec_arc);
+            let mut hdrs = match rec_mut.get_obj(1) {
+                Obj::Map(m) => (**m).clone(),
+                _ => OrderedMap::with_capacity(1),
+            };
+            hdrs.set(
+                MapKey::Str(Arc::new("access-control-allow-origin".into())),
+                MapVal::Obj(Obj::str(origin.as_ref())),
+            );
+            rec_mut.set_obj(1, Obj::Map(Arc::new(hdrs)));
+        }
         if cached_to_restore.is_some() {
-            self.cached_http_req = cached_to_restore;
+            self.host.cached_http_req = cached_to_restore;
         }
         Ok(resp)
+    }
+
+    fn invoke_http_route_handler(
+        &mut self,
+        module: &Module,
+        s_top: usize,
+        o_top: usize,
+        handler: &Obj,
+        body_json_plan: Option<u16>,
+        req_obj: &Obj,
+    ) -> Result<Obj, RuntimeError> {
+        let Some(plan_idx) = body_json_plan else {
+            return self.invoke_http_fn(module, s_top, o_top, handler, std::slice::from_ref(req_obj));
+        };
+        let body_str = match req_obj {
+            Obj::Record(rec) => match rec.get_obj(2) {
+                Obj::Str(s) => s.as_str().to_string(),
+                _ => String::new(),
+            },
+            _ => String::new(),
+        };
+        let decoded = match crate::native::json_decode::decode_json_with_plan(
+            &body_str,
+            &module.json_plans[plan_idx as usize],
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                let msg = json_escape_str(&e.message);
+                return Ok(make_response_obj(
+                    400,
+                    format!(r#"{{"error":"invalid_json","message":"{}"}}"#, msg),
+                    Some("application/json; charset=utf-8"),
+                ));
+            }
+        };
+        let mut violations = Vec::new();
+        self.validate_dyn_val(module, s_top, o_top, &decoded, "", &mut violations, 0)?;
+        if !violations.is_empty() {
+            let mut body = String::from(r#"{"error":"validation_failed","issues":["#);
+            for (idx, v) in violations.iter().enumerate() {
+                if idx > 0 {
+                    body.push(',');
+                }
+                if let Obj::Record(rec) = v {
+                    let path = match rec.get_obj(0) {
+                        Obj::Str(s) => s.as_str(),
+                        _ => "",
+                    };
+                    let code = match rec.get_obj(1) {
+                        Obj::Str(s) => s.as_str(),
+                        _ => "",
+                    };
+                    let msg = match rec.get_obj(2) {
+                        Obj::Str(s) => s.as_str(),
+                        _ => "",
+                    };
+                    body.push_str(&format!(
+                        r#"{{"path":"{}","code":"{}","message":"{}"}}"#,
+                        json_escape_str(path),
+                        json_escape_str(code),
+                        json_escape_str(msg),
+                    ));
+                }
+            }
+            body.push_str("]}");
+            return Ok(make_response_obj(
+                422,
+                &body,
+                Some("application/json; charset=utf-8"),
+            ));
+        }
+        self.invoke_http_fn(module, s_top, o_top, handler, &[req_obj.clone(), decoded])
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -331,8 +504,8 @@ impl Vm {
                 self.objs[o_base + a as usize] = make_response_with_body_obj(status, body, None);
             }
             HTTP_ROUTER => {
-                let id = self.routers.len();
-                self.routers.push(RouterState::default());
+                let id = self.host.routers.len();
+                self.host.routers.push(RouterState::default());
                 self.objs[o_base + a as usize] = make_router_obj(id as i64);
             }
             HTTP_ROUTE_GET
@@ -356,19 +529,175 @@ impl Vm {
                     HTTP_ROUTE_HEAD => "HEAD",
                     _ => "*",
                 };
-                self.routers[rid]
+                self.host.routers[rid]
                     .routes
                     .push(RouteEntry::new(method, &pattern, handler));
             }
             HTTP_ROUTE_BEFORE => {
                 let rid = self.extract_router_id(&self.objs[o_base + a as usize])?;
                 let handler = self.objs[o_base + b as usize].clone();
-                self.routers[rid].before.push(handler);
+                self.host.routers[rid].before.push((None, handler));
             }
             HTTP_ROUTE_AFTER => {
                 let rid = self.extract_router_id(&self.objs[o_base + a as usize])?;
                 let handler = self.objs[o_base + b as usize].clone();
-                self.routers[rid].after.push(handler);
+                self.host.routers[rid].after.push((None, handler));
+            }
+            HTTP_ROUTE_GROUP_BEFORE => {
+                let rid = self.extract_router_id(&self.objs[o_base + a as usize])?;
+                let prefix = self.sys_str(o_base, b, "router group before")?.as_str().into();
+                let handler = self.objs[o_base + c as usize].clone();
+                self.host.routers[rid].before.push((Some(prefix), handler));
+            }
+            HTTP_ROUTE_GROUP_AFTER => {
+                let rid = self.extract_router_id(&self.objs[o_base + a as usize])?;
+                let prefix = self.sys_str(o_base, b, "router group after")?.as_str().into();
+                let handler = self.objs[o_base + c as usize].clone();
+                self.host.routers[rid].after.push((Some(prefix), handler));
+            }
+            HTTP_ROUTE_STATIC => {
+                let rid = self.extract_router_id(&self.objs[o_base + a as usize])?;
+                let url_prefix = self.sys_str(o_base, b, "router static")?.as_str().into();
+                let dir_path = self.sys_str(o_base, c, "router static")?.as_str().into();
+                self.host.routers[rid].statics.push((url_prefix, dir_path));
+            }
+            HTTP_ROUTE_CORS => {
+                let rid = self.extract_router_id(&self.objs[o_base + a as usize])?;
+                let origin = self.sys_str(o_base, b, "router cors")?.as_str().into();
+                self.host.routers[rid].cors_origin = Some(origin);
+            }
+            HTTP_ROUTE_TYPED_BODY => {
+                let rid = self.extract_router_id(&self.objs[o_base + a as usize])?;
+                if let Some(last) = self.host.routers[rid].routes.last_mut() {
+                    last.body_json_plan = Some(c);
+                }
+            }
+            HTTP_OK_JSON | HTTP_STATUS_JSON => {
+                let (status, val) = if aux == HTTP_OK_JSON {
+                    (200i64, &self.objs[o_base + b as usize])
+                } else {
+                    (
+                        self.scalars[s_base + b as usize] as i64,
+                        &self.objs[o_base + c as usize],
+                    )
+                };
+                let resp = match crate::native::json_encode::encode_json_obj(val, &module.struct_schemas) {
+                    Ok(json_str) => make_response_obj(status, json_str, Some("application/json; charset=utf-8")),
+                    Err(e) => make_response_obj(
+                        500,
+                        format!(r#"{{"error":"encode_error","message":"{}"}}"#, json_escape_str(&e.message)),
+                        Some("application/json; charset=utf-8"),
+                    ),
+                };
+                self.objs[o_base + a as usize] = resp;
+            }
+            HTTP_REDIRECT => {
+                let status = self.scalars[s_base + b as usize] as i64;
+                let url = self.sys_str(o_base, c, "http.redirect()")?;
+                let mut hdrs = OrderedMap::with_capacity(1);
+                hdrs.set(
+                    MapKey::Str(Arc::new("location".into())),
+                    MapVal::Obj(Obj::Str(url)),
+                );
+                let mut s = StructData::new(SCHEMA_HTTP_RESPONSE, 1, 2);
+                s.set_scalar(0, status as u64);
+                s.set_obj(0, Obj::str(""));
+                s.set_obj(1, Obj::Map(Arc::new(hdrs)));
+                self.objs[o_base + a as usize] = Obj::Record(Arc::new(s));
+            }
+            HTTP_NO_CONTENT => {
+                self.objs[o_base + a as usize] = make_response_obj(204, "", None);
+            }
+            HTTP_REQ_HEADER | HTTP_REQ_PARAM | HTTP_REQ_QUERY_PARAM => {
+                let Obj::Record(rec) = &self.objs[o_base + b as usize] else {
+                    return Err(err_msg("Expected http.Request"));
+                };
+                let key = self.sys_str(o_base, c, "Request lookup")?;
+                let field_idx = match aux {
+                    HTTP_REQ_HEADER => 3,
+                    HTTP_REQ_QUERY_PARAM => 4,
+                    _ => 5,
+                };
+                let found = match rec.get_obj(field_idx) {
+                    Obj::Map(map) => {
+                        if aux == HTTP_REQ_HEADER {
+                            let lower = key.as_str().to_ascii_lowercase();
+                            map.get(&MapKey::Str(Arc::new(lower.as_str().into())))
+                                .or_else(|| {
+                                    map.entries.iter().find_map(|(k, v)| match k {
+                                        MapKey::Str(ks) if ks.as_str().eq_ignore_ascii_case(key.as_str()) => Some(v),
+                                        _ => None,
+                                    })
+                                })
+                                .and_then(|v| match v {
+                                    MapVal::Obj(o) => Some(o.clone()),
+                                    _ => None,
+                                })
+                        } else {
+                            map.get(&MapKey::Str(key)).and_then(|v| match v {
+                                MapVal::Obj(o) => Some(o.clone()),
+                                _ => None,
+                            })
+                        }
+                    }
+                    _ => None,
+                };
+                self.objs[o_base + a as usize] = found.unwrap_or(Obj::Empty);
+            }
+            HTTP_GET_JSON => {
+                let Obj::Record(packed) = &self.objs[o_base + b as usize] else {
+                    return Err(err_msg("Expected packed get_json args"));
+                };
+                let plan_idx = packed.get_scalar(0) as usize;
+                let mut url = match packed.get_obj(0) {
+                    Obj::Str(s) => s.as_str().to_string(),
+                    _ => return Err(err_msg("Expected String URL in http.get_json()")),
+                };
+                if let Obj::Map(qmap) = packed.get_obj(1)
+                    && !qmap.is_empty()
+                    && let Obj::Str(qs) = crate::native::url::encode_query_map(qmap)
+                {
+                    if url.contains('?') {
+                        url.push('&');
+                    } else {
+                        url.push('?');
+                    }
+                    url.push_str(qs.as_str());
+                }
+                let hdrs = vec![("Accept".to_string(), "application/json".to_string())];
+                let resp = http_client_request("GET", &url, "", &hdrs);
+                let out = match &resp {
+                    Obj::Record(rec) if rec.schema_id == SCHEMA_HTTP_RESPONSE => {
+                        let body = match rec.get_obj(0) {
+                            Obj::Str(s) => s.as_str(),
+                            _ => "",
+                        };
+                        match crate::native::json_decode::decode_json_with_plan(
+                            body,
+                            &module.json_plans[plan_idx],
+                        ) {
+                            Ok(v) => v,
+                            Err(e) => make_http_error("decode_error", &e.message),
+                        }
+                    }
+                    _ => resp,
+                };
+                self.objs[o_base + a as usize] = out;
+            }
+            HTTP_POST_JSON => {
+                let url = self.sys_str(o_base, b, "http.post_json()")?;
+                let val = &self.objs[o_base + c as usize];
+                let out = match crate::native::json_encode::encode_json_obj(val, &module.struct_schemas) {
+                    Ok(body) => {
+                        let hdrs = vec![
+                            ("Content-Type".to_string(), "application/json".to_string()),
+                            ("Accept".to_string(), "application/json".to_string()),
+                        ];
+                        http_client_request("POST", url.as_str(), &body, &hdrs)
+                    }
+                    Err(e) => make_http_error("encode_error", &e.message),
+                };
+                self.objs[o_base + a as usize] = out;
             }
             HTTP_DISPATCH => {
                 let rid = self.extract_router_id(&self.objs[o_base + b as usize])?;
@@ -390,9 +719,9 @@ impl Vm {
                     self.objs[o_base + a as usize] = make_http_error("bind_error", e.to_string());
                     return Ok(());
                 }
-                self.routers[rid].stop_flag.store(false, Ordering::Release);
-                let stop_flag = Arc::clone(&self.routers[rid].stop_flag);
-                let router_state = self.routers[rid].clone();
+                self.host.routers[rid].stop_flag.store(false, Ordering::Release);
+                let stop_flag = Arc::clone(&self.host.routers[rid].stop_flag);
+                let router_state = self.host.routers[rid].clone();
                 let script_args = self.script_args.clone();
                 let workers = std::thread::available_parallelism()
                     .map(|n| n.get().clamp(4, 16))
@@ -407,7 +736,7 @@ impl Vm {
                         scope.spawn(move || {
                             let mut worker_vm = Vm::new();
                             worker_vm.script_args = script_args;
-                            worker_vm.routers.push(router_state);
+                            worker_vm.host.routers.push(router_state);
                             loop {
                                 let stream = {
                                     let Ok(guard) = rx.lock() else { break };
@@ -440,7 +769,7 @@ impl Vm {
             }
             HTTP_STOP => {
                 let rid = self.extract_router_id(&self.objs[o_base + b as usize])?;
-                self.routers[rid].stop_flag.store(true, Ordering::Release);
+                self.host.routers[rid].stop_flag.store(true, Ordering::Release);
                 self.objs[o_base + a as usize] = Obj::Empty;
             }
             HTTP_GET => {
@@ -613,7 +942,7 @@ fn serve_connection(vm: &mut Vm, module: &Module, rid: usize, stream: TcpStream)
                         break;
                     }
                 }
-                if !raw.keep_alive || vm.routers[rid].stop_flag.load(Ordering::Acquire) {
+                if !raw.keep_alive || vm.host.routers[rid].stop_flag.load(Ordering::Acquire) {
                     break;
                 }
             }

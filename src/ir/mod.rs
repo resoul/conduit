@@ -874,6 +874,29 @@ impl Module {
                                     check_o(b, &ctx)?;
                                     check_o(c, &ctx)?;
                                 }
+                                24 => {
+                                    check_o(a, &ctx)?;
+                                    if (c as usize) >= self.json_plans.len() {
+                                        return Err(format!("http body json_plan {} out of bounds", c));
+                                    }
+                                }
+                                25..=27 | 33..=35 | 37 => {
+                                    check_o(a, &ctx)?;
+                                    check_o(b, &ctx)?;
+                                    check_o(c, &ctx)?;
+                                }
+                                28 | 29 | 36 => {
+                                    check_o(a, &ctx)?;
+                                    check_o(b, &ctx)?;
+                                }
+                                30 | 31 => {
+                                    check_o(a, &ctx)?;
+                                    check_s(b, &ctx)?;
+                                    check_o(c, &ctx)?;
+                                }
+                                32 => {
+                                    check_o(a, &ctx)?;
+                                }
                                 _ => return Err(format!("Invalid http aux {}", aux)),
                             },
                             crate::vm::opcode::EXT_DB_OP => match aux {

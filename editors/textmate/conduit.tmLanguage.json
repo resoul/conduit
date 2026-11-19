@@ -4,73 +4,396 @@
   "scopeName": "source.conduit",
   "fileTypes": ["cdt"],
   "patterns": [
-    {
-      "name": "comment.line.double-slash.conduit",
-      "match": "//.*$"
-    },
-    {
-      "name": "meta.annotation.marker.conduit",
-      "match": "\\[#[a-zA-Z_][a-zA-Z0-9_]*\\]"
-    },
-    {
-      "name": "entity.other.attribute-name.conduit",
-      "match": "@[a-zA-Z_][a-zA-Z0-9_]*(\\.[a-zA-Z_][a-zA-Z0-9_]*)?"
-    },
-    {
-      "name": "string.quoted.double.conduit",
-      "begin": "\"",
-      "end": "\"",
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#field-tags" },
+    { "include": "#annotations" },
+    { "include": "#import-list" },
+    { "include": "#struct-block" },
+    { "include": "#declarations" },
+    { "include": "#dsl-bindings" },
+    { "include": "#http-routes" },
+    { "include": "#keywords" },
+    { "include": "#constants" },
+    { "include": "#types" },
+    { "include": "#identifiers" },
+    { "include": "#operators" }
+  ],
+  "repository": {
+    "comments": {
       "patterns": [
         {
-          "name": "constant.character.escape.conduit",
-          "match": "\\\\."
+          "name": "comment.line.documentation.conduit",
+          "match": "///.*$"
         },
         {
-          "name": "constant.other.placeholder.conduit",
-          "match": "\\{[^}\\n]*\\}"
+          "name": "comment.line.double-slash.conduit",
+          "match": "//.*$"
         }
       ]
     },
-    {
-      "name": "keyword.control.conduit",
-      "match": "\\b(func|return|if|else|guard|while|for|in|break|continue|switch|case|var|const|enum|struct|type|error|export|import|from|as|cli|group|cmd|flag|opt|arg|rest|router|before|after|migration|up|down|schedule|every|interval)\\b"
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.conduit",
+          "begin": "\"",
+          "beginCaptures": {
+            "0": { "name": "punctuation.definition.string.begin.conduit" }
+          },
+          "end": "\"",
+          "endCaptures": {
+            "0": { "name": "punctuation.definition.string.end.conduit" }
+          },
+          "patterns": [
+            {
+              "name": "constant.character.escape.conduit",
+              "match": "\\\\[\"\\\\ntr{}]"
+            },
+            {
+              "name": "constant.character.escape.conduit",
+              "match": "\\\\."
+            },
+            {
+              "match": "(\\{)([a-zA-Z_][a-zA-Z0-9_]*(?:\\.[a-zA-Z_][a-zA-Z0-9_]*)*)(\\})",
+              "captures": {
+                "1": { "name": "punctuation.section.interpolation.begin.conduit" },
+                "2": {
+                  "patterns": [
+                    {
+                      "name": "variable.other.property.conduit",
+                      "match": "(?<=\\.)[a-zA-Z_][a-zA-Z0-9_]*"
+                    },
+                    {
+                      "name": "constant.other.conduit",
+                      "match": "\\b[A-Z][A-Z0-9]*_[A-Z0-9_]+\\b|\\b[A-Z]{2,}[0-9]*\\b"
+                    },
+                    {
+                      "name": "variable.other.conduit",
+                      "match": "[a-zA-Z_][a-zA-Z0-9_]*"
+                    }
+                  ]
+                },
+                "3": { "name": "punctuation.section.interpolation.end.conduit" }
+              }
+            }
+          ]
+        }
+      ]
     },
-    {
-      "name": "constant.language.boolean.conduit",
-      "match": "\\b(true|false)\\b"
+    "field-tags": {
+      "patterns": [
+        {
+          "name": "string.quoted.other.field-tag.conduit",
+          "match": "`[^`\\n]*`"
+        }
+      ]
     },
-    {
-      "name": "constant.language.nil.conduit",
-      "match": "\\bnil\\b"
+    "annotations": {
+      "patterns": [
+        {
+          "name": "entity.other.attribute-name.marker.conduit",
+          "match": "\\[#[a-zA-Z_][a-zA-Z0-9_]*\\]"
+        },
+        {
+          "name": "entity.other.attribute-name.db.conduit",
+          "match": "@db\\.[a-zA-Z_][a-zA-Z0-9_]*"
+        },
+        {
+          "name": "entity.other.attribute-name.validation.conduit",
+          "match": "@validation\\.[a-zA-Z_][a-zA-Z0-9_]*"
+        },
+        {
+          "name": "entity.other.attribute-name.env.conduit",
+          "match": "@env\\b"
+        },
+        {
+          "name": "entity.other.attribute-name.conduit",
+          "match": "@[a-zA-Z_][a-zA-Z0-9_]*(?:\\.[a-zA-Z_][a-zA-Z0-9_]*)?"
+        }
+      ]
     },
-    {
-      "name": "support.type.conduit",
-      "match": "\\b(Int|Float|String|Bool|Void|Map|IndexError|KeyError|ParseError|CliError|EnvError|FsError|Reader|Writer|ProcessError|Output|CryptoError|UrlError|Url|CsvError|HttpError|Request|Response|BinaryResponse|Router|DbError|Connection|Param|CronError|Scheduler|ValidationError|DecodeError|EncodeError|TimeError|Duration|Instant|Timestamp|Issue)\\b"
+    "import-list": {
+      "patterns": [
+        {
+          "begin": "\\b(import)\\s*(\\{)",
+          "beginCaptures": {
+            "1": { "name": "keyword.control.import.conduit" },
+            "2": { "name": "punctuation.section.block.begin.conduit" }
+          },
+          "end": "\\}",
+          "endCaptures": {
+            "0": { "name": "punctuation.section.block.end.conduit" }
+          },
+          "patterns": [
+            { "include": "#comments" },
+            {
+              "name": "keyword.control.import.conduit",
+              "match": "\\bas\\b"
+            },
+            { "include": "#types" },
+            {
+              "name": "entity.name.function.conduit",
+              "match": "\\b[a-z_][a-zA-Z0-9_]*\\b"
+            }
+          ]
+        }
+      ]
     },
-    {
-      "name": "entity.name.type.conduit",
-      "match": "\\b[A-Z][a-zA-Z0-9_]*\\b"
+    "struct-block": {
+      "patterns": [
+        {
+          "begin": "\\b(struct)\\s+([A-Z][a-zA-Z0-9_]*)\\s*(\\{)",
+          "beginCaptures": {
+            "1": { "name": "storage.type.struct.conduit" },
+            "2": { "name": "entity.name.type.declaration.conduit" },
+            "3": { "name": "punctuation.section.block.begin.conduit" }
+          },
+          "end": "\\}",
+          "endCaptures": {
+            "0": { "name": "punctuation.section.block.end.conduit" }
+          },
+          "patterns": [
+            { "include": "#comments" },
+            { "include": "#strings" },
+            { "include": "#field-tags" },
+            { "include": "#annotations" },
+            {
+              "begin": "\\{",
+              "end": "\\}",
+              "patterns": [
+                { "include": "$self" }
+              ]
+            },
+            {
+              "match": "^\\s*([a-z_][a-zA-Z0-9_]*)(?=\\s*:(?!=))",
+              "captures": {
+                "1": { "name": "variable.other.property.conduit" }
+              }
+            },
+            { "include": "$self" }
+          ]
+        }
+      ]
     },
-    {
-      "name": "support.function.builtin.conduit",
-      "match": "\\b(print|map|filter|reduce)\\b"
+    "declarations": {
+      "patterns": [
+        {
+          "match": "\\b(func)\\s+([a-zA-Z_][a-zA-Z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.type.function.conduit" },
+            "2": { "name": "entity.name.function.conduit" }
+          }
+        },
+        {
+          "match": "\\b(error)\\s+([A-Z][a-zA-Z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.type.conduit" },
+            "2": { "name": "entity.name.tag.error.conduit" }
+          }
+        },
+        {
+          "match": "\\b(struct|enum|type)\\s+([A-Z][a-zA-Z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.type.conduit" },
+            "2": { "name": "entity.name.type.declaration.conduit" }
+          }
+        },
+        {
+          "match": "(?<!\\.)\\b(router|cli|schedule)\\s+([A-Z][a-zA-Z0-9_]*)",
+          "captures": {
+            "1": { "name": "keyword.other.dsl.block.conduit" },
+            "2": { "name": "entity.name.type.declaration.conduit" }
+          }
+        },
+        {
+          "match": "\\b(const)\\s+([a-zA-Z_][a-zA-Z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.type.const.conduit" },
+            "2": { "name": "constant.other.conduit" }
+          }
+        }
+      ]
     },
-    {
-      "name": "constant.numeric.conduit",
-      "match": "\\b[0-9]+(\\.[0-9]+)?\\b"
+    "dsl-bindings": {
+      "patterns": [
+        {
+          "match": "^\\s*(cmd)\\s+([a-zA-Z_][a-zA-Z0-9_]*)(?=\\s+\")",
+          "captures": {
+            "1": { "name": "keyword.other.dsl.clause.conduit" },
+            "2": { "name": "entity.name.function.conduit" }
+          }
+        },
+        {
+          "match": "^\\s*(flag)\\s+([a-zA-Z_][a-zA-Z0-9_]*)(?=\\s+\")",
+          "captures": {
+            "1": { "name": "keyword.other.dsl.clause.conduit" },
+            "2": { "name": "variable.other.property.conduit" }
+          }
+        },
+        {
+          "match": "^\\s*(opt|arg|rest)\\s+([a-zA-Z_][a-zA-Z0-9_]*)(?=\\s*:)",
+          "captures": {
+            "1": { "name": "keyword.other.dsl.clause.conduit" },
+            "2": { "name": "variable.other.property.conduit" }
+          }
+        },
+        {
+          "match": "^\\s*(before|after)\\s+([a-zA-Z_][a-zA-Z0-9_]*)(?=\\s*(?://.*)?$)",
+          "captures": {
+            "1": { "name": "keyword.other.dsl.clause.conduit" },
+            "2": { "name": "entity.name.function.handler.conduit" }
+          }
+        },
+        {
+          "match": "(=>)\\s*([a-zA-Z_][a-zA-Z0-9_]*)(?=\\s*(?://.*)?$)",
+          "captures": {
+            "1": { "name": "keyword.control.arrow.conduit" },
+            "2": { "name": "entity.name.function.handler.conduit" }
+          }
+        }
+      ]
     },
-    {
-      "name": "entity.name.function.conduit",
-      "match": "\\bfunc\\s+([a-zA-Z_][a-zA-Z0-9_]*)"
+    "http-routes": {
+      "patterns": [
+        {
+          "match": "^\\s*(get|post|put|patch|delete|head|options|any)\\b(?=\\s+\")",
+          "captures": {
+            "1": { "name": "keyword.other.http-method.conduit" }
+          }
+        }
+      ]
     },
-    {
-      "name": "entity.name.function.call.conduit",
-      "match": "\\b([a-z_][a-zA-Z0-9_]*)\\s*(?=[<(])"
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.flow.conduit",
+          "match": "\\b(if|else|guard|return|switch|case|for|while|in|break|continue)\\b"
+        },
+        {
+          "name": "keyword.control.import.conduit",
+          "match": "\\b(import|from|export|as)\\b"
+        },
+        {
+          "name": "storage.type.conduit",
+          "match": "\\b(func|var|const|struct|enum|type|error)\\b"
+        },
+        {
+          "name": "keyword.other.dsl.block.conduit",
+          "match": "(?<!\\.)\\b(router|cli|schedule)\\b(?=\\s+[A-Z])"
+        },
+        {
+          "name": "keyword.other.dsl.block.conduit",
+          "match": "(?<!\\.)\\b(migration)\\b(?=\\s+[0-9])"
+        },
+        {
+          "name": "keyword.other.dsl.block.conduit",
+          "match": "(?<!\\.)\\b(group)\\b(?=\\s+\")"
+        },
+        {
+          "name": "keyword.other.dsl.clause.conduit",
+          "match": "(?<!\\.)\\b(up|down)\\b(?=\\s*\\{)"
+        },
+        {
+          "match": "^\\s*(static|cors|every)\\b(?=\\s+\")",
+          "captures": {
+            "1": { "name": "keyword.other.dsl.clause.conduit" }
+          }
+        },
+        {
+          "match": "^\\s*(interval)\\b(?=\\s+[0-9])",
+          "captures": {
+            "1": { "name": "keyword.other.dsl.clause.conduit" }
+          }
+        }
+      ]
     },
-    {
-      "name": "keyword.operator.conduit",
-      "match": "(:=|->|\\|>|\\?\\?|==|!=|<=|>=|[+\\-*/=<>?|])"
+    "constants": {
+      "patterns": [
+        {
+          "name": "constant.language.boolean.conduit",
+          "match": "\\b(true|false)\\b"
+        },
+        {
+          "name": "constant.language.nil.conduit",
+          "match": "\\bnil\\b"
+        },
+        {
+          "name": "constant.numeric.conduit",
+          "match": "\\b[0-9]+(?:\\.[0-9]+)?\\b"
+        }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "name": "storage.type.primitive.conduit",
+          "match": "\\b(Int|Float|String|Bool|Void|Map)\\b"
+        },
+        {
+          "name": "entity.name.tag.error.conduit",
+          "match": "\\b[A-Z][a-zA-Z0-9_]*Error\\b"
+        },
+        {
+          "name": "support.type.conduit",
+          "match": "\\b(Reader|Writer|Output|Url|Request|Response|BinaryResponse|Router|Connection|Param|Scheduler|Violation|Duration|Instant|Timestamp|Issue)\\b"
+        },
+        {
+          "name": "constant.other.conduit",
+          "match": "\\b[A-Z][A-Z0-9]*_[A-Z0-9_]+\\b|\\b[A-Z]{2,}[0-9]*\\b"
+        },
+        {
+          "name": "entity.name.type.conduit",
+          "match": "\\b[A-Z][a-zA-Z0-9_]*\\b"
+        }
+      ]
+    },
+    "identifiers": {
+      "patterns": [
+        {
+          "name": "support.function.builtin.conduit",
+          "match": "(?<!\\.)\\b(print|map|filter|reduce)\\b(?=\\s*\\()"
+        },
+        {
+          "match": "\\b([a-z_][a-zA-Z0-9_]*)(?=\\s*(?:<[^>\\n]+>\\s*)?\\()",
+          "captures": {
+            "1": { "name": "entity.name.function.call.conduit" }
+          }
+        },
+        {
+          "match": "(?<=\\.)([a-z_][a-zA-Z0-9_]*)\\b",
+          "captures": {
+            "1": { "name": "variable.other.property.conduit" }
+          }
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.control.arrow.conduit",
+          "match": "(\\|>|=>)"
+        },
+        {
+          "name": "keyword.operator.arrow.conduit",
+          "match": "(->)"
+        },
+        {
+          "name": "keyword.operator.error-handling.conduit",
+          "match": "(\\?\\?|\\?\\.|\\?)"
+        },
+        {
+          "name": "keyword.operator.assignment.conduit",
+          "match": "(:=|=)"
+        },
+        {
+          "name": "keyword.operator.comparison.conduit",
+          "match": "(==|!=|<=|>=|&&|\\|\\||!|<|>)"
+        },
+        {
+          "name": "keyword.operator.arithmetic.conduit",
+          "match": "(\\.\\.|[+\\-*/%|])"
+        }
+      ]
     }
-  ]
+  }
 }
-

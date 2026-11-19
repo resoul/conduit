@@ -6,26 +6,123 @@ use crate::frontend::lexer::{ESCAPED_CLOSE_BRACE, ESCAPED_OPEN_BRACE};
 use crate::frontend::types::{ModuleId, Type, TypeId};
 use crate::native::JsonType;
 
+pub struct NativeModuleSpec {
+    pub name: &'static str,
+    pub fns: &'static [&'static str],
+    pub types: &'static [&'static str],
+}
+
+pub const NATIVE_MODULES: &[NativeModuleSpec] = &[
+    NativeModuleSpec {
+        name: "cdt.json",
+        fns: &["decode", "encode"],
+        types: &["DecodeError", "EncodeError"],
+    },
+    NativeModuleSpec {
+        name: "cdt.time",
+        fns: &["now", "monotonic", "elapsed", "seconds", "milliseconds"],
+        types: &["Timestamp", "Instant", "Duration", "TimeError"],
+    },
+    NativeModuleSpec {
+        name: "cdt.validation",
+        fns: &["min", "max", "email", "check"],
+        types: &["Issue", "Violation", "ValidationError"],
+    },
+    NativeModuleSpec {
+        name: "cdt.env",
+        fns: &["get", "require", "args", "load"],
+        types: &["EnvError"],
+    },
+    NativeModuleSpec {
+        name: "cdt.cli",
+        fns: &["parse", "parse_args", "help", "dispatch", "dispatch_args"],
+        types: &["CliError"],
+    },
+    NativeModuleSpec {
+        name: "cdt.fs",
+        fns: &[
+            "read_text", "write_text", "append_text", "write_atomic", "read_lines", "each_line",
+            "exists", "is_file", "is_dir", "size", "list_dir", "mkdir_all", "remove", "copy",
+            "rename", "open_read", "open_write", "open_append",
+        ],
+        types: &["FsError", "Reader", "Writer"],
+    },
+    NativeModuleSpec {
+        name: "cdt.path",
+        fns: &[
+            "join", "join_all", "dirname", "basename", "ext", "stem", "normalize", "is_abs",
+            "with_ext",
+        ],
+        types: &[],
+    },
+    NativeModuleSpec {
+        name: "cdt.process",
+        fns: &["run", "status", "cwd", "set_cwd", "pid", "exit"],
+        types: &["ProcessError", "Output"],
+    },
+    NativeModuleSpec {
+        name: "cdt.crypto",
+        fns: &[
+            "sha256", "hmac_sha256", "base64_encode", "base64_decode", "hex_encode", "hex_decode",
+            "uuid_v4", "random_bytes_hex", "random_int", "hash_password", "verify_password",
+            "constant_time_eq",
+        ],
+        types: &["CryptoError"],
+    },
+    NativeModuleSpec {
+        name: "cdt.url",
+        fns: &["parse", "encode", "decode", "encode_query", "decode_query"],
+        types: &["UrlError", "Url"],
+    },
+    NativeModuleSpec {
+        name: "cdt.csv",
+        fns: &["parse", "parse_with", "parse_records", "stringify", "stringify_with"],
+        types: &["CsvError"],
+    },
+    NativeModuleSpec {
+        name: "cdt.math",
+        fns: &[
+            "pi", "e", "tau", "sqrt", "sin", "cos", "tan", "asin", "acos", "atan", "exp", "ln",
+            "log10", "floor", "ceil", "round", "trunc", "pow", "atan2", "hypot",
+        ],
+        types: &[],
+    },
+    NativeModuleSpec {
+        name: "cdt.log",
+        fns: &["debug", "info", "warn", "error", "set_level", "set_json", "get_level"],
+        types: &[],
+    },
+    NativeModuleSpec {
+        name: "cdt.http",
+        fns: &[
+            "text", "html", "json", "ok_json", "status_json", "redirect", "no_content", "response",
+            "response_with", "router", "build", "serve", "get", "post", "get_json", "post_json",
+            "request", "request_timeout", "get_bytes", "request_bytes",
+        ],
+        types: &["HttpError", "Request", "Response", "BinaryResponse", "Router"],
+    },
+    NativeModuleSpec {
+        name: "cdt.db",
+        fns: &["connect", "int", "float", "bool", "text", "null", "ddl"],
+        types: &["Connection", "Param", "DbError"],
+    },
+    NativeModuleSpec {
+        name: "cdt.cron",
+        fns: &["run", "start", "run_once", "validate"],
+        types: &["Scheduler", "CronError"],
+    },
+];
+
+pub fn find_native_module(path: &str) -> Option<&'static NativeModuleSpec> {
+    NATIVE_MODULES.iter().find(|m| m.name == path)
+}
+
+pub fn is_native_module(path: &str) -> bool {
+    find_native_module(path).is_some()
+}
+
 pub(crate) fn is_valid_native_type(mod_name: &str, ty_name: &str) -> bool {
-    match mod_name {
-        "cdt.json" => matches!(ty_name, "DecodeError" | "EncodeError"),
-        "cdt.time" => matches!(ty_name, "Timestamp" | "Instant" | "Duration" | "TimeError"),
-        "cdt.validation" => matches!(ty_name, "Issue" | "Violation" | "ValidationError"),
-        "cdt.env" => ty_name == "EnvError",
-        "cdt.cli" => ty_name == "CliError",
-        "cdt.fs" => matches!(ty_name, "FsError" | "Reader" | "Writer"),
-        "cdt.process" => matches!(ty_name, "ProcessError" | "Output"),
-        "cdt.crypto" => ty_name == "CryptoError",
-        "cdt.url" => matches!(ty_name, "UrlError" | "Url"),
-        "cdt.csv" => ty_name == "CsvError",
-        "cdt.http" => matches!(
-            ty_name,
-            "HttpError" | "Request" | "Response" | "BinaryResponse" | "Router"
-        ),
-        "cdt.db" => matches!(ty_name, "Connection" | "Param" | "DbError"),
-        "cdt.cron" => matches!(ty_name, "Scheduler" | "CronError"),
-        _ => false,
-    }
+    find_native_module(mod_name).is_some_and(|m| m.types.contains(&ty_name))
 }
 
 pub(crate) fn register_native_imports(
@@ -36,357 +133,44 @@ pub(crate) fn register_native_imports(
         let ItemKind::Import { path, alias, names } = &item.kind else {
             continue;
         };
-        match path.as_str() {
-            "cdt.json" => {
-                if let Some(a) = alias {
-                    checked.json_aliases.insert(a.clone());
-                }
-                for spec in names {
-                    match spec.name.as_str() {
-                        "decode" | "encode" => insert_unique(
-                            &mut checked.json_direct_fns,
-                            &spec.alias,
-                            &spec.name,
-                        )?,
-                        "DecodeError" | "EncodeError" => {
-                            checked.json_direct_types.insert(spec.alias.clone(), spec.name.clone());
-                        }
-                        other => {
-                            return Err(format!("Module 'cdt.json' has no exported member '{}'", other));
-                        }
-                    }
-                }
+        let Some(spec_mod) = find_native_module(path) else {
+            return Err(format!("Unknown or unlinked module '{}'", path));
+        };
+        if let Some(a) = alias {
+            checked.native_aliases.insert(a.clone(), spec_mod.name);
+        }
+        for spec in names {
+            if spec_mod.fns.contains(&spec.name.as_str()) {
+                insert_unique_native(
+                    &mut checked.native_direct_fns,
+                    &spec.alias,
+                    spec_mod.name,
+                    &spec.name,
+                )?;
+            } else if spec_mod.types.contains(&spec.name.as_str()) {
+                checked
+                    .native_direct_types
+                    .insert(spec.alias.clone(), (spec_mod.name, spec.name.clone()));
+            } else {
+                return Err(format!(
+                    "Module '{}' has no exported member '{}'",
+                    spec_mod.name, spec.name
+                ));
             }
-            "cdt.time" => {
-                if let Some(a) = alias {
-                    checked.time_aliases.insert(a.clone());
-                }
-                for spec in names {
-                    match spec.name.as_str() {
-                        "now" | "monotonic" | "elapsed" | "seconds" | "milliseconds" => {
-                            insert_unique(&mut checked.time_direct_fns, &spec.alias, &spec.name)?;
-                        }
-                        "Timestamp" | "Instant" | "Duration" | "TimeError" => {
-                            checked.time_direct_types.insert(spec.alias.clone(), spec.name.clone());
-                        }
-                        other => {
-                            return Err(format!("Module 'cdt.time' has no exported member '{}'", other));
-                        }
-                    }
-                }
-            }
-            "cdt.validation" => {
-                if let Some(a) = alias {
-                    checked.val_aliases.insert(a.clone());
-                }
-                for spec in names {
-                    match spec.name.as_str() {
-                        "min" | "max" | "email" | "check" => {
-                            insert_unique(&mut checked.val_direct_fns, &spec.alias, &spec.name)?;
-                        }
-                        "Issue" | "Violation" | "ValidationError" => {
-                            checked.val_direct_types.insert(spec.alias.clone(), spec.name.clone());
-                        }
-                        other => {
-                            return Err(format!(
-                                "Module 'cdt.validation' has no exported member '{}'",
-                                other
-                            ));
-                        }
-                    }
-                }
-            }
-            "cdt.env" => {
-                if let Some(a) = alias {
-                    checked.env_aliases.insert(a.clone());
-                }
-                for spec in names {
-                    match spec.name.as_str() {
-                        "get" | "require" | "args" | "load" => {
-                            insert_unique(&mut checked.env_direct_fns, &spec.alias, &spec.name)?;
-                        }
-                        "EnvError" => {
-                            checked.env_direct_types.insert(spec.alias.clone(), spec.name.clone());
-                        }
-                        other => {
-                            return Err(format!("Module 'cdt.env' has no exported member '{}'", other));
-                        }
-                    }
-                }
-            }
-            "cdt.cli" => {
-                if let Some(a) = alias {
-                    checked.cli_aliases.insert(a.clone());
-                }
-                for spec in names {
-                    match spec.name.as_str() {
-                        "parse" | "parse_args" | "help" | "dispatch" | "dispatch_args" => {
-                            insert_unique(&mut checked.cli_direct_fns, &spec.alias, &spec.name)?;
-                        }
-                        "CliError" => {
-                            checked.cli_direct_types.insert(spec.alias.clone(), spec.name.clone());
-                        }
-                        other => {
-                            return Err(format!("Module 'cdt.cli' has no exported member '{}'", other));
-                        }
-                    }
-                }
-            }
-            "cdt.fs" => {
-                if let Some(a) = alias {
-                    checked.fs_aliases.insert(a.clone());
-                }
-                for spec in names {
-                    match spec.name.as_str() {
-                        "read_text" | "write_text" | "append_text" | "write_atomic"
-                        | "read_lines" | "each_line" | "exists" | "is_file" | "is_dir" | "size"
-                        | "list_dir" | "mkdir_all" | "remove" | "copy" | "rename"
-                        | "open_read" | "open_write" | "open_append" => {
-                            insert_unique(&mut checked.fs_direct_fns, &spec.alias, &spec.name)?;
-                        }
-                        "FsError" | "Reader" | "Writer" => {
-                            checked.fs_direct_types.insert(spec.alias.clone(), spec.name.clone());
-                        }
-                        other => {
-                            return Err(format!("Module 'cdt.fs' has no exported member '{}'", other));
-                        }
-                    }
-                }
-            }
-            "cdt.path" => {
-                if let Some(a) = alias {
-                    checked.path_aliases.insert(a.clone());
-                }
-                for spec in names {
-                    match spec.name.as_str() {
-                        "join" | "join_all" | "dirname" | "basename" | "ext" | "stem"
-                        | "normalize" | "is_abs" | "with_ext" => {
-                            insert_unique(&mut checked.path_direct_fns, &spec.alias, &spec.name)?;
-                        }
-                        other => {
-                            return Err(format!("Module 'cdt.path' has no exported member '{}'", other));
-                        }
-                    }
-                }
-            }
-            "cdt.process" => {
-                if let Some(a) = alias {
-                    checked.process_aliases.insert(a.clone());
-                }
-                for spec in names {
-                    match spec.name.as_str() {
-                        "run" | "status" | "cwd" | "set_cwd" | "pid" | "exit" => {
-                            insert_unique(&mut checked.process_direct_fns, &spec.alias, &spec.name)?;
-                        }
-                        "ProcessError" | "Output" => {
-                            checked
-                                .process_direct_types
-                                .insert(spec.alias.clone(), spec.name.clone());
-                        }
-                        other => {
-                            return Err(format!(
-                                "Module 'cdt.process' has no exported member '{}'",
-                                other
-                            ));
-                        }
-                    }
-                }
-            }
-            "cdt.crypto" => {
-                if let Some(a) = alias {
-                    checked.crypto_aliases.insert(a.clone());
-                }
-                for spec in names {
-                    match spec.name.as_str() {
-                        "sha256" | "hmac_sha256" | "base64_encode" | "base64_decode"
-                        | "hex_encode" | "hex_decode" | "uuid_v4" | "random_bytes_hex"
-                        | "random_int" | "hash_password" | "verify_password"
-                        | "constant_time_eq" => {
-                            insert_unique(&mut checked.crypto_direct_fns, &spec.alias, &spec.name)?;
-                        }
-                        "CryptoError" => {
-                            checked
-                                .crypto_direct_types
-                                .insert(spec.alias.clone(), spec.name.clone());
-                        }
-                        other => {
-                            return Err(format!(
-                                "Module 'cdt.crypto' has no exported member '{}'",
-                                other
-                            ));
-                        }
-                    }
-                }
-            }
-            "cdt.url" => {
-                if let Some(a) = alias {
-                    checked.url_aliases.insert(a.clone());
-                }
-                for spec in names {
-                    match spec.name.as_str() {
-                        "parse" | "encode" | "decode" | "encode_query" | "decode_query" => {
-                            insert_unique(&mut checked.url_direct_fns, &spec.alias, &spec.name)?;
-                        }
-                        "UrlError" | "Url" => {
-                            checked
-                                .url_direct_types
-                                .insert(spec.alias.clone(), spec.name.clone());
-                        }
-                        other => {
-                            return Err(format!(
-                                "Module 'cdt.url' has no exported member '{}'",
-                                other
-                            ));
-                        }
-                    }
-                }
-            }
-            "cdt.csv" => {
-                if let Some(a) = alias {
-                    checked.csv_aliases.insert(a.clone());
-                }
-                for spec in names {
-                    match spec.name.as_str() {
-                        "parse" | "parse_with" | "parse_records" | "stringify" | "stringify_with" => {
-                            insert_unique(&mut checked.csv_direct_fns, &spec.alias, &spec.name)?;
-                        }
-                        "CsvError" => {
-                            checked
-                                .csv_direct_types
-                                .insert(spec.alias.clone(), spec.name.clone());
-                        }
-                        other => {
-                            return Err(format!(
-                                "Module 'cdt.csv' has no exported member '{}'",
-                                other
-                            ));
-                        }
-                    }
-                }
-            }
-            "cdt.math" => {
-                if let Some(a) = alias {
-                    checked.math_aliases.insert(a.clone());
-                }
-                for spec in names {
-                    match spec.name.as_str() {
-                        "pi" | "e" | "tau" | "sqrt" | "sin" | "cos" | "tan" | "asin" | "acos"
-                        | "atan" | "exp" | "ln" | "log10" | "floor" | "ceil" | "round" | "trunc"
-                        | "pow" | "atan2" | "hypot" => {
-                            insert_unique(&mut checked.math_direct_fns, &spec.alias, &spec.name)?;
-                        }
-                        other => {
-                            return Err(format!(
-                                "Module 'cdt.math' has no exported member '{}'",
-                                other
-                            ));
-                        }
-                    }
-                }
-            }
-            "cdt.log" => {
-                if let Some(a) = alias {
-                    checked.log_aliases.insert(a.clone());
-                }
-                for spec in names {
-                    match spec.name.as_str() {
-                        "debug" | "info" | "warn" | "error" | "set_level" | "set_json"
-                        | "get_level" => {
-                            insert_unique(&mut checked.log_direct_fns, &spec.alias, &spec.name)?;
-                        }
-                        other => {
-                            return Err(format!(
-                                "Module 'cdt.log' has no exported member '{}'",
-                                other
-                            ));
-                        }
-                    }
-                }
-            }
-            "cdt.http" => {
-                if let Some(a) = alias {
-                    checked.http_aliases.insert(a.clone());
-                }
-                for spec in names {
-                    match spec.name.as_str() {
-                        "text" | "html" | "json" | "response" | "response_with" | "router"
-                        | "build" | "serve" | "get" | "post" | "request" | "request_timeout"
-                        | "get_bytes" | "request_bytes" => {
-                            insert_unique(&mut checked.http_direct_fns, &spec.alias, &spec.name)?;
-                        }
-                        "HttpError" | "Request" | "Response" | "BinaryResponse" | "Router" => {
-                            checked
-                                .http_direct_types
-                                .insert(spec.alias.clone(), spec.name.clone());
-                        }
-                        other => {
-                            return Err(format!(
-                                "Module 'cdt.http' has no exported member '{}'",
-                                other
-                            ));
-                        }
-                    }
-                }
-            }
-            "cdt.db" => {
-                if let Some(a) = alias {
-                    checked.db_aliases.insert(a.clone());
-                }
-                for spec in names {
-                    match spec.name.as_str() {
-                        "connect" | "int" | "float" | "bool" | "text" | "null" | "ddl" => {
-                            insert_unique(&mut checked.db_direct_fns, &spec.alias, &spec.name)?;
-                        }
-                        "Connection" | "Param" | "DbError" => {
-                            checked
-                                .db_direct_types
-                                .insert(spec.alias.clone(), spec.name.clone());
-                        }
-                        other => {
-                            return Err(format!(
-                                "Module 'cdt.db' has no exported member '{}'",
-                                other
-                            ));
-                        }
-                    }
-                }
-            }
-            "cdt.cron" => {
-                if let Some(a) = alias {
-                    checked.cron_aliases.insert(a.clone());
-                }
-                for spec in names {
-                    match spec.name.as_str() {
-                        "run" | "start" | "run_once" | "validate" => {
-                            insert_unique(&mut checked.cron_direct_fns, &spec.alias, &spec.name)?;
-                        }
-                        "Scheduler" | "CronError" => {
-                            checked
-                                .cron_direct_types
-                                .insert(spec.alias.clone(), spec.name.clone());
-                        }
-                        other => {
-                            return Err(format!(
-                                "Module 'cdt.cron' has no exported member '{}'",
-                                other
-                            ));
-                        }
-                    }
-                }
-            }
-            other => return Err(format!("Unknown or unlinked module '{}'", other)),
         }
     }
     Ok(())
 }
 
-fn insert_unique(
-    map: &mut HashMap<String, String>,
+fn insert_unique_native(
+    map: &mut HashMap<String, (&'static str, String)>,
     alias: &str,
+    mod_name: &'static str,
     target: &str,
 ) -> Result<(), String> {
-    if let Some(prev) = map.insert(alias.to_string(), target.to_string())
-        && prev != target
+    if let Some((prev_mod, prev_target)) =
+        map.insert(alias.to_string(), (mod_name, target.to_string()))
+        && (prev_mod != mod_name || prev_target != target)
     {
         return Err(format!("Duplicate imported identifier '{}'", alias));
     }
@@ -416,89 +200,15 @@ pub fn resolve_type_expr(te: &TypeExpr, checked: &CheckedProgram) -> Result<Type
                 Ok(Type::Custom(TypeId::program(name)))
             }
             _ if checked.enums.contains_key(name) => Ok(Type::Enum(name.clone())),
-            _ if checked.json_direct_types.contains_key(name) => Ok(Type::Custom(TypeId::native(
-                "cdt.json",
-                &checked.json_direct_types[name],
-            ))),
-            _ if checked.time_direct_types.contains_key(name) => Ok(Type::Custom(TypeId::native(
-                "cdt.time",
-                &checked.time_direct_types[name],
-            ))),
-            _ if checked.val_direct_types.contains_key(name) => Ok(Type::Custom(TypeId::native(
-                "cdt.validation",
-                &checked.val_direct_types[name],
-            ))),
-            _ if checked.env_direct_types.contains_key(name) => Ok(Type::Custom(TypeId::native(
-                "cdt.env",
-                &checked.env_direct_types[name],
-            ))),
-            _ if checked.cli_direct_types.contains_key(name) => Ok(Type::Custom(TypeId::native(
-                "cdt.cli",
-                &checked.cli_direct_types[name],
-            ))),
-            _ if checked.fs_direct_types.contains_key(name) => Ok(Type::Custom(TypeId::native(
-                "cdt.fs",
-                &checked.fs_direct_types[name],
-            ))),
-            _ if checked.process_direct_types.contains_key(name) => Ok(Type::Custom(TypeId::native(
-                "cdt.process",
-                &checked.process_direct_types[name],
-            ))),
-            _ if checked.crypto_direct_types.contains_key(name) => Ok(Type::Custom(TypeId::native(
-                "cdt.crypto",
-                &checked.crypto_direct_types[name],
-            ))),
-            _ if checked.url_direct_types.contains_key(name) => Ok(Type::Custom(TypeId::native(
-                "cdt.url",
-                &checked.url_direct_types[name],
-            ))),
-            _ if checked.csv_direct_types.contains_key(name) => Ok(Type::Custom(TypeId::native(
-                "cdt.csv",
-                &checked.csv_direct_types[name],
-            ))),
-            _ if checked.http_direct_types.contains_key(name) => Ok(Type::Custom(TypeId::native(
-                "cdt.http",
-                &checked.http_direct_types[name],
-            ))),
-            _ if checked.db_direct_types.contains_key(name) => Ok(Type::Custom(TypeId::native(
-                "cdt.db",
-                &checked.db_direct_types[name],
-            ))),
-            _ if checked.cron_direct_types.contains_key(name) => Ok(Type::Custom(TypeId::native(
-                "cdt.cron",
-                &checked.cron_direct_types[name],
-            ))),
+            _ if checked.native_direct_types.contains_key(name) => {
+                let (mod_name, ty_name) = &checked.native_direct_types[name];
+                Ok(Type::Custom(TypeId::native(*mod_name, ty_name)))
+            }
             _ if name.contains('.') => {
                 let mut parts = name.splitn(2, '.');
                 let alias = parts.next().unwrap_or("");
                 let sub = parts.next().unwrap_or("");
-                let mod_name = if checked.json_aliases.contains(alias) {
-                    "cdt.json"
-                } else if checked.time_aliases.contains(alias) {
-                    "cdt.time"
-                } else if checked.val_aliases.contains(alias) {
-                    "cdt.validation"
-                } else if checked.env_aliases.contains(alias) {
-                    "cdt.env"
-                } else if checked.cli_aliases.contains(alias) {
-                    "cdt.cli"
-                } else if checked.fs_aliases.contains(alias) {
-                    "cdt.fs"
-                } else if checked.process_aliases.contains(alias) {
-                    "cdt.process"
-                } else if checked.crypto_aliases.contains(alias) {
-                    "cdt.crypto"
-                } else if checked.url_aliases.contains(alias) {
-                    "cdt.url"
-                } else if checked.csv_aliases.contains(alias) {
-                    "cdt.csv"
-                } else if checked.http_aliases.contains(alias) {
-                    "cdt.http"
-                } else if checked.db_aliases.contains(alias) {
-                    "cdt.db"
-                } else if checked.cron_aliases.contains(alias) {
-                    "cdt.cron"
-                } else {
+                let Some(&mod_name) = checked.native_aliases.get(alias) else {
                     return Err(format!("Unknown type '{}'", name));
                 };
                 if !is_valid_native_type(mod_name, sub) {

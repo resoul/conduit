@@ -77,12 +77,17 @@ impl<'a> Reader<'a> {
             other => Err(format!("Invalid bool tag {} in bundle", other)),
         }
     }
-    fn u16(&mut self) -> Result<u16, String> { Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap())) }
-    fn i16(&mut self) -> Result<i16, String> { Ok(i16::from_le_bytes(self.take(2)?.try_into().unwrap())) }
-    fn u32(&mut self) -> Result<u32, String> { Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap())) }
-    fn i32(&mut self) -> Result<i32, String> { Ok(i32::from_le_bytes(self.take(4)?.try_into().unwrap())) }
-    fn u64(&mut self) -> Result<u64, String> { Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap())) }
-    fn i64(&mut self) -> Result<i64, String> { Ok(i64::from_le_bytes(self.take(8)?.try_into().unwrap())) }
+    fn take_arr<const N: usize>(&mut self) -> Result<[u8; N], String> {
+        self.take(N)?
+            .try_into()
+            .map_err(|_| "Unexpected EOF in bundle".to_string())
+    }
+    fn u16(&mut self) -> Result<u16, String> { Ok(u16::from_le_bytes(self.take_arr()?)) }
+    fn i16(&mut self) -> Result<i16, String> { Ok(i16::from_le_bytes(self.take_arr()?)) }
+    fn u32(&mut self) -> Result<u32, String> { Ok(u32::from_le_bytes(self.take_arr()?)) }
+    fn i32(&mut self) -> Result<i32, String> { Ok(i32::from_le_bytes(self.take_arr()?)) }
+    fn u64(&mut self) -> Result<u64, String> { Ok(u64::from_le_bytes(self.take_arr()?)) }
+    fn i64(&mut self) -> Result<i64, String> { Ok(i64::from_le_bytes(self.take_arr()?)) }
     fn f64(&mut self) -> Result<f64, String> { Ok(f64::from_bits(self.u64()?)) }
     fn str(&mut self) -> Result<String, String> {
         let len = self.u32()? as usize;

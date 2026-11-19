@@ -194,8 +194,8 @@ impl Vm {
                         let handle = std::thread::spawn(move || {
                             scheduler_loop(m, jobs, stop_bg, running_bg);
                         });
-                        let id = self.cron_schedulers.len();
-                        self.cron_schedulers.push(Some(CronSchedulerState {
+                        let id = self.host.cron_schedulers.len();
+                        self.host.cron_schedulers.push(Some(CronSchedulerState {
                             stop,
                             running,
                             handle: Some(handle),
@@ -226,7 +226,7 @@ impl Vm {
             }
             CRON_STOP => {
                 let id = self.extract_scheduler_id(&self.objs[o_base + b as usize])?;
-                if let Some(Some(mut st)) = self.cron_schedulers.get_mut(id).map(|slot| slot.take()) {
+                if let Some(Some(mut st)) = self.host.cron_schedulers.get_mut(id).map(|slot| slot.take()) {
                     st.stop.store(true, Ordering::Release);
                     if let Some(h) = st.handle.take() {
                         let _ = h.join();
@@ -236,6 +236,7 @@ impl Vm {
             CRON_IS_RUNNING => {
                 let id = self.extract_scheduler_id(&self.objs[o_base + b as usize])?;
                 let is_running = self
+                    .host
                     .cron_schedulers
                     .get(id)
                     .and_then(|s| s.as_ref())

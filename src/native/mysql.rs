@@ -230,13 +230,25 @@ impl<'a> PktReader<'a> {
         Ok(self.take(1)?[0])
     }
     fn u16(&mut self) -> Result<u16, String> {
-        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
+        let arr: [u8; 2] = self
+            .take(2)?
+            .try_into()
+            .map_err(|_| "Unexpected EOF in MySQL u16".to_string())?;
+        Ok(u16::from_le_bytes(arr))
     }
     fn u32(&mut self) -> Result<u32, String> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+        let arr: [u8; 4] = self
+            .take(4)?
+            .try_into()
+            .map_err(|_| "Unexpected EOF in MySQL u32".to_string())?;
+        Ok(u32::from_le_bytes(arr))
     }
     fn u64(&mut self) -> Result<u64, String> {
-        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+        let arr: [u8; 8] = self
+            .take(8)?
+            .try_into()
+            .map_err(|_| "Unexpected EOF in MySQL u64".to_string())?;
+        Ok(u64::from_le_bytes(arr))
     }
     fn lenenc_int(&mut self) -> Result<Option<u64>, String> {
         let b = self.u8()?;
@@ -547,7 +559,10 @@ impl MysqlConn {
                 .map_err(|m| DbErr::new("connect_error", m, ""))?;
             state.conn = Some(conn);
         }
-        let conn = state.conn.as_mut().unwrap();
+        let conn = state
+            .conn
+            .as_mut()
+            .ok_or_else(|| DbErr::new("closed", "MySQL connection is closed", ""))?;
         let outcome = if params.is_empty() {
             run_text_query(conn, sql)
         } else {

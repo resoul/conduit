@@ -1,17 +1,15 @@
 import * as db from "cdt.db"
-import { text, bool } from "cdt.db"
+import { text } from "cdt.db"
 import * as crypto from "cdt.crypto"
 import * as env from "cdt.env"
 
 @db.table("users")
 struct User {
-    @db.pk @db.auto
-    id: Int
-    @db.unique @db.index
-    email: String
+    id: Int @db.pk @db.auto = 0
+    email: String @db.unique @db.index
     pw_hash: String
     active: Bool = true
-    bio: String?
+    bio: String? = nil
 }
 
 migration 1 "create_users" {
@@ -21,10 +19,7 @@ migration 1 "create_users" {
 
 migration 2 "seed_admin" {
     up {
-        db.exec(
-            "INSERT INTO users (email, pw_hash, active, bio) VALUES (?, ?, ?, ?)",
-            [text("admin@example.com"), text("seeded"), bool(true), text("System administrator")],
-        )?
+        db.insert<User>(User(email: "admin@example.com", pw_hash: "seeded", bio: "System administrator"))?
     }
     down {
         db.exec("DELETE FROM users WHERE email = ?", [text("admin@example.com")])?
@@ -40,11 +35,11 @@ export func main() -> Void | db.DbError | crypto.CryptoError | env.EnvError {
     print("Connected to {d}, applied {applied} migration(s)")
 
     pw_hash := crypto.hash_password("hunter2")?
-    conn.insert<User>(User(id: 0, email: "alice@example.com", pw_hash: pw_hash, active: true, bio: nil))?
+    conn.insert<User>(User(email: "alice@example.com", pw_hash: pw_hash))?
 
     // Demonstrate transaction rollback
     conn.begin()?
-    conn.insert<User>(User(id: 0, email: "temp@example.com", pw_hash: "x", active: false, bio: nil))?
+    conn.insert<User>(User(email: "temp@example.com", pw_hash: "x", active: false))?
     conn.rollback()?
 
     users := conn.all<User>()?

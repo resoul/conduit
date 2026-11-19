@@ -32,25 +32,7 @@ use crate::ir::Module;
 use crate::ir::lower::compile_program;
 
 fn is_native_mod(path: &str) -> bool {
-    matches!(
-        path,
-        "cdt.json"
-            | "cdt.time"
-            | "cdt.validation"
-            | "cdt.env"
-            | "cdt.cli"
-            | "cdt.fs"
-            | "cdt.path"
-            | "cdt.process"
-            | "cdt.crypto"
-            | "cdt.url"
-            | "cdt.csv"
-            | "cdt.math"
-            | "cdt.log"
-            | "cdt.http"
-            | "cdt.db"
-            | "cdt.cron"
-    )
+    check_native::is_native_module(path)
 }
 
 fn resolve_import_file(base_dir: &Path, root_dir: &Path, imp: &str) -> Result<PathBuf, String> {

@@ -85,8 +85,8 @@ impl Vm {
                 let path = self.extract_str(o_base, b, "fs.open_read()")?;
                 let res = match open_buf_reader(&path) {
                     Ok(reader) => {
-                        let id = self.fs_readers.len();
-                        self.fs_readers.push(Some(reader));
+                        let id = self.host.fs_readers.len();
+                        self.host.fs_readers.push(Some(reader));
                         make_reader_handle(id)
                     }
                     Err(e) => e,
@@ -98,8 +98,8 @@ impl Vm {
                 let append = aux == FS_OPEN_APPEND;
                 let res = match open_buf_writer(&path, append) {
                     Ok(writer) => {
-                        let id = self.fs_writers.len();
-                        self.fs_writers.push(Some(writer));
+                        let id = self.host.fs_writers.len();
+                        self.host.fs_writers.push(Some(writer));
                         make_writer_handle(id)
                     }
                     Err(e) => e,
@@ -108,7 +108,7 @@ impl Vm {
             }
             FS_READER_READ_LINE => {
                 let id = self.extract_handle(o_base, b, SCHEMA_FS_READER, "Reader.read_line()")?;
-                let res = match self.fs_readers.get_mut(id).and_then(|s| s.as_mut()) {
+                let res = match self.host.fs_readers.get_mut(id).and_then(|s| s.as_mut()) {
                     Some(reader) => reader_read_line(reader),
                     None => make_fs_error("io", "<reader>", "Reader is already closed"),
                 };
@@ -116,13 +116,13 @@ impl Vm {
             }
             FS_READER_CLOSE => {
                 let id = self.extract_handle(o_base, b, SCHEMA_FS_READER, "Reader.close()")?;
-                if let Some(slot) = self.fs_readers.get_mut(id) {
+                if let Some(slot) = self.host.fs_readers.get_mut(id) {
                     *slot = None;
                 }
             }
             FS_WRITER_FLUSH => {
                 let id = self.extract_handle(o_base, b, SCHEMA_FS_WRITER, "Writer.flush()")?;
-                let res = match self.fs_writers.get_mut(id).and_then(|s| s.as_mut()) {
+                let res = match self.host.fs_writers.get_mut(id).and_then(|s| s.as_mut()) {
                     Some(w) => match w.flush() {
                         Ok(()) => Obj::Empty,
                         Err(e) => io_err_obj("<writer>", &e),
@@ -133,7 +133,7 @@ impl Vm {
             }
             FS_WRITER_CLOSE => {
                 let id = self.extract_handle(o_base, b, SCHEMA_FS_WRITER, "Writer.close()")?;
-                let res = match self.fs_writers.get_mut(id).and_then(|s| s.take()) {
+                let res = match self.host.fs_writers.get_mut(id).and_then(|s| s.take()) {
                     Some(mut w) => match w.flush() {
                         Ok(()) => Obj::Empty,
                         Err(e) => io_err_obj("<writer>", &e),
@@ -191,7 +191,7 @@ impl Vm {
                 let Obj::Str(data) = &self.objs[o_base + c as usize] else {
                     return Err(err_msg("Expected String in Writer.write()"));
                 };
-                let res = match self.fs_writers.get_mut(id).and_then(|s| s.as_mut()) {
+                let res = match self.host.fs_writers.get_mut(id).and_then(|s| s.as_mut()) {
                     Some(w) => {
                         let bytes = data.as_bytes();
                         let r = if aux == FS_WRITER_WRITE_LINE {
@@ -224,7 +224,7 @@ impl Vm {
                 let Obj::List(ListStorage::Obj(lines)) = &self.objs[o_base + c as usize] else {
                     return Err(err_msg("Expected [String] in Writer.write_lines()"));
                 };
-                let res = match self.fs_writers.get_mut(id).and_then(|s| s.as_mut()) {
+                let res = match self.host.fs_writers.get_mut(id).and_then(|s| s.as_mut()) {
                     Some(w) => {
                         let mut res = Obj::Empty;
                         for line in lines.iter() {
@@ -248,7 +248,7 @@ impl Vm {
                 let res = if n < 0 {
                     make_fs_error("invalid_input", "<reader>", "read_chunk() size must be >= 0")
                 } else {
-                    match self.fs_readers.get_mut(id).and_then(|s| s.as_mut()) {
+                    match self.host.fs_readers.get_mut(id).and_then(|s| s.as_mut()) {
                         Some(r) => reader_read_chunk(r, n as usize),
                         None => make_fs_error("io", "<reader>", "Reader is already closed"),
                     }

@@ -1,0 +1,231 @@
+{
+  "editor.tokenColorCustomizations": {
+    "textMateRules": [
+      {
+        "name": "Conduit comments",
+        "scope": [
+          "comment.line.double-slash.conduit"
+        ],
+        "settings": {
+          "foreground": "#7A7E85",
+          "fontStyle": "italic"
+        }
+      },
+      {
+        "name": "Conduit doc comments",
+        "scope": [
+          "comment.line.documentation.conduit"
+        ],
+        "settings": {
+          "foreground": "#5F826B",
+          "fontStyle": "italic"
+        }
+      },
+      {
+        "name": "Conduit keywords, storage, booleans, nil",
+        "scope": [
+          "keyword.control.flow.conduit",
+          "keyword.control.import.conduit",
+          "storage.type.conduit",
+          "storage.type.function.conduit",
+          "storage.type.struct.conduit",
+          "storage.type.const.conduit",
+          "constant.language.boolean.conduit",
+          "constant.language.nil.conduit"
+        ],
+        "settings": {
+          "foreground": "#CF8E6D"
+        }
+      },
+      {
+        "name": "Conduit declarative DSL blocks",
+        "scope": [
+          "keyword.other.dsl.block.conduit"
+        ],
+        "settings": {
+          "foreground": "#CF8E6D",
+          "fontStyle": "bold"
+        }
+      },
+      {
+        "name": "Conduit declarative DSL clauses",
+        "scope": [
+          "keyword.other.dsl.clause.conduit"
+        ],
+        "settings": {
+          "foreground": "#E0966C"
+        }
+      },
+      {
+        "name": "Conduit HTTP route verbs",
+        "scope": [
+          "keyword.other.http-method.conduit"
+        ],
+        "settings": {
+          "foreground": "#2AACB8",
+          "fontStyle": "bold"
+        }
+      },
+      {
+        "name": "Conduit strings",
+        "scope": [
+          "string.quoted.double.conduit",
+          "punctuation.definition.string.begin.conduit",
+          "punctuation.definition.string.end.conduit"
+        ],
+        "settings": {
+          "foreground": "#6AAB73"
+        }
+      },
+      {
+        "name": "Conduit string escapes and interpolation braces",
+        "scope": [
+          "constant.character.escape.conduit",
+          "punctuation.section.interpolation.begin.conduit",
+          "punctuation.section.interpolation.end.conduit"
+        ],
+        "settings": {
+          "foreground": "#CF8E6D"
+        }
+      },
+      {
+        "name": "Conduit numbers",
+        "scope": [
+          "constant.numeric.conduit"
+        ],
+        "settings": {
+          "foreground": "#2AACB8"
+        }
+      },
+      {
+        "name": "Conduit annotations and field tags",
+        "scope": [
+          "entity.other.attribute-name.db.conduit",
+          "entity.other.attribute-name.env.conduit",
+          "entity.other.attribute-name.marker.conduit",
+          "entity.other.attribute-name.conduit",
+          "string.quoted.other.field-tag.conduit"
+        ],
+        "settings": {
+          "foreground": "#B3AE60"
+        }
+      },
+      {
+        "name": "Conduit validation annotations",
+        "scope": [
+          "entity.other.attribute-name.validation.conduit"
+        ],
+        "settings": {
+          "foreground": "#D5B778"
+        }
+      },
+      {
+        "name": "Conduit function declarations",
+        "scope": [
+          "entity.name.function.conduit",
+          "entity.name.function.handler.conduit"
+        ],
+        "settings": {
+          "foreground": "#56A8F5"
+        }
+      },
+      {
+        "name": "Conduit function and method calls",
+        "scope": [
+          "entity.name.function.call.conduit"
+        ],
+        "settings": {
+          "foreground": "#FFC66D"
+        }
+      },
+      {
+        "name": "Conduit builtin functions",
+        "scope": [
+          "support.function.builtin.conduit"
+        ],
+        "settings": {
+          "foreground": "#FFC66D"
+        }
+      },
+      {
+        "name": "Conduit types",
+        "scope": [
+          "storage.type.primitive.conduit",
+          "support.type.conduit",
+          "entity.name.type.declaration.conduit",
+          "entity.name.type.conduit"
+        ],
+        "settings": {
+          "foreground": "#6FAFBD"
+        }
+      },
+      {
+        "name": "Conduit error types",
+        "scope": [
+          "entity.name.tag.error.conduit"
+        ],
+        "settings": {
+          "foreground": "#D5B778"
+        }
+      },
+      {
+        "name": "Conduit struct fields and properties",
+        "scope": [
+          "variable.other.property.conduit"
+        ],
+        "settings": {
+          "foreground": "#C77DBB"
+        }
+      },
+      {
+        "name": "Conduit constants",
+        "scope": [
+          "constant.other.conduit"
+        ],
+        "settings": {
+          "foreground": "#C77DBB",
+          "fontStyle": "italic"
+        }
+      },
+      {
+        "name": "Conduit variables",
+        "scope": [
+          "variable.other.conduit"
+        ],
+        "settings": {
+          "foreground": "#BCBEC4"
+        }
+      },
+      {
+        "name": "Conduit arrow and pipeline operators",
+        "scope": [
+          "keyword.control.arrow.conduit",
+          "keyword.operator.arrow.conduit"
+        ],
+        "settings": {
+          "foreground": "#CF8E6D"
+        }
+      },
+      {
+        "name": "Conduit error handling operators",
+        "scope": [
+          "keyword.operator.error-handling.conduit"
+        ],
+        "settings": {
+          "foreground": "#E0966C"
+        }
+      },
+      {
+        "name": "Conduit operators",
+        "scope": [
+          "keyword.operator.assignment.conduit",
+          "keyword.operator.comparison.conduit",
+          "keyword.operator.arithmetic.conduit"
+        ],
+        "settings": {
+          "foreground": "#BCBEC4"
+        }
+      }
+    ]
+  }
+}

@@ -210,10 +210,18 @@ impl<'a> Reader<'a> {
         Ok(slice)
     }
     fn i16(&mut self) -> Result<i16, String> {
-        Ok(i16::from_be_bytes(self.take(2)?.try_into().unwrap()))
+        let arr: [u8; 2] = self
+            .take(2)?
+            .try_into()
+            .map_err(|_| "Unexpected EOF in PG i16".to_string())?;
+        Ok(i16::from_be_bytes(arr))
     }
     fn i32(&mut self) -> Result<i32, String> {
-        Ok(i32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+        let arr: [u8; 4] = self
+            .take(4)?
+            .try_into()
+            .map_err(|_| "Unexpected EOF in PG i32".to_string())?;
+        Ok(i32::from_be_bytes(arr))
     }
     fn cstr(&mut self) -> Result<String, String> {
         let rest = &self.data[self.pos..];
@@ -695,7 +703,10 @@ impl PgConn {
             state.conn = Some(conn);
         }
 
-        let conn = state.conn.as_mut().unwrap();
+        let conn = state
+            .conn
+            .as_mut()
+            .ok_or_else(|| DbErr::new("closed", "PostgreSQL connection is closed", ""))?;
         let outcome = run_statement(conn, sql, params, want_rows);
         if let Err(Failure::Broken(_)) = &outcome {
             state.conn = None;

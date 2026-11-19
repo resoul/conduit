@@ -69,6 +69,35 @@ impl<'a> Checker<'a> {
         })
     }
 
+    fn check_native_module_call(
+        &mut self,
+        mod_name: &str,
+        sym: &str,
+        type_args: &mut [TypeExpr],
+        args: &mut [Expr],
+        named_args: &mut [NamedArg],
+    ) -> Result<Type, String> {
+        match mod_name {
+            "cdt.json" => self.check_json_call(sym, type_args, args, named_args),
+            "cdt.time" => self.check_time_call(sym, type_args, args, named_args),
+            "cdt.validation" => self.check_validation_call(sym, type_args, args, named_args),
+            "cdt.env" => self.check_env_call(sym, type_args, args, named_args),
+            "cdt.cli" => self.check_cli_call(sym, type_args, args, named_args),
+            "cdt.fs" => self.check_fs_call(sym, type_args, args, named_args),
+            "cdt.path" => self.check_path_call(sym, type_args, args, named_args),
+            "cdt.process" => self.check_process_call(sym, type_args, args, named_args),
+            "cdt.crypto" => self.check_crypto_call(sym, type_args, args, named_args),
+            "cdt.url" => self.check_url_call(sym, type_args, args, named_args),
+            "cdt.csv" => self.check_csv_call(sym, type_args, args, named_args),
+            "cdt.math" => self.check_math_call(sym, type_args, args, named_args),
+            "cdt.log" => self.check_log_call(sym, type_args, args, named_args),
+            "cdt.http" => self.check_http_call(sym, type_args, args, named_args),
+            "cdt.db" => self.check_db_call(sym, type_args, args, named_args),
+            "cdt.cron" => self.check_cron_call(sym, type_args, args, named_args),
+            other => Err(format!("Unknown native module '{}'", other)),
+        }
+    }
+
     pub(crate) fn check_call(
         &mut self,
         callee: &mut Expr,
@@ -83,53 +112,8 @@ impl<'a> Checker<'a> {
                 if mod_alias == "Map" && field == "from" {
                     return self.check_map_from(type_args, args, named_args);
                 }
-                if self.checked.json_aliases.contains(mod_alias) {
-                    return self.check_json_call(field, type_args, args, named_args);
-                }
-                if self.checked.time_aliases.contains(mod_alias) {
-                    return self.check_time_call(field, type_args, args, named_args);
-                }
-                if self.checked.val_aliases.contains(mod_alias) {
-                    return self.check_validation_call(field, type_args, args, named_args);
-                }
-                if self.checked.env_aliases.contains(mod_alias) {
-                    return self.check_env_call(field, type_args, args, named_args);
-                }
-                if self.checked.cli_aliases.contains(mod_alias) {
-                    return self.check_cli_call(field, type_args, args, named_args);
-                }
-                if self.checked.fs_aliases.contains(mod_alias) {
-                    return self.check_fs_call(field, type_args, args, named_args);
-                }
-                if self.checked.path_aliases.contains(mod_alias) {
-                    return self.check_path_call(field, type_args, args, named_args);
-                }
-                if self.checked.process_aliases.contains(mod_alias) {
-                    return self.check_process_call(field, type_args, args, named_args);
-                }
-                if self.checked.crypto_aliases.contains(mod_alias) {
-                    return self.check_crypto_call(field, type_args, args, named_args);
-                }
-                if self.checked.url_aliases.contains(mod_alias) {
-                    return self.check_url_call(field, type_args, args, named_args);
-                }
-                if self.checked.csv_aliases.contains(mod_alias) {
-                    return self.check_csv_call(field, type_args, args, named_args);
-                }
-                if self.checked.math_aliases.contains(mod_alias) {
-                    return self.check_math_call(field, type_args, args, named_args);
-                }
-                if self.checked.log_aliases.contains(mod_alias) {
-                    return self.check_log_call(field, type_args, args, named_args);
-                }
-                if self.checked.http_aliases.contains(mod_alias) {
-                    return self.check_http_call(field, type_args, args, named_args);
-                }
-                if self.checked.db_aliases.contains(mod_alias) {
-                    return self.check_db_call(field, type_args, args, named_args);
-                }
-                if self.checked.cron_aliases.contains(mod_alias) {
-                    return self.check_cron_call(field, type_args, args, named_args);
+                if let Some(&mod_name) = self.checked.native_aliases.get(mod_alias) {
+                    return self.check_native_module_call(mod_name, field, type_args, args, named_args);
                 }
             }
             self.check_expr(target, None)?;
@@ -168,117 +152,13 @@ impl<'a> Checker<'a> {
                 "IndexError" | "KeyError" | "ParseError" => {
                     return self.check_prelude_error_ctor(name, type_args, args, named_args);
                 }
-                _ if self.checked.json_direct_fns.contains_key(name) => {
-                    let method = self.checked.json_direct_fns[name].clone();
-                    return self.check_json_call(&method, type_args, args, named_args);
+                _ if self.checked.native_direct_fns.contains_key(name) => {
+                    let (mod_name, sym) = self.checked.native_direct_fns[name].clone();
+                    return self.check_native_module_call(mod_name, &sym, type_args, args, named_args);
                 }
-                _ if self.checked.time_direct_fns.contains_key(name) => {
-                    let method = self.checked.time_direct_fns[name].clone();
-                    return self.check_time_call(&method, type_args, args, named_args);
-                }
-                _ if self.checked.time_direct_types.contains_key(name) => {
-                    let sym = self.checked.time_direct_types[name].clone();
-                    return self.check_time_call(&sym, type_args, args, named_args);
-                }
-                _ if self.checked.val_direct_fns.contains_key(name) => {
-                    let method = self.checked.val_direct_fns[name].clone();
-                    return self.check_validation_call(&method, type_args, args, named_args);
-                }
-                _ if self.checked.val_direct_types.contains_key(name) => {
-                    let sym = self.checked.val_direct_types[name].clone();
-                    return self.check_validation_call(&sym, type_args, args, named_args);
-                }
-                _ if self.checked.env_direct_fns.contains_key(name) => {
-                    let sym = self.checked.env_direct_fns[name].clone();
-                    return self.check_env_call(&sym, type_args, args, named_args);
-                }
-                _ if self.checked.env_direct_types.contains_key(name) => {
-                    let sym = self.checked.env_direct_types[name].clone();
-                    return self.check_env_call(&sym, type_args, args, named_args);
-                }
-                _ if self.checked.cli_direct_fns.contains_key(name) => {
-                    let sym = self.checked.cli_direct_fns[name].clone();
-                    return self.check_cli_call(&sym, type_args, args, named_args);
-                }
-                _ if self.checked.cli_direct_types.contains_key(name) => {
-                    let sym = self.checked.cli_direct_types[name].clone();
-                    return self.check_cli_call(&sym, type_args, args, named_args);
-                }
-                _ if self.checked.fs_direct_fns.contains_key(name) => {
-                    let sym = self.checked.fs_direct_fns[name].clone();
-                    return self.check_fs_call(&sym, type_args, args, named_args);
-                }
-                _ if self.checked.fs_direct_types.contains_key(name) => {
-                    let sym = self.checked.fs_direct_types[name].clone();
-                    return self.check_fs_call(&sym, type_args, args, named_args);
-                }
-                _ if self.checked.path_direct_fns.contains_key(name) => {
-                    let sym = self.checked.path_direct_fns[name].clone();
-                    return self.check_path_call(&sym, type_args, args, named_args);
-                }
-                _ if self.checked.process_direct_fns.contains_key(name) => {
-                    let sym = self.checked.process_direct_fns[name].clone();
-                    return self.check_process_call(&sym, type_args, args, named_args);
-                }
-                _ if self.checked.process_direct_types.contains_key(name) => {
-                    let sym = self.checked.process_direct_types[name].clone();
-                    return self.check_process_call(&sym, type_args, args, named_args);
-                }
-                _ if self.checked.crypto_direct_fns.contains_key(name) => {
-                    let sym = self.checked.crypto_direct_fns[name].clone();
-                    return self.check_crypto_call(&sym, type_args, args, named_args);
-                }
-                _ if self.checked.crypto_direct_types.contains_key(name) => {
-                    let sym = self.checked.crypto_direct_types[name].clone();
-                    return self.check_crypto_call(&sym, type_args, args, named_args);
-                }
-                _ if self.checked.url_direct_fns.contains_key(name) => {
-                    let sym = self.checked.url_direct_fns[name].clone();
-                    return self.check_url_call(&sym, type_args, args, named_args);
-                }
-                _ if self.checked.url_direct_types.contains_key(name) => {
-                    let sym = self.checked.url_direct_types[name].clone();
-                    return self.check_url_call(&sym, type_args, args, named_args);
-                }
-                _ if self.checked.csv_direct_fns.contains_key(name) => {
-                    let sym = self.checked.csv_direct_fns[name].clone();
-                    return self.check_csv_call(&sym, type_args, args, named_args);
-                }
-                _ if self.checked.csv_direct_types.contains_key(name) => {
-                    let sym = self.checked.csv_direct_types[name].clone();
-                    return self.check_csv_call(&sym, type_args, args, named_args);
-                }
-                _ if self.checked.math_direct_fns.contains_key(name) => {
-                    let sym = self.checked.math_direct_fns[name].clone();
-                    return self.check_math_call(&sym, type_args, args, named_args);
-                }
-                _ if self.checked.log_direct_fns.contains_key(name) => {
-                    let sym = self.checked.log_direct_fns[name].clone();
-                    return self.check_log_call(&sym, type_args, args, named_args);
-                }
-                _ if self.checked.http_direct_fns.contains_key(name) => {
-                    let sym = self.checked.http_direct_fns[name].clone();
-                    return self.check_http_call(&sym, type_args, args, named_args);
-                }
-                _ if self.checked.http_direct_types.contains_key(name) => {
-                    let sym = self.checked.http_direct_types[name].clone();
-                    return self.check_http_call(&sym, type_args, args, named_args);
-                }
-                _ if self.checked.db_direct_fns.contains_key(name) => {
-                    let sym = self.checked.db_direct_fns[name].clone();
-                    return self.check_db_call(&sym, type_args, args, named_args);
-                }
-                _ if self.checked.db_direct_types.contains_key(name) => {
-                    let sym = self.checked.db_direct_types[name].clone();
-                    return self.check_db_call(&sym, type_args, args, named_args);
-                }
-                _ if self.checked.cron_direct_fns.contains_key(name) => {
-                    let sym = self.checked.cron_direct_fns[name].clone();
-                    return self.check_cron_call(&sym, type_args, args, named_args);
-                }
-                _ if self.checked.cron_direct_types.contains_key(name) => {
-                    let sym = self.checked.cron_direct_types[name].clone();
-                    return self.check_cron_call(&sym, type_args, args, named_args);
+                _ if self.checked.native_direct_types.contains_key(name) => {
+                    let (mod_name, sym) = self.checked.native_direct_types[name].clone();
+                    return self.check_native_module_call(mod_name, &sym, type_args, args, named_args);
                 }
                 _ if self.checked.generic_structs.contains_key(name) => {
                     let base = name.clone();

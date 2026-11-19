@@ -89,11 +89,30 @@ pub fn shake_unreachable_funcs(
             }
         }
     }
+    let mut extra_validators: Vec<String> = Vec::new();
     for (_, entries) in &checked.http_router_plans {
         for entry in entries {
-            if reachable.insert(entry.handler_name.clone()) {
+            if !entry.handler_name.is_empty() && reachable.insert(entry.handler_name.clone()) {
                 queue.push_back(entry.handler_name.clone());
             }
+            if let Some(sname) = &entry.body_struct {
+                let body_ty = crate::frontend::types::Type::Custom(
+                    crate::frontend::types::TypeId::program(sname),
+                );
+                let mut visited: HashSet<&str> = HashSet::new();
+                collect_validated_type_refs(
+                    &body_ty,
+                    checked,
+                    &struct_fields,
+                    &mut visited,
+                    &mut extra_validators,
+                );
+            }
+        }
+    }
+    for vname in extra_validators {
+        if reachable.insert(vname.clone()) {
+            queue.push_back(vname);
         }
     }
     for (_, entries) in &checked.cron_schedule_plans {
@@ -317,11 +336,11 @@ fn is_validation_check_callee(
     match &callee.kind {
         ExprKind::Member { target, field } => {
             field == "check"
-                && matches!(&target.kind, ExprKind::Ident(alias) if !is_shadowed(scopes, alias) && checked.val_aliases.contains(alias))
+                && matches!(&target.kind, ExprKind::Ident(alias) if !is_shadowed(scopes, alias) && checked.is_native_alias(alias, "cdt.validation"))
         }
         ExprKind::Ident(name) => {
             !is_shadowed(scopes, name)
-                && checked.val_direct_fns.get(name).map(String::as_str) == Some("check")
+                && checked.native_direct_fn(name, "cdt.validation") == Some("check")
         }
         _ => false,
     }
