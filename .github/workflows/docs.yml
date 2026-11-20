@@ -1,8 +1,9 @@
 name: docs
 
 on:
-  push:
-    branches: [main]
+  workflow_run:
+    workflows: ["release"]
+    types: [completed]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -19,9 +20,12 @@ concurrency:
 jobs:
   build-and-test:
     name: Build & Verify Documentation
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Setup Rust toolchain
         run: rustup default stable
@@ -50,7 +54,7 @@ jobs:
           test -f docs/.vitepress/dist/library/validation.html
 
       - name: Upload Pages artifact
-        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        if: (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success') || github.event_name == 'workflow_dispatch'
         uses: actions/upload-pages-artifact@v3
         with:
           path: docs/.vitepress/dist
@@ -58,7 +62,7 @@ jobs:
   deploy:
     name: Deploy to GitHub Pages
     needs: build-and-test
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    if: (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     environment:
       name: github-pages

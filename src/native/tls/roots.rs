@@ -1,5 +1,3 @@
-//! Trusted root CA store with lazy loading and OS keychain/store integration.
-
 use std::collections::HashMap;
 use std::fs;
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -262,7 +260,6 @@ fn load_windows_roots() -> Result<Vec<Vec<u8>>, TlsError> {
             h_cert_store: *mut c_void,
             p_prev_cert_context: *const CertContext,
         ) -> *const CertContext;
-        fn CertFreeCertificateContext(p_cert_context: *const CertContext) -> i32;
         fn CertCloseStore(h_cert_store: *mut c_void, dw_flags: u32) -> i32;
     }
 
@@ -295,6 +292,5 @@ fn load_windows_roots() -> Result<Vec<Vec<u8>>, TlsError> {
         }
         let _ = CertCloseStore(store, 0);
     }
-    let _ = Path::new(""); // keep Path import clean across targets if needed
     Ok(ders)
 }

@@ -2,9 +2,12 @@
   "name": "conduit-textmate",
   "displayName": "Conduit TextMate Grammar",
   "description": "TextMate grammar for Conduit .cdt files",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "publisher": "resoul",
-  "categories": ["Programming Languages", "Themes"],
+  "categories": [
+    "Programming Languages",
+    "Themes"
+  ],
   "engines": {
     "vscode": "*"
   },
@@ -12,8 +15,13 @@
     "languages": [
       {
         "id": "conduit",
-        "aliases": ["Conduit", "conduit"],
-        "extensions": [".cdt"],
+        "aliases": [
+          "Conduit",
+          "conduit"
+        ],
+        "extensions": [
+          ".cdt"
+        ],
         "configuration": "./language-configuration.json"
       }
     ],
