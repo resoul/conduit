@@ -220,10 +220,13 @@ impl BigUint {
         self.mul(other).rem(m)
     }
 
-    /// Public-exponent modular exponentiation (used for RSA verify & Fermat inversion).
+    /// Public-exponent modular exponentiation (uses Montgomery multiplication for odd moduli).
     pub fn mod_pow(&self, exp: &Self, m: &Self) -> Self {
         if m.is_zero() {
             return Self::zero();
+        }
+        if !m.is_even() {
+            return self.mod_pow_montgomery(exp, m);
         }
         let mut base = self.rem(m);
         let mut res = Self::one().rem(m);
@@ -239,6 +242,42 @@ impl BigUint {
         res
     }
 
+    fn mod_pow_montgomery(&self, exp: &Self, m: &Self) -> Self {
+        let k = m.limbs.len();
+        let n = &m.limbs;
+        let n0_inv = mont_n0_inv(n[0]);
+
+        // Compute R^2 mod m where R = 2^(64*k)
+        let mut r2 = Self::zero();
+        r2.limbs = vec![0u64; 2 * k + 1];
+        r2.limbs[2 * k] = 1;
+        let r2_mod = r2.rem(m);
+
+        let base_mod = self.rem(m);
+        let mut base_limbs = vec![0u64; k];
+        base_limbs[..base_mod.limbs.len()].copy_from_slice(&base_mod.limbs);
+        let mut r2_limbs = vec![0u64; k];
+        r2_limbs[..r2_mod.limbs.len()].copy_from_slice(&r2_mod.limbs);
+
+        let base_mont = mont_mul(&base_limbs, &r2_limbs, n, n0_inv);
+        let mut one_limbs = vec![0u64; k];
+        one_limbs[0] = 1;
+        let mut acc_mont = mont_mul(&one_limbs, &r2_limbs, n, n0_inv);
+
+        let bits = exp.bit_len();
+        for i in (0..bits).rev() {
+            acc_mont = mont_mul(&acc_mont, &acc_mont, n, n0_inv);
+            if exp.bit(i) {
+                acc_mont = mont_mul(&acc_mont, &base_mont, n, n0_inv);
+            }
+        }
+
+        let res_limbs = mont_mul(&acc_mont, &one_limbs, n, n0_inv);
+        let mut res = Self { limbs: res_limbs };
+        res.trim();
+        res
+    }
+
     /// Modular inverse for prime modulus `p > 2` via Fermat's Little Theorem: `a^(p-2) mod p`.
     pub fn mod_inv_prime(&self, p: &Self) -> Option<Self> {
         if self.is_zero() || p.cmp_val(&Self::from_u64(2)) != Ordering::Greater {
@@ -248,6 +287,73 @@ impl BigUint {
         let inv = self.mod_pow(&p_minus_2, p);
         if inv.is_zero() { None } else { Some(inv) }
     }
+}
+
+/// Computes `-n0^-1 mod 2^64` for odd `n0` using Newton's method.
+#[inline]
+fn mont_n0_inv(n0: u64) -> u64 {
+    let mut x = 1u64;
+    for _ in 0..6 {
+        x = x.wrapping_mul(2u64.wrapping_sub(n0.wrapping_mul(x)));
+    }
+    x.wrapping_neg()
+}
+
+/// Montgomery multiplication `a * b * R^-1 mod n` (SOS/CIOS), `a.len() == b.len() == n.len() == k`.
+fn mont_mul(a: &[u64], b: &[u64], n: &[u64], n0_inv: u64) -> Vec<u64> {
+    let k = n.len();
+    let mut t = vec![0u64; k + 2];
+    for &ai in a {
+        let mut carry = 0u128;
+        for j in 0..k {
+            let p = (ai as u128) * (b[j] as u128) + (t[j] as u128) + carry;
+            t[j] = p as u64;
+            carry = p >> 64;
+        }
+        let s = (t[k] as u128) + carry;
+        t[k] = s as u64;
+        t[k + 1] = (s >> 64) as u64;
+
+        let m = t[0].wrapping_mul(n0_inv);
+        let mut carry2 = ((m as u128) * (n[0] as u128) + (t[0] as u128)) >> 64;
+        for j in 1..k {
+            let p = (m as u128) * (n[j] as u128) + (t[j] as u128) + carry2;
+            t[j - 1] = p as u64;
+            carry2 = p >> 64;
+        }
+        let s2 = (t[k] as u128) + carry2;
+        t[k - 1] = s2 as u64;
+        t[k] = t[k + 1] + ((s2 >> 64) as u64);
+        t[k + 1] = 0;
+    }
+
+    // Final conditional subtraction if t >= n
+    let mut ge = t[k] > 0;
+    if !ge {
+        ge = true;
+        for j in (0..k).rev() {
+            if t[j] != n[j] {
+                ge = t[j] > n[j];
+                break;
+            }
+        }
+    }
+    if ge {
+        let mut borrow = 0u128;
+        for j in 0..k {
+            let sub = (n[j] as u128) + borrow;
+            let tj = t[j] as u128;
+            if tj >= sub {
+                t[j] = (tj - sub) as u64;
+                borrow = 0;
+            } else {
+                t[j] = ((1u128 << 64) + tj - sub) as u64;
+                borrow = 1;
+            }
+        }
+    }
+    t.truncate(k);
+    t
 }
 
 #[cfg(test)]

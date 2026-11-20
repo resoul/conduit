@@ -11,7 +11,7 @@ use crate::native::tls::crypto::p256::ecdsa_p256_verify_der;
 use crate::native::tls::crypto::p384::ecdsa_p384_verify_der;
 use crate::native::tls::crypto::rsa::{RsaHashAlg, RsaPublicKey};
 use crate::native::tls::crypto::sha2::{Digest, Sha256, Sha384, Sha512};
-use crate::native::tls::error::{AlertDescription, TlsError};
+use crate::native::tls::error::TlsError;
 use crate::native::tls::handshake::{
     CipherSuite, HT_CERTIFICATE, HT_CERTIFICATE_REQUEST, HT_CLIENT_KEY_EXCHANGE, HT_FINISHED,
     HT_SERVER_HELLO_DONE, HT_SERVER_KEY_EXCHANGE, HandshakeReader, SIG_ECDSA_SECP256R1_SHA256,
@@ -187,10 +187,8 @@ pub fn finish_tls12_handshake<S: Read + Write>(
     master_secret.zeroize();
 
     if !constant_time_eq(&raw_fin[4..], &expected_vd) {
-        return Err(TlsError::RemoteAlert {
-            level: 2,
-            description: AlertDescription::DecryptError,
-        });
+        let _ = record.write_record(stream, crate::native::tls::record::CT_ALERT, &[2, 51]);
+        return Err(TlsError::ProtocolError("TLS 1.2 server Finished verify_data mismatch".to_string()));
     }
 
     Ok(HandshakeOutcome {

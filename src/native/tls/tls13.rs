@@ -164,7 +164,7 @@ pub fn finish_tls13_handshake<S: Read + Write>(
 
     let mut shared_secret = eph.ecdh(peer_group, &peer_pub)?;
 
-    let (client_hs_secret, server_hs_secret, master_secret) = if suite.uses_sha384() {
+    let (mut client_hs_secret, mut server_hs_secret, mut master_secret) = if suite.uses_sha384() {
         let zeros = [0u8; 48];
         let empty_hash = Sha384::digest_vec(b"");
         let early = hkdf_extract::<Sha384>(&zeros, &zeros);
@@ -253,11 +253,12 @@ pub fn finish_tls13_handshake<S: Read + Write>(
     }
     let th_before_fin = transcript.current_hash();
     let expected_server_fin = compute_finished_verify_data(suite, &server_hs_secret, &th_before_fin);
+    server_hs_secret.zeroize();
     if !constant_time_eq(&raw[4..], &expected_server_fin) {
-        return Err(TlsError::RemoteAlert {
-            level: 2,
-            description: AlertDescription::DecryptError,
-        });
+        client_hs_secret.zeroize();
+        master_secret.zeroize();
+        let _ = record.write_record(stream, CT_ALERT, &[2, 51]);
+        return Err(TlsError::ProtocolError("server Finished verify_data mismatch".to_string()));
     }
     transcript.update(&raw);
 
@@ -274,6 +275,7 @@ pub fn finish_tls13_handshake<S: Read + Write>(
             derive_secret::<Sha256>(&master_secret, b"s ap traffic", &th_server_fin),
         )
     };
+    master_secret.zeroize();
 
     // 5. Client optional empty Certificate + Finished
     if cert_requested {
@@ -288,6 +290,7 @@ pub fn finish_tls13_handshake<S: Read + Write>(
 
     let th_client_fin = transcript.current_hash();
     let client_verify_data = compute_finished_verify_data(suite, &client_hs_secret, &th_client_fin);
+    client_hs_secret.zeroize();
     let client_fin_msg = wrap_handshake(HT_FINISHED, &client_verify_data);
     record.write_record(stream, CT_HANDSHAKE, &client_fin_msg)?;
 
@@ -489,6 +492,11 @@ pub fn connect_tls_handshake<S: Read + Write>(
         if sh2.is_hrr {
             return Err(TlsError::ProtocolError("received second HelloRetryRequest".to_string()));
         }
+        if sh2.selected_version != 0x0304 || sh2.cipher_suite != sh.cipher_suite {
+            return Err(TlsError::ProtocolError(
+                "ServerHello after HRR changed version or cipher suite".to_string(),
+            ));
+        }
         transcript.update(&raw_sh2);
         sh = sh2;
     } else if sh.selected_version == 0x0304 {
@@ -497,6 +505,11 @@ pub fn connect_tls_handshake<S: Read + Write>(
     }
 
     if sh.selected_version == 0x0304 {
+        if sh.session_id != legacy_session_id {
+            return Err(TlsError::ProtocolError(
+                "TLS 1.3 ServerHello did not echo legacy_session_id".to_string(),
+            ));
+        }
         return finish_tls13_handshake(stream, cfg, record, transcript, hs_reader, sh, eph);
     }
 
@@ -509,6 +522,11 @@ pub fn connect_tls_handshake<S: Read + Write>(
     }
 
     if allow_tls12 && sh.selected_version == 0x0303 && !sh.is_hrr {
+        if sh.cipher_suite.is_tls13() {
+            return Err(TlsError::ProtocolError(
+                "TLS 1.3 cipher suite selected for TLS 1.2".to_string(),
+            ));
+        }
         transcript.update(&raw_sh);
         return crate::native::tls::tls12::finish_tls12_handshake(
             stream,

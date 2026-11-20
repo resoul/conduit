@@ -192,9 +192,14 @@ pub fn parse_x509<'a>(der: &'a [u8]) -> Result<X509Cert<'a>, TlsError> {
         if !ext_wrap.is_empty() {
             return Err(TlsError::CertificateError("trailing bytes after extensions".to_string()));
         }
+        let mut seen_oids: Vec<&[u8]> = Vec::new();
         while !exts.is_empty() {
             let mut ext = exts.read_sequence()?;
             let oid = ext.read_oid()?;
+            if seen_oids.contains(&oid) {
+                return Err(TlsError::CertificateError("duplicate X.509 extension".to_string()));
+            }
+            seen_oids.push(oid);
             let critical = if ext.peek_tag() == Some(TAG_BOOLEAN) {
                 ext.read_boolean()?
             } else {
@@ -222,7 +227,7 @@ pub fn parse_x509<'a>(der: &'a [u8]) -> Result<X509Cert<'a>, TlsError> {
                     eku_server_auth = parse_eku_server_auth(val)?;
                 }
                 OID_EXT_NAME_CONSTRAINTS => {
-                    name_constraints = Some(parse_name_constraints(val)?);
+                    name_constraints = Some(parse_name_constraints(val, critical)?);
                 }
                 OID_EXT_SUBJECT_KEY_ID | OID_EXT_AUTH_KEY_ID | OID_EXT_CERT_POLICIES => {
                     // Safe to ignore when non-critical; if certPolicies is critical we only
@@ -430,7 +435,7 @@ fn parse_eku_server_auth(val: &[u8]) -> Result<bool, TlsError> {
     Ok(server_auth)
 }
 
-fn parse_name_constraints(val: &[u8]) -> Result<NameConstraints, TlsError> {
+fn parse_name_constraints(val: &[u8], critical: bool) -> Result<NameConstraints, TlsError> {
     let mut seq = DerReader::new(val).read_sequence()?;
     let mut nc = NameConstraints::default();
     while !seq.is_empty() {
@@ -454,6 +459,10 @@ fn parse_name_constraints(val: &[u8]) -> Result<NameConstraints, TlsError> {
                 } else {
                     nc.excluded_dns.push(lower);
                 }
+            } else if critical {
+                return Err(TlsError::CertificateError(
+                    "unsupported critical nameConstraints subtree type".to_string(),
+                ));
             }
         }
     }
@@ -512,9 +521,21 @@ fn parse_4d(s: &str) -> Result<i64, TlsError> {
         .map_err(|_| TlsError::CertificateError("invalid digit in certificate time".to_string()))
 }
 
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            let leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+            if leap { 29 } else { 28 }
+        }
+        _ => 0,
+    }
+}
+
 fn civil_to_unix(year: i64, month: i64, day: i64, hour: i64, min: i64, sec: i64) -> Result<i64, TlsError> {
     if !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
+        || !(1..=days_in_month(year, month)).contains(&day)
         || !(0..=23).contains(&hour)
         || !(0..=59).contains(&min)
         || !(0..=59).contains(&sec)

@@ -9,6 +9,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
+* **HTTP Server Hardening & Runtime Optimizations**:
+  * Replaced the 20ms non-blocking `accept()` polling loop in `router.serve()` with blocking `accept()` + wake-on-stop, hardened HTTP request parsing against request smuggling (`Transfer-Encoding`, duplicate/non-digit `Content-Length`, whitespace in header names), bounded line reads (`read_crlf_line`), and tightened keep-alive idle/header timeouts.
+  * Switched `cdt.cache` and DB statement caches to `FxBuildHasher` with automatic `key_locks` cleanup, and added Montgomery modular exponentiation for RSA verification.
 * **Built-in Zero-Dependency TLS 1.2 / 1.3 Client (`src/native/tls/`)**:
   * Implemented pure-Rust TLS 1.3 (RFC 8446) and TLS 1.2 (ECDHE + AEAD with mandatory `extended_master_secret`, RFC 7627) client with AES-128/256-GCM (AES-NI / ARMv8 AES + PCLMULQDQ / PMULL + constant-time fallback), ChaCha20-Poly1305, X25519, NIST P-256, P-384, RSA PKCS#1 v1.5 / RSASSA-PSS, X.509 v3 / SAN / RFC 6125 verification, and OS trust store loading (`Security.framework` on macOS, `crypt32.dll` on Windows, system PEM bundles on Linux/BSD).
   * Integrated native TLS into PostgreSQL (`sslmode=disable|allow|prefer|require|verify-ca|verify-full`, `sslrootcert`, `SCRAM-SHA-256-PLUS`), MySQL (`ssl-mode=disabled|preferred|required|verify_ca|verify_identity`, `sslrootcert`, `caching_sha2_password` full auth over TLS), Redis (`rediss://`, `tls_verify`, `ca_file`), and HTTPS (`http.get` / `http.request`, removing the external `curl` subprocess dependency).

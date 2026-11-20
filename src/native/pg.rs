@@ -678,8 +678,8 @@ struct CachedPgStmt {
 
 #[derive(Default)]
 struct PgStmtCache {
-    map: HashMap<String, CachedPgStmt>,
-    order: VecDeque<String>,
+    map: HashMap<std::sync::Arc<str>, CachedPgStmt, crate::vm::value::FxBuildHasher>,
+    order: VecDeque<std::sync::Arc<str>>,
     next_id: u64,
 }
 
@@ -690,20 +690,23 @@ impl PgStmtCache {
     }
 
     fn get(&mut self, sql: &str) -> Option<CachedPgStmt> {
-        let entry = self.map.get(sql).cloned()?;
-        if self.order.back().map(String::as_str) != Some(sql) {
-            if let Some(pos) = self.order.iter().position(|k| k == sql) {
+        let (key_arc, entry) = self.map.get_key_value(sql)?;
+        let key_arc = std::sync::Arc::clone(key_arc);
+        let entry = entry.clone();
+        if self.order.back().map(|k| &**k) != Some(sql) {
+            if let Some(pos) = self.order.iter().position(|k| &**k == sql) {
                 self.order.remove(pos);
             }
-            self.order.push_back(sql.to_string());
+            self.order.push_back(key_arc);
         }
         Some(entry)
     }
 
     fn insert(&mut self, sql: String, stmt: CachedPgStmt) -> Option<String> {
+        let key_arc: std::sync::Arc<str> = std::sync::Arc::from(sql);
         let mut evicted_name = None;
-        if let Some(prev) = self.map.insert(sql.clone(), stmt) {
-            if let Some(pos) = self.order.iter().position(|k| k == &sql) {
+        if let Some(prev) = self.map.insert(std::sync::Arc::clone(&key_arc), stmt) {
+            if let Some(pos) = self.order.iter().position(|k| *k == key_arc) {
                 self.order.remove(pos);
             }
             evicted_name = Some(prev.name);
@@ -713,12 +716,12 @@ impl PgStmtCache {
         {
             evicted_name = Some(old_stmt.name);
         }
-        self.order.push_back(sql);
+        self.order.push_back(key_arc);
         evicted_name
     }
 
     fn remove(&mut self, sql: &str) -> Option<String> {
-        if let Some(pos) = self.order.iter().position(|k| k == sql) {
+        if let Some(pos) = self.order.iter().position(|k| &**k == sql) {
             self.order.remove(pos);
         }
         self.map.remove(sql).map(|s| s.name)

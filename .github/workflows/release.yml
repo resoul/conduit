@@ -8,8 +8,16 @@ permissions:
   contents: write
 
 jobs:
+  tests:
+    uses: ./.github/workflows/ci.yml
+
+  bench:
+    needs: tests
+    uses: ./.github/workflows/bench.yml
+
   build:
     name: build (${{ matrix.target }})
+    needs: bench
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: true
@@ -34,10 +42,6 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: echo "RUSTFLAGS=-C target-feature=+crt-static" >> "$GITHUB_ENV"
-
-      - name: Run tests
-        if: matrix.native
-        run: cargo test --release --target ${{ matrix.target }}
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}

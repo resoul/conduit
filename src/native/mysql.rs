@@ -360,26 +360,28 @@ struct CachedMysqlStmt {
 
 #[derive(Default)]
 struct MysqlStmtCache {
-    map: HashMap<String, CachedMysqlStmt>,
-    order: VecDeque<String>,
+    map: HashMap<std::sync::Arc<str>, CachedMysqlStmt, crate::vm::value::FxBuildHasher>,
+    order: VecDeque<std::sync::Arc<str>>,
 }
 
 impl MysqlStmtCache {
     fn get(&mut self, sql: &str) -> Option<CachedMysqlStmt> {
-        let entry = *self.map.get(sql)?;
-        if self.order.back().map(String::as_str) != Some(sql) {
-            if let Some(pos) = self.order.iter().position(|k| k == sql) {
+        let (key_arc, &entry) = self.map.get_key_value(sql)?;
+        let key_arc = std::sync::Arc::clone(key_arc);
+        if self.order.back().map(|k| &**k) != Some(sql) {
+            if let Some(pos) = self.order.iter().position(|k| &**k == sql) {
                 self.order.remove(pos);
             }
-            self.order.push_back(sql.to_string());
+            self.order.push_back(key_arc);
         }
         Some(entry)
     }
 
     fn insert(&mut self, sql: String, stmt: CachedMysqlStmt) -> Option<u32> {
+        let key_arc: std::sync::Arc<str> = std::sync::Arc::from(sql);
         let mut evicted_id = None;
-        if let Some(prev) = self.map.insert(sql.clone(), stmt) {
-            if let Some(pos) = self.order.iter().position(|k| k == &sql) {
+        if let Some(prev) = self.map.insert(std::sync::Arc::clone(&key_arc), stmt) {
+            if let Some(pos) = self.order.iter().position(|k| *k == key_arc) {
                 self.order.remove(pos);
             }
             evicted_id = Some(prev.stmt_id);
@@ -389,12 +391,12 @@ impl MysqlStmtCache {
         {
             evicted_id = Some(old_stmt.stmt_id);
         }
-        self.order.push_back(sql);
+        self.order.push_back(key_arc);
         evicted_id
     }
 
     fn remove(&mut self, sql: &str) {
-        if let Some(pos) = self.order.iter().position(|k| k == sql) {
+        if let Some(pos) = self.order.iter().position(|k| &**k == sql) {
             self.order.remove(pos);
         }
         self.map.remove(sql);

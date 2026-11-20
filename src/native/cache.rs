@@ -395,7 +395,7 @@ struct CacheInner {
     max_entries: usize,
     slots: Vec<CacheSlot>,
     free_slots: Vec<u32>,
-    index: HashMap<Arc<str>, u32>,
+    index: HashMap<Arc<str>, u32, crate::vm::value::FxBuildHasher>,
     head: u32,
     tail: u32,
     live_count: usize,
@@ -409,7 +409,7 @@ impl CacheInner {
             max_entries,
             slots: Vec::new(),
             free_slots: Vec::new(),
-            index: HashMap::new(),
+            index: HashMap::with_hasher(crate::vm::value::FxBuildHasher),
             head: LRU_NONE,
             tail: LRU_NONE,
             live_count: 0,
@@ -657,14 +657,14 @@ impl CacheInner {
 
 pub(crate) struct CacheStore {
     state: Mutex<CacheInner>,
-    key_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    key_locks: Mutex<HashMap<String, Arc<Mutex<()>>, crate::vm::value::FxBuildHasher>>,
 }
 
 impl CacheStore {
     fn new_in_mem(max_entries: usize) -> Self {
         Self {
             state: Mutex::new(CacheInner::new(max_entries)),
-            key_locks: Mutex::new(HashMap::new()),
+            key_locks: Mutex::new(HashMap::with_hasher(crate::vm::value::FxBuildHasher)),
         }
     }
 
@@ -768,12 +768,15 @@ impl CacheStore {
 
         Ok(Self {
             state: Mutex::new(inner),
-            key_locks: Mutex::new(HashMap::new()),
+            key_locks: Mutex::new(HashMap::with_hasher(crate::vm::value::FxBuildHasher)),
         })
     }
 
     pub(crate) fn key_lock(&self, key: &str) -> Arc<Mutex<()>> {
         let mut map = self.key_locks.lock().unwrap_or_else(|e| e.into_inner());
+        if map.len() > 256 && map.len().is_multiple_of(64) {
+            map.retain(|_, v| Arc::strong_count(v) > 1);
+        }
         Arc::clone(
             map.entry(key.to_string())
                 .or_insert_with(|| Arc::new(Mutex::new(()))),

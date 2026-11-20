@@ -72,6 +72,7 @@ pub struct RouterState {
     pub statics: Vec<(Box<str>, Box<str>)>,
     pub cors_origin: Option<Box<str>>,
     pub stop_flag: Arc<AtomicBool>,
+    pub listen_addr: Arc<std::sync::Mutex<Option<std::net::SocketAddr>>>,
 }
 
 #[inline]
@@ -431,9 +432,22 @@ pub enum ReadHttpError {
     Io(io::Error),
 }
 
+fn is_http_tchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' | b'^' | b'_'
+                | b'`' | b'|' | b'~'
+        )
+}
+
 fn read_crlf_line<R: BufRead>(reader: &mut R) -> Result<Option<String>, ReadHttpError> {
     let mut buf = Vec::new();
-    let n = reader.read_until(b'\n', &mut buf).map_err(ReadHttpError::Io)?;
+    let n = reader
+        .by_ref()
+        .take(MAX_LINE as u64 + 1)
+        .read_until(b'\n', &mut buf)
+        .map_err(ReadHttpError::Io)?;
     if n == 0 {
         return Ok(None);
     }
@@ -480,6 +494,7 @@ pub fn read_http_request<R: BufRead>(reader: &mut R) -> Result<RawHttpRequest, R
 
     let mut headers = Vec::new();
     let mut content_length: usize = 0;
+    let mut saw_content_length = false;
     let mut conn_header: Option<String> = None;
     loop {
         let Some(line) = read_crlf_line(reader)? else {
@@ -494,9 +509,23 @@ pub fn read_http_request<R: BufRead>(reader: &mut R) -> Result<RawHttpRequest, R
         let Some((name, val)) = line.split_once(':') else {
             return Err(ReadHttpError::Bad("Malformed HTTP header".to_string()));
         };
-        let lname = name.trim().to_ascii_lowercase();
+        if name.is_empty() || !name.bytes().all(is_http_tchar) {
+            return Err(ReadHttpError::Bad("Invalid HTTP header name".to_string()));
+        }
+        let lname = name.to_ascii_lowercase();
         let val = val.trim().to_string();
-        if lname == "content-length" {
+        if lname == "transfer-encoding" {
+            return Err(ReadHttpError::Bad(
+                "Transfer-Encoding is not supported".to_string(),
+            ));
+        } else if lname == "content-length" {
+            if saw_content_length {
+                return Err(ReadHttpError::Bad("Duplicate Content-Length header".to_string()));
+            }
+            saw_content_length = true;
+            if val.is_empty() || !val.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(ReadHttpError::Bad("Invalid Content-Length".to_string()));
+            }
             content_length = val
                 .parse::<usize>()
                 .map_err(|_| ReadHttpError::Bad("Invalid Content-Length".to_string()))?;

@@ -72,8 +72,11 @@ impl RsaPublicKey {
         if !(2048..=8192).contains(&bit_len) {
             return None;
         }
-        // Reject weak public exponents (e < 65537 or even)
-        if e.is_even() || e.cmp_val(&BigUint::from_u64(65537)) == std::cmp::Ordering::Less {
+        // Reject weak public exponents (e < 65537 or even) and huge DoS exponents (e >= 2^33)
+        if e.is_even()
+            || e.cmp_val(&BigUint::from_u64(65537)) == std::cmp::Ordering::Less
+            || e.bit_len() > 33
+        {
             return None;
         }
         if e.cmp_val(&n) != std::cmp::Ordering::Less {

@@ -715,9 +715,10 @@ impl Vm {
                         return Ok(());
                     }
                 };
-                if let Err(e) = listener.set_nonblocking(true) {
-                    self.objs[o_base + a as usize] = make_http_error("bind_error", e.to_string());
-                    return Ok(());
+                if let Ok(local) = listener.local_addr()
+                    && let Ok(mut guard) = self.host.routers[rid].listen_addr.lock()
+                {
+                    *guard = Some(local);
                 }
                 self.host.routers[rid].stop_flag.store(false, Ordering::Release);
                 let stop_flag = Arc::clone(&self.host.routers[rid].stop_flag);
@@ -752,24 +753,39 @@ impl Vm {
                     while !stop_flag.load(Ordering::Acquire) {
                         match listener.accept() {
                             Ok((stream, _)) => {
-                                let _ = stream.set_nonblocking(false);
+                                if stop_flag.load(Ordering::Acquire) {
+                                    break;
+                                }
                                 if tx.send(stream).is_err() {
                                     break;
                                 }
                             }
-                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                std::thread::sleep(Duration::from_millis(20));
-                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                             Err(_) => break,
                         }
                     }
                     drop(tx);
                 });
+                if let Ok(mut guard) = self.host.routers[rid].listen_addr.lock() {
+                    *guard = None;
+                }
                 self.objs[o_base + a as usize] = Obj::Empty;
             }
             HTTP_STOP => {
                 let rid = self.extract_router_id(&self.objs[o_base + b as usize])?;
                 self.host.routers[rid].stop_flag.store(true, Ordering::Release);
+                if let Ok(guard) = self.host.routers[rid].listen_addr.lock()
+                    && let Some(mut addr) = *guard
+                {
+                    if addr.ip().is_unspecified() {
+                        addr.set_ip(if addr.is_ipv4() {
+                            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+                        } else {
+                            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+                        });
+                    }
+                    let _ = TcpStream::connect_timeout(&addr, Duration::from_millis(50));
+                }
                 self.objs[o_base + a as usize] = Obj::Empty;
             }
             HTTP_GET => {
@@ -901,12 +917,18 @@ fn extract_header_pairs(obj: &Obj) -> Vec<(String, String)> {
 }
 
 fn serve_connection(vm: &mut Vm, module: &Module, rid: usize, stream: TcpStream) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
     let Ok((mut reader, mut writer)) = reader_writer_pair(stream) else {
         return;
     };
+    let mut first_req = true;
     loop {
+        if !first_req {
+            // Keep-alive idle timeout to prevent slowloris / connection exhaustion
+            let _ = reader.get_ref().set_read_timeout(Some(Duration::from_secs(5)));
+        }
+        first_req = false;
         match read_http_request(&mut reader) {
             Ok(raw) => {
                 let head_only = raw.method.eq_ignore_ascii_case("HEAD");

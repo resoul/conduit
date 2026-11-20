@@ -16,6 +16,7 @@ use crate::native::tls::x509::{
 };
 
 pub const MAX_CHAIN_LEN: usize = 10;
+pub const MAX_SIG_CHECKS: usize = 16;
 
 pub fn unix_now() -> i64 {
     SystemTime::now()
@@ -61,7 +62,17 @@ pub fn verify_server_cert(
     let mut visited = vec![false; parsed.len()];
     visited[0] = true;
     let mut path_indices = vec![0usize];
-    if !build_and_verify_path(leaf, &parsed, roots, &mut visited, &mut path_indices, 0, now)? {
+    let mut sig_checks_left = MAX_SIG_CHECKS;
+    if !build_and_verify_path(
+        leaf,
+        &parsed,
+        roots,
+        &mut visited,
+        &mut path_indices,
+        0,
+        now,
+        &mut sig_checks_left,
+    )? {
         return Err(TlsError::CertificateError(
             "unable to verify certificate chain against any trusted root CA".to_string(),
         ));
@@ -69,6 +80,7 @@ pub fn verify_server_cert(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_and_verify_path<'a>(
     current: &X509Cert<'a>,
     intermediates: &[X509Cert<'a>],
@@ -77,6 +89,7 @@ fn build_and_verify_path<'a>(
     path_indices: &mut Vec<usize>,
     ca_depth: usize,
     now: i64,
+    sig_checks_left: &mut usize,
 ) -> Result<bool, TlsError> {
     if path_indices.len() > MAX_CHAIN_LEN {
         return Ok(false);
@@ -90,9 +103,15 @@ fn build_and_verify_path<'a>(
         if check_validity(&root, now).is_err() {
             continue;
         }
-        if !check_ca_constraints(&root, ca_depth) {
+        if !check_ca_constraints(&root, ca_depth, true) {
             continue;
         }
+        if *sig_checks_left == 0 {
+            return Err(TlsError::CertificateError(
+                "certificate chain signature verification limit exceeded".to_string(),
+            ));
+        }
+        *sig_checks_left -= 1;
         if verify_signature(current, &root).is_ok() {
             if let Some(nc) = &root.name_constraints {
                 check_name_constraints_on_leaf(nc, intermediates[0].san.as_slice())?;
@@ -109,9 +128,15 @@ fn build_and_verify_path<'a>(
         if check_validity(cand, now).is_err() {
             continue;
         }
-        if !check_ca_constraints(cand, ca_depth) {
+        if !check_ca_constraints(cand, ca_depth, false) {
             continue;
         }
+        if *sig_checks_left == 0 {
+            return Err(TlsError::CertificateError(
+                "certificate chain signature verification limit exceeded".to_string(),
+            ));
+        }
+        *sig_checks_left -= 1;
         if verify_signature(current, cand).is_err() {
             continue;
         }
@@ -128,6 +153,7 @@ fn build_and_verify_path<'a>(
             path_indices,
             ca_depth + 1,
             now,
+            sig_checks_left,
         )? {
             return Ok(true);
         }
@@ -148,8 +174,9 @@ fn check_validity(cert: &X509Cert<'_>, now: i64) -> Result<(), TlsError> {
     Ok(())
 }
 
-fn check_ca_constraints(ca: &X509Cert<'_>, sub_ca_count: usize) -> bool {
-    if !ca.is_ca {
+fn check_ca_constraints(ca: &X509Cert<'_>, sub_ca_count: usize, is_trust_anchor: bool) -> bool {
+    // Allow legacy X.509 v1 trust anchors without BasicConstraints
+    if !ca.is_ca && !(is_trust_anchor && ca.version == 0) {
         return false;
     }
     if ca.has_key_usage && !ca.key_cert_sign {

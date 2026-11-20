@@ -2,8 +2,7 @@ name: Cross-OS Benchmarks
 
 on:
   workflow_dispatch:
-  push:
-    tags: ['v*']
+  workflow_call:
 
 jobs:
   benchmark:
