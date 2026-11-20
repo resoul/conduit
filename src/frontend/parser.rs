@@ -171,9 +171,9 @@ impl Parser {
                 true,
             ));
         }
-        if !item_annotations.is_empty() && !matches!(tok.kind, TokenKind::KwStruct) {
+        if !item_annotations.is_empty() && !matches!(tok.kind, TokenKind::KwStruct | TokenKind::KwError) {
             return Err(ParserError {
-                message: "Item annotations (e.g. '@db.table(...)') are only allowed on struct declarations"
+                message: "Item annotations (e.g. '@db.table(...)', '@http.status(...)') are only allowed on struct or error declarations"
                     .to_string(),
                 span: item_annotations[0].span,
             });
@@ -186,8 +186,10 @@ impl Parser {
             TokenKind::KwEnum => self.parse_enum_item(is_exported),
             TokenKind::KwError => self.parse_error_item(is_exported),
             TokenKind::Ident(kw) if kw == "cli" => self.parse_cli_item(is_exported),
+            TokenKind::Ident(kw) if kw == "config" => self.parse_config_item(is_exported),
             TokenKind::Ident(kw) if kw == "router" => self.parse_router_item(is_exported),
             TokenKind::Ident(kw) if kw == "schedule" => self.parse_schedule_item(is_exported),
+            TokenKind::Ident(kw) if kw == "job" => self.parse_job_item(is_exported),
             TokenKind::Ident(kw) if kw == "migration" => self.parse_migration_item(),
             TokenKind::Ident(kw) if kw == "query" => self.parse_query_item(is_exported),
             TokenKind::Ident(kw) if kw == "test" => self.parse_test_item(is_exported, export_span),
@@ -623,6 +625,32 @@ impl Parser {
             ItemKind::Struct {
                 name,
                 type_params,
+                fields,
+            },
+            start_span,
+            is_exported,
+        ))
+    }
+
+    fn parse_config_item(&mut self, is_exported: bool) -> Result<Item, ParserError> {
+        let (_, start_span) = self.expect_ident()?;
+        let (name, _) = self.expect_ident()?;
+        self.expect(&TokenKind::LBrace)?;
+        let mut fields = self.parse_field_list(&TokenKind::RBrace)?;
+        self.expect(&TokenKind::RBrace)?;
+        for f in &mut fields {
+            if !f.annotations.iter().any(|a| a.target == "env") {
+                f.annotations.push(FieldAnnotation {
+                    target: "env".to_string(),
+                    args: Vec::new(),
+                    span: f.span,
+                });
+            }
+        }
+        Ok(Item::new_exported(
+            ItemKind::Struct {
+                name,
+                type_params: Vec::new(),
                 fields,
             },
             start_span,

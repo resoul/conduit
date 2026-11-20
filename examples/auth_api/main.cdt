@@ -79,14 +79,14 @@ func extract_bearer(req: http.Request) -> String? {
     return tok
 }
 
-func require_jwt(req: http.Request) -> http.Response? {
+func require_jwt(req: http.Request) -> Claims | http.Response {
     tok := extract_bearer(req) ?? ""
     if tok.is_empty() {
         return http.status_json(401, ErrReply(code: "missing_bearer_token"))
     }
     switch jwt.verify<Claims>(tok, jwt_secret()) {
-        case Claims(_):
-            return nil
+        case Claims(claims):
+            return claims
         case jwt.JwtError(_):
             return http.status_json(401, ErrReply(code: "invalid_or_expired_token"))
     }
@@ -113,25 +113,19 @@ func login_handler(_req: http.Request, body: LoginRequest) -> http.Response {
     }
 }
 
-func me_handler(req: http.Request) -> http.Response {
-    tok := extract_bearer(req) ?? ""
-    switch jwt.verify<Claims>(tok, jwt_secret()) {
-        case Claims(claims):
-            profiles := cache.open("auth_api_profiles", 500)
-            p_key := "profile:{claims.sub}"
-            prof_res := profiles.get_or_set(p_key, 30000, () => "plan=pro;verified=true")
-            switch prof_res {
-                case String(prof):
-                    return http.ok_json(MeReply(user: claims.sub, role: claims.role, profile: prof))
-                case cache.CacheError(e):
-                    return http.status_json(500, ErrReply(code: e.message))
-            }
-        case jwt.JwtError(_):
-            return http.status_json(401, ErrReply(code: "invalid_or_expired_token"))
+func me_handler(_req: http.Request, claims: Claims) -> http.Response {
+    profiles := cache.open("auth_api_profiles", 500)
+    p_key := "profile:{claims.sub}"
+    prof_res := profiles.get_or_set(p_key, 30000, () => "plan=pro;verified=true")
+    switch prof_res {
+        case String(prof):
+            return http.ok_json(MeReply(user: claims.sub, role: claims.role, profile: prof))
+        case cache.CacheError(e):
+            return http.status_json(500, ErrReply(code: e.message))
     }
 }
 
-func note_handler(_req: http.Request, body: AuditNote) -> http.Response {
+func note_handler(_req: http.Request, body: AuditNote, _claims: Claims) -> http.Response {
     var ts = "1970-01-01T00:00:00Z"
     switch time.now() {
         case time.Timestamp(t):
@@ -192,14 +186,15 @@ export router AuthApi "JWT + Cache + File Lock Auth API" {
     cors "*"
     post "/auth/login" => login_handler
     group "/api" {
-        before require_jwt
-        get "/me" => me_handler
-        post "/notes" => note_handler
+        guard require_jwt {
+            get "/me" => me_handler
+            post "/notes" => note_handler
+        }
     }
 }
 
-export schedule Maintenance {
-    interval 60s => compact_sessions
+export job CompactSessions interval 60s {
+    _res := compact_sessions()
 }
 
 export func build_auth_router() -> http.Router {

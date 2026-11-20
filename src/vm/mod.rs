@@ -92,6 +92,7 @@ pub(crate) struct VmHostState {
     pub(crate) fs_readers: Vec<Option<std::io::BufReader<std::fs::File>>>,
     pub(crate) fs_writers: Vec<Option<std::io::BufWriter<std::fs::File>>>,
     pub(crate) routers: Vec<crate::native::http::RouterState>,
+    pub(crate) http_clients: Vec<crate::native::http::HttpClientState>,
     pub(crate) db_conns: Vec<DbConnSlot>,
     pub(crate) db_conn_free: Vec<usize>,
     pub(crate) db_pools: Vec<DbPoolSlot>,

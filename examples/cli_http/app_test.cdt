@@ -49,4 +49,30 @@ test "cli_http router cors group middleware and routes" {
     ))
     assert_eq(r_auth.status, 200)
     assert(r_auth.body.contains("\"status\":\"ok\""))
+
+    // Typed @http.status(404) error union on GET /users/:id
+    r_missing := r.dispatch(http.Request(method: "GET", path: "/users/missing", body: "", headers: empty, query: empty, params: empty))
+    assert_eq(r_missing.status, 404)
+    assert(r_missing.body.contains("user not found"))
+
+    // Typed @http.query defaults + @validation.range on GET /items
+    r_items := r.dispatch(http.Request(method: "GET", path: "/items", body: "", headers: empty, query: empty, params: empty))
+    assert_eq(r_items.status, 200)
+    assert(r_items.body.contains("\"page\":1"))
+    assert(r_items.body.contains("\"limit\":10"))
+
+    r_bad_limit := r.dispatch(http.Request(
+        method: "GET",
+        path: "/items",
+        body: "",
+        headers: empty,
+        query: Map.from([("limit", "99")]),
+        params: empty,
+    ))
+    assert_eq(r_bad_limit.status, 422)
+
+    // Pooled http.Client builder & stats
+    client := http.client("http://127.0.0.1:1").bearer("secret").timeout_ms(500)
+    assert_eq(client.pool_stats().get("idle") ?? -1, 0)
+    client.close()
 }

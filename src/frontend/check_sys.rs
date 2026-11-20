@@ -668,6 +668,18 @@ impl Checker<'_> {
                 }
                 Ok(router_ty)
             }
+            "client" => {
+                if !type_args.is_empty() || !named_args.is_empty() || args.len() > 1 {
+                    return Err("http.client(base_url?) expects 0 or 1 String argument".to_string());
+                }
+                if args.len() == 1 {
+                    self.check_expr(&mut args[0], Some(&Type::String))?;
+                    if args[0].ty != Type::String {
+                        return Err(format!("http.client base_url expects String, got {}", args[0].ty));
+                    }
+                }
+                Ok(Type::Custom(TypeId::native("cdt.http", "Client")))
+            }
             "build" | "serve" => {
                 let expect_args = usize::from(sym == "serve");
                 if type_args.len() != 1 || !named_args.is_empty() || args.len() != expect_args {
@@ -898,12 +910,136 @@ impl Checker<'_> {
         &mut self,
         type_name: &str,
         method: &str,
+        type_args: &[TypeExpr],
         args: &mut [Expr],
     ) -> Result<Type, String> {
         let http_err = Type::Custom(TypeId::native("cdt.http", "HttpError"));
         let req_ty = Type::Custom(TypeId::native("cdt.http", "Request"));
         let resp_ty = Type::Custom(TypeId::native("cdt.http", "Response"));
+        let client_ty = Type::Custom(TypeId::native("cdt.http", "Client"));
+        let str_map = Type::Map(Box::new(Type::String), Box::new(Type::String));
+        if !(type_name == "Client" && method == "get_json") && !type_args.is_empty() {
+            return Err(format!("Method '.{}()' does not accept type arguments", method));
+        }
         match (type_name, method) {
+            ("Client", "header") => {
+                if args.len() != 2 {
+                    return Err("Client.header(name, value) expects 2 String arguments".to_string());
+                }
+                for (i, label) in [(0, "name"), (1, "value")] {
+                    self.check_expr(&mut args[i], Some(&Type::String))?;
+                    if args[i].ty != Type::String {
+                        return Err(format!("Client.header {} expects String, got {}", label, args[i].ty));
+                    }
+                }
+                Ok(client_ty)
+            }
+            ("Client", "bearer" | "base_url") => {
+                if args.len() != 1 {
+                    return Err(format!("Client.{}() expects 1 String argument", method));
+                }
+                self.check_expr(&mut args[0], Some(&Type::String))?;
+                if args[0].ty != Type::String {
+                    return Err(format!("Client.{}() expects String, got {}", method, args[0].ty));
+                }
+                Ok(client_ty)
+            }
+            ("Client", "timeout_ms") => {
+                if args.len() != 1 {
+                    return Err("Client.timeout_ms(ms) expects 1 Int argument".to_string());
+                }
+                self.check_expr(&mut args[0], Some(&Type::Int))?;
+                if args[0].ty != Type::Int {
+                    return Err(format!("Client.timeout_ms() expects Int, got {}", args[0].ty));
+                }
+                Ok(client_ty)
+            }
+            ("Client", "get" | "delete") => {
+                if args.len() != 1 {
+                    return Err(format!("Client.{}(path) expects 1 String argument", method));
+                }
+                self.check_expr(&mut args[0], Some(&Type::String))?;
+                if args[0].ty != Type::String {
+                    return Err(format!("Client.{}() path expects String, got {}", method, args[0].ty));
+                }
+                Ok(Type::union(vec![resp_ty, http_err]))
+            }
+            ("Client", "post" | "put" | "patch") => {
+                if args.len() != 2 {
+                    return Err(format!("Client.{}(path, body) expects 2 String arguments", method));
+                }
+                for (i, label) in [(0, "path"), (1, "body")] {
+                    self.check_expr(&mut args[i], Some(&Type::String))?;
+                    if args[i].ty != Type::String {
+                        return Err(format!("Client.{} {} expects String, got {}", method, label, args[i].ty));
+                    }
+                }
+                Ok(Type::union(vec![resp_ty, http_err]))
+            }
+            ("Client", "get_json") => {
+                if type_args.len() != 1 || !(1..=2).contains(&args.len()) {
+                    return Err("Client.get_json<T>(path, query?) expects 1 type argument and 1 or 2 arguments".to_string());
+                }
+                let target_ty = self.checked.resolve_type_mut(&type_args[0])?;
+                self.check_expr(&mut args[0], Some(&Type::String))?;
+                if args[0].ty != Type::String {
+                    return Err(format!("Client.get_json path expects String, got {}", args[0].ty));
+                }
+                if args.len() == 2 {
+                    self.check_expr(&mut args[1], Some(&str_map))?;
+                    if args[1].ty != str_map {
+                        return Err(format!("Client.get_json query expects Map<String, String>, got {}", args[1].ty));
+                    }
+                }
+                Ok(Type::union(vec![target_ty, http_err]))
+            }
+            ("Client", "post_json") => {
+                if args.len() != 2 {
+                    return Err("Client.post_json(path, body) expects 2 arguments".to_string());
+                }
+                self.check_expr(&mut args[0], Some(&Type::String))?;
+                if args[0].ty != Type::String {
+                    return Err(format!("Client.post_json path expects String, got {}", args[0].ty));
+                }
+                self.check_expr(&mut args[1], None)?;
+                Ok(Type::union(vec![resp_ty, http_err]))
+            }
+            ("Client", "request") => {
+                if !(2..=4).contains(&args.len()) {
+                    return Err("Client.request(method, path, body?, headers?) expects 2 to 4 arguments".to_string());
+                }
+                for (i, label) in [(0, "method"), (1, "path")] {
+                    self.check_expr(&mut args[i], Some(&Type::String))?;
+                    if args[i].ty != Type::String {
+                        return Err(format!("Client.request {} expects String, got {}", label, args[i].ty));
+                    }
+                }
+                if args.len() >= 3 {
+                    self.check_expr(&mut args[2], Some(&Type::String))?;
+                    if args[2].ty != Type::String {
+                        return Err(format!("Client.request body expects String, got {}", args[2].ty));
+                    }
+                }
+                if args.len() == 4 {
+                    self.check_expr(&mut args[3], Some(&str_map))?;
+                    if args[3].ty != str_map {
+                        return Err(format!("Client.request headers expects Map<String, String>, got {}", args[3].ty));
+                    }
+                }
+                Ok(Type::union(vec![resp_ty, http_err]))
+            }
+            ("Client", "close") => {
+                if !args.is_empty() {
+                    return Err("Client.close() takes 0 arguments".to_string());
+                }
+                Ok(Type::Void)
+            }
+            ("Client", "pool_stats") => {
+                if !args.is_empty() {
+                    return Err("Client.pool_stats() takes 0 arguments".to_string());
+                }
+                Ok(Type::Map(Box::new(Type::String), Box::new(Type::Int)))
+            }
             (
                 "Router",
                 "get" | "post" | "put" | "delete" | "patch" | "options" | "head" | "any",
@@ -1023,6 +1159,119 @@ impl Checker<'_> {
     }
 }
 
+fn extract_http_body_type_name(ty: &Type, checked: &CheckedProgram) -> Option<String> {
+    match ty {
+        Type::Custom(tid)
+            if tid.module == ModuleId::Program
+                && checked.struct_by_name.contains_key(&tid.name)
+                && !checked.http_query_structs.contains(&tid.name) =>
+        {
+            Some(tid.name.clone())
+        }
+        Type::DataEnum(ename) if checked.data_enums.contains_key(ename) => Some(ename.clone()),
+        _ => None,
+    }
+}
+
+pub(crate) fn eval_http_query_default(
+    expr: &Expr,
+    ty: &Type,
+) -> Result<crate::ir::HttpQueryDefault, String> {
+    let inner_ty = match ty {
+        Type::Optional(inner) => {
+            if matches!(expr.kind, ExprKind::Nil) {
+                return Ok(crate::ir::HttpQueryDefault::Nil);
+            }
+            inner.as_ref()
+        }
+        other => other,
+    };
+    match (inner_ty, &expr.kind) {
+        (Type::String, ExprKind::String(s)) => Ok(crate::ir::HttpQueryDefault::Str(s.clone())),
+        (Type::Int, ExprKind::Int(n)) => Ok(crate::ir::HttpQueryDefault::Int(*n)),
+        (Type::Int, ExprKind::Unary { op: crate::frontend::ast::UnaryOp::Neg, expr }) => {
+            if let ExprKind::Int(n) = expr.kind {
+                Ok(crate::ir::HttpQueryDefault::Int(-n))
+            } else {
+                Err("Default value must be a constant literal".to_string())
+            }
+        }
+        (Type::Float, ExprKind::Float(f)) => Ok(crate::ir::HttpQueryDefault::Float(*f)),
+        (Type::Float, ExprKind::Int(n)) => Ok(crate::ir::HttpQueryDefault::Float(*n as f64)),
+        (Type::Float, ExprKind::Unary { op: crate::frontend::ast::UnaryOp::Neg, expr }) => {
+            match expr.kind {
+                ExprKind::Float(f) => Ok(crate::ir::HttpQueryDefault::Float(-f)),
+                ExprKind::Int(n) => Ok(crate::ir::HttpQueryDefault::Float(-(n as f64))),
+                _ => Err("Default value must be a constant literal".to_string()),
+            }
+        }
+        (Type::Bool, ExprKind::Bool(b)) => Ok(crate::ir::HttpQueryDefault::Bool(*b)),
+        _ => Err(format!(
+            "@http.query field default must be a constant literal matching '{}'",
+            ty
+        )),
+    }
+}
+
+fn validate_http_query_struct(name: &str, checked: &CheckedProgram) -> Result<(), String> {
+    let sid = *checked
+        .struct_by_name
+        .get(name)
+        .ok_or_else(|| format!("Unknown @http.query struct '{}'", name))?;
+    let st = &checked.structs[sid];
+    for f in &st.fields {
+        let inner = match &f.ty {
+            Type::Optional(inner) => inner.as_ref(),
+            other => other,
+        };
+        if !matches!(inner, Type::String | Type::Int | Type::Float | Type::Bool) {
+            return Err(format!(
+                "@http.query struct '{}.{}' has unsupported type '{}' (expected String, Int, Float, Bool, or Optional)",
+                name, f.name, f.ty
+            ));
+        }
+        if let Some(def) = &f.default {
+            eval_http_query_default(def, &f.ty).map_err(|e| {
+                format!("@http.query struct '{}.{}': {}", name, f.name, e)
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn is_http_auto_resp_leaf(ty: &Type, resp_ty: &Type, checked: &CheckedProgram) -> bool {
+    if ty == resp_ty || *ty == Type::Void {
+        return true;
+    }
+    crate::frontend::check::type_to_json_type(ty, checked).is_some()
+}
+
+fn validate_http_handler_return_type(
+    ret_ty: &Type,
+    resp_ty: &Type,
+    checked: &CheckedProgram,
+    router_name: &str,
+    handler_name: &str,
+) -> Result<bool, String> {
+    if ret_ty == resp_ty {
+        return Ok(false);
+    }
+    let ok = match ret_ty {
+        Type::Optional(inner) => is_http_auto_resp_leaf(inner, resp_ty, checked),
+        Type::Union(vars) => vars
+            .iter()
+            .all(|v| is_http_auto_resp_leaf(v, resp_ty, checked)),
+        other => is_http_auto_resp_leaf(other, resp_ty, checked),
+    };
+    if !ok {
+        return Err(format!(
+            "router '{}' handler '{}' return type '{}' is not http.Response or JSON-serializable (or union thereof)",
+            router_name, handler_name, ret_ty
+        ));
+    }
+    Ok(true)
+}
+
 pub(crate) fn ensure_http_router_plan(
     checked: &mut CheckedProgram,
     router_name: &str,
@@ -1064,7 +1313,10 @@ pub(crate) fn ensure_http_router_plan(
                 entries.push(HttpRouterDeclEntry {
                     kind: HttpRouterDeclKind::Before,
                     handler_name: handler_name.clone(),
+                    query_struct: None,
                     body_struct: None,
+                    guard_handler: None,
+                    auto_response: false,
                 });
             }
             "router.after" => {
@@ -1088,7 +1340,10 @@ pub(crate) fn ensure_http_router_plan(
                 entries.push(HttpRouterDeclEntry {
                     kind: HttpRouterDeclKind::After,
                     handler_name: handler_name.clone(),
+                    query_struct: None,
                     body_struct: None,
+                    guard_handler: None,
+                    auto_response: false,
                 });
             }
             "router.group_before" => {
@@ -1111,7 +1366,10 @@ pub(crate) fn ensure_http_router_plan(
                 entries.push(HttpRouterDeclEntry {
                     kind: HttpRouterDeclKind::GroupBefore(prefix.clone()),
                     handler_name: handler_name.clone(),
+                    query_struct: None,
                     body_struct: None,
+                    guard_handler: None,
+                    auto_response: false,
                 });
             }
             "router.group_after" => {
@@ -1138,7 +1396,10 @@ pub(crate) fn ensure_http_router_plan(
                 entries.push(HttpRouterDeclEntry {
                     kind: HttpRouterDeclKind::GroupAfter(prefix.clone()),
                     handler_name: handler_name.clone(),
+                    query_struct: None,
                     body_struct: None,
+                    guard_handler: None,
+                    auto_response: false,
                 });
             }
             "router.static" => {
@@ -1151,7 +1412,10 @@ pub(crate) fn ensure_http_router_plan(
                 entries.push(HttpRouterDeclEntry {
                     kind: HttpRouterDeclKind::Static(url_prefix.clone(), dir_path.clone()),
                     handler_name: String::new(),
+                    query_struct: None,
                     body_struct: None,
+                    guard_handler: None,
+                    auto_response: false,
                 });
             }
             "router.cors" => {
@@ -1161,7 +1425,10 @@ pub(crate) fn ensure_http_router_plan(
                 entries.push(HttpRouterDeclEntry {
                     kind: HttpRouterDeclKind::Cors(origin.clone()),
                     handler_name: String::new(),
+                    query_struct: None,
                     body_struct: None,
+                    guard_handler: None,
+                    auto_response: false,
                 });
             }
             tag => {
@@ -1174,43 +1441,124 @@ pub(crate) fn ensure_http_router_plan(
                 let Some(Expr { kind: ExprKind::Ident(handler_name), .. }) = ann.args.get(1) else {
                     return Err(format!("Invalid route handler in router '{}'", router_name));
                 };
+                let guard_info = if let Some(Expr { kind: ExprKind::Ident(gname), .. }) = ann.args.get(2) {
+                    let gfid = *checked.func_by_name.get(gname).ok_or_else(|| {
+                        format!("Unknown guard '{}' in router '{}'", gname, router_name)
+                    })?;
+                    let gsig = &checked.funcs[gfid as usize];
+                    let ctx_ty = match &gsig.return_type {
+                        Type::Union(vars) if vars.len() == 2 => {
+                            let non_resp: Vec<&Type> = vars.iter().filter(|t| *t != resp_ty).collect();
+                            if non_resp.len() == 1 && *non_resp[0] != Type::Void {
+                                non_resp[0].clone()
+                            } else {
+                                return Err(format!(
+                                    "router '{}' guard '{}' must return Ctx | http.Response",
+                                    router_name, gname
+                                ));
+                            }
+                        }
+                        _ => {
+                            return Err(format!(
+                                "router '{}' guard '{}' must have signature (http.Request) -> Ctx | http.Response",
+                                router_name, gname
+                            ));
+                        }
+                    };
+                    if gsig.params.len() != 1 || gsig.params[0] != *req_ty {
+                        return Err(format!(
+                            "router '{}' guard '{}' must have signature (http.Request) -> Ctx | http.Response",
+                            router_name, gname
+                        ));
+                    }
+                    Some((gname.clone(), ctx_ty))
+                } else {
+                    None
+                };
+
                 let fid = *checked.func_by_name.get(handler_name).ok_or_else(|| {
                     format!("Unknown handler '{}' in router '{}'", handler_name, router_name)
                 })?;
                 let sig = &checked.funcs[fid as usize];
-                let body_struct = if sig.params.len() == 1
-                    && sig.params[0] == *req_ty
-                    && sig.return_type == *resp_ty
-                {
-                    None
-                } else if sig.params.len() == 2
-                    && sig.params[0] == *req_ty
-                    && sig.return_type == *resp_ty
-                    && let Type::Custom(tid) = &sig.params[1]
-                    && tid.module == ModuleId::Program
-                    && checked.struct_by_name.contains_key(&tid.name)
-                {
-                    Some(tid.name.clone())
-                } else if sig.params.len() == 2
-                    && sig.params[0] == *req_ty
-                    && sig.return_type == *resp_ty
-                    && let Type::DataEnum(ename) = &sig.params[1]
-                    && checked.data_enums.contains_key(ename)
-                {
-                    Some(ename.clone())
+                let auto_response = validate_http_handler_return_type(
+                    &sig.return_type,
+                    resp_ty,
+                    checked,
+                    router_name,
+                    handler_name,
+                )?;
+                let has_guard = guard_info.is_some();
+                let mut sig_ok = !sig.params.is_empty() && sig.params[0] == *req_ty;
+                if let Some((_, ref ctx_ty)) = guard_info {
+                    sig_ok &= sig.params.len() >= 2 && sig.params.last() == Some(ctx_ty);
+                }
+                let (query_struct, body_struct) = if sig_ok {
+                    let mid_end = sig.params.len() - usize::from(has_guard);
+                    let mid = &sig.params[1..mid_end];
+                    match mid {
+                        [] => (None, None),
+                        [p1] => {
+                            if let Type::Custom(tid) = p1
+                                && tid.module == ModuleId::Program
+                                && checked.http_query_structs.contains(&tid.name)
+                            {
+                                validate_http_query_struct(&tid.name, checked)?;
+                                (Some(tid.name.clone()), None)
+                            } else if let Some(bname) = extract_http_body_type_name(p1, checked) {
+                                (None, Some(bname))
+                            } else {
+                                sig_ok = false;
+                                (None, None)
+                            }
+                        }
+                        [p1, p2] => {
+                            if let Type::Custom(tid) = p1
+                                && tid.module == ModuleId::Program
+                                && checked.http_query_structs.contains(&tid.name)
+                                && let Some(bname) = extract_http_body_type_name(p2, checked)
+                            {
+                                validate_http_query_struct(&tid.name, checked)?;
+                                (Some(tid.name.clone()), Some(bname))
+                            } else {
+                                sig_ok = false;
+                                (None, None)
+                            }
+                        }
+                        _ => {
+                            sig_ok = false;
+                            (None, None)
+                        }
+                    }
                 } else {
+                    (None, None)
+                };
+                if !sig_ok {
+                    if let Some((ref gname, ref ctx_ty)) = guard_info {
+                        return Err(format!(
+                            "router '{}' guarded route '{} {}' handler '{}' must accept (http.Request, [QueryStruct], [BodyStruct], {}) (guard '{}')",
+                            router_name,
+                            method.to_ascii_uppercase(),
+                            pat,
+                            handler_name,
+                            ctx_ty,
+                            gname
+                        ));
+                    }
                     return Err(format!(
-                        "router '{}' route '{} {}' handler '{}' must have signature (http.Request) -> http.Response or (http.Request, BodyStruct) -> http.Response",
+                        "router '{}' route '{} {}' handler '{}' must accept (http.Request, [QueryStruct], [BodyStruct])",
                         router_name,
                         method.to_ascii_uppercase(),
                         pat,
                         handler_name
                     ));
-                };
+                }
                 entries.push(HttpRouterDeclEntry {
                     kind: HttpRouterDeclKind::Route(method.to_string(), pat.clone()),
                     handler_name: handler_name.clone(),
+                    query_struct,
                     body_struct,
+                    guard_handler: guard_info.map(|(g, _)| g),
+                    auto_response,
                 });
             }
         }
@@ -2153,7 +2501,7 @@ pub(crate) fn ensure_cron_schedule_plan(
     Ok(())
 }
 
-fn is_cron_handler_return(ty: &Type, checked: &CheckedProgram) -> bool {
+pub(crate) fn is_cron_handler_return(ty: &Type, checked: &CheckedProgram) -> bool {
     match ty {
         Type::Void => true,
         Type::Union(vars) => vars

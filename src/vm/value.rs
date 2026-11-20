@@ -253,6 +253,7 @@ pub const SCHEMA_REDIS_CLIENT: u32 = 0xFFFF_0051;
 pub const SCHEMA_REDIS_LOCK: u32 = 0xFFFF_0052;
 pub const SCHEMA_DB_QUERY: u32 = 0xFFFF_0053;
 pub const SCHEMA_DB_POOL: u32 = 0xFFFF_0054;
+pub const SCHEMA_HTTP_CLIENT: u32 = 0xFFFF_0055;
 
 #[inline]
 pub fn is_builtin_error_schema(schema_id: u32) -> bool {

@@ -124,6 +124,33 @@ pub struct TestSpec {
     pub line: usize,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum HttpQueryDefault {
+    Str(String),
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    Nil,
+}
+
+#[derive(Debug, Clone)]
+pub struct HttpQueryFieldPlan {
+    pub name: String,
+    pub param_name: String,
+    pub kind: u8, // 0=String, 1=Int, 2=Float, 3=Bool
+    pub is_optional: bool,
+    pub slot: u16,
+    pub default_val: Option<HttpQueryDefault>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HttpQueryPlan {
+    pub schema_id: u32,
+    pub scalar_len: u16,
+    pub obj_len: u16,
+    pub fields: Vec<HttpQueryFieldPlan>,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct Module {
     pub functions: Vec<FunctionProto>,
@@ -142,6 +169,7 @@ pub struct Module {
     pub db_models: Vec<DbModelMeta>,
     pub schedules: Vec<SchedulePlan>,
     pub tests: Vec<TestSpec>,
+    pub http_query_plans: Vec<HttpQueryPlan>,
 }
 
 impl Module {
@@ -922,6 +950,33 @@ impl Module {
                                 }
                                 32 => {
                                     check_o(a, &ctx)?;
+                                }
+                                38 => {
+                                    check_o(a, &ctx)?;
+                                    check_o(b, &ctx)?;
+                                }
+                                39 => {
+                                    check_o(a, &ctx)?;
+                                    if (c as usize) >= self.http_query_plans.len() {
+                                        return Err(format!("HTTP query plan {} out of bounds", c));
+                                    }
+                                }
+                                40 => {
+                                    check_o(a, &ctx)?;
+                                }
+                                41 | 48 | 49 => {
+                                    check_o(a, &ctx)?;
+                                    check_o(b, &ctx)?;
+                                }
+                                42 | 44..=47 => {
+                                    check_o(a, &ctx)?;
+                                    check_o(b, &ctx)?;
+                                    check_o(c, &ctx)?;
+                                }
+                                43 => {
+                                    check_o(a, &ctx)?;
+                                    check_o(b, &ctx)?;
+                                    check_s(c, &ctx)?;
                                 }
                                 _ => return Err(format!("Invalid http aux {}", aux)),
                             },

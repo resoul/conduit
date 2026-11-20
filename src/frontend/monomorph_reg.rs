@@ -260,20 +260,66 @@ pub(crate) fn register_program_types(
                 default: None,
             });
         }
-        let db_table = program.items.iter().find_map(|it| {
-            if let ItemKind::Struct { name: sname, .. } = &it.kind
-                && sname == name
-            {
-                for ann in &it.annotations {
-                    if ann.target == "db.table"
-                        && let Some(Expr { kind: ExprKind::String(t), .. }) = ann.args.first()
-                    {
-                        return Some(t.clone());
+        let mut db_table = None;
+        let mut is_http_query = false;
+        let mut http_status: Option<u16> = None;
+        for it in &program.items {
+            let matched_item = match &it.kind {
+                ItemKind::Struct { name: sname, .. } if sname == name => true,
+                ItemKind::Error { name: ename, .. } if ename == name => true,
+                _ => false,
+            };
+            if !matched_item {
+                continue;
+            }
+            for ann in &it.annotations {
+                match ann.target.as_str() {
+                    "db.table" => {
+                        if let Some(Expr { kind: ExprKind::String(t), .. }) = ann.args.first() {
+                            db_table = Some(t.clone());
+                        }
                     }
+                    "http.query" => {
+                        if matches!(it.kind, ItemKind::Error { .. }) {
+                            return Err(format!("@http.query cannot be applied to error '{}'", name));
+                        }
+                        if !ann.args.is_empty() {
+                            return Err(format!("@http.query on '{}' takes no arguments", name));
+                        }
+                        is_http_query = true;
+                    }
+                    "http.status" => {
+                        if ann.args.len() != 1 {
+                            return Err(format!(
+                                "@http.status on '{}' expects 1 integer status code (100..=599)",
+                                name
+                            ));
+                        }
+                        let Some(Expr { kind: ExprKind::Int(code), .. }) = ann.args.first() else {
+                            return Err(format!(
+                                "@http.status on '{}' expects an integer literal status code",
+                                name
+                            ));
+                        };
+                        if !(100..=599).contains(code) {
+                            return Err(format!(
+                                "@http.status({}) on '{}' must be between 100 and 599",
+                                code, name
+                            ));
+                        }
+                        http_status = Some(*code as u16);
+                    }
+                    _ => {}
                 }
             }
-            None
-        });
+            break;
+        }
+        if is_http_query {
+            checked.http_query_structs.insert(name.clone());
+        }
+        if let Some(code) = http_status {
+            checked.http_status_by_struct.insert(name.clone(), code);
+        }
         checked.structs[*id] = ResolvedStruct {
             schema_id: *id as u32,
             name: name.clone(),
@@ -282,13 +328,15 @@ pub(crate) fn register_program_types(
             scalar_len,
             obj_len,
         };
-        checked.struct_schemas[*id] = StructSchema::with_flags(
+        let mut schema = StructSchema::with_flags(
             *id as u32,
             name,
             schema_fields,
             checked.error_structs.contains(name),
             enum_tags.get(id).cloned(),
         );
+        schema.http_status = http_status;
+        checked.struct_schemas[*id] = schema;
     }
 
     let tmpl_list: Vec<(Vec<String>, Vec<FieldDef>)> = checked
@@ -357,6 +405,24 @@ pub(crate) fn register_program_types(
                 name: name.clone(),
                 params: p_tys,
                 defaults,
+                return_type: ret_ty,
+            });
+        } else if let ItemKind::Job(j) = &item.kind {
+            if checked.generic_funcs.contains_key(&j.name) {
+                return Err(format!("Duplicate function '{}'", j.name));
+            }
+            let fid = checked.funcs.len() as u32;
+            if checked.func_by_name.insert(j.name.clone(), fid).is_some() {
+                return Err(format!("Duplicate function '{}'", j.name));
+            }
+            let ret_ty = match &j.return_type {
+                Some(rt) => checked.resolve_type(rt)?,
+                None => Type::Void,
+            };
+            checked.funcs.push(FuncSig {
+                name: j.name.clone(),
+                params: Vec::new(),
+                defaults: Vec::new(),
                 return_type: ret_ty,
             });
         } else if let ItemKind::Query(q) = &item.kind {

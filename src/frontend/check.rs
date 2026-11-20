@@ -55,7 +55,10 @@ pub struct CronScheduleEntry {
 pub struct HttpRouterDeclEntry {
     pub kind: HttpRouterDeclKind,
     pub handler_name: String,
+    pub query_struct: Option<String>,
     pub body_struct: Option<String>,
+    pub guard_handler: Option<String>,
+    pub auto_response: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +87,8 @@ pub struct CheckedProgram {
     pub struct_abouts: HashMap<String, String>,
     pub validator_funcs: HashSet<String>,
     pub error_structs: HashSet<String>,
+    pub http_query_structs: HashSet<String>,
+    pub http_status_by_struct: HashMap<String, u16>,
     pub validation_plans: Vec<ValidationStructPlan>,
     pub generic_structs: HashMap<String, GenericStructTemplate>,
     pub generic_funcs: HashMap<String, GenericFuncTemplate>,
@@ -163,6 +168,8 @@ pub fn check_program_with_roots(
         struct_abouts: HashMap::new(),
         validator_funcs: HashSet::new(),
         error_structs: HashSet::new(),
+        http_query_structs: HashSet::new(),
+        http_status_by_struct: HashMap::new(),
         validation_plans: Vec::new(),
         generic_structs: HashMap::new(),
         generic_funcs: HashMap::new(),
@@ -180,6 +187,7 @@ pub fn check_program_with_roots(
     let mut all_errors: Vec<String> = Vec::new();
     check_default_exprs(program, &mut checked, &mut all_errors);
     crate::frontend::check_query::check_and_desugar_queries(program, &mut checked, &mut all_errors);
+    check_and_desugar_jobs(program, &mut checked, &mut all_errors);
 
     let mut idx = 0usize;
     while idx < program.items.len() {
@@ -471,6 +479,7 @@ fn check_default_exprs(
             ItemKind::Query(q) => {
                 check_param_defaults(&q.name, &mut q.params, checked, &source_file, all_errors);
             }
+            ItemKind::Job(_) => {}
             ItemKind::Enum { name, variants } => {
                 if let Some(dvars) = checked.data_enums.get(name).cloned() {
                     for (vast, dv) in variants.iter_mut().zip(dvars.iter()) {
@@ -513,6 +522,76 @@ fn check_default_exprs(
                 }
             }
             _ => {}
+        }
+    }
+}
+
+fn check_and_desugar_jobs(
+    program: &mut Program,
+    checked: &mut CheckedProgram,
+    all_errors: &mut Vec<String>,
+) {
+    let mut job_entries = Vec::new();
+    for item in &mut program.items {
+        let source_file = item.source_file.clone();
+        let ItemKind::Job(_) = &item.kind else {
+            continue;
+        };
+        let placeholder = ItemKind::ExportList { names: Vec::new() };
+        let ItemKind::Job(job) = std::mem::replace(&mut item.kind, placeholder) else {
+            continue;
+        };
+
+        if let Some(expr) = &job.cron_expr
+            && let Err(e) = crate::native::cron::parse_cron_expr(expr)
+        {
+            all_errors.push(format_check_err(
+                job.expr_span,
+                source_file.as_deref(),
+                format!("Invalid cron expression '{}' in job '{}': {}", expr, job.name, e),
+            ));
+        }
+
+        if let Some(&fid) = checked.func_by_name.get(&job.name) {
+            let ret_ty = &checked.funcs[fid as usize].return_type;
+            if !crate::frontend::check_sys::is_cron_handler_return(ret_ty, checked) {
+                all_errors.push(format_check_err(
+                    item.span,
+                    source_file.as_deref(),
+                    format!(
+                        "job '{}' must have return type Void or Void | Error, got {}",
+                        job.name, ret_ty
+                    ),
+                ));
+            }
+        }
+
+        job_entries.push(CronScheduleEntry {
+            name: job.name.clone(),
+            cron_expr: job.cron_expr,
+            interval_ms: job.interval_ms,
+            handler_name: job.name.clone(),
+        });
+
+        item.kind = ItemKind::Func {
+            name: job.name,
+            type_params: Vec::new(),
+            params: Vec::new(),
+            return_type: job.return_type,
+            body: job.body,
+            is_validator: false,
+        };
+    }
+
+    if !job_entries.is_empty() {
+        if let Some((_, existing)) = checked
+            .cron_schedule_plans
+            .iter_mut()
+            .find(|(n, _)| n == "Jobs")
+        {
+            existing.extend(job_entries);
+        } else {
+            checked.cron_schedule_plans.push(("Jobs".to_string(), job_entries));
         }
     }
 }

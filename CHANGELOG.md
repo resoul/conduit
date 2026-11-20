@@ -5,10 +5,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
-## [Unreleased]
+## [0.3.4] - 2026-11-21
 
 ### Added
 
+* **Pooled HTTP/1.1 Keep-Alive Client (`http.Client`)**:
+  * Added `http.client(base_url?: String) -> http.Client` (`src/native/http.rs`, `src/vm/exec_http.rs`) with an `HttpConnPool` (up to 8 idle TCP/TLS connections per `(host, port, tls)`, 60s idle TTL, and automatic stale-socket retry).
+  * Added fluent builder methods (`.header`, `.bearer`, `.timeout_ms`, `.base_url`), pooled request methods (`.get`, `.post`, `.put`, `.patch`, `.delete`, `.get_json<T>`, `.post_json`, `.request`), and pool management (`.pool_stats`, `.close`).
+* **Typed HTTP Query/Path Binding & Declarative Return/Error Responses**:
+  * Added `@http.query` struct annotation (`src/frontend/{monomorph_reg,check_sys}.rs`, `src/ir/lower_native.rs`, `src/vm/exec_http.rs`) to automatically bind, default, and `@validation.*`-check `:param` path and `?key=val` query parameters (`400 invalid_query` / `422 validation_failed`), combinable with typed JSON body structs and `guard` contexts.
+  * Added `@http.status(code)` annotation on `struct` and `error` types and automatic HTTP response serialization for route handlers returning `T`, `Void` (`204`), `T?` (`200`/`404`), or unions `T | AppError` (`src/frontend/check_sys.rs`, `src/vm/exec_http.rs`, `src/openapi.rs`).
+* **Declarative `config`, `job`, and Typed Router `guard` Blocks**:
+  * Added top-level `config Name { ... }` blocks (`src/frontend/parser.rs`) with automatic `@env` mapping and `conduit env example <file.cdt> [-o <file>]` CLI command (`src/native/env.rs`, `src/main.rs`) to generate `.env.example` templates.
+  * Added top-level `job Name every "<cron>"` / `job Name interval <duration>` blocks (`src/frontend/parser_cli.rs`, `src/frontend/check.rs`) with compile-time cron validation and automatic registration for `conduit cron list/print/run`.
+  * Added typed `guard <fn> { ... }` blocks inside `router { ... }` (`src/frontend/parser_cli.rs`, `src/frontend/check_sys.rs`, `src/vm/exec_http.rs`), enforcing `(http.Request) -> Ctx | http.Response` and passing the typed `Ctx` directly into guarded route handlers.
 * **HTTP Server Hardening & Runtime Optimizations**:
   * Replaced the 20ms non-blocking `accept()` polling loop in `router.serve()` with blocking `accept()` + wake-on-stop, hardened HTTP request parsing against request smuggling (`Transfer-Encoding`, duplicate/non-digit `Content-Length`, whitespace in header names), bounded line reads (`read_crlf_line`), and tightened keep-alive idle/header timeouts.
   * Switched `cdt.cache` and DB statement caches to `FxBuildHasher` with automatic `key_locks` cleanup, and added Montgomery modular exponentiation for RSA verification.

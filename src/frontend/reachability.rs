@@ -95,6 +95,11 @@ pub fn shake_unreachable_funcs(
             if !entry.handler_name.is_empty() && reachable.insert(entry.handler_name.clone()) {
                 queue.push_back(entry.handler_name.clone());
             }
+            if let Some(gname) = &entry.guard_handler
+                && reachable.insert(gname.clone())
+            {
+                queue.push_back(gname.clone());
+            }
             if let Some(sname) = &entry.body_struct {
                 let body_ty = crate::frontend::types::Type::Custom(
                     crate::frontend::types::TypeId::program(sname),
@@ -452,6 +457,12 @@ pub(crate) fn expand_program_aliases(
             | ItemKind::ExportList { .. }
             | ItemKind::Migration { .. } => {}
             ItemKind::Test { body, .. } => expand_block_aliases(body, aliases)?,
+            ItemKind::Job(j) => {
+                if let Some(rt) = &mut j.return_type {
+                    expand_type_expr(rt, aliases, 0)?;
+                }
+                expand_block_aliases(&mut j.body, aliases)?;
+            }
             ItemKind::Query(q) => {
                 for p in &mut q.params {
                     expand_type_expr(&mut p.ty, aliases, 0)?;

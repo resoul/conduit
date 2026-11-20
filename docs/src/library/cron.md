@@ -24,6 +24,22 @@ export func main() -> Void | cron.CronError {
 }
 ```
 
+## Declarative `job` Blocks
+
+You can also declare standalone top-level jobs directly with `job <Name> every "<cron>"` or `job <Name> interval <duration>`:
+
+```conduit
+job CleanupSessions every "*/5 * * * *" {
+    log.info("Cleaning up expired sessions")
+}
+
+job Heartbeat interval 10s -> Void | log.LogError {
+    log.debug("tick")
+}
+```
+
+Top-level `job` blocks are automatically registered for `conduit cron list`, `conduit cron print`, and `conduit cron run`.
+
 ## Declarative `schedule` Block
 
 * `every "<5-field cron>" => handler` — Standard 5-field UTC cron expression (`min hour dom mon dow`) or macro (`@hourly`, `@daily`, `@weekly`, `@monthly`, `@yearly`). Validated at compile time.

@@ -1,6 +1,7 @@
+use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
@@ -8,8 +9,8 @@ use crate::native::tls::{TlsConfig, TlsVersion, Transport, VerifyMode};
 
 use crate::vm::string::VmString;
 use crate::vm::value::{
-    ListStorage, MapKey, MapVal, Obj, OrderedMap, SCHEMA_HTTP_BINARY_RESPONSE, SCHEMA_HTTP_ERROR,
-    SCHEMA_HTTP_REQUEST, SCHEMA_HTTP_RESPONSE, SCHEMA_HTTP_ROUTER, StructData,
+    ListStorage, MapKey, MapVal, Obj, OrderedMap, SCHEMA_HTTP_BINARY_RESPONSE, SCHEMA_HTTP_CLIENT,
+    SCHEMA_HTTP_ERROR, SCHEMA_HTTP_REQUEST, SCHEMA_HTTP_RESPONSE, SCHEMA_HTTP_ROUTER, StructData,
 };
 
 pub const MAX_LINE: usize = 8 * 1024;
@@ -32,7 +33,10 @@ pub struct RouteEntry {
     pub param_count: usize,
     pub segments: Vec<RouteSeg>,
     pub handler: Obj,
+    pub query_plan: Option<u16>,
     pub body_json_plan: Option<u16>,
+    pub guard: Option<Obj>,
+    pub auto_resp_kind: Option<u8>,
 }
 
 impl RouteEntry {
@@ -59,7 +63,10 @@ impl RouteEntry {
             param_count,
             segments,
             handler,
+            query_plan: None,
             body_json_plan: None,
+            guard: None,
+            auto_resp_kind: None,
         }
     }
 }
@@ -800,13 +807,14 @@ fn parse_http_response_raw<R: BufRead>(
     reader: &mut R,
     method: &str,
     is_curl: bool,
-) -> Result<RawHttpResponse, String> {
-    let (status, headers, content_length, is_chunked) = loop {
+) -> Result<(RawHttpResponse, bool), String> {
+    let (status, headers, content_length, is_chunked, can_keep_alive) = loop {
         let status_line = read_client_crlf_line(reader, MAX_LINE)
             .map_err(|e| format!("failed to read status line: {}", e))?
             .ok_or_else(|| "empty HTTP response".to_string())?;
         let mut parts = status_line.splitn(3, ' ');
-        let _proto = parts.next().unwrap_or("");
+        let proto = parts.next().unwrap_or("");
+        let is_http_10 = proto.eq_ignore_ascii_case("HTTP/1.0");
         let code_str = parts
             .next()
             .ok_or_else(|| format!("malformed HTTP status line: {}", status_line))?;
@@ -817,6 +825,8 @@ fn parse_http_response_raw<R: BufRead>(
         let mut headers = Vec::new();
         let mut content_length: Option<usize> = None;
         let mut is_chunked = false;
+        let mut conn_close = false;
+        let mut conn_keep_alive = false;
         let mut count = 0usize;
         loop {
             let line = read_client_crlf_line(reader, MAX_LINE)
@@ -838,6 +848,15 @@ fn parse_http_response_raw<R: BufRead>(
                     }
                 } else if key == "transfer-encoding" && val.to_ascii_lowercase().contains("chunked") {
                     is_chunked = true;
+                } else if key == "connection" {
+                    for token in val.split(',') {
+                        let t = token.trim().to_ascii_lowercase();
+                        if t == "close" {
+                            conn_close = true;
+                        } else if t == "keep-alive" {
+                            conn_keep_alive = true;
+                        }
+                    }
                 }
                 headers.push((key, val));
             }
@@ -855,7 +874,13 @@ fn parse_http_response_raw<R: BufRead>(
         if (100..200).contains(&status) || is_proxy_connect || is_curl_redirect_hop {
             continue;
         }
-        break (status, headers, content_length, is_chunked);
+        let body_framed = method.eq_ignore_ascii_case("HEAD")
+            || status == 204
+            || status == 304
+            || is_chunked
+            || content_length.is_some();
+        let ka = body_framed && !conn_close && (!is_http_10 || conn_keep_alive);
+        break (status, headers, content_length, is_chunked, ka);
     };
 
     let body_bytes = if method.eq_ignore_ascii_case("HEAD") || status == 204 || status == 304 {
@@ -883,11 +908,14 @@ fn parse_http_response_raw<R: BufRead>(
         buf
     };
 
-    Ok(RawHttpResponse {
-        status,
-        headers,
-        body: body_bytes,
-    })
+    Ok((
+        RawHttpResponse {
+            status,
+            headers,
+            body: body_bytes,
+        },
+        can_keep_alive,
+    ))
 }
 
 const MAX_REDIRECTS: usize = 10;
@@ -912,13 +940,137 @@ fn resolve_redirect_url(base: &ParsedUrl, location: &str) -> String {
     format!("{}://{}{}{}", scheme, base.host_header, dir, loc)
 }
 
-fn tcp_http_request_once(
-    method: &str,
-    parsed: &ParsedUrl,
-    body: &[u8],
-    headers: &[(String, String)],
-    timeout: Duration,
-) -> Result<RawHttpResponse, Obj> {
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PoolKey {
+    is_https: bool,
+    host: String,
+    port: u16,
+}
+
+struct PooledConn {
+    reader: BufReader<Transport>,
+    last_used: Instant,
+}
+
+const POOL_MAX_IDLE_PER_HOST: usize = 8;
+const POOL_IDLE_TTL: Duration = Duration::from_secs(60);
+
+#[derive(Default)]
+pub struct HttpConnPool {
+    idle: Mutex<HashMap<PoolKey, Vec<PooledConn>>>,
+}
+
+impl HttpConnPool {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn take(&self, key: &PoolKey) -> Option<BufReader<Transport>> {
+        let mut map = self.idle.lock().ok()?;
+        let list = map.get_mut(key)?;
+        let now = Instant::now();
+        while let Some(conn) = list.pop() {
+            if now.duration_since(conn.last_used) < POOL_IDLE_TTL {
+                if list.is_empty() {
+                    map.remove(key);
+                }
+                return Some(conn.reader);
+            }
+        }
+        map.remove(key);
+        None
+    }
+
+    fn put(&self, key: PoolKey, reader: BufReader<Transport>) {
+        if !reader.buffer().is_empty() {
+            return;
+        }
+        if let Ok(mut map) = self.idle.lock() {
+            let list = map.entry(key).or_default();
+            if list.len() >= POOL_MAX_IDLE_PER_HOST {
+                list.remove(0);
+            }
+            list.push(PooledConn {
+                reader,
+                last_used: Instant::now(),
+            });
+        }
+    }
+
+    pub fn idle_count(&self) -> usize {
+        let Ok(mut map) = self.idle.lock() else {
+            return 0;
+        };
+        let now = Instant::now();
+        let mut total = 0usize;
+        map.retain(|_, list| {
+            list.retain(|c| now.duration_since(c.last_used) < POOL_IDLE_TTL);
+            total += list.len();
+            !list.is_empty()
+        });
+        total
+    }
+
+    pub fn clear(&self) {
+        if let Ok(mut map) = self.idle.lock() {
+            map.clear();
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct HttpClientState {
+    pub base_url: String,
+    pub default_headers: Vec<(String, String)>,
+    pub timeout_ms: i64,
+    pub pool: Arc<HttpConnPool>,
+}
+
+impl HttpClientState {
+    pub fn new(base_url: String) -> Self {
+        Self {
+            base_url,
+            default_headers: Vec::new(),
+            timeout_ms: 30_000,
+            pool: Arc::new(HttpConnPool::new()),
+        }
+    }
+
+    pub fn set_header(&mut self, name: String, value: String) {
+        if let Some((_, v)) = self
+            .default_headers
+            .iter_mut()
+            .find(|(k, _)| k.eq_ignore_ascii_case(&name))
+        {
+            *v = value;
+        } else {
+            self.default_headers.push((name, value));
+        }
+    }
+}
+
+pub fn make_http_client_obj(client_id: usize) -> Obj {
+    let mut s = StructData::new(SCHEMA_HTTP_CLIENT, 1, 0);
+    s.set_scalar(0, client_id as u64);
+    Obj::Record(Arc::new(s))
+}
+
+pub fn resolve_client_url(base_url: &str, path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") || base_url.is_empty() {
+        return trimmed.to_string();
+    }
+    let base = base_url.trim_end_matches('/');
+    if trimmed.is_empty() {
+        base.to_string()
+    } else if trimmed.starts_with(['?', '/']) {
+        format!("{}{}", base, trimmed)
+    } else {
+        format!("{}/{}", base, trimmed)
+    }
+}
+
+fn open_http_transport(parsed: &ParsedUrl, timeout: Duration) -> Result<Transport, Obj> {
     let addr_str = format!("{}:{}", parsed.host, parsed.port);
     let addrs: Vec<_> = match addr_str.to_socket_addrs() {
         Ok(it) => it.collect(),
@@ -965,7 +1117,7 @@ fn tcp_http_request_once(
     let _ = stream.set_read_timeout(Some(remaining));
     let _ = stream.set_write_timeout(Some(remaining));
 
-    let mut transport = if parsed.is_https {
+    let transport = if parsed.is_https {
         let mut tls_cfg = TlsConfig::new(&parsed.host);
         tls_cfg.verify = VerifyMode::VerifyFull;
         tls_cfg.alpn = vec![b"http/1.1"];
@@ -992,7 +1144,16 @@ fn tcp_http_request_once(
     }
     let _ = transport.set_read_timeout(Some(remaining));
     let _ = transport.set_write_timeout(Some(remaining));
+    Ok(transport)
+}
 
+fn build_http_request_bytes(
+    method: &str,
+    parsed: &ParsedUrl,
+    body: &[u8],
+    headers: &[(String, String)],
+    keep_alive: bool,
+) -> Result<Vec<u8>, Obj> {
     let mut req = Vec::new();
     req.extend_from_slice(format!("{} {} HTTP/1.1\r\n", method, parsed.path_and_query).as_bytes());
     let has_host = headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host"));
@@ -1001,7 +1162,11 @@ fn tcp_http_request_once(
     }
     let has_conn = headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("connection"));
     if !has_conn {
-        req.extend_from_slice(b"Connection: close\r\n");
+        if keep_alive {
+            req.extend_from_slice(b"Connection: keep-alive\r\n");
+        } else {
+            req.extend_from_slice(b"Connection: close\r\n");
+        }
     }
     let has_len = headers
         .iter()
@@ -1017,13 +1182,58 @@ fn tcp_http_request_once(
     }
     req.extend_from_slice(b"\r\n");
     req.extend_from_slice(body);
+    Ok(req)
+}
 
-    if let Err(e) = transport.write_all(&req).and_then(|_| transport.flush()) {
-        return Err(make_http_error("io_error", format!("failed to send request: {}", e)));
+fn tcp_http_request_once(
+    method: &str,
+    parsed: &ParsedUrl,
+    body: &[u8],
+    headers: &[(String, String)],
+    timeout: Duration,
+    pool: Option<&HttpConnPool>,
+) -> Result<RawHttpResponse, Obj> {
+    let want_keep_alive = pool.is_some();
+    let req = build_http_request_bytes(method, parsed, body, headers, want_keep_alive)?;
+    let pool_key = PoolKey {
+        is_https: parsed.is_https,
+        host: parsed.host.to_ascii_lowercase(),
+        port: parsed.port,
+    };
+
+    if let Some(p) = pool
+        && let Some(mut reader) = p.take(&pool_key)
+    {
+        let _ = reader.get_ref().set_read_timeout(Some(timeout));
+        let _ = reader.get_ref().set_write_timeout(Some(timeout));
+        if reader
+            .get_mut()
+            .write_all(&req)
+            .and_then(|_| reader.get_mut().flush())
+            .is_ok()
+            && let Ok((resp, can_ka)) = parse_http_response_raw(&mut reader, method, false)
+        {
+            if can_ka {
+                p.put(pool_key, reader);
+            }
+            return Ok(resp);
+        }
+        // Stale pooled connection closed by peer: fall through to fresh connection.
     }
 
+    let transport = open_http_transport(parsed, timeout)?;
     let mut reader = BufReader::new(transport);
-    parse_http_response_raw(&mut reader, method, false).map_err(|e| make_http_error("http_error", e))
+    if let Err(e) = reader.get_mut().write_all(&req).and_then(|_| reader.get_mut().flush()) {
+        return Err(make_http_error("io_error", format!("failed to send request: {}", e)));
+    }
+    let (resp, can_ka) = parse_http_response_raw(&mut reader, method, false)
+        .map_err(|e| make_http_error("http_error", e))?;
+    if let Some(p) = pool
+        && can_ka
+    {
+        p.put(pool_key, reader);
+    }
+    Ok(resp)
 }
 
 fn http_client_request_raw(
@@ -1032,6 +1242,7 @@ fn http_client_request_raw(
     body: &[u8],
     headers: &[(String, String)],
     timeout_ms: i64,
+    pool: Option<&HttpConnPool>,
 ) -> Result<RawHttpResponse, Obj> {
     if timeout_ms <= 0 {
         return Err(make_http_error("invalid_timeout", "timeout_ms must be > 0"));
@@ -1056,7 +1267,7 @@ fn http_client_request_raw(
             Ok(p) => p,
             Err(e) => return Err(make_http_error("invalid_url", e)),
         };
-        let resp = tcp_http_request_once(&cur_method, &parsed, &cur_body, headers, timeout)?;
+        let resp = tcp_http_request_once(&cur_method, &parsed, &cur_body, headers, timeout, pool)?;
         if matches!(resp.status, 301..=303 | 307 | 308)
             && let Some((_, loc)) = resp.headers.iter().find(|(k, _)| k == "location")
         {
@@ -1105,7 +1316,21 @@ pub fn http_client_request_with_timeout(
     headers: &[(String, String)],
     timeout_ms: i64,
 ) -> Obj {
-    match http_client_request_raw(method, url, body.as_bytes(), headers, timeout_ms) {
+    match http_client_request_raw(method, url, body.as_bytes(), headers, timeout_ms, None) {
+        Ok(resp) => build_response_obj(resp.status, &resp.body, resp.headers),
+        Err(err_obj) => err_obj,
+    }
+}
+
+pub fn http_client_pooled_request(
+    method: &str,
+    url: &str,
+    body: &str,
+    headers: &[(String, String)],
+    timeout_ms: i64,
+    pool: &HttpConnPool,
+) -> Obj {
+    match http_client_request_raw(method, url, body.as_bytes(), headers, timeout_ms, Some(pool)) {
         Ok(resp) => build_response_obj(resp.status, &resp.body, resp.headers),
         Err(err_obj) => err_obj,
     }
@@ -1118,8 +1343,60 @@ pub fn http_client_bytes_request(
     headers: &[(String, String)],
     timeout_ms: i64,
 ) -> Obj {
-    match http_client_request_raw(method, url, body, headers, timeout_ms) {
+    match http_client_request_raw(method, url, body, headers, timeout_ms, None) {
         Ok(resp) => build_binary_response_obj(resp.status, &resp.body, resp.headers),
         Err(err_obj) => err_obj,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn resolve_client_url_joins_base_and_paths() {
+        assert_eq!(
+            resolve_client_url("https://api.example.com/v1/", "/users"),
+            "https://api.example.com/v1/users"
+        );
+        assert_eq!(
+            resolve_client_url("https://api.example.com/v1", "users"),
+            "https://api.example.com/v1/users"
+        );
+        assert_eq!(
+            resolve_client_url("https://api.example.com/v1", "?page=2"),
+            "https://api.example.com/v1?page=2"
+        );
+        assert_eq!(
+            resolve_client_url("https://api.example.com/v1", "http://other.local/x"),
+            "http://other.local/x"
+        );
+    }
+
+    #[test]
+    fn parse_http_response_detects_keep_alive_framing() {
+        let raw_ka = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        let mut r1 = BufReader::new(Cursor::new(&raw_ka[..]));
+        let (resp1, ka1) = parse_http_response_raw(&mut r1, "GET", false).unwrap();
+        assert_eq!(resp1.status, 200);
+        assert_eq!(resp1.body, b"ok");
+        assert!(ka1);
+
+        let raw_close = b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok";
+        let mut r2 = BufReader::new(Cursor::new(&raw_close[..]));
+        let (_, ka2) = parse_http_response_raw(&mut r2, "GET", false).unwrap();
+        assert!(!ka2);
+
+        let raw_10 = b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        let mut r3 = BufReader::new(Cursor::new(&raw_10[..]));
+        let (_, ka3) = parse_http_response_raw(&mut r3, "GET", false).unwrap();
+        assert!(!ka3);
+
+        let raw_unframed = b"HTTP/1.1 200 OK\r\n\r\nhello";
+        let mut r4 = BufReader::new(Cursor::new(&raw_unframed[..]));
+        let (resp4, ka4) = parse_http_response_raw(&mut r4, "GET", false).unwrap();
+        assert_eq!(resp4.body, b"hello");
+        assert!(!ka4);
     }
 }

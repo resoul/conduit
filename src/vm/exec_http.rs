@@ -5,16 +5,17 @@ use std::time::Duration;
 
 use crate::ir::Module;
 use crate::native::http::{
-    MatchedParams, ReadHttpError, RouteEntry, RouterState, http_client_bytes_request,
-    http_client_request, http_client_request_with_timeout, lookup_route, make_http_error,
+    HttpClientState, MatchedParams, ReadHttpError, RouteEntry, RouterState,
+    http_client_bytes_request, http_client_pooled_request, http_client_request,
+    http_client_request_with_timeout, lookup_route, make_http_client_obj, make_http_error,
     make_request_obj, make_response_obj, make_response_with_body_obj, make_router_obj,
-    read_http_request, reader_writer_pair, route_prefix_matches, try_serve_static,
-    write_error_response, write_http_response_ext,
+    read_http_request, reader_writer_pair, resolve_client_url, route_prefix_matches,
+    try_serve_static, write_error_response, write_http_response_ext,
 };
 use crate::vm::exec_cold::err_msg;
 use crate::vm::value::{
-    ListStorage, MapKey, MapVal, Obj, OrderedMap, SCHEMA_HTTP_REQUEST, SCHEMA_HTTP_RESPONSE,
-    SCHEMA_HTTP_ROUTER, SMALL_MAP_LIMIT, StructData,
+    ListStorage, MapKey, MapVal, Obj, OrderedMap, SCHEMA_HTTP_CLIENT, SCHEMA_HTTP_REQUEST,
+    SCHEMA_HTTP_RESPONSE, SCHEMA_HTTP_ROUTER, SMALL_MAP_LIMIT, StructData,
 };
 use crate::vm::{ExecResult, RuntimeError, Vm};
 
@@ -72,6 +73,18 @@ pub const HTTP_REQ_PARAM: u8 = 34;
 pub const HTTP_REQ_QUERY_PARAM: u8 = 35;
 pub const HTTP_GET_JSON: u8 = 36;
 pub const HTTP_POST_JSON: u8 = 37;
+pub const HTTP_ROUTE_GUARD: u8 = 38;
+pub const HTTP_ROUTE_TYPED_QUERY: u8 = 39;
+pub const HTTP_ROUTE_AUTO_RESP: u8 = 40;
+pub const HTTP_CLIENT_NEW: u8 = 41;
+pub const HTTP_CLIENT_HEADER: u8 = 42;
+pub const HTTP_CLIENT_TIMEOUT: u8 = 43;
+pub const HTTP_CLIENT_BASE_URL: u8 = 44;
+pub const HTTP_CLIENT_REQUEST: u8 = 45;
+pub const HTTP_CLIENT_GET_JSON: u8 = 46;
+pub const HTTP_CLIENT_POST_JSON: u8 = 47;
+pub const HTTP_CLIENT_CLOSE: u8 = 48;
+pub const HTTP_CLIENT_POOL_STATS: u8 = 49;
 
 #[inline]
 fn populate_ordered_map_from_params(map: &mut OrderedMap, params: MatchedParams) {
@@ -112,14 +125,14 @@ fn set_matched_params_on_record(req_mut: &mut StructData, params: MatchedParams)
 }
 
 impl Vm {
-    fn invoke_http_fn(
+    fn invoke_http_fn_raw(
         &mut self,
         module: &Module,
         s_top: usize,
         o_top: usize,
         handler: &Obj,
         args: &[Obj],
-    ) -> Result<Obj, RuntimeError> {
+    ) -> Result<ExecResult, RuntimeError> {
         let (func_id, has_closure) = match handler {
             Obj::Func(fid) => (*fid, false),
             Obj::Closure(cd) => (cd.func_id, true),
@@ -148,20 +161,33 @@ impl Vm {
             self.objs[closure_slot] = Obj::Empty;
         }
         match res {
-            Ok(ExecResult::Obj(o)) => {
+            Ok(val) => {
                 if used_objs > func.num_objs as usize {
                     self.clear_obj_range(
                         child_o + func.num_objs as usize,
                         used_objs - func.num_objs as usize,
                     );
                 }
-                Ok(o)
+                Ok(val)
             }
-            Ok(_) => Err(err_msg("HTTP handler must return an object")),
             Err(e) => {
                 self.clear_obj_range(child_o, used_objs);
                 Err(e)
             }
+        }
+    }
+
+    fn invoke_http_fn(
+        &mut self,
+        module: &Module,
+        s_top: usize,
+        o_top: usize,
+        handler: &Obj,
+        args: &[Obj],
+    ) -> Result<Obj, RuntimeError> {
+        match self.invoke_http_fn_raw(module, s_top, o_top, handler, args)? {
+            ExecResult::Obj(o) => Ok(o),
+            _ => Err(err_msg("HTTP handler must return an object")),
         }
     }
 
@@ -177,6 +203,20 @@ impl Vm {
             return Err(err_msg("Invalid Router handle"));
         }
         Ok(id)
+    }
+
+    fn extract_client_id(&self, obj: &Obj) -> Result<usize, RuntimeError> {
+        let Obj::Record(rec) = obj else {
+            return Err(err_msg("Expected http.Client"));
+        };
+        if rec.schema_id != SCHEMA_HTTP_CLIENT {
+            return Err(err_msg("Expected http.Client"));
+        }
+        let cid = rec.get_scalar(0) as usize;
+        if cid >= self.host.http_clients.len() {
+            return Err(err_msg("Invalid http.Client handle"));
+        }
+        Ok(cid)
     }
 
     fn extract_response_fields<'a>(
@@ -279,22 +319,31 @@ impl Vm {
                 let matched = {
                     let routes = &self.host.routers[router_id].routes;
                     match lookup_route(routes, &req_method, &req_path) {
-                        Ok((entry, params)) => {
-                            Ok((entry.handler.clone(), entry.body_json_plan, params))
-                        }
+                        Ok((entry, params)) => Ok((
+                            entry.handler.clone(),
+                            entry.query_plan,
+                            entry.body_json_plan,
+                            entry.guard.clone(),
+                            entry.auto_resp_kind,
+                            params,
+                        )),
                         Err(status) => Err(status),
                     }
                 };
                 match matched {
-                    Ok((handler, body_plan, MatchedParams::None)) => self.invoke_http_route_handler(
-                        module,
-                        s_top,
-                        o_top,
-                        &handler,
-                        body_plan,
-                        &req_obj,
-                    )?,
-                    Ok((handler, body_plan, matched_params)) => {
+                    Ok((handler, query_plan, body_plan, guard, auto_resp_kind, MatchedParams::None)) => self
+                        .invoke_http_route_handler(
+                            module,
+                            s_top,
+                            o_top,
+                            &handler,
+                            query_plan,
+                            body_plan,
+                            guard.as_ref(),
+                            auto_resp_kind,
+                            &req_obj,
+                        )?,
+                    Ok((handler, query_plan, body_plan, guard, auto_resp_kind, matched_params)) => {
                         let mut cached = self.host.cached_http_req.take();
                         let Obj::Record(ref mut rec_arc) = req_obj else {
                             return Err(err_msg("Expected Request"));
@@ -324,7 +373,10 @@ impl Vm {
                             s_top,
                             o_top,
                             &handler,
+                            query_plan,
                             body_plan,
+                            guard.as_ref(),
+                            auto_resp_kind,
                             &req_obj,
                         )?
                     }
@@ -385,76 +437,87 @@ impl Vm {
         Ok(resp)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn invoke_http_route_handler(
         &mut self,
         module: &Module,
         s_top: usize,
         o_top: usize,
         handler: &Obj,
+        query_plan: Option<u16>,
         body_json_plan: Option<u16>,
+        guard: Option<&Obj>,
+        auto_resp_kind: Option<u8>,
         req_obj: &Obj,
     ) -> Result<Obj, RuntimeError> {
-        let Some(plan_idx) = body_json_plan else {
-            return self.invoke_http_fn(module, s_top, o_top, handler, std::slice::from_ref(req_obj));
-        };
-        let body_str = match req_obj {
-            Obj::Record(rec) => match rec.get_obj(2) {
-                Obj::Str(s) => s.as_str().to_string(),
-                _ => String::new(),
-            },
-            _ => String::new(),
-        };
-        let decoded = match crate::native::json_decode::decode_json_with_plan(
-            &body_str,
-            &module.json_plans[plan_idx as usize],
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                let msg = json_escape_str(&e.message);
-                return Ok(make_response_obj(
-                    400,
-                    format!(r#"{{"error":"invalid_json","message":"{}"}}"#, msg),
-                    Some("application/json; charset=utf-8"),
-                ));
+        let guard_ctx = if let Some(g) = guard {
+            let res = self.invoke_http_fn(module, s_top, o_top, g, std::slice::from_ref(req_obj))?;
+            if matches!(&res, Obj::Record(rec) if rec.schema_id == SCHEMA_HTTP_RESPONSE) {
+                return Ok(res);
             }
+            Some(res)
+        } else {
+            None
         };
-        let mut violations = Vec::new();
-        self.validate_dyn_val(module, s_top, o_top, &decoded, "", &mut violations, 0)?;
-        if !violations.is_empty() {
-            let mut body = String::from(r#"{"error":"validation_failed","issues":["#);
-            for (idx, v) in violations.iter().enumerate() {
-                if idx > 0 {
-                    body.push(',');
-                }
-                if let Obj::Record(rec) = v {
-                    let path = match rec.get_obj(0) {
-                        Obj::Str(s) => s.as_str(),
-                        _ => "",
-                    };
-                    let code = match rec.get_obj(1) {
-                        Obj::Str(s) => s.as_str(),
-                        _ => "",
-                    };
-                    let msg = match rec.get_obj(2) {
-                        Obj::Str(s) => s.as_str(),
-                        _ => "",
-                    };
-                    body.push_str(&format!(
-                        r#"{{"path":"{}","code":"{}","message":"{}"}}"#,
-                        json_escape_str(path),
-                        json_escape_str(code),
-                        json_escape_str(msg),
+
+        let mut call_args = Vec::with_capacity(4);
+        call_args.push(req_obj.clone());
+
+        if let Some(q_idx) = query_plan {
+            let decoded_q = match decode_http_query_params(&module.http_query_plans[q_idx as usize], req_obj) {
+                Ok(v) => v,
+                Err(msg) => {
+                    return Ok(make_response_obj(
+                        400,
+                        format!(r#"{{"error":"invalid_query","message":"{}"}}"#, json_escape_str(&msg)),
+                        Some("application/json; charset=utf-8"),
                     ));
                 }
+            };
+            let mut violations = Vec::new();
+            self.validate_dyn_val(module, s_top, o_top, &decoded_q, "", &mut violations, 0)?;
+            if !violations.is_empty() {
+                return Ok(format_validation_error_response(&violations));
             }
-            body.push_str("]}");
-            return Ok(make_response_obj(
-                422,
-                &body,
-                Some("application/json; charset=utf-8"),
-            ));
+            call_args.push(decoded_q);
         }
-        self.invoke_http_fn(module, s_top, o_top, handler, &[req_obj.clone(), decoded])
+
+        if let Some(plan_idx) = body_json_plan {
+            let body_str = match req_obj {
+                Obj::Record(rec) => match rec.get_obj(2) {
+                    Obj::Str(s) => s.as_str().to_string(),
+                    _ => String::new(),
+                },
+                _ => String::new(),
+            };
+            let decoded = match crate::native::json_decode::decode_json_with_plan(
+                &body_str,
+                &module.json_plans[plan_idx as usize],
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    let msg = json_escape_str(&e.message);
+                    return Ok(make_response_obj(
+                        400,
+                        format!(r#"{{"error":"invalid_json","message":"{}"}}"#, msg),
+                        Some("application/json; charset=utf-8"),
+                    ));
+                }
+            };
+            let mut violations = Vec::new();
+            self.validate_dyn_val(module, s_top, o_top, &decoded, "", &mut violations, 0)?;
+            if !violations.is_empty() {
+                return Ok(format_validation_error_response(&violations));
+            }
+            call_args.push(decoded);
+        }
+
+        if let Some(ctx) = guard_ctx {
+            call_args.push(ctx);
+        }
+
+        let raw_res = self.invoke_http_fn_raw(module, s_top, o_top, handler, &call_args)?;
+        convert_auto_http_response(module, raw_res, auto_resp_kind)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -570,6 +633,25 @@ impl Vm {
                 let rid = self.extract_router_id(&self.objs[o_base + a as usize])?;
                 if let Some(last) = self.host.routers[rid].routes.last_mut() {
                     last.body_json_plan = Some(c);
+                }
+            }
+            HTTP_ROUTE_GUARD => {
+                let rid = self.extract_router_id(&self.objs[o_base + a as usize])?;
+                let g = self.objs[o_base + b as usize].clone();
+                if let Some(last) = self.host.routers[rid].routes.last_mut() {
+                    last.guard = Some(g);
+                }
+            }
+            HTTP_ROUTE_TYPED_QUERY => {
+                let rid = self.extract_router_id(&self.objs[o_base + a as usize])?;
+                if let Some(last) = self.host.routers[rid].routes.last_mut() {
+                    last.query_plan = Some(c);
+                }
+            }
+            HTTP_ROUTE_AUTO_RESP => {
+                let rid = self.extract_router_id(&self.objs[o_base + a as usize])?;
+                if let Some(last) = self.host.routers[rid].routes.last_mut() {
+                    last.auto_resp_kind = Some(c as u8);
                 }
             }
             HTTP_OK_JSON | HTTP_STATUS_JSON => {
@@ -698,6 +780,191 @@ impl Vm {
                     Err(e) => make_http_error("encode_error", &e.message),
                 };
                 self.objs[o_base + a as usize] = out;
+            }
+            HTTP_CLIENT_NEW => {
+                let base_url = self.sys_str(o_base, b, "http.client()")?.as_str().to_string();
+                let cid = self.host.http_clients.len();
+                self.host.http_clients.push(HttpClientState::new(base_url));
+                self.objs[o_base + a as usize] = make_http_client_obj(cid);
+            }
+            HTTP_CLIENT_HEADER => {
+                let cid = self.extract_client_id(&self.objs[o_base + b as usize])?;
+                let Obj::Record(packed) = &self.objs[o_base + c as usize] else {
+                    return Err(err_msg("Expected packed Client.header args"));
+                };
+                let name = match packed.get_obj(0) {
+                    Obj::Str(s) => s.as_str().to_string(),
+                    _ => return Err(err_msg("Client.header name must be String")),
+                };
+                let value = match packed.get_obj(1) {
+                    Obj::Str(s) => s.as_str().to_string(),
+                    _ => return Err(err_msg("Client.header value must be String")),
+                };
+                let mut next = self.host.http_clients[cid].clone();
+                next.set_header(name, value);
+                let new_cid = self.host.http_clients.len();
+                self.host.http_clients.push(next);
+                self.objs[o_base + a as usize] = make_http_client_obj(new_cid);
+            }
+            HTTP_CLIENT_TIMEOUT => {
+                let cid = self.extract_client_id(&self.objs[o_base + b as usize])?;
+                let ms = self.scalars[s_base + c as usize] as i64;
+                let mut next = self.host.http_clients[cid].clone();
+                next.timeout_ms = ms;
+                let new_cid = self.host.http_clients.len();
+                self.host.http_clients.push(next);
+                self.objs[o_base + a as usize] = make_http_client_obj(new_cid);
+            }
+            HTTP_CLIENT_BASE_URL => {
+                let cid = self.extract_client_id(&self.objs[o_base + b as usize])?;
+                let base_url = self.sys_str(o_base, c, "Client.base_url()")?.as_str().to_string();
+                let mut next = self.host.http_clients[cid].clone();
+                next.base_url = base_url;
+                let new_cid = self.host.http_clients.len();
+                self.host.http_clients.push(next);
+                self.objs[o_base + a as usize] = make_http_client_obj(new_cid);
+            }
+            HTTP_CLIENT_REQUEST => {
+                let cid = self.extract_client_id(&self.objs[o_base + b as usize])?;
+                let Obj::Record(packed) = &self.objs[o_base + c as usize] else {
+                    return Err(err_msg("Expected packed Client.request args"));
+                };
+                let method = match packed.get_obj(0) {
+                    Obj::Str(s) => s.as_str().to_string(),
+                    _ => return Err(err_msg("Client.request method must be String")),
+                };
+                let path = match packed.get_obj(1) {
+                    Obj::Str(s) => s.as_str().to_string(),
+                    _ => return Err(err_msg("Client.request path must be String")),
+                };
+                let body = match packed.get_obj(2) {
+                    Obj::Str(s) => s.as_str().to_string(),
+                    _ => String::new(),
+                };
+                let mut hdrs = self.host.http_clients[cid].default_headers.clone();
+                if let Obj::Map(extra) = packed.get_obj(3) {
+                    for (k, v) in &extra.entries {
+                        if let (MapKey::Str(ks), MapVal::Obj(Obj::Str(vs))) = (k, v) {
+                            if let Some((_, existing)) = hdrs
+                                .iter_mut()
+                                .find(|(hk, _)| hk.eq_ignore_ascii_case(ks.as_str()))
+                            {
+                                *existing = vs.as_str().to_string();
+                            } else {
+                                hdrs.push((ks.as_str().to_string(), vs.as_str().to_string()));
+                            }
+                        }
+                    }
+                }
+                let full_url = resolve_client_url(&self.host.http_clients[cid].base_url, &path);
+                let timeout_ms = self.host.http_clients[cid].timeout_ms;
+                let pool = Arc::clone(&self.host.http_clients[cid].pool);
+                let resp = http_client_pooled_request(
+                    &method,
+                    &full_url,
+                    &body,
+                    &hdrs,
+                    timeout_ms,
+                    &pool,
+                );
+                self.objs[o_base + a as usize] = resp;
+            }
+            HTTP_CLIENT_GET_JSON => {
+                let cid = self.extract_client_id(&self.objs[o_base + b as usize])?;
+                let Obj::Record(packed) = &self.objs[o_base + c as usize] else {
+                    return Err(err_msg("Expected packed Client.get_json args"));
+                };
+                let plan_idx = packed.get_scalar(0) as usize;
+                let path = match packed.get_obj(0) {
+                    Obj::Str(s) => s.as_str().to_string(),
+                    _ => return Err(err_msg("Client.get_json path must be String")),
+                };
+                let mut full_url = resolve_client_url(&self.host.http_clients[cid].base_url, &path);
+                if let Obj::Map(qmap) = packed.get_obj(1)
+                    && !qmap.is_empty()
+                    && let Obj::Str(qs) = crate::native::url::encode_query_map(qmap)
+                {
+                    if full_url.contains('?') {
+                        full_url.push('&');
+                    } else {
+                        full_url.push('?');
+                    }
+                    full_url.push_str(qs.as_str());
+                }
+                let mut hdrs = self.host.http_clients[cid].default_headers.clone();
+                if !hdrs.iter().any(|(k, _)| k.eq_ignore_ascii_case("accept")) {
+                    hdrs.push(("Accept".to_string(), "application/json".to_string()));
+                }
+                let timeout_ms = self.host.http_clients[cid].timeout_ms;
+                let pool = Arc::clone(&self.host.http_clients[cid].pool);
+                let resp = http_client_pooled_request(
+                    "GET",
+                    &full_url,
+                    "",
+                    &hdrs,
+                    timeout_ms,
+                    &pool,
+                );
+                let out = match &resp {
+                    Obj::Record(rec) if rec.schema_id == SCHEMA_HTTP_RESPONSE => {
+                        let body = match rec.get_obj(0) {
+                            Obj::Str(s) => s.as_str(),
+                            _ => "",
+                        };
+                        match crate::native::json_decode::decode_json_with_plan(
+                            body,
+                            &module.json_plans[plan_idx],
+                        ) {
+                            Ok(v) => v,
+                            Err(e) => make_http_error("decode_error", &e.message),
+                        }
+                    }
+                    _ => resp,
+                };
+                self.objs[o_base + a as usize] = out;
+            }
+            HTTP_CLIENT_POST_JSON => {
+                let cid = self.extract_client_id(&self.objs[o_base + b as usize])?;
+                let Obj::Record(packed) = &self.objs[o_base + c as usize] else {
+                    return Err(err_msg("Expected packed Client.post_json args"));
+                };
+                let path = match packed.get_obj(0) {
+                    Obj::Str(s) => s.as_str().to_string(),
+                    _ => return Err(err_msg("Client.post_json path must be String")),
+                };
+                let val = packed.get_obj(1);
+                let out = match crate::native::json_encode::encode_json_obj(val, &module.struct_schemas) {
+                    Ok(body) => {
+                        let mut hdrs = self.host.http_clients[cid].default_headers.clone();
+                        if !hdrs.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) {
+                            hdrs.push(("Content-Type".to_string(), "application/json".to_string()));
+                        }
+                        if !hdrs.iter().any(|(k, _)| k.eq_ignore_ascii_case("accept")) {
+                            hdrs.push(("Accept".to_string(), "application/json".to_string()));
+                        }
+                        let full_url = resolve_client_url(&self.host.http_clients[cid].base_url, &path);
+                        let timeout_ms = self.host.http_clients[cid].timeout_ms;
+                        let pool = Arc::clone(&self.host.http_clients[cid].pool);
+                        http_client_pooled_request("POST", &full_url, &body, &hdrs, timeout_ms, &pool)
+                    }
+                    Err(e) => make_http_error("encode_error", &e.message),
+                };
+                self.objs[o_base + a as usize] = out;
+            }
+            HTTP_CLIENT_CLOSE => {
+                let cid = self.extract_client_id(&self.objs[o_base + b as usize])?;
+                self.host.http_clients[cid].pool.clear();
+                self.objs[o_base + a as usize] = Obj::Empty;
+            }
+            HTTP_CLIENT_POOL_STATS => {
+                let cid = self.extract_client_id(&self.objs[o_base + b as usize])?;
+                let idle = self.host.http_clients[cid].pool.idle_count() as i64;
+                let mut m = OrderedMap::with_capacity(1);
+                m.set(
+                    MapKey::Str(Arc::new("idle".into())),
+                    MapVal::Scalar(idle as u64),
+                );
+                self.objs[o_base + a as usize] = Obj::Map(Arc::new(m));
             }
             HTTP_DISPATCH => {
                 let rid = self.extract_router_id(&self.objs[o_base + b as usize])?;
@@ -978,6 +1245,239 @@ fn serve_connection(vm: &mut Vm, module: &Module, rid: usize, stream: TcpStream)
                 break;
             }
             Err(ReadHttpError::Io(_)) => break,
+        }
+    }
+}
+
+fn format_validation_error_response(violations: &[Obj]) -> Obj {
+    let mut body = String::from(r#"{"error":"validation_failed","issues":["#);
+    for (idx, v) in violations.iter().enumerate() {
+        if idx > 0 {
+            body.push(',');
+        }
+        if let Obj::Record(rec) = v {
+            let path = match rec.get_obj(0) {
+                Obj::Str(s) => s.as_str(),
+                _ => "",
+            };
+            let code = match rec.get_obj(1) {
+                Obj::Str(s) => s.as_str(),
+                _ => "",
+            };
+            let msg = match rec.get_obj(2) {
+                Obj::Str(s) => s.as_str(),
+                _ => "",
+            };
+            body.push_str(&format!(
+                r#"{{"path":"{}","code":"{}","message":"{}"}}"#,
+                json_escape_str(path),
+                json_escape_str(code),
+                json_escape_str(msg),
+            ));
+        }
+    }
+    body.push_str("]}");
+    make_response_obj(422, &body, Some("application/json; charset=utf-8"))
+}
+
+fn lookup_req_str_map<'a>(map_obj: &'a Obj, key: &str) -> Option<&'a str> {
+    let Obj::Map(m) = map_obj else {
+        return None;
+    };
+    let val = m.get(&MapKey::Str(Arc::new(key.to_string().into())))?;
+    match val {
+        MapVal::Obj(Obj::Str(s)) => Some(s.as_str()),
+        _ => None,
+    }
+}
+
+fn decode_http_query_params(
+    plan: &crate::ir::HttpQueryPlan,
+    req_obj: &Obj,
+) -> Result<Obj, String> {
+    let Obj::Record(rec) = req_obj else {
+        return Err("Expected Request".to_string());
+    };
+    let query_map = rec.get_obj(4);
+    let params_map = rec.get_obj(5);
+    let mut out = StructData::new(plan.schema_id, plan.scalar_len, plan.obj_len);
+
+    for f in &plan.fields {
+        let raw_opt = lookup_req_str_map(params_map, &f.param_name)
+            .or_else(|| lookup_req_str_map(query_map, &f.param_name));
+
+        match raw_opt {
+            Some(raw) => {
+                if f.is_optional && raw.is_empty() && f.kind != 0 {
+                    out.set_obj(f.slot as usize, Obj::Empty);
+                    continue;
+                }
+                match f.kind {
+                    0 => out.set_obj(f.slot as usize, Obj::str(raw)),
+                    1 => {
+                        let n = raw.trim().parse::<i64>().map_err(|_| {
+                            format!("Parameter '{}' must be an integer", f.param_name)
+                        })?;
+                        if f.is_optional {
+                            out.set_obj(f.slot as usize, Obj::boxed_int(n));
+                        } else {
+                            out.set_scalar(f.slot as usize, n as u64);
+                        }
+                    }
+                    2 => {
+                        let v = raw.trim().parse::<f64>().map_err(|_| {
+                            format!("Parameter '{}' must be a number", f.param_name)
+                        })?;
+                        if !v.is_finite() {
+                            return Err(format!("Parameter '{}' must be finite", f.param_name));
+                        }
+                        if f.is_optional {
+                            out.set_obj(f.slot as usize, Obj::boxed_float(v.to_bits()));
+                        } else {
+                            out.set_scalar(f.slot as usize, v.to_bits());
+                        }
+                    }
+                    3 => {
+                        let b = match raw.trim().to_ascii_lowercase().as_str() {
+                            "true" | "1" => true,
+                            "false" | "0" => false,
+                            _ => {
+                                return Err(format!(
+                                    "Parameter '{}' must be a boolean",
+                                    f.param_name
+                                ));
+                            }
+                        };
+                        if f.is_optional {
+                            out.set_obj(f.slot as usize, Obj::boxed_bool(b));
+                        } else {
+                            out.set_scalar(f.slot as usize, b as u64);
+                        }
+                    }
+                    _ => return Err("Unsupported query field kind".to_string()),
+                }
+            }
+            None => match &f.default_val {
+                Some(crate::ir::HttpQueryDefault::Nil) => {
+                    out.set_obj(f.slot as usize, Obj::Empty);
+                }
+                Some(crate::ir::HttpQueryDefault::Str(s)) => {
+                    out.set_obj(f.slot as usize, Obj::str(s.clone()));
+                }
+                Some(crate::ir::HttpQueryDefault::Int(n)) => {
+                    if f.is_optional {
+                        out.set_obj(f.slot as usize, Obj::boxed_int(*n));
+                    } else {
+                        out.set_scalar(f.slot as usize, *n as u64);
+                    }
+                }
+                Some(crate::ir::HttpQueryDefault::Float(v)) => {
+                    if f.is_optional {
+                        out.set_obj(f.slot as usize, Obj::boxed_float(v.to_bits()));
+                    } else {
+                        out.set_scalar(f.slot as usize, v.to_bits());
+                    }
+                }
+                Some(crate::ir::HttpQueryDefault::Bool(b)) => {
+                    if f.is_optional {
+                        out.set_obj(f.slot as usize, Obj::boxed_bool(*b));
+                    } else {
+                        out.set_scalar(f.slot as usize, *b as u64);
+                    }
+                }
+                None if f.is_optional => {
+                    out.set_obj(f.slot as usize, Obj::Empty);
+                }
+                None => {
+                    return Err(format!("Missing required parameter '{}'", f.param_name));
+                }
+            },
+        }
+    }
+
+    Ok(Obj::Record(Arc::new(out)))
+}
+
+fn convert_auto_http_response(
+    module: &Module,
+    raw: ExecResult,
+    auto_resp_kind: Option<u8>,
+) -> Result<Obj, RuntimeError> {
+    let Some(kind) = auto_resp_kind else {
+        return match raw {
+            ExecResult::Obj(o) => Ok(o),
+            _ => Err(err_msg("HTTP handler must return an object")),
+        };
+    };
+    match raw {
+        ExecResult::Void => Ok(make_response_obj(204, "", None)),
+        ExecResult::Scalar(bits) => {
+            let body = match kind {
+                2 => {
+                    let f = f64::from_bits(bits);
+                    if f.is_finite() {
+                        f.to_string()
+                    } else {
+                        "null".to_string()
+                    }
+                }
+                3 => {
+                    if bits != 0 {
+                        "true".to_string()
+                    } else {
+                        "false".to_string()
+                    }
+                }
+                4 => return Ok(make_response_obj(204, "", None)),
+                _ => (bits as i64).to_string(),
+            };
+            Ok(make_response_obj(
+                200,
+                body,
+                Some("application/json; charset=utf-8"),
+            ))
+        }
+        ExecResult::Obj(obj) => {
+            if let Obj::Record(rec) = &obj
+                && rec.schema_id == SCHEMA_HTTP_RESPONSE
+            {
+                return Ok(obj);
+            }
+            if matches!(obj, Obj::Empty) {
+                if kind == 5 {
+                    return Ok(make_response_obj(
+                        404,
+                        r#"{"error":"not_found","message":"Not found"}"#,
+                        Some("application/json; charset=utf-8"),
+                    ));
+                }
+                return Ok(make_response_obj(204, "", None));
+            }
+            let status = if let Obj::Record(rec) = &obj {
+                crate::native::find_schema(&module.struct_schemas, rec.schema_id)
+                    .map(|s| {
+                        s.http_status
+                            .unwrap_or(if s.is_error { 500 } else { 200 })
+                    })
+                    .unwrap_or(200)
+            } else {
+                200
+            };
+            match crate::native::json_encode::encode_json_obj(&obj, &module.struct_schemas) {
+                Ok(json_str) => Ok(make_response_obj(
+                    status as i64,
+                    json_str,
+                    Some("application/json; charset=utf-8"),
+                )),
+                Err(e) => Ok(make_response_obj(
+                    500,
+                    format!(
+                        r#"{{"error":"encode_error","message":"{}"}}"#,
+                        json_escape_str(&e.message)
+                    ),
+                    Some("application/json; charset=utf-8"),
+                )),
+            }
         }
     }
 }

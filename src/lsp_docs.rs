@@ -77,6 +77,7 @@ pub fn lookup_native_hover(word: &str, qualified: &str) -> Option<&'static str> 
         "math.pow" | "math.atan2" | "math.hypot" => {
             Some("```conduit\nfunc math.<fn>(a: Float, b: Float) -> Float\n```\nTwo-argument floating-point math function.")
         }
+        "http.client" => Some("```conduit\nfunc http.client(base_url?: String) -> http.Client\n```\nCreates a pooled keep-alive HTTP/1.1 client with optional `base_url`, default headers (`.header`, `.bearer`), and `.timeout_ms`."),
         "log.debug" | "log.info" | "log.warn" | "log.error" => {
             Some("```conduit\nfunc log.<level>(msg: String) -> Void\n```\nLogs a timestamped message to `stderr` if the current log level permits.")
         }

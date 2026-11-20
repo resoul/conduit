@@ -172,3 +172,55 @@ pub fn exec_env_load(plan: &EnvLoadPlan) -> Obj {
 
     Obj::Record(Arc::new(rec))
 }
+
+/// Generates a `.env.example` template from all `config` blocks and structs with `@env` fields.
+pub fn generate_env_example(checked: &crate::frontend::check::CheckedProgram) -> Result<String, String> {
+    use crate::frontend::ast::{ExprKind, UnaryOp};
+    use crate::frontend::types::Type;
+
+    let mut sections = Vec::new();
+    for st in &checked.structs {
+        let env_fields: Vec<_> = st.fields.iter().filter(|f| f.env_name.is_some()).collect();
+        if env_fields.is_empty() {
+            continue;
+        }
+        let clean_name = st.name.rsplit("::").next().unwrap_or(&st.name);
+        let mut lines = vec![format!("# {}", clean_name)];
+        for f in env_fields {
+            let var = f.env_name.as_deref().unwrap_or_default();
+            let is_opt = matches!(f.ty, Type::Optional(_));
+            let default_str = f.default.as_ref().and_then(|e| match &e.kind {
+                ExprKind::Int(v) => Some(v.to_string()),
+                ExprKind::Float(v) => Some(v.to_string()),
+                ExprKind::Bool(v) => Some(v.to_string()),
+                ExprKind::String(s) => {
+                    if s.contains([' ', '#', '\t']) || s.is_empty() {
+                        Some(format!("\"{}\"", s.replace('"', "\\\"")))
+                    } else {
+                        Some(s.clone())
+                    }
+                }
+                ExprKind::Unary {
+                    op: UnaryOp::Neg,
+                    expr,
+                } => match &expr.kind {
+                    ExprKind::Int(v) => Some(format!("-{v}")),
+                    ExprKind::Float(v) => Some(format!("-{v}")),
+                    _ => None,
+                },
+                _ => None,
+            });
+            match default_str {
+                Some(def) => lines.push(format!("{var}={def} # {}, default: {def}", f.ty)),
+                None if is_opt => lines.push(format!("# {var}= # optional ({})", f.ty)),
+                None => lines.push(format!("{var}= # required ({})", f.ty)),
+            }
+        }
+        sections.push(lines.join("\n"));
+    }
+
+    if sections.is_empty() {
+        return Err("No config blocks or structs with @env annotations found".to_string());
+    }
+    Ok(sections.join("\n\n"))
+}

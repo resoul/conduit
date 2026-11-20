@@ -112,6 +112,7 @@ fn main() {
         Some("watch") => watch::run_watch_cmd(&args[1..]),
         Some("fmt") => run_fmt_cmd(&args[1..]),
         Some("db") => run_db_cmd(&args[1..]),
+        Some("env") => run_env_cmd(&args[1..]),
         Some("cron") => run_cron_cmd(&args[1..]),
         Some("lsp") => {
             if let Err(e) = conduit::lsp::run_lsp_server() {
@@ -124,12 +125,12 @@ fn main() {
         }
         Some("--help" | "-h" | "help") => {
             println!(
-                "Conduit v{}\n\nUsage:\n  conduit bench [--filter <pat>] [--strict]\n  conduit build <file.cdt> [-o <output>]\n  conduit check <file.cdt>\n  conduit cron <list|print|run> <file.cdt> [job]\n  conduit db <migrate|rollback|status> <file.cdt> [--url <dsn>] [--steps <n>] [--dry-run]\n  conduit disasm <file.cdt>\n  conduit fmt <file_or_dir> [--check]\n  conduit openapi <file.cdt> [--router <name>] [--title <str>] [--version <str>] [--server <url>] [-o <file>]\n  conduit routes <file.cdt> [--router <name>]\n  conduit run <file.cdt> [-- args...]\n  conduit test [file_or_dir] [--filter <pat>] [--fail-fast]\n  conduit watch <file.cdt> [-- args...]\n  conduit lsp\n  conduit --version, -V\n  conduit --help, -h",
+                "Conduit v{}\n\nUsage:\n  conduit bench [--filter <pat>] [--strict]\n  conduit build <file.cdt> [-o <output>]\n  conduit check <file.cdt>\n  conduit cron <list|print|run> <file.cdt> [job]\n  conduit db <migrate|rollback|status> <file.cdt> [--url <dsn>] [--steps <n>] [--dry-run]\n  conduit disasm <file.cdt>\n  conduit env example <file.cdt> [-o <file>]\n  conduit fmt <file_or_dir> [--check]\n  conduit openapi <file.cdt> [--router <name>] [--title <str>] [--version <str>] [--server <url>] [-o <file>]\n  conduit routes <file.cdt> [--router <name>]\n  conduit run <file.cdt> [-- args...]\n  conduit test [file_or_dir] [--filter <pat>] [--fail-fast]\n  conduit watch <file.cdt> [-- args...]\n  conduit lsp\n  conduit --version, -V\n  conduit --help, -h",
                 env!("CARGO_PKG_VERSION")
             );
         }
         Some(cmd) => {
-            eprintln!("Unknown command '{}'. Usage: conduit <bench|build|check|cron|db|disasm|fmt|openapi|routes|run|test|watch|lsp> ...", cmd);
+            eprintln!("Unknown command '{}'. Usage: conduit <bench|build|check|cron|db|disasm|env|fmt|openapi|routes|run|test|watch|lsp> ...", cmd);
             process::exit(2);
         }
     }
@@ -755,5 +756,64 @@ fn run_openapi_cmd(args: &[String]) {
         }
     } else {
         println!("{}", spec);
+    }
+}
+
+fn run_env_cmd(args: &[String]) {
+    if args.first().map(|s| s.as_str()) != Some("example") {
+        eprintln!("Usage: conduit env example <file.cdt> [-o <file>]");
+        process::exit(2);
+    }
+    let mut file: Option<String> = None;
+    let mut output: Option<String> = None;
+    let mut i = 1usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-o" | "--out" => {
+                i += 1;
+                if i < args.len() {
+                    output = Some(args[i].clone());
+                } else {
+                    eprintln!("Missing path after {}", args[i - 1]);
+                    process::exit(2);
+                }
+            }
+            arg if !arg.starts_with('-') && file.is_none() => {
+                file = Some(arg.to_string());
+            }
+            other => {
+                eprintln!("Usage: conduit env example <file.cdt> [-o <file>] (unexpected '{}')", other);
+                process::exit(2);
+            }
+        }
+        i += 1;
+    }
+
+    let Some(file_str) = file else {
+        eprintln!("Usage: conduit env example <file.cdt> [-o <file>]");
+        process::exit(2);
+    };
+    let path = Path::new(&file_str);
+    let (_program, checked) = match frontend::check_file(path) {
+        Ok(res) => res,
+        Err(e) => {
+            print_check_error(path, &e);
+            process::exit(1);
+        }
+    };
+    let content = match conduit::native::env::generate_env_example(&checked) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Env example error: {}", e);
+            process::exit(1);
+        }
+    };
+    if let Some(out_file) = output {
+        if let Err(e) = std::fs::write(&out_file, format!("{}\n", content)) {
+            eprintln!("Failed to write '{}': {}", out_file, e);
+            process::exit(1);
+        }
+    } else {
+        println!("{}", content);
     }
 }

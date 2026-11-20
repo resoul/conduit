@@ -102,10 +102,10 @@ pub const NATIVE_MODULES: &[NativeModuleSpec] = &[
         name: "cdt.http",
         fns: &[
             "text", "html", "json", "ok_json", "status_json", "redirect", "no_content", "response",
-            "response_with", "router", "build", "serve", "get", "post", "get_json", "post_json",
-            "request", "request_timeout", "get_bytes", "request_bytes",
+            "response_with", "router", "build", "serve", "client", "get", "post", "get_json",
+            "post_json", "request", "request_timeout", "get_bytes", "request_bytes",
         ],
-        types: &["HttpError", "Request", "Response", "BinaryResponse", "Router"],
+        types: &["HttpError", "Request", "Response", "BinaryResponse", "Router", "Client"],
     },
     NativeModuleSpec {
         name: "cdt.db",
@@ -932,10 +932,7 @@ impl<'a> Checker<'a> {
                 self.check_fs_method(&tid.name, method, args)
             }
             (ModuleId::Native(ref m), _, _) if m == "cdt.http" => {
-                if !type_args.is_empty() {
-                    return Err(format!("Method '.{}()' does not accept type arguments", method));
-                }
-                self.check_http_method(&tid.name, method, args)
+                self.check_http_method(&tid.name, method, type_args, args)
             }
             (ModuleId::Native(ref m), _, _) if m == "cdt.db" => {
                 self.check_db_method(&tid.name, method, type_args, args)

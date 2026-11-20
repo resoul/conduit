@@ -1,5 +1,23 @@
 import * as http from "cdt.http"
 import { EncodeError } from "cdt.json"
+import * as validation from "cdt.validation"
+
+@http.status(404)
+error NotFoundError {
+    message: String
+}
+
+@http.query
+struct UserParams {
+    id: String
+}
+
+@http.query
+struct ListItemsQuery {
+    page: Int = 1
+    @validation.range(1, 50)
+    limit: Int = 10
+}
 
 struct ItemPatch {
     id: String
@@ -8,6 +26,11 @@ struct ItemPatch {
 
 struct UserReply {
     user_id: String
+}
+
+struct ItemsPage {
+    page: Int
+    limit: Int
 }
 
 struct StatusReply {
@@ -32,9 +55,15 @@ func home_handler(_req: http.Request) -> http.Response {
     return http.text("cdt-curl demo server")
 }
 
-func get_user_handler(req: http.Request) -> http.Response {
-    id := req.param("id") ?? "unknown"
-    return http.ok_json(UserReply(user_id: id))
+func get_user_handler(_req: http.Request, q: UserParams) -> UserReply | NotFoundError {
+    if q.id == "missing" {
+        return NotFoundError(message: "user not found")
+    }
+    return UserReply(user_id: q.id)
+}
+
+func list_items_handler(_req: http.Request, q: ListItemsQuery) -> ItemsPage {
+    return ItemsPage(page: q.page, limit: q.limit)
 }
 
 func echo_handler(req: http.Request) -> http.Response {
@@ -63,6 +92,7 @@ export router DemoApi "CdtCurl demo HTTP router" {
     after add_powered_by
     get "/" => home_handler
     get "/users/:id" => get_user_handler
+    get "/items" => list_items_handler
     post "/echo" => echo_handler
     patch "/items/:id" => patch_item_handler
     options "/items/:id" => options_item_handler

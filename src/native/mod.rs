@@ -145,6 +145,7 @@ pub struct StructSchema {
     pub has_duplicate_json_names: bool,
     pub is_error: bool,
     pub enum_tag: Option<String>,
+    pub http_status: Option<u16>,
 }
 
 impl StructSchema {
@@ -246,6 +247,7 @@ impl StructSchema {
             has_duplicate_json_names,
             is_error,
             enum_tag,
+            http_status: None,
         }
     }
 }

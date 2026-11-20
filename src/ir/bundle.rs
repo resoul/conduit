@@ -428,6 +428,7 @@ pub fn encode_bundle(module: &Module, main_fid: u32, main_ret_tag: u8) -> Result
         w.u32(s.schema_id);
         w.str(&s.type_name);
         w.bool(s.is_error);
+        w.u16(s.http_status.unwrap_or(0));
         w.bool(s.enum_tag.is_some());
         if let Some(tag) = &s.enum_tag {
             w.str(tag);
@@ -545,6 +546,27 @@ pub fn encode_bundle(module: &Module, main_fid: u32, main_ret_tag: u8) -> Result
             Ok(())
         })
     })?;
+    w.list(&module.http_query_plans, |w, qp| {
+        w.u32(qp.schema_id);
+        w.u16(qp.scalar_len);
+        w.u16(qp.obj_len);
+        w.list(&qp.fields, |w, f| {
+            w.str(&f.name);
+            w.str(&f.param_name);
+            w.u8(f.kind);
+            w.bool(f.is_optional);
+            w.u16(f.slot);
+            match &f.default_val {
+                None => w.u8(0),
+                Some(crate::ir::HttpQueryDefault::Str(s)) => { w.u8(1); w.str(s); }
+                Some(crate::ir::HttpQueryDefault::Int(n)) => { w.u8(2); w.i64(*n); }
+                Some(crate::ir::HttpQueryDefault::Float(v)) => { w.u8(3); w.u64(v.to_bits()); }
+                Some(crate::ir::HttpQueryDefault::Bool(b)) => { w.u8(4); w.bool(*b); }
+                Some(crate::ir::HttpQueryDefault::Nil) => w.u8(5),
+            }
+            Ok(())
+        })
+    })?;
 
     Ok(w.0)
 }
@@ -613,13 +635,17 @@ pub fn decode_bundle(bytes: &[u8]) -> Result<(Module, u32, u8), String> {
         let schema_id = r.u32()?;
         let type_name = r.str()?;
         let is_error = r.bool()?;
+        let raw_http_status = r.u16()?;
+        let http_status = if raw_http_status == 0 { None } else { Some(raw_http_status) };
         let enum_tag = if r.bool()? { Some(r.str()?) } else { None };
         let field_defs = r.vec(|r| Ok(StructFieldDef {
             name: r.str()?,
             json_name: r.str()?,
             ty: decode_json_type(r)?,
         }))?;
-        Ok(StructSchema::with_flags(schema_id, type_name, field_defs, is_error, enum_tag))
+        let mut schema = StructSchema::with_flags(schema_id, type_name, field_defs, is_error, enum_tag);
+        schema.http_status = http_status;
+        Ok(schema)
     })?;
     let json_roots = r.vec(decode_json_type)?;
     module.json_plans = json_roots
@@ -743,6 +769,37 @@ pub fn decode_bundle(bytes: &[u8]) -> Result<(Module, u32, u8), String> {
             })
         })?;
         Ok(crate::ir::SchedulePlan { name, jobs })
+    })?;
+    module.http_query_plans = r.vec(|r| {
+        Ok(crate::ir::HttpQueryPlan {
+            schema_id: r.u32()?,
+            scalar_len: r.u16()?,
+            obj_len: r.u16()?,
+            fields: r.vec(|r| {
+                let name = r.str()?;
+                let param_name = r.str()?;
+                let kind = r.u8()?;
+                let is_optional = r.bool()?;
+                let slot = r.u16()?;
+                let default_val = match r.u8()? {
+                    0 => None,
+                    1 => Some(crate::ir::HttpQueryDefault::Str(r.str()?)),
+                    2 => Some(crate::ir::HttpQueryDefault::Int(r.i64()?)),
+                    3 => Some(crate::ir::HttpQueryDefault::Float(f64::from_bits(r.u64()?))),
+                    4 => Some(crate::ir::HttpQueryDefault::Bool(r.bool()?)),
+                    5 => Some(crate::ir::HttpQueryDefault::Nil),
+                    tag => return Err(format!("Invalid HttpQueryDefault tag {} in bundle", tag)),
+                };
+                Ok(crate::ir::HttpQueryFieldPlan {
+                    name,
+                    param_name,
+                    kind,
+                    is_optional,
+                    slot,
+                    default_val,
+                })
+            })?,
+        })
     })?;
 
     module.validate()?;

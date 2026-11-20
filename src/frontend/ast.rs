@@ -299,6 +299,17 @@ pub enum ItemKind {
         body: Block,
     },
     Query(Box<QuerySpec>),
+    Job(Box<JobSpec>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct JobSpec {
+    pub name: String,
+    pub cron_expr: Option<String>,
+    pub interval_ms: Option<u64>,
+    pub expr_span: Span,
+    pub return_type: Option<TypeExpr>,
+    pub body: Block,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -39,8 +39,8 @@ use crate::vm::value::{
     SCHEMA_CRYPTO_ERROR, SCHEMA_CSV_ERROR, SCHEMA_DB_CONN, SCHEMA_DB_ERROR, SCHEMA_DB_PARAM,
     SCHEMA_DB_POOL,
     SCHEMA_EMPTY_TAG, SCHEMA_ENV_ERROR, SCHEMA_FS_ERROR, SCHEMA_FS_READER, SCHEMA_FS_WRITER,
-    SCHEMA_HTTP_BINARY_RESPONSE, SCHEMA_HTTP_ERROR, SCHEMA_HTTP_REQUEST, SCHEMA_HTTP_RESPONSE,
-    SCHEMA_HTTP_ROUTER, SCHEMA_INDEX_ERROR, SCHEMA_JSON_DECODE_ERROR, SCHEMA_JSON_ENCODE_ERROR,
+    SCHEMA_HTTP_BINARY_RESPONSE, SCHEMA_HTTP_CLIENT, SCHEMA_HTTP_ERROR, SCHEMA_HTTP_REQUEST,
+    SCHEMA_HTTP_RESPONSE, SCHEMA_HTTP_ROUTER, SCHEMA_INDEX_ERROR, SCHEMA_JSON_DECODE_ERROR, SCHEMA_JSON_ENCODE_ERROR,
     SCHEMA_JWT_ERROR, SCHEMA_KEY_ERROR, SCHEMA_LIST_TAG, SCHEMA_LOCK_ERROR, SCHEMA_LOCK_GUARD,
     SCHEMA_MAP_TAG, SCHEMA_PARSE_ERROR, SCHEMA_PROCESS_ERROR, SCHEMA_PROCESS_OUTPUT,
     SCHEMA_REDIS_CLIENT, SCHEMA_REDIS_ERROR, SCHEMA_REDIS_LOCK, SCHEMA_STR_TAG,
@@ -1270,6 +1270,25 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 self.ops.push(Op::ExtOp { kind: EXT_HTTP_OP, aux, a, b: req_o, c });
                 Ok(a)
             }
+            "client" => {
+                let b = if args.len() == 1 {
+                    self.lower_obj(&args[0])?
+                } else {
+                    let s_idx = self.mc.intern_str("")?;
+                    let r = self.alloc_temp_o();
+                    self.ops.push(Op::LoadConstObj { dst_obj: r, idx: s_idx });
+                    r
+                };
+                let a = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_HTTP_OP,
+                    aux: HTTP_CLIENT_NEW,
+                    a,
+                    b,
+                    c: 0,
+                });
+                Ok(a)
+            }
             "build" | "serve" => {
                 use crate::frontend::check::HttpRouterDeclKind;
                 let ty = self.mc.checked.resolve_type(&type_args[0])?;
@@ -1395,6 +1414,18 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                                 b: pat_o,
                                 c: handler_o,
                             });
+                            if let Some(qname) = &entry.query_struct {
+                                let q_plan = build_http_query_plan(qname, self.mc.checked)?;
+                                let q_idx = self.mc.module.http_query_plans.len() as u16;
+                                self.mc.module.http_query_plans.push(q_plan);
+                                self.ops.push(Op::ExtOp {
+                                    kind: EXT_HTTP_OP,
+                                    aux: HTTP_ROUTE_TYPED_QUERY,
+                                    a: router_o,
+                                    b: 0,
+                                    c: q_idx,
+                                });
+                            }
                             if let Some(body_name) = &entry.body_struct {
                                 let json_ty = if self.mc.checked.data_enums.contains_key(body_name) {
                                     crate::frontend::check::type_to_json_type(
@@ -1413,6 +1444,44 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                                     a: router_o,
                                     b: 0,
                                     c: plan_idx,
+                                });
+                            }
+                            if let Some(guard_name) = &entry.guard_handler {
+                                let gfid = *self
+                                    .mc
+                                    .checked
+                                    .func_by_name
+                                    .get(guard_name)
+                                    .ok_or_else(|| format!("Unknown router guard '{}'", guard_name))?;
+                                let guard_o = self.alloc_temp_o();
+                                self.ops.push(Op::LoadFuncObj {
+                                    dst_obj: guard_o,
+                                    func_id: gfid as u16,
+                                });
+                                self.ops.push(Op::ExtOp {
+                                    kind: EXT_HTTP_OP,
+                                    aux: HTTP_ROUTE_GUARD,
+                                    a: router_o,
+                                    b: guard_o,
+                                    c: 0,
+                                });
+                            }
+                            if entry.auto_response {
+                                let sig = &self.mc.checked.funcs[fid as usize];
+                                let ret_kind: u16 = match &sig.return_type {
+                                    Type::Int => 1,
+                                    Type::Float => 2,
+                                    Type::Bool => 3,
+                                    Type::Void => 4,
+                                    Type::Optional(_) => 5,
+                                    _ => 0,
+                                };
+                                self.ops.push(Op::ExtOp {
+                                    kind: EXT_HTTP_OP,
+                                    aux: HTTP_ROUTE_AUTO_RESP,
+                                    a: router_o,
+                                    b: 0,
+                                    c: ret_kind,
                                 });
                             }
                         }
@@ -1549,11 +1618,211 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
         type_name: &str,
         target: &Expr,
         method: &str,
+        type_args: &[TypeExpr],
         args: &[Expr],
     ) -> Result<u16, String> {
         use crate::vm::exec_http::*;
         let router_o = self.lower_obj(target)?;
         match (type_name, method) {
+            ("Client", "header") => {
+                let name_o = self.lower_obj(&args[0])?;
+                let val_o = self.lower_obj(&args[1])?;
+                let desc_idx = self.mc.intern_record_desc(RecordDesc {
+                    schema_id: SCHEMA_HTTP_CLIENT,
+                    scalar_regs: Box::new([]),
+                    obj_regs: Box::new([name_o, val_o]),
+                })?;
+                let packed = self.alloc_temp_o();
+                self.ops.push(Op::NewRecord { dst_obj: packed, desc_idx });
+                let dst_o = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_HTTP_OP,
+                    aux: HTTP_CLIENT_HEADER,
+                    a: dst_o,
+                    b: router_o,
+                    c: packed,
+                });
+                Ok(dst_o)
+            }
+            ("Client", "bearer") => {
+                let k_idx = self.mc.intern_str("authorization")?;
+                let k_o = self.alloc_temp_o();
+                self.ops.push(Op::LoadConstObj { dst_obj: k_o, idx: k_idx });
+                let tok_o = self.lower_obj(&args[0])?;
+                let p_idx = self.mc.intern_str("Bearer ")?;
+                let p_o = self.alloc_temp_o();
+                self.ops.push(Op::LoadConstObj { dst_obj: p_o, idx: p_idx });
+                let val_o = self.alloc_temp_o();
+                self.ops.push(Op::StrConcat { dst_obj: val_o, a_obj: p_o, b_obj: tok_o });
+                let desc_idx = self.mc.intern_record_desc(RecordDesc {
+                    schema_id: SCHEMA_HTTP_CLIENT,
+                    scalar_regs: Box::new([]),
+                    obj_regs: Box::new([k_o, val_o]),
+                })?;
+                let packed = self.alloc_temp_o();
+                self.ops.push(Op::NewRecord { dst_obj: packed, desc_idx });
+                let dst_o = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_HTTP_OP,
+                    aux: HTTP_CLIENT_HEADER,
+                    a: dst_o,
+                    b: router_o,
+                    c: packed,
+                });
+                Ok(dst_o)
+            }
+            ("Client", "base_url") => {
+                let url_o = self.lower_obj(&args[0])?;
+                let dst_o = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_HTTP_OP,
+                    aux: HTTP_CLIENT_BASE_URL,
+                    a: dst_o,
+                    b: router_o,
+                    c: url_o,
+                });
+                Ok(dst_o)
+            }
+            ("Client", "timeout_ms") => {
+                let ms_s = self.lower_scalar(&args[0])?;
+                let dst_o = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_HTTP_OP,
+                    aux: HTTP_CLIENT_TIMEOUT,
+                    a: dst_o,
+                    b: router_o,
+                    c: ms_s,
+                });
+                Ok(dst_o)
+            }
+            ("Client", "get" | "delete" | "post" | "put" | "patch" | "request") => {
+                let (method_o, path_o, body_o, hdrs_o) = if method == "request" {
+                    let m_o = self.lower_obj(&args[0])?;
+                    let p_o = self.lower_obj(&args[1])?;
+                    let b_o = if args.len() >= 3 {
+                        self.lower_obj(&args[2])?
+                    } else {
+                        let s_idx = self.mc.intern_str("")?;
+                        let r = self.alloc_temp_o();
+                        self.ops.push(Op::LoadConstObj { dst_obj: r, idx: s_idx });
+                        r
+                    };
+                    let h_o = if args.len() == 4 {
+                        self.lower_obj(&args[3])?
+                    } else {
+                        let e_idx = self.mc.intern_empty()?;
+                        let r = self.alloc_temp_o();
+                        self.ops.push(Op::LoadConstObj { dst_obj: r, idx: e_idx });
+                        r
+                    };
+                    (m_o, p_o, b_o, h_o)
+                } else {
+                    let m_idx = self.mc.intern_str(&method.to_ascii_uppercase())?;
+                    let m_o = self.alloc_temp_o();
+                    self.ops.push(Op::LoadConstObj { dst_obj: m_o, idx: m_idx });
+                    let p_o = self.lower_obj(&args[0])?;
+                    let b_o = if matches!(method, "post" | "put" | "patch") {
+                        self.lower_obj(&args[1])?
+                    } else {
+                        let s_idx = self.mc.intern_str("")?;
+                        let r = self.alloc_temp_o();
+                        self.ops.push(Op::LoadConstObj { dst_obj: r, idx: s_idx });
+                        r
+                    };
+                    let e_idx = self.mc.intern_empty()?;
+                    let h_o = self.alloc_temp_o();
+                    self.ops.push(Op::LoadConstObj { dst_obj: h_o, idx: e_idx });
+                    (m_o, p_o, b_o, h_o)
+                };
+                let desc_idx = self.mc.intern_record_desc(RecordDesc {
+                    schema_id: SCHEMA_HTTP_CLIENT,
+                    scalar_regs: Box::new([]),
+                    obj_regs: Box::new([method_o, path_o, body_o, hdrs_o]),
+                })?;
+                let packed = self.alloc_temp_o();
+                self.ops.push(Op::NewRecord { dst_obj: packed, desc_idx });
+                let dst_o = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_HTTP_OP,
+                    aux: HTTP_CLIENT_REQUEST,
+                    a: dst_o,
+                    b: router_o,
+                    c: packed,
+                });
+                Ok(dst_o)
+            }
+            ("Client", "get_json") => {
+                let target_ty = self.mc.resolve_type(&type_args[0])?;
+                let json_ty = crate::frontend::check_native::type_to_json_type(
+                    &target_ty,
+                    self.mc.checked,
+                )
+                .ok_or_else(|| format!("Unsupported JSON type '{}' in Client.get_json()", target_ty))?;
+                let plan_idx = self.mc.add_json_decode_plan(&json_ty)?;
+                let path_o = self.lower_obj(&args[0])?;
+                let query_o = if args.len() == 2 {
+                    self.lower_obj(&args[1])?
+                } else {
+                    let e_idx = self.mc.intern_empty()?;
+                    let r = self.alloc_temp_o();
+                    self.ops.push(Op::LoadConstObj { dst_obj: r, idx: e_idx });
+                    r
+                };
+                let plan_s = self.alloc_temp_s();
+                self.load_int_into(plan_s, plan_idx as i64)?;
+                let desc_idx = self.mc.intern_record_desc(RecordDesc {
+                    schema_id: SCHEMA_HTTP_CLIENT,
+                    scalar_regs: Box::new([plan_s]),
+                    obj_regs: Box::new([path_o, query_o]),
+                })?;
+                let packed = self.alloc_temp_o();
+                self.ops.push(Op::NewRecord { dst_obj: packed, desc_idx });
+                let dst_o = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_HTTP_OP,
+                    aux: HTTP_CLIENT_GET_JSON,
+                    a: dst_o,
+                    b: router_o,
+                    c: packed,
+                });
+                Ok(dst_o)
+            }
+            ("Client", "post_json") => {
+                let path_o = self.lower_obj(&args[0])?;
+                let body_o = self.lower_obj(&args[1])?;
+                let desc_idx = self.mc.intern_record_desc(RecordDesc {
+                    schema_id: SCHEMA_HTTP_CLIENT,
+                    scalar_regs: Box::new([]),
+                    obj_regs: Box::new([path_o, body_o]),
+                })?;
+                let packed = self.alloc_temp_o();
+                self.ops.push(Op::NewRecord { dst_obj: packed, desc_idx });
+                let dst_o = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_HTTP_OP,
+                    aux: HTTP_CLIENT_POST_JSON,
+                    a: dst_o,
+                    b: router_o,
+                    c: packed,
+                });
+                Ok(dst_o)
+            }
+            ("Client", "close" | "pool_stats") => {
+                let aux = if method == "close" {
+                    HTTP_CLIENT_CLOSE
+                } else {
+                    HTTP_CLIENT_POOL_STATS
+                };
+                let dst_o = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_HTTP_OP,
+                    aux,
+                    a: dst_o,
+                    b: router_o,
+                    c: 0,
+                });
+                Ok(dst_o)
+            }
             ("Request", "header" | "param" | "query_param") => {
                 let aux = match method {
                     "header" => HTTP_REQ_HEADER,
@@ -1647,7 +1916,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
         if let ModuleId::Native(m) = &tid.module
             && m == "cdt.http"
         {
-            return self.lower_http_method(&tid.name, target, method, args);
+            return self.lower_http_method(&tid.name, target, method, type_args, args);
         }
         if let ModuleId::Native(m) = &tid.module
             && m == "cdt.db"
@@ -2885,4 +3154,52 @@ fn http_route_aux(method: &str) -> u8 {
         "head" => HTTP_ROUTE_HEAD,
         _ => HTTP_ROUTE_ANY,
     }
+}
+
+fn build_http_query_plan(
+    name: &str,
+    checked: &crate::frontend::check::CheckedProgram,
+) -> Result<crate::ir::HttpQueryPlan, String> {
+    let sid = *checked
+        .struct_by_name
+        .get(name)
+        .ok_or_else(|| format!("Unknown @http.query struct '{}'", name))?;
+    let st = &checked.structs[sid];
+    let mut fields = Vec::with_capacity(st.fields.len());
+    for f in &st.fields {
+        let (is_optional, inner) = match &f.ty {
+            Type::Optional(inner) => (true, inner.as_ref()),
+            other => (false, other),
+        };
+        let kind = match inner {
+            Type::String => 0,
+            Type::Int => 1,
+            Type::Float => 2,
+            Type::Bool => 3,
+            other => {
+                return Err(format!(
+                    "@http.query field '{}.{}' has unsupported type '{}'",
+                    name, f.name, other
+                ));
+            }
+        };
+        let default_val = match &f.default {
+            Some(expr) => Some(crate::frontend::check_sys::eval_http_query_default(expr, &f.ty)?),
+            None => None,
+        };
+        fields.push(crate::ir::HttpQueryFieldPlan {
+            name: f.name.clone(),
+            param_name: f.json_name.clone(),
+            kind,
+            is_optional,
+            slot: f.slot_idx,
+            default_val,
+        });
+    }
+    Ok(crate::ir::HttpQueryPlan {
+        schema_id: st.schema_id,
+        scalar_len: st.scalar_len,
+        obj_len: st.obj_len,
+        fields,
+    })
 }

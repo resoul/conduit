@@ -14,9 +14,24 @@ import * as env from "cdt.env"
 
 ---
 
-## Declarative Config Loading (`@env` & `env.load<T>()`)
+## Declarative Config Loading (`config`, `@env` & `env.load<T>()`)
 
-You can annotate struct fields with `@env` or `@env("VAR_NAME")` and load them in one typed call with `env.load<T>() -> T | env.EnvError`:
+You can declare a `config` block (which automatically maps all fields to `@env` variables) or annotate `struct` fields with `@env` / `@env("VAR_NAME")`, and load them in one typed call with `env.load<T>() -> T | env.EnvError`:
+
+```conduit
+config AppConfig {
+    port: Int @validation.min(1024) = 8080
+    debug: Bool @env("APP_DEBUG") = false
+    api_key: String
+    region: String? @env("APP_REGION")
+}
+```
+
+You can also generate a `.env.example` template directly from the CLI:
+
+```sh
+conduit env example app.cdt -o .env.example
+```
 
 - `@env` maps a field to the uppercase form of its field name (e.g., `port` -> `PORT`).
 - `@env("CUSTOM_NAME")` maps the field to `"CUSTOM_NAME"`.

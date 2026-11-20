@@ -315,12 +315,30 @@ impl Parser {
         fields: &mut Vec<FieldDef>,
         idx: &mut usize,
     ) -> Result<(), ParserError> {
+        self.parse_router_body_with_guard(prefix, None, fields, idx)
+    }
+
+    fn parse_router_body_with_guard(
+        &mut self,
+        prefix: &str,
+        guard_fn: Option<(&str, Span)>,
+        fields: &mut Vec<FieldDef>,
+        idx: &mut usize,
+    ) -> Result<(), ParserError> {
         while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
             let tok = self.peek().clone();
+            if matches!(tok.kind, TokenKind::KwGuard) {
+                self.bump();
+                let (g_name, g_span) = self.expect_ident()?;
+                self.expect(&TokenKind::LBrace)?;
+                self.parse_router_body_with_guard(prefix, Some((&g_name, g_span)), fields, idx)?;
+                self.expect(&TokenKind::RBrace)?;
+                continue;
+            }
             let TokenKind::Ident(kw) = &tok.kind else {
                 return Err(ParserError {
                     message: format!(
-                        "Expected 'group', 'static', 'cors', 'before', 'after', 'get', 'post', 'put', 'delete', 'patch', 'options', 'head', or 'any' in router block, got '{:?}'",
+                        "Expected 'group', 'guard', 'static', 'cors', 'before', 'after', 'get', 'post', 'put', 'delete', 'patch', 'options', 'head', or 'any' in router block, got '{:?}'",
                         tok.kind
                     ),
                     span: tok.span,
@@ -337,7 +355,14 @@ impl Parser {
                 };
                 let joined = join_route_prefix(prefix, &sub_prefix);
                 self.expect(&TokenKind::LBrace)?;
-                self.parse_router_body(&joined, fields, idx)?;
+                self.parse_router_body_with_guard(&joined, guard_fn, fields, idx)?;
+                self.expect(&TokenKind::RBrace)?;
+                continue;
+            }
+            if kw == "guard" {
+                let (g_name, g_span) = self.expect_ident()?;
+                self.expect(&TokenKind::LBrace)?;
+                self.parse_router_body_with_guard(prefix, Some((&g_name, g_span)), fields, idx)?;
                 self.expect(&TokenKind::RBrace)?;
                 continue;
             }
@@ -418,16 +443,24 @@ impl Parser {
                     let full_pat = join_route_prefix(prefix, &pat);
                     self.expect(&TokenKind::FatArrow)?;
                     let (handler_name, hspan) = self.expect_ident()?;
+                    let mut route_args = vec![
+                        str_expr(full_pat, pspan),
+                        Expr {
+                            kind: ExprKind::Ident(handler_name),
+                            ty: crate::frontend::types::Type::Void,
+                            span: hspan,
+                        },
+                    ];
+                    if let Some((g_name, g_span)) = guard_fn {
+                        route_args.push(Expr {
+                            kind: ExprKind::Ident(g_name.to_string()),
+                            ty: crate::frontend::types::Type::Void,
+                            span: g_span,
+                        });
+                    }
                     FieldAnnotation {
                         target: format!("router.{}", kw),
-                        args: vec![
-                            str_expr(full_pat, pspan),
-                            Expr {
-                                kind: ExprKind::Ident(handler_name),
-                                ty: crate::frontend::types::Type::Void,
-                                span: hspan,
-                            },
-                        ],
+                        args: route_args,
                         span,
                     }
                 }
@@ -834,6 +867,107 @@ impl Parser {
             op,
             value: Box::new(value),
         })
+    }
+
+    pub(super) fn parse_job_item(&mut self, is_exported: bool) -> Result<Item, ParserError> {
+        let start_span = self.bump().span; // consume 'job'
+        let (name, _) = self.expect_ident()?;
+        let tok = self.peek().clone();
+        let TokenKind::Ident(kw) = &tok.kind else {
+            return Err(ParserError {
+                message: format!(
+                    "Expected 'every' or 'interval' after job name '{}', got '{:?}'",
+                    name, tok.kind
+                ),
+                span: tok.span,
+            });
+        };
+        let mut cron_expr = None;
+        let mut interval_ms = None;
+        let expr_span;
+        match kw.as_str() {
+            "every" => {
+                self.bump();
+                expr_span = self.peek().span;
+                let Some(expr) = self.try_take_string() else {
+                    return Err(ParserError {
+                        message: "Expected cron expression string after 'every'".to_string(),
+                        span: expr_span,
+                    });
+                };
+                cron_expr = Some(expr);
+            }
+            "interval" => {
+                self.bump();
+                expr_span = self.peek().span;
+                let ms = match self.peek().kind.clone() {
+                    TokenKind::Int(n) if n > 0 => {
+                        self.bump();
+                        let unit_tok = self.peek().clone();
+                        let mult = match &unit_tok.kind {
+                            TokenKind::Ident(u) if u == "ms" => {
+                                self.bump();
+                                1i64
+                            }
+                            TokenKind::Ident(u) if u == "s" => {
+                                self.bump();
+                                1_000i64
+                            }
+                            TokenKind::Ident(u) if u == "m" => {
+                                self.bump();
+                                60_000i64
+                            }
+                            TokenKind::Ident(u) if u == "h" => {
+                                self.bump();
+                                3_600_000i64
+                            }
+                            _ => {
+                                return Err(ParserError {
+                                    message: "Expected duration unit ('ms', 's', 'm', or 'h') after interval integer".to_string(),
+                                    span: unit_tok.span,
+                                });
+                            }
+                        };
+                        n.saturating_mul(mult) as u64
+                    }
+                    _ => {
+                        return Err(ParserError {
+                            message: "Expected positive integer duration (e.g. 10s, 500ms, 5m) after 'interval'".to_string(),
+                            span: expr_span,
+                        });
+                    }
+                };
+                interval_ms = Some(ms);
+            }
+            other => {
+                return Err(ParserError {
+                    message: format!(
+                        "Expected 'every' or 'interval' in job '{}', got '{}'",
+                        name, other
+                    ),
+                    span: tok.span,
+                });
+            }
+        }
+
+        let return_type = if self.match_token(&TokenKind::Arrow) {
+            Some(self.parse_type_expr()?)
+        } else {
+            None
+        };
+        let body = self.parse_block()?;
+        Ok(Item::new_exported(
+            ItemKind::Job(Box::new(JobSpec {
+                name,
+                cron_expr,
+                interval_ms,
+                expr_span,
+                return_type,
+                body,
+            })),
+            start_span,
+            is_exported,
+        ))
     }
 }
 

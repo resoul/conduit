@@ -57,6 +57,9 @@ fn collect_local_defs(items: &[Item]) -> HashSet<String> {
             ItemKind::Query(q) => {
                 defs.insert(q.name.clone());
             }
+            ItemKind::Job(j) => {
+                defs.insert(j.name.clone());
+            }
             ItemKind::Import { .. }
             | ItemKind::ExportList { .. }
             | ItemKind::Migration { .. }
@@ -81,6 +84,11 @@ fn rename_item_decl(item: &mut Item, rename: &HashMap<String, String>) {
         ItemKind::Query(q) => {
             if let Some(new_name) = rename.get(&q.name) {
                 q.name = new_name.clone();
+            }
+        }
+        ItemKind::Job(j) => {
+            if let Some(new_name) = rename.get(&j.name) {
+                j.name = new_name.clone();
             }
         }
         ItemKind::Import { .. }
@@ -271,6 +279,9 @@ fn load_module(
                 ItemKind::Query(q) => {
                     exports.insert(q.name.clone(), local_to_global[&q.name].clone());
                 }
+                ItemKind::Job(j) => {
+                    exports.insert(j.name.clone(), local_to_global[&j.name].clone());
+                }
                 ItemKind::ExportList { names } => {
                     for spec in names {
                         let resolved = local_to_global
@@ -438,6 +449,13 @@ fn rewrite_items(items: &mut [Item], env: &RewriteEnv) -> Result<(), String> {
             ItemKind::Test { body, .. } => {
                 let mut scopes = Vec::new();
                 rewrite_block_stmts(body, env, &mut scopes)?;
+            }
+            ItemKind::Job(j) => {
+                if let Some(rt) = &mut j.return_type {
+                    rewrite_type_expr(rt, env)?;
+                }
+                let mut scopes = Vec::new();
+                rewrite_block_stmts(&mut j.body, env, &mut scopes)?;
             }
             ItemKind::Query(q) => {
                 let mut scopes = vec![HashSet::new()];

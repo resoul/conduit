@@ -350,7 +350,7 @@ fn cli_routes_and_openapi_commands() {
     assert!(routes_auth_out.contains("/auth/login"), "{routes_auth_out}");
     assert!(routes_auth_out.contains("LoginRequest"), "{routes_auth_out}");
     assert!(routes_auth_out.contains("/api/me"), "{routes_auth_out}");
-    assert!(routes_auth_out.contains("before: require_jwt"), "{routes_auth_out}");
+    assert!(routes_auth_out.contains("guard: require_jwt"), "{routes_auth_out}");
 
     let routes_cli = Command::new(conduit_bin())
         .args(["routes", cli_http_main.to_str().unwrap()])
@@ -416,4 +416,365 @@ fn cli_routes_and_openapi_commands() {
         .output()
         .unwrap();
     assert!(!bad_router.status.success());
+}
+
+#[test]
+fn cli_env_example_and_config_block() {
+    let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir_path = std::env::temp_dir().join(format!("conduit_env_ex_{}_{}", std::process::id(), n));
+    fs::create_dir_all(&dir_path).unwrap();
+    let main_cdt = dir_path.join("app.cdt");
+    fs::write(
+        &main_cdt,
+        r#"
+import * as env from "cdt.env"
+
+config AppConfig {
+    port: Int = 8080
+    debug: Bool @env("APP_DEBUG") = false
+    api_key: String
+    region: String? @env("APP_REGION")
+}
+
+func main() -> Void {
+    switch env.load<AppConfig>() {
+        case AppConfig(c): print("{c.port}:{c.debug}:{c.api_key}")
+        case env.EnvError(e): print("err:{e.name}")
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let ex_out = Command::new(conduit_bin())
+        .args(["env", "example", main_cdt.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        ex_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&ex_out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&ex_out.stdout);
+    assert!(stdout.contains("# AppConfig"), "{stdout}");
+    assert!(stdout.contains("PORT=8080"), "{stdout}");
+    assert!(stdout.contains("APP_DEBUG=false"), "{stdout}");
+    assert!(stdout.contains("API_KEY= # required (String)"), "{stdout}");
+    assert!(stdout.contains("# APP_REGION= # optional (String?)"), "{stdout}");
+
+    let run_out = Command::new(conduit_bin())
+        .args(["run", main_cdt.to_str().unwrap()])
+        .env("API_KEY", "secret123")
+        .env("APP_DEBUG", "true")
+        .output()
+        .unwrap();
+    assert!(
+        run_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run_out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run_out.stdout).trim(), "8080:true:secret123");
+    let _ = fs::remove_dir_all(&dir_path);
+}
+
+#[test]
+fn cli_top_level_job_blocks() {
+    let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir_path = std::env::temp_dir().join(format!("conduit_job_e2e_{}_{}", std::process::id(), n));
+    fs::create_dir_all(&dir_path).unwrap();
+    let main_cdt = dir_path.join("jobs.cdt");
+    fs::write(
+        &main_cdt,
+        r#"
+job CleanupSessions every "*/5 * * * *" {
+    print("cleanup_ok")
+}
+
+job Heartbeat interval 10s -> Void {
+    print("beat_ok")
+}
+
+func main() -> Void {}
+"#,
+    )
+    .unwrap();
+
+    let list_out = Command::new(conduit_bin())
+        .args(["cron", "list", main_cdt.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(list_out.status.success(), "stderr: {}", String::from_utf8_lossy(&list_out.stderr));
+    let list_str = String::from_utf8_lossy(&list_out.stdout);
+    assert!(list_str.contains("CleanupSessions -> every \"*/5 * * * *\""), "{list_str}");
+    assert!(list_str.contains("Heartbeat -> interval 10000ms"), "{list_str}");
+
+    let run_out = Command::new(conduit_bin())
+        .args(["cron", "run", main_cdt.to_str().unwrap(), "CleanupSessions"])
+        .output()
+        .unwrap();
+    assert!(run_out.status.success(), "stderr: {}", String::from_utf8_lossy(&run_out.stderr));
+    assert_eq!(String::from_utf8_lossy(&run_out.stdout).trim(), "cleanup_ok");
+    let _ = fs::remove_dir_all(&dir_path);
+}
+
+#[test]
+fn cli_router_guard_typed_context() {
+    let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir_path = std::env::temp_dir().join(format!("conduit_guard_e2e_{}_{}", std::process::id(), n));
+    fs::create_dir_all(&dir_path).unwrap();
+    let main_cdt = dir_path.join("api.cdt");
+    fs::write(
+        &main_cdt,
+        r#"
+import * as http from "cdt.http"
+
+struct AuthUser {
+    name: String
+    role: String
+}
+
+func require_user(req: http.Request) -> AuthUser | http.Response {
+    tok := req.header("authorization")
+    if tok == "Bearer secret" {
+        return AuthUser(name: "alice", role: "admin")
+    }
+    return http.status_json(401, AuthUser(name: "anon", role: "none"))
+}
+
+func get_me(req: http.Request, user: AuthUser) -> http.Response {
+    return http.text("{user.name}:{user.role}")
+}
+
+func health(req: http.Request) -> http.Response {
+    return http.text("ok")
+}
+
+router Api {
+    guard require_user {
+        get "/me" => get_me
+    }
+    get "/health" => health
+}
+
+func main() -> Void {
+    r := http.build<Api>()
+    empty_m := Map<String, String>()
+    auth_m := Map.from([("authorization", "Bearer secret")])
+    r1 := r.dispatch(http.Request(method: "GET", path: "/me", body: "", headers: empty_m, query: empty_m, params: empty_m))
+    r2 := r.dispatch(http.Request(method: "GET", path: "/me", body: "", headers: auth_m, query: empty_m, params: empty_m))
+    r3 := r.dispatch(http.Request(method: "GET", path: "/health", body: "", headers: empty_m, query: empty_m, params: empty_m))
+    print("{r1.status}:{r2.status}:{r2.body}:{r3.status}:{r3.body}")
+}
+"#,
+    )
+    .unwrap();
+
+    let run_out = Command::new(conduit_bin())
+        .args(["run", main_cdt.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(run_out.status.success(), "stderr: {}", String::from_utf8_lossy(&run_out.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&run_out.stdout).trim(),
+        "401:200:alice:admin:200:ok"
+    );
+
+    // Mismatched handler signature inside guard must fail check
+    let bad_cdt = dir_path.join("bad_guard.cdt");
+    fs::write(
+        &bad_cdt,
+        r#"
+import * as http from "cdt.http"
+struct AuthUser { name: String }
+func require_user(req: http.Request) -> AuthUser | http.Response { return http.text(401, "no") }
+func bad_handler(req: http.Request) -> http.Response { return http.text(200, "ok") }
+router Api {
+    guard require_user {
+        get "/me" => bad_handler
+    }
+}
+func main() -> Void { _ := http.build<Api>() }
+"#,
+    )
+    .unwrap();
+    let bad_out = Command::new(conduit_bin())
+        .args(["check", bad_cdt.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!bad_out.status.success());
+    let _ = fs::remove_dir_all(&dir_path);
+}
+
+#[test]
+fn cli_http_typed_query_and_auto_responses() {
+    let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir_path = std::env::temp_dir().join(format!("conduit_http_q_{}_{}", std::process::id(), n));
+    fs::create_dir_all(&dir_path).unwrap();
+    let main_cdt = dir_path.join("app.cdt");
+    fs::write(
+        &main_cdt,
+        r#"
+import * as http from "cdt.http"
+import * as validation from "cdt.validation"
+
+@http.status(404)
+error NotFoundError {
+    message: String,
+}
+
+@http.query
+struct UserQuery {
+    id: Int,
+    page: Int = 1,
+    @validation.range(1, 50)
+    limit: Int = 10,
+    q: String?,
+}
+
+struct UpdateBody {
+    @validation.min_len(2)
+    name: String,
+}
+
+struct UserOut {
+    id: Int,
+    page: Int,
+    limit: Int,
+    name: String,
+}
+
+func get_user(_req: http.Request, q: UserQuery) -> UserOut | NotFoundError {
+    if q.id == 999 {
+        return NotFoundError(message: "user not found")
+    }
+    label := q.q ?? "none"
+    return UserOut(id: q.id, page: q.page, limit: q.limit, name: label)
+}
+
+func update_user(_req: http.Request, q: UserQuery, body: UpdateBody) -> UserOut | NotFoundError {
+    if q.id == 999 {
+        return NotFoundError(message: "user not found")
+    }
+    return UserOut(id: q.id, page: q.page, limit: q.limit, name: body.name)
+}
+
+func delete_user(req: http.Request) -> Void | NotFoundError {
+    if (req.param("id") ?? "") == "999" {
+        return NotFoundError(message: "user not found")
+    }
+    return
+}
+
+router Api {
+    get "/users/:id" => get_user
+    post "/users/:id" => update_user
+    delete "/users/:id" => delete_user
+}
+
+func main() -> Void {
+    r := http.build<Api>()
+    empty_m := Map<String, String>()
+
+    // 1. Defaults + path param -> 200 JSON
+    r1 := r.dispatch(http.Request(method: "GET", path: "/users/42", body: "", headers: empty_m, query: empty_m, params: empty_m))
+    // 2. Explicit query params -> 200 JSON
+    q2 := Map.from([("page", "3"), ("limit", "25"), ("q", "alice")])
+    r2 := r.dispatch(http.Request(method: "GET", path: "/users/42", body: "", headers: empty_m, query: q2, params: empty_m))
+    // 3. Domain error -> 404 JSON
+    r3 := r.dispatch(http.Request(method: "GET", path: "/users/999", body: "", headers: empty_m, query: empty_m, params: empty_m))
+    // 4. Validation failure on query -> 422
+    q4 := Map.from([("limit", "99")])
+    r4 := r.dispatch(http.Request(method: "GET", path: "/users/42", body: "", headers: empty_m, query: q4, params: empty_m))
+    // 5. Invalid int in path param -> 400
+    r5 := r.dispatch(http.Request(method: "GET", path: "/users/abc", body: "", headers: empty_m, query: empty_m, params: empty_m))
+    // 6. Query + Body together -> 200
+    q6 := Map.from([("limit", "5")])
+    r6 := r.dispatch(http.Request(method: "POST", path: "/users/7", body: "{\"name\":\"bob\"}", headers: empty_m, query: q6, params: empty_m))
+    // 7. Void | Error -> 204
+    r7 := r.dispatch(http.Request(method: "DELETE", path: "/users/7", body: "", headers: empty_m, query: empty_m, params: empty_m))
+
+    print("{r1.status}|{r1.body}|{r2.status}|{r2.body}|{r3.status}|{r3.body}|{r4.status}|{r5.status}|{r6.status}|{r6.body}|{r7.status}")
+}
+"#,
+    )
+    .unwrap();
+
+    let run_out = Command::new(conduit_bin())
+        .args(["run", main_cdt.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        run_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run_out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run_out.stdout);
+    let out = stdout.trim();
+    assert_eq!(
+        out,
+        r#"200|{"id":42,"page":1,"limit":10,"name":"none"}|200|{"id":42,"page":3,"limit":25,"name":"alice"}|404|{"message":"user not found"}|422|400|200|{"id":7,"page":1,"limit":5,"name":"bob"}|204"#
+    );
+
+    let openapi_out = Command::new(conduit_bin())
+        .args(["openapi", main_cdt.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        openapi_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&openapi_out.stderr)
+    );
+    let spec = String::from_utf8_lossy(&openapi_out.stdout);
+    assert!(spec.contains(r#""in": "query""#), "{spec}");
+    assert!(spec.contains(r#""in": "path""#), "{spec}");
+    assert!(spec.contains(r#""type": "integer""#), "{spec}");
+    assert!(spec.contains(r#""404""#), "{spec}");
+    assert!(spec.contains(r#""204""#), "{spec}");
+    let _ = fs::remove_dir_all(&dir_path);
+}
+
+#[test]
+fn cli_http_client_pool_builder_e2e() {
+    let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir_path = std::env::temp_dir().join(format!("conduit_http_cli_{}_{}", std::process::id(), n));
+    fs::create_dir_all(&dir_path).unwrap();
+    let main_cdt = dir_path.join("client.cdt");
+    fs::write(
+        &main_cdt,
+        r#"
+import * as http from "cdt.http"
+
+func main() -> Void {
+    c := http.client("http://127.0.0.1:1")
+        .bearer("tok_123")
+        .header("X-App", "conduit")
+        .timeout_ms(200)
+        .base_url("invalid://bad")
+
+    stats := c.pool_stats()
+    idle_before := stats.get("idle") ?? -1
+    res := c.get("/health")
+    err_kind := ""
+    switch res {
+        case http.HttpError(e): err_kind = e.kind
+        case http.Response(_): err_kind = "ok"
+    }
+    c.close()
+    print("{idle_before}:{err_kind}")
+}
+"#,
+    )
+    .unwrap();
+
+    let run_out = Command::new(conduit_bin())
+        .args(["run", main_cdt.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        run_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run_out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run_out.stdout).trim(), "0:invalid_url");
+    let _ = fs::remove_dir_all(&dir_path);
 }

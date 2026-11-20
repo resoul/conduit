@@ -239,6 +239,13 @@
         },
         {
           "match": "^\\s*(before|after)\\s+([a-zA-Z_][a-zA-Z0-9_]*)(?=\\s*(?://.*)?$)",
+        },
+        {
+          "match": "^\\s*(guard)\\s+([a-zA-Z_][a-zA-Z0-9_]*)(?=\\s*\\{)",
+          "captures": {
+            "1": { "name": "keyword.control.conduit" },
+            "2": { "name": "entity.name.function.conduit" }
+          }
           "captures": {
             "1": { "name": "keyword.other.dsl.clause.conduit" },
             "2": { "name": "entity.name.function.handler.conduit" }
@@ -279,7 +286,7 @@
         },
         {
           "name": "keyword.other.dsl.block.conduit",
-          "match": "(?<!\\.)\\b(router|cli|schedule)\\b(?=\\s+[A-Z])"
+          "match": "(?<!\\.)\\b(router|cli|schedule|config|job)\\b(?=\\s+[A-Z])"
         },
         {
           "name": "keyword.other.dsl.block.conduit",

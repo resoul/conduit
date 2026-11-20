@@ -15,12 +15,14 @@ import * as http from "cdt.http"
 - `BinaryResponse { status: Int, body: [Int], headers: Map<String, String> }`
 - `HttpError { kind: String, message: String }`
 - `Router`
+- `Client` — Reusable HTTP/1.1 client with base URL, default headers, configurable timeout, and a thread-safe Keep-Alive TCP/TLS connection pool.
 
 ## Module Functions
 
 | Function | Signature | Description |
 | :--- | :--- | :--- |
 | `router` | `http.router() -> Router` | Creates a new HTTP router. |
+| `client` | `http.client(base_url?: String) -> Client` | Creates a pooled keep-alive `http.Client` with an optional `base_url` (default timeout `30000` ms). |
 | `build` | `http.build<T>() -> Router` | Instantiates a `Router` from a declarative `router Name { ... }` schema. |
 | `serve` | `http.serve<T>(addr: String) -> Void \| HttpError` | Builds and starts a blocking multi-threaded HTTP/1.1 server from a declarative `router Name { ... }` schema. |
 | `text` | `http.text(body: String) -> Response` | `200 OK` with `text/plain; charset=utf-8`. |
@@ -40,6 +42,36 @@ import * as http from "cdt.http"
 | `request_timeout` | `http.request_timeout(method: String, url: String, body: String, headers: Map<String, String>, timeout_ms: Int) -> Response \| HttpError` | Sends a custom HTTP request with an explicit timeout in milliseconds. |
 | `get_bytes` | `http.get_bytes(url: String) -> BinaryResponse \| HttpError` | Sends an HTTP `GET` request and returns raw byte list `[Int]` (`0..=255`). |
 | `request_bytes` | `http.request_bytes(method: String, url: String, body: [Int], headers: Map<String, String>) -> BinaryResponse \| HttpError` | Sends a binary HTTP request and returns `BinaryResponse`. |
+
+## `Client` Methods (Keep-Alive Pool)
+
+`http.Client` reuses idle HTTP/1.1 TCP and TLS connections per `(host, port, tls)` across requests (up to 8 idle connections per host, 60s idle TTL) and transparently retries once on a fresh socket if a pooled connection was closed by the server.
+
+| Method | Signature | Description |
+| :--- | :--- | :--- |
+| `header` | `c.header(name: String, value: String) -> Client` | Returns a client copy (sharing the same pool) with default header `name: value`. |
+| `bearer` | `c.bearer(token: String) -> Client` | Sets `Authorization: Bearer <token>` on the client. |
+| `timeout_ms` | `c.timeout_ms(ms: Int) -> Client` | Sets request timeout in milliseconds. |
+| `base_url` | `c.base_url(url: String) -> Client` | Updates the client's `base_url`. |
+| `get` | `c.get(path: String) -> Response \| HttpError` | Pooled `GET` against `base_url + path` (or full URL). |
+| `delete` | `c.delete(path: String) -> Response \| HttpError` | Pooled `DELETE` request. |
+| `post` | `c.post(path: String, body: String) -> Response \| HttpError` | Pooled `POST` request with string `body`. |
+| `put` | `c.put(path: String, body: String) -> Response \| HttpError` | Pooled `PUT` request with string `body`. |
+| `patch` | `c.patch(path: String, body: String) -> Response \| HttpError` | Pooled `PATCH` request with string `body`. |
+| `get_json` | `c.get_json<T>(path: String, query?: Map<String, String>) -> T \| HttpError` | Pooled `GET` (`Accept: application/json`) decoding JSON into `T`. |
+| `post_json` | `c.post_json(path: String, body: T) -> Response \| HttpError` | Pooled `POST` encoding `body` as JSON (`Content-Type: application/json`). |
+| `request` | `c.request(method: String, path: String, body?: String, headers?: Map<String, String>) -> Response \| HttpError` | Pooled custom request with optional body and per-request headers. |
+| `pool_stats` | `c.pool_stats() -> Map<String, Int>` | Returns pool metrics (`{"idle": <count>}`). |
+| `close` | `c.close() -> Void` | Closes and drains all idle connections in the client's pool. |
+
+```conduit
+api := http.client("https://api.example.com")
+    .bearer(token)
+    .timeout_ms(5000)
+
+user := api.get_json<User>("/v1/me")?
+api.close()
+```
 
 ## `Router` Methods
 
@@ -64,6 +96,9 @@ import * as http from "cdt.http"
 
 Inside `router Name { ... }`:
 - `group "/api/v1" { before auth; get "/users" => list_users }` — Route prefix grouping with local `before`/`after` middleware scoped to that prefix.
+- `guard auth_user { get "/me" => me }` — Typed route guard block: `auth_user(req: http.Request) -> Ctx | http.Response` short-circuits on `http.Response` or passes `Ctx` as the last typed parameter to handlers inside the block.
+- `@http.query` struct binding — Annotate a struct with `@http.query` to automatically parse and validate `:param` path parameters and `?key=val` query parameters (with defaults and `@validation.*` -> `400 invalid_query` / `422 validation_failed`). Handlers can accept `(http.Request, QueryStruct)`, `(http.Request, QueryStruct, BodyStruct)`, and/or `GuardCtx`.
+- `@http.status(code)` & typed return/error unions — Handlers can return any JSON-serializable type `T`, `Void` (`204`), `T?` (`200`/`404`), `http.Response`, or a union `T | AppError` directly; annotate `error` or `struct` types with `@http.status(404)` (unannotated `error` defaults to `500`, `struct` defaults to `200`). Both `@http.query` parameters and typed return/error responses are reflected in `conduit openapi`.
 - `static "/assets" => "./public"` — Serves static files with `Content-Type` detection and path-traversal protection.
 - `cors "*"` — Automatically handles `OPTIONS` preflight (`204`) and injects `access-control-allow-origin` on responses.
 

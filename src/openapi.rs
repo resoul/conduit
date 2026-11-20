@@ -146,6 +146,9 @@ pub fn format_routes(
             let norm_path = normalize_display_path(pattern);
             let (before, after) = collect_route_middleware(entries, &norm_path);
             let mut mw_parts = Vec::new();
+            if let Some(g) = &e.guard_handler {
+                mw_parts.push(format!("guard: {}", clean_symbol_name(g)));
+            }
             if !before.is_empty() {
                 mw_parts.push(format!("before: {}", before.join(", ")));
             }
@@ -494,6 +497,74 @@ fn infer_handler_responses(
         }]
     } else {
         dedup.into_values().collect()
+    }
+}
+
+fn infer_auto_return_responses(
+    ret_ty: &Type,
+    checked: &CheckedProgram,
+    explicit: Vec<InferredResponse>,
+) -> Vec<InferredResponse> {
+    let mut out: BTreeMap<u16, InferredResponse> = BTreeMap::new();
+    let mut push_leaf = |ty: &Type| {
+        if let Type::Custom(tid) = ty
+            && let ModuleId::Native(m) = &tid.module
+            && m == "cdt.http"
+            && tid.name == "Response"
+        {
+            for r in &explicit {
+                out.entry(r.status).or_insert_with(|| r.clone());
+            }
+            return;
+        }
+        if *ty == Type::Void {
+            out.entry(204).or_insert(InferredResponse {
+                status: 204,
+                media_type: None,
+                body_ty: None,
+            });
+            return;
+        }
+        let status = match ty {
+            Type::Custom(tid) if tid.module == ModuleId::Program => {
+                if let Some(&st) = checked.http_status_by_struct.get(&tid.name) {
+                    st
+                } else if checked.error_structs.contains(&tid.name) {
+                    500
+                } else {
+                    200
+                }
+            }
+            _ => 200,
+        };
+        out.entry(status).or_insert_with(|| InferredResponse {
+            status,
+            media_type: Some("application/json"),
+            body_ty: Some(ty.clone()),
+        });
+    };
+
+    match ret_ty {
+        Type::Optional(inner) => {
+            push_leaf(inner);
+            out.entry(404).or_insert(InferredResponse {
+                status: 404,
+                media_type: Some("application/json"),
+                body_ty: None,
+            });
+        }
+        Type::Union(vars) => {
+            for v in vars {
+                push_leaf(v);
+            }
+        }
+        other => push_leaf(other),
+    }
+
+    if out.is_empty() {
+        explicit
+    } else {
+        out.into_values().collect()
     }
 }
 
@@ -1108,24 +1179,56 @@ pub fn generate_openapi_json(
                 ("tags".to_string(), JsonVal::Arr(vec![JsonVal::Str(clean_router.clone())])),
             ];
 
-            if !path_params.is_empty() {
-                let params_arr = path_params
+            let mut path_param_schemas: HashMap<String, JsonVal> = HashMap::new();
+            let mut query_params_arr: Vec<JsonVal> = Vec::new();
+            let mut has_query_struct = false;
+            if let Some(qname) = &e.query_struct
+                && let Some(&qsid) = checked.struct_by_name.get(qname)
+            {
+                has_query_struct = true;
+                let qst = &checked.structs[qsid];
+                let path_set: HashSet<&str> = path_params.iter().map(|s| s.as_str()).collect();
+                for f in &qst.fields {
+                    let (is_opt, inner_ty) = match &f.ty {
+                        Type::Optional(inner) => (true, inner.as_ref()),
+                        other => (false, other),
+                    };
+                    let schema = registry.type_to_schema(inner_ty);
+                    if path_set.contains(f.json_name.as_str()) {
+                        path_param_schemas.insert(f.json_name.clone(), schema);
+                    } else {
+                        query_params_arr.push(JsonVal::Obj(vec![
+                            ("name".to_string(), JsonVal::Str(f.json_name.clone())),
+                            ("in".to_string(), JsonVal::Str("query".to_string())),
+                            (
+                                "required".to_string(),
+                                JsonVal::Bool(!is_opt && f.default.is_none()),
+                            ),
+                            ("schema".to_string(), schema),
+                        ]));
+                    }
+                }
+            }
+
+            if !path_params.is_empty() || !query_params_arr.is_empty() {
+                let mut params_arr: Vec<JsonVal> = path_params
                     .into_iter()
                     .map(|pname| {
+                        let schema = path_param_schemas.remove(&pname).unwrap_or_else(|| {
+                            JsonVal::Obj(vec![(
+                                "type".to_string(),
+                                JsonVal::Str("string".to_string()),
+                            )])
+                        });
                         JsonVal::Obj(vec![
                             ("name".to_string(), JsonVal::Str(pname)),
                             ("in".to_string(), JsonVal::Str("path".to_string())),
                             ("required".to_string(), JsonVal::Bool(true)),
-                            (
-                                "schema".to_string(),
-                                JsonVal::Obj(vec![(
-                                    "type".to_string(),
-                                    JsonVal::Str("string".to_string()),
-                                )]),
-                            ),
+                            ("schema".to_string(), schema),
                         ])
                     })
                     .collect();
+                params_arr.extend(query_params_arr);
                 op_fields.push(("parameters".to_string(), JsonVal::Arr(params_arr)));
             }
 
@@ -1184,7 +1287,13 @@ pub fn generate_openapi_json(
                 ));
             }
 
-            let inferred = infer_handler_responses(program, checked, &e.handler_name);
+            let mut inferred = infer_handler_responses(program, checked, &e.handler_name);
+            if e.auto_response
+                && let Some(&fid) = checked.func_by_name.get(&e.handler_name)
+            {
+                let sig = &checked.funcs[fid as usize];
+                inferred = infer_auto_return_responses(&sig.return_type, checked, inferred);
+            }
             let mut responses_map: BTreeMap<u16, JsonVal> = BTreeMap::new();
             for resp in inferred {
                 let mut resp_obj = vec![(
@@ -1209,7 +1318,8 @@ pub fn generate_openapi_json(
                 responses_map.insert(resp.status, JsonVal::Obj(resp_obj));
             }
 
-            if e.body_struct.is_some() {
+            if e.body_struct.is_some() || has_query_struct {
+                has_body_structs = true;
                 responses_map.entry(400).or_insert_with(|| {
                     JsonVal::Obj(vec![
                         ("description".to_string(), JsonVal::Str("Bad Request".to_string())),
