@@ -1,9 +1,10 @@
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::process::Command;
 use std::sync::{Arc, LazyLock};
 use std::sync::atomic::AtomicBool;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use crate::native::tls::{TlsConfig, TlsVersion, Transport, VerifyMode};
 
 use crate::vm::string::VmString;
 use crate::vm::value::{
@@ -899,10 +900,15 @@ fn tcp_http_request_once(
     }
 
     let connect_timeout = timeout.min(Duration::from_secs(10));
+    let deadline = Instant::now() + timeout;
     let mut stream = None;
     let mut last_err = None;
     for addr in addrs {
-        match TcpStream::connect_timeout(&addr, connect_timeout) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(make_http_error("timeout", "request timed out while connecting"));
+        }
+        match TcpStream::connect_timeout(&addr, connect_timeout.min(remaining)) {
             Ok(s) => {
                 stream = Some(s);
                 break;
@@ -923,8 +929,40 @@ fn tcp_http_request_once(
             ));
         }
     };
-    let _ = stream.set_read_timeout(Some(timeout));
-    let _ = stream.set_write_timeout(Some(timeout));
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(make_http_error("timeout", "request timed out"));
+    }
+    let _ = stream.set_read_timeout(Some(remaining));
+    let _ = stream.set_write_timeout(Some(remaining));
+
+    let mut transport = if parsed.is_https {
+        let mut tls_cfg = TlsConfig::new(&parsed.host);
+        tls_cfg.verify = VerifyMode::VerifyFull;
+        tls_cfg.alpn = vec![b"http/1.1"];
+        tls_cfg.min_version = TlsVersion::Tls12;
+        tls_cfg.handshake_timeout = remaining;
+        match crate::native::tls::connect(stream, &tls_cfg) {
+            Ok(tls_stream) => Transport::Tls(Box::new(tls_stream)),
+            Err(e) => {
+                let kind = if e.is_certificate_error() {
+                    "certificate_error"
+                } else {
+                    "tls_error"
+                };
+                return Err(make_http_error(kind, e.to_string()));
+            }
+        }
+    } else {
+        Transport::Plain(stream)
+    };
+
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(make_http_error("timeout", "request timed out after TLS handshake"));
+    }
+    let _ = transport.set_read_timeout(Some(remaining));
+    let _ = transport.set_write_timeout(Some(remaining));
 
     let mut req = Vec::new();
     req.extend_from_slice(format!("{} {} HTTP/1.1\r\n", method, parsed.path_and_query).as_bytes());
@@ -951,81 +989,12 @@ fn tcp_http_request_once(
     req.extend_from_slice(b"\r\n");
     req.extend_from_slice(body);
 
-    let mut reader_stream = match stream.try_clone() {
-        Ok(s) => s,
-        Err(e) => return Err(make_http_error("io_error", format!("stream clone failed: {}", e))),
-    };
-    if let Err(e) = reader_stream.write_all(&req).and_then(|_| reader_stream.flush()) {
+    if let Err(e) = transport.write_all(&req).and_then(|_| transport.flush()) {
         return Err(make_http_error("io_error", format!("failed to send request: {}", e)));
     }
 
-    let mut reader = BufReader::new(stream);
+    let mut reader = BufReader::new(transport);
     parse_http_response_raw(&mut reader, method, false).map_err(|e| make_http_error("http_error", e))
-}
-
-fn curl_https_request(
-    method: &str,
-    url: &str,
-    body: &[u8],
-    headers: &[(String, String)],
-    timeout: Duration,
-    max_redirs: usize,
-) -> Result<RawHttpResponse, Obj> {
-    let secs = timeout.as_secs().max(1);
-    let mut cmd = Command::new("curl");
-    cmd.arg("-sS")
-        .arg("-i")
-        .arg("-L")
-        .arg("--max-redirs")
-        .arg(max_redirs.to_string())
-        .arg("--max-time")
-        .arg(secs.to_string())
-        .arg("-X")
-        .arg(method);
-    for (k, v) in headers {
-        if k.contains(['\r', '\n', '\0']) || v.contains(['\r', '\n', '\0']) {
-            return Err(make_http_error(
-                "invalid_header",
-                "header name or value contains control characters",
-            ));
-        }
-        cmd.arg("-H").arg(format!("{}: {}", k, v));
-    }
-    if !body.is_empty() {
-        cmd.arg("--data-binary").arg("@-");
-        cmd.stdin(std::process::Stdio::piped());
-    }
-    cmd.arg(url);
-
-    let out = if body.is_empty() {
-        cmd.output()
-    } else {
-        cmd.stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .and_then(|mut child| {
-                if let Some(mut stdin) = child.stdin.take() {
-                    stdin.write_all(body)?;
-                }
-                child.wait_with_output()
-            })
-    };
-    let out = match out {
-        Ok(o) => o,
-        Err(e) => return Err(make_http_error("curl_error", format!("failed to execute curl: {}", e))),
-    };
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        let msg = if stderr.is_empty() {
-            format!("curl exited with status {}", out.status)
-        } else {
-            stderr
-        };
-        return Err(make_http_error("http_error", msg));
-    }
-
-    let mut cursor = io::Cursor::new(out.stdout.as_slice());
-    parse_http_response_raw(&mut cursor, method, true).map_err(|e| make_http_error("http_error", e))
 }
 
 fn http_client_request_raw(
@@ -1058,16 +1027,6 @@ fn http_client_request_raw(
             Ok(p) => p,
             Err(e) => return Err(make_http_error("invalid_url", e)),
         };
-        if parsed.is_https {
-            return curl_https_request(
-                &cur_method,
-                &cur_url,
-                &cur_body,
-                headers,
-                timeout,
-                MAX_REDIRECTS - hop,
-            );
-        }
         let resp = tcp_http_request_once(&cur_method, &parsed, &cur_body, headers, timeout)?;
         if matches!(resp.status, 301..=303 | 307 | 308)
             && let Some((_, loc)) = resp.headers.iter().find(|(k, _)| k == "location")
@@ -1078,7 +1037,14 @@ fn http_client_request_raw(
                     format!("exceeded {} redirects", MAX_REDIRECTS),
                 ));
             }
-            cur_url = resolve_redirect_url(&parsed, loc);
+            let next_url = resolve_redirect_url(&parsed, loc);
+            if parsed.is_https && next_url.starts_with("http://") {
+                return Err(make_http_error(
+                    "tls_error",
+                    "refusing insecure redirect from https:// to http://",
+                ));
+            }
+            cur_url = next_url;
             if matches!(resp.status, 301..=303) && cur_method != "HEAD" {
                 cur_method = "GET".to_string();
                 cur_body.clear();

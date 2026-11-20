@@ -1,12 +1,15 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::native::crypto::{encode_hex, fill_random_bytes};
 use crate::native::json_encode::write_escaped_bytes;
+use crate::native::tls::roots::RootSource;
+use crate::native::tls::{TlsConfig, TlsStream, TlsVersion, VerifyMode};
 use crate::native::url::percent_decode;
 use crate::vm::value::{
     Obj, SCHEMA_REDIS_CLIENT, SCHEMA_REDIS_ERROR, SCHEMA_REDIS_LOCK, StructData,
@@ -105,6 +108,12 @@ pub fn make_redis_lock(client_id: u64, key: String, token: String) -> Obj {
 // ── URL Parsing ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedisTlsConfig {
+    pub verify: VerifyMode,
+    pub ca_file: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RedisConfig {
     pub is_mock: bool,
     pub host: String,
@@ -113,19 +122,22 @@ pub struct RedisConfig {
     pub password: Option<String>,
     pub db: u32,
     pub timeout_ms: u64,
+    pub tls: Option<RedisTlsConfig>,
 }
 
 pub fn parse_redis_url(raw: &str) -> Result<RedisConfig, RedisErr> {
-    let (is_mock, rest) = if let Some(r) = raw.strip_prefix("redis://") {
-        (false, r)
+    let (is_mock, is_tls, rest) = if let Some(r) = raw.strip_prefix("redis://") {
+        (false, false, r)
+    } else if let Some(r) = raw.strip_prefix("rediss://") {
+        (false, true, r)
     } else if cfg!(test)
         && let Some(r) = raw.strip_prefix("redis-mock://")
     {
-        (true, r)
+        (true, false, r)
     } else {
         return Err(RedisErr::new(
             "invalid_url",
-            "Redis URL must start with redis://",
+            "Redis URL must start with redis:// or rediss://",
         ));
     };
 
@@ -135,6 +147,8 @@ pub fn parse_redis_url(raw: &str) -> Result<RedisConfig, RedisErr> {
     };
 
     let mut timeout_ms = 5_000u64;
+    let mut tls_verify = VerifyMode::VerifyFull;
+    let mut ca_file: Option<String> = None;
     if let Some(q) = query {
         for pair in q.split('&') {
             if pair.is_empty() {
@@ -143,19 +157,55 @@ pub fn parse_redis_url(raw: &str) -> Result<RedisConfig, RedisErr> {
             let Some((k, v)) = pair.split_once('=') else {
                 return Err(RedisErr::new("invalid_url", "Invalid query parameter in Redis URL"));
             };
-            if k == "timeout_ms" {
-                let ms = v.parse::<u64>().map_err(|_| {
-                    RedisErr::new("invalid_url", format!("Invalid timeout_ms '{}'", v))
-                })?;
-                if ms == 0 {
-                    return Err(RedisErr::new("invalid_url", "timeout_ms must be > 0"));
+            match k {
+                "timeout_ms" => {
+                    let ms = v.parse::<u64>().map_err(|_| {
+                        RedisErr::new("invalid_url", format!("Invalid timeout_ms '{}'", v))
+                    })?;
+                    if ms == 0 {
+                        return Err(RedisErr::new("invalid_url", "timeout_ms must be > 0"));
+                    }
+                    timeout_ms = ms;
                 }
-                timeout_ms = ms;
-            } else {
-                return Err(RedisErr::new(
-                    "invalid_url",
-                    format!("Unsupported Redis URL query option '{}'", k),
-                ));
+                "tls_verify" => {
+                    if !is_tls {
+                        return Err(RedisErr::new(
+                            "invalid_url",
+                            "tls_verify is only supported with rediss://",
+                        ));
+                    }
+                    tls_verify = match v {
+                        "full" => VerifyMode::VerifyFull,
+                        "ca" => VerifyMode::VerifyCa,
+                        "none" => VerifyMode::Disable,
+                        _ => {
+                            return Err(RedisErr::new(
+                                "invalid_url",
+                                format!("Invalid tls_verify '{}' (expected full, ca, or none)", v),
+                            ));
+                        }
+                    };
+                }
+                "ca_file" => {
+                    if !is_tls {
+                        return Err(RedisErr::new(
+                            "invalid_url",
+                            "ca_file is only supported with rediss://",
+                        ));
+                    }
+                    let decoded = percent_decode(v, false)
+                        .map_err(|_| RedisErr::new("invalid_url", "Invalid ca_file encoding"))?;
+                    if decoded.is_empty() {
+                        return Err(RedisErr::new("invalid_url", "ca_file cannot be empty"));
+                    }
+                    ca_file = Some(decoded);
+                }
+                _ => {
+                    return Err(RedisErr::new(
+                        "invalid_url",
+                        format!("Unsupported Redis URL query option '{}'", k),
+                    ));
+                }
             }
         }
     }
@@ -244,6 +294,15 @@ pub fn parse_redis_url(raw: &str) -> Result<RedisConfig, RedisErr> {
         return Err(RedisErr::new("invalid_url", "Missing host in Redis URL"));
     }
 
+    let tls = if is_tls {
+        Some(RedisTlsConfig {
+            verify: tls_verify,
+            ca_file,
+        })
+    } else {
+        None
+    };
+
     Ok(RedisConfig {
         is_mock,
         host,
@@ -252,6 +311,7 @@ pub fn parse_redis_url(raw: &str) -> Result<RedisConfig, RedisErr> {
         password,
         db,
         timeout_ms,
+        tls,
     })
 }
 
@@ -393,6 +453,7 @@ pub fn encode_resp_response(val: &RespValue, out: &mut Vec<u8>) {
 
 enum RedisStream {
     Tcp(TcpStream),
+    Tls(Box<TlsStream<TcpStream>>),
     #[cfg(test)]
     Mock(MockRedisStream),
 }
@@ -401,6 +462,7 @@ impl Read for RedisStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
             RedisStream::Tcp(s) => s.read(buf),
+            RedisStream::Tls(s) => s.read(buf),
             #[cfg(test)]
             RedisStream::Mock(m) => m.read(buf),
         }
@@ -411,6 +473,7 @@ impl Write for RedisStream {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self {
             RedisStream::Tcp(s) => s.write(buf),
+            RedisStream::Tls(s) => s.write(buf),
             #[cfg(test)]
             RedisStream::Mock(m) => m.write(buf),
         }
@@ -419,6 +482,7 @@ impl Write for RedisStream {
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
             RedisStream::Tcp(s) => s.flush(),
+            RedisStream::Tls(s) => s.flush(),
             #[cfg(test)]
             RedisStream::Mock(m) => m.flush(),
         }
@@ -985,7 +1049,20 @@ impl RedisConn {
             let _ = tcp.set_read_timeout(Some(timeout));
             let _ = tcp.set_write_timeout(Some(timeout));
             let _ = tcp.set_nodelay(true);
-            RedisStream::Tcp(tcp)
+            if let Some(tls_cfg) = &cfg.tls {
+                let mut tcfg = TlsConfig::new(&cfg.host);
+                tcfg.verify = tls_cfg.verify;
+                tcfg.min_version = TlsVersion::Tls12;
+                tcfg.handshake_timeout = timeout;
+                if let Some(ca) = &tls_cfg.ca_file {
+                    tcfg.roots = RootSource::File(PathBuf::from(ca));
+                }
+                let tls_stream = crate::native::tls::connect(tcp, &tcfg)
+                    .map_err(|e| RedisErr::new("tls_error", format!("Redis TLS handshake failed: {e}")))?;
+                RedisStream::Tls(Box::new(tls_stream))
+            } else {
+                RedisStream::Tcp(tcp)
+            }
         };
 
         let mut conn = Self {
@@ -1254,6 +1331,16 @@ mod tests {
         assert!(parse_redis_url("redis://").is_err());
         assert!(parse_redis_url("redis://localhost:0").is_err());
         assert!(parse_redis_url("redis://localhost/bad").is_err());
+
+        let c_tls = parse_redis_url(
+            "rediss://default:tok@redis.example.com:6380/0?tls_verify=ca&ca_file=/tmp/ca.pem",
+        )
+        .unwrap();
+        assert!(c_tls.tls.is_some());
+        let t = c_tls.tls.unwrap();
+        assert_eq!(t.verify, VerifyMode::VerifyCa);
+        assert_eq!(t.ca_file.as_deref(), Some("/tmp/ca.pem"));
+        assert!(parse_redis_url("redis://localhost?tls_verify=none").is_err());
     }
 
     #[test]

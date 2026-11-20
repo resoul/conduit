@@ -192,3 +192,12 @@ conduit db status app.cdt --url postgres://conduit:secret@127.0.0.1:5432/app
 conduit db migrate app.cdt --url postgres://conduit:secret@127.0.0.1:5432/app [--dry-run]
 conduit db rollback app.cdt --url postgres://conduit:secret@127.0.0.1:5432/app [--steps 1] [--dry-run]
 ```
+
+## TLS & Security
+
+Conduit includes a built-in zero-dependency TLS 1.2 / 1.3 client used by PostgreSQL, MySQL, Redis (`rediss://`), and HTTPS (`http.get` / `http.request`).
+
+- **PostgreSQL URL parameters:** `sslmode=disable|allow|prefer|require|verify-ca|verify-full` (default: `disable`), `sslrootcert=/path/to/ca.pem`. Note: `allow` is simplified to try TLS first (like `prefer`) and fall back to plaintext if the server refuses SSL (`'N'`). When TLS is active and the server advertises `SCRAM-SHA-256-PLUS`, `tls-server-end-point` channel binding is automatically negotiated.
+- **MySQL URL parameters:** `ssl-mode=disabled|preferred|required|verify_ca|verify_identity` (default: `disabled`), `sslrootcert=/path/to/ca.pem` (or `ssl-ca`). Enables `caching_sha2_password` full authentication over TLS.
+- **Redis URL parameters:** Use `rediss://...` with optional `tls_verify=full|ca|none` (default: `full`) and `ca_file=/path/to/ca.pem`.
+- **Supported algorithms & limits:** TLS 1.3 (`AES-128/256-GCM`, `ChaCha20-Poly1305`, `X25519`, `P-256`) and TLS 1.2 (`ECDHE` + `AEAD` with mandatory `extended_master_secret`). Legacy SSLv3 / TLS 1.0 / TLS 1.1, CBC, RC4, 3DES, static RSA/DHE, renegotiation, compression, and CRL/OCSP revocation checks are not supported.

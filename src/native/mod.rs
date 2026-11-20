@@ -23,6 +23,7 @@ pub mod pg;
 pub mod process;
 pub mod redis;
 pub mod time;
+pub mod tls;
 pub mod url;
 pub mod validation;
 

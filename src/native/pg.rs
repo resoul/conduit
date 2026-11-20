@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -9,11 +10,27 @@ use crate::native::crypto::{
     pbkdf2_sha256, sha256_bytes,
 };
 use crate::native::db::{Cell, Column, DbErr, QueryResult};
+use crate::native::tls::crypto::rsa::RsaHashAlg;
+use crate::native::tls::crypto::sha2::{sha384_bytes, sha512_bytes};
+use crate::native::tls::roots::RootSource;
+use crate::native::tls::x509::{SigAlg, parse_x509};
+use crate::native::tls::{TlsConfig, TlsVersion, Transport, VerifyMode};
 use crate::native::url::percent_decode;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_MESSAGE: usize = 512 * 1024 * 1024;
 const PROTOCOL_3_0: i32 = 196_608;
+const SSL_REQUEST_CODE: i32 = 80_877_103;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PgSslMode {
+    Disable,
+    Allow,
+    Prefer,
+    Require,
+    VerifyCa,
+    VerifyFull,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PgConfig {
@@ -26,6 +43,8 @@ pub struct PgConfig {
     pub connect_timeout: Duration,
     pub search_path: Option<String>,
     pub prepare: bool,
+    pub ssl_mode: PgSslMode,
+    pub ssl_root_cert: Option<String>,
 }
 
 fn decode_url_part(text: &str) -> Result<String, String> {
@@ -98,18 +117,33 @@ pub fn parse_pg_url(url: &str) -> Result<PgConfig, String> {
     let mut connect_timeout = Duration::from_secs(10);
     let mut search_path = None;
     let mut prepare = true;
+    let mut ssl_mode = PgSslMode::Disable;
+    let mut ssl_root_cert = None;
     for pair in query.split('&').filter(|p| !p.is_empty()) {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
         let value = decode_url_part(value)?;
         match key {
-            "sslmode" => match value.as_str() {
-                "disable" | "allow" | "prefer" => {}
-                _ => {
-                    return Err(format!(
-                        "sslmode={value}: TLS is not supported yet; connect via a local tunnel/proxy (pgbouncer, stunnel, ssh -L) with sslmode=disable"
-                    ));
+            "sslmode" => {
+                ssl_mode = match value.as_str() {
+                    "disable" => PgSslMode::Disable,
+                    "allow" => PgSslMode::Allow,
+                    "prefer" => PgSslMode::Prefer,
+                    "require" => PgSslMode::Require,
+                    "verify-ca" => PgSslMode::VerifyCa,
+                    "verify-full" => PgSslMode::VerifyFull,
+                    _ => {
+                        return Err(format!(
+                            "sslmode={value}: expected disable, allow, prefer, require, verify-ca, or verify-full"
+                        ));
+                    }
+                };
+            }
+            "sslrootcert" => {
+                if value.is_empty() {
+                    return Err("sslrootcert cannot be empty".to_string());
                 }
-            },
+                ssl_root_cert = Some(value);
+            }
             "application_name" => application_name = value,
             "search_path" => {
                 if value.is_empty() || !value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
@@ -141,7 +175,7 @@ pub fn parse_pg_url(url: &str) -> Result<PgConfig, String> {
             },
             other => {
                 return Err(format!(
-                    "Unknown PostgreSQL URL parameter '{}'; supported: sslmode, application_name, connect_timeout, search_path, prepare",
+                    "Unknown PostgreSQL URL parameter '{}'; supported: sslmode, sslrootcert, application_name, connect_timeout, search_path, prepare",
                     other
                 ));
             }
@@ -158,6 +192,8 @@ pub fn parse_pg_url(url: &str) -> Result<PgConfig, String> {
         connect_timeout,
         search_path,
         prepare,
+        ssl_mode,
+        ssl_root_cert,
     })
 }
 
@@ -341,18 +377,44 @@ fn decode_b64_raw(s: &str) -> Option<Vec<u8>> {
 pub struct ScramClient {
     nonce: String,
     bare: String,
+    gs2_header: String,
+    cbind_input: Vec<u8>,
 }
 
 impl ScramClient {
     pub fn new(user: &str, nonce: &str) -> Self {
+        Self::with_channel_binding(user, nonce, None)
+    }
+
+    pub fn with_channel_binding(
+        user: &str,
+        nonce: &str,
+        tls_server_end_point: Option<&[u8]>,
+    ) -> Self {
+        let (gs2_header, cbind_input) = match tls_server_end_point {
+            Some(cb_data) => {
+                let hdr = "p=tls-server-end-point,,".to_string();
+                let mut input = Vec::with_capacity(hdr.len() + cb_data.len());
+                input.extend_from_slice(hdr.as_bytes());
+                input.extend_from_slice(cb_data);
+                (hdr, input)
+            }
+            None => {
+                let hdr = "n,,".to_string();
+                let input = hdr.as_bytes().to_vec();
+                (hdr, input)
+            }
+        };
         Self {
             nonce: nonce.to_string(),
             bare: format!("n={user},r={nonce}"),
+            gs2_header,
+            cbind_input,
         }
     }
 
     pub fn first_message(&self) -> String {
-        format!("n,,{}", self.bare)
+        format!("{}{}", self.gs2_header, self.bare)
     }
 
     pub fn final_message(&self, password: &str, server_first: &str) -> Result<(String, Vec<u8>), String> {
@@ -384,7 +446,7 @@ impl ScramClient {
         let client_key = hmac_sha256_bytes(&salted, b"Client Key");
         let stored_key = sha256_bytes(&client_key);
 
-        let without_proof = format!("c=biws,r={combined}");
+        let without_proof = format!("c={},r={combined}", encode_base64(&self.cbind_input));
         let auth_message = format!("{},{server_first},{without_proof}", self.bare);
         let client_signature = hmac_sha256_bytes(&stored_key, auth_message.as_bytes());
         let proof: Vec<u8> = client_key
@@ -664,7 +726,7 @@ impl PgStmtCache {
 }
 
 struct Conn {
-    reader: BufReader<TcpStream>,
+    reader: BufReader<Transport>,
     msg_buf: Vec<u8>,
     last_active: std::time::Instant,
     stmt_cache: PgStmtCache,
@@ -702,17 +764,7 @@ impl Conn {
         if self.last_active.elapsed() < Duration::from_secs(5) {
             return self.reader.buffer().is_empty();
         }
-        let stream = self.reader.get_ref();
-        if stream.set_nonblocking(true).is_err() {
-            return false;
-        }
-        let mut probe = [0u8; 1];
-        let alive = match stream.peek(&mut probe) {
-            Ok(_) => false,
-            Err(e) => e.kind() == io::ErrorKind::WouldBlock,
-        };
-        let _ = stream.set_nonblocking(false);
-        alive && self.reader.buffer().is_empty()
+        self.reader.buffer().is_empty() && self.reader.get_mut().is_alive_probe()
     }
 }
 
@@ -1063,6 +1115,21 @@ fn run_simple(conn: &mut Conn, sql: &str) -> Result<(), String> {
     })
 }
 
+fn tls_server_end_point_hash(der: &[u8]) -> Vec<u8> {
+    if let Ok(cert) = parse_x509(der) {
+        match cert.sig_alg {
+            SigAlg::RsaPkcs1(RsaHashAlg::Sha384)
+            | SigAlg::RsaPss(RsaHashAlg::Sha384)
+            | SigAlg::EcdsaSha384 => return sha384_bytes(der).to_vec(),
+            SigAlg::RsaPkcs1(RsaHashAlg::Sha512)
+            | SigAlg::RsaPss(RsaHashAlg::Sha512)
+            | SigAlg::EcdsaSha512 => return sha512_bytes(der).to_vec(),
+            _ => {}
+        }
+    }
+    sha256_bytes(der).to_vec()
+}
+
 fn open_connection(config: &PgConfig) -> Result<Conn, String> {
     let target = format!("{}:{}", config.host, config.port);
     let addresses = target
@@ -1079,7 +1146,7 @@ fn open_connection(config: &PgConfig) -> Result<Conn, String> {
             Err(e) => last_error = Some(e),
         }
     }
-    let stream = stream.ok_or_else(|| match last_error {
+    let mut stream = stream.ok_or_else(|| match last_error {
         Some(e) => format!("Failed to connect to PostgreSQL '{target}': {e}"),
         None => format!("No addresses resolved for '{target}'"),
     })?;
@@ -1090,8 +1157,68 @@ fn open_connection(config: &PgConfig) -> Result<Conn, String> {
     stream
         .set_write_timeout(Some(IO_TIMEOUT))
         .map_err(|e| e.to_string())?;
+
+    let transport = if config.ssl_mode != PgSslMode::Disable {
+        let mut ssl_req = [0u8; 8];
+        ssl_req[..4].copy_from_slice(&8i32.to_be_bytes());
+        ssl_req[4..8].copy_from_slice(&SSL_REQUEST_CODE.to_be_bytes());
+        stream
+            .write_all(&ssl_req)
+            .and_then(|_| stream.flush())
+            .map_err(|e| format!("Failed to send PostgreSQL SSLRequest: {e}"))?;
+
+        let mut reply = [0u8; 1];
+        stream
+            .read_exact(&mut reply)
+            .map_err(|e| format!("Failed to read PostgreSQL SSLRequest response: {e}"))?;
+
+        match reply[0] {
+            b'S' => {
+                let verify = match config.ssl_mode {
+                    PgSslMode::Allow | PgSslMode::Prefer => VerifyMode::Disable,
+                    PgSslMode::Require => {
+                        if config.ssl_root_cert.is_some() {
+                            VerifyMode::VerifyCa
+                        } else {
+                            VerifyMode::Disable
+                        }
+                    }
+                    PgSslMode::VerifyCa => VerifyMode::VerifyCa,
+                    PgSslMode::VerifyFull => VerifyMode::VerifyFull,
+                    PgSslMode::Disable => return Err("internal error: invalid TLS mode".to_string()),
+                };
+                let mut tls_cfg = TlsConfig::new(&config.host);
+                tls_cfg.verify = verify;
+                tls_cfg.min_version = TlsVersion::Tls12;
+                tls_cfg.handshake_timeout = config.connect_timeout;
+                if let Some(ca_path) = &config.ssl_root_cert {
+                    tls_cfg.roots = RootSource::File(PathBuf::from(ca_path));
+                }
+                let tls_stream = crate::native::tls::connect(stream, &tls_cfg)
+                    .map_err(|e| format!("PostgreSQL TLS handshake failed: {e}"))?;
+                Transport::Tls(Box::new(tls_stream))
+            }
+            b'N' => {
+                if matches!(
+                    config.ssl_mode,
+                    PgSslMode::Require | PgSslMode::VerifyCa | PgSslMode::VerifyFull
+                ) {
+                    return Err("PostgreSQL server does not support TLS".to_string());
+                }
+                Transport::Plain(stream)
+            }
+            other => {
+                return Err(format!(
+                    "Unexpected PostgreSQL SSLRequest reply byte 0x{other:02x}"
+                ));
+            }
+        }
+    } else {
+        Transport::Plain(stream)
+    };
+
     let mut conn = Conn {
-        reader: BufReader::with_capacity(64 * 1024, stream),
+        reader: BufReader::with_capacity(64 * 1024, transport),
         msg_buf: Vec::with_capacity(4096),
         last_active: std::time::Instant::now(),
         stmt_cache: PgStmtCache::default(),
@@ -1127,23 +1254,38 @@ fn open_connection(config: &PgConfig) -> Result<Conn, String> {
                             }
                             methods.push(method);
                         }
-                        if !methods.iter().any(|m| m == "SCRAM-SHA-256") {
+                        let use_plus = methods.iter().any(|m| m == "SCRAM-SHA-256-PLUS")
+                            && conn.reader.get_ref().leaf_cert_der().is_some();
+                        let selected_method = if use_plus {
+                            "SCRAM-SHA-256-PLUS"
+                        } else if methods.iter().any(|m| m == "SCRAM-SHA-256") {
+                            "SCRAM-SHA-256"
+                        } else {
                             return Err(format!(
                                 "Unsupported PostgreSQL auth methods {:?} (only SCRAM-SHA-256 supported)",
                                 methods
                             ));
-                        }
+                        };
                         if config.password.is_none() {
                             return Err("PostgreSQL requested password, none provided in URL".to_string());
                         }
+                        let cb_data = if use_plus {
+                            conn.reader
+                                .get_ref()
+                                .leaf_cert_der()
+                                .map(tls_server_end_point_hash)
+                        } else {
+                            None
+                        };
                         let mut rnd = [0u8; 18];
                         fill_random_bytes(&mut rnd)?;
                         let nonce = encode_base64(&rnd);
-                        let client = ScramClient::new("", &nonce);
+                        let client =
+                            ScramClient::with_channel_binding("", &nonce, cb_data.as_deref());
                         let first = client.first_message();
                         let mut message = Out::message(b'p');
                         message
-                            .cstr("SCRAM-SHA-256")
+                            .cstr(selected_method)
                             .i32(first.len() as i32)
                             .raw(first.as_bytes());
                         conn.send(&message.finish(true))?;
@@ -1209,6 +1351,15 @@ mod tests {
         assert_eq!(cfg.host, "127.0.0.1");
         assert_eq!(cfg.port, 5433);
         assert_eq!(cfg.database, "shop");
+        assert_eq!(cfg.ssl_mode, PgSslMode::Disable);
+
+        let cfg2 = parse_pg_url(
+            "postgres://ann:pw@db.internal/app?sslmode=verify-full&sslrootcert=/tmp/ca.pem",
+        )
+        .unwrap();
+        assert_eq!(cfg2.ssl_mode, PgSslMode::VerifyFull);
+        assert_eq!(cfg2.ssl_root_cert.as_deref(), Some("/tmp/ca.pem"));
+        assert!(parse_pg_url("postgres://ann@localhost/app?sslmode=bogus").is_err());
     }
 
     #[test]

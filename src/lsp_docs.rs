@@ -97,7 +97,7 @@ pub fn lookup_native_hover(word: &str, qualified: &str) -> Option<&'static str> 
         "http.post_json" => Some("```conduit\nfunc http.post_json(url: String, body: T) -> Response | HttpError\n```\nEncodes `body` as JSON and sends a `POST` request with `Content-Type: application/json`."),
         "http.response" => Some("```conduit\nfunc http.response(status: Int, body: String) -> Response\n```\nCreates an HTTP response with a custom status code."),
         "http.response_with" => Some("```conduit\nfunc http.response_with(status: Int, body: String, headers: Map<String, String>) -> Response\n```\nCreates an HTTP response with custom status code, body, and headers."),
-        "http.get" => Some("```conduit\nfunc http.get(url: String) -> Response | HttpError\n```\nSends an HTTP/HTTPS `GET` request (follows redirects; `http://` via `TcpStream`, `https://` via `curl`)."),
+        "http.get" => Some("```conduit\nfunc http.get(url: String) -> Response | HttpError\n```\nSends an HTTP/HTTPS `GET` request (follows redirects; `http://` and `https://` via built-in TCP/TLS client)."),
         "http.post" => Some("```conduit\nfunc http.post(url: String, body: String) -> Response | HttpError\n```\nSends an HTTP/HTTPS `POST` request with a string body."),
         "http.request" => Some("```conduit\nfunc http.request(method: String, url: String, body: String, headers: Map<String, String>) -> Response | HttpError\n```\nSends a custom HTTP/HTTPS request with headers and body."),
         "http.request_timeout" => Some("```conduit\nfunc http.request_timeout(method: String, url: String, body: String, headers: Map<String, String>, timeout_ms: Int) -> Response | HttpError\n```\nSends a custom HTTP/HTTPS request with an explicit timeout in milliseconds."),

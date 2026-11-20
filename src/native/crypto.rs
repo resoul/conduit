@@ -262,6 +262,71 @@ pub fn sha256_bytes(data: &[u8]) -> [u8; 32] {
     out
 }
 
+/// Streaming SHA-256 hasher reusing hardware-accelerated compression.
+#[derive(Clone)]
+pub struct Sha256 {
+    state: [u32; 8],
+    buf: [u8; 64],
+    buf_len: usize,
+    total_bytes: u64,
+}
+
+impl Default for Sha256 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Sha256 {
+    pub fn new() -> Self {
+        Self {
+            state: sha256_init_state(),
+            buf: [0u8; 64],
+            buf_len: 0,
+            total_bytes: 0,
+        }
+    }
+
+    pub fn update(&mut self, mut data: &[u8]) {
+        self.total_bytes = self.total_bytes.wrapping_add(data.len() as u64);
+        if self.buf_len > 0 {
+            let take = (64 - self.buf_len).min(data.len());
+            self.buf[self.buf_len..self.buf_len + take].copy_from_slice(&data[..take]);
+            self.buf_len += take;
+            data = &data[take..];
+            if self.buf_len == 64 {
+                sha256_compress(&mut self.state, std::slice::from_ref(&self.buf));
+                self.buf_len = 0;
+            }
+        }
+        let (full_blocks, rem) = data.as_chunks::<64>();
+        if !full_blocks.is_empty() {
+            sha256_compress(&mut self.state, full_blocks);
+        }
+        if !rem.is_empty() {
+            self.buf[..rem.len()].copy_from_slice(rem);
+            self.buf_len = rem.len();
+        }
+    }
+
+    pub fn finalize(mut self) -> [u8; 32] {
+        let mut tail = [0u8; 128];
+        tail[..self.buf_len].copy_from_slice(&self.buf[..self.buf_len]);
+        tail[self.buf_len] = 0x80;
+        let total_tail = if self.buf_len < 56 { 64 } else { 128 };
+        let bit_len = self.total_bytes.wrapping_mul(8);
+        tail[total_tail - 8..total_tail].copy_from_slice(&bit_len.to_be_bytes());
+        let tail_blocks = tail[..total_tail].as_chunks::<64>().0;
+        sha256_compress(&mut self.state, tail_blocks);
+
+        let mut out = [0u8; 32];
+        for (i, word) in self.state.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        out
+    }
+}
+
 pub fn hmac_sha256_bytes(key: &[u8], data: &[u8]) -> [u8; 32] {
     let mut k_block = [0u8; 64];
     if key.len() > 64 {
@@ -377,16 +442,16 @@ const B64_LUT: [i8; 256] = {
     lut
 };
 
-fn decode_base64_slice(clean: &[u8]) -> Result<Obj, bool> {
+fn decode_base64_bytes_slice(clean: &[u8]) -> Result<Result<Vec<u8>, (&'static str, &'static str)>, bool> {
     if !clean.len().is_multiple_of(4) {
         let has_ws = clean.iter().any(|b| b.is_ascii_whitespace());
         if has_ws {
             return Err(true);
         }
-        return Ok(make_crypto_error(
+        return Ok(Err((
             "invalid_base64",
             "Base64 length must be a multiple of 4",
-        ));
+        )));
     }
     let mut out = Vec::with_capacity((clean.len() / 4) * 3 + 8);
     let mut simd_chars = 0usize;
@@ -409,7 +474,7 @@ fn decode_base64_slice(clean: &[u8]) -> Result<Obj, bool> {
                 {
                     return Err(true);
                 }
-                return Ok(make_crypto_error("invalid_base64", "Invalid Base64 character"));
+                return Ok(Err(("invalid_base64", "Invalid Base64 character")));
             }
             let n = ((a as u32) << 18) | ((b as u32) << 12) | ((c as u32) << 6) | (d as u32);
             out.extend_from_slice(&[(n >> 16) as u8, (n >> 8) as u8, n as u8]);
@@ -420,7 +485,7 @@ fn decode_base64_slice(clean: &[u8]) -> Result<Obj, bool> {
             if last.iter().any(|x| x.is_ascii_whitespace()) {
                 return Err(true);
             }
-            return Ok(make_crypto_error("invalid_base64", "Invalid Base64 character"));
+            return Ok(Err(("invalid_base64", "Invalid Base64 character")));
         }
         let c = if last[2] == b'=' {
             -2
@@ -430,7 +495,7 @@ fn decode_base64_slice(clean: &[u8]) -> Result<Obj, bool> {
                 if last[2].is_ascii_whitespace() || last[3].is_ascii_whitespace() {
                     return Err(true);
                 }
-                return Ok(make_crypto_error("invalid_base64", "Invalid Base64 character"));
+                return Ok(Err(("invalid_base64", "Invalid Base64 character")));
             }
             v
         };
@@ -442,12 +507,12 @@ fn decode_base64_slice(clean: &[u8]) -> Result<Obj, bool> {
                 if last[3].is_ascii_whitespace() {
                     return Err(true);
                 }
-                return Ok(make_crypto_error("invalid_base64", "Invalid Base64 character"));
+                return Ok(Err(("invalid_base64", "Invalid Base64 character")));
             }
             v
         };
         if c == -2 && d != -2 {
-            return Ok(make_crypto_error("invalid_base64", "Invalid Base64 padding"));
+            return Ok(Err(("invalid_base64", "Invalid Base64 padding")));
         }
         out.push(((a as u8) << 2) | ((b as u8) >> 4));
         if c >= 0 {
@@ -457,23 +522,30 @@ fn decode_base64_slice(clean: &[u8]) -> Result<Obj, bool> {
             }
         }
     }
-    Ok(match String::from_utf8(out) {
-        Ok(text) => Obj::str(text),
-        Err(e) => make_crypto_error("invalid_utf8", e.to_string()),
-    })
+    Ok(Ok(out))
+}
+
+pub fn decode_base64_bytes(s: &str) -> Result<Vec<u8>, (&'static str, &'static str)> {
+    let raw = s.as_bytes();
+    match decode_base64_bytes_slice(raw) {
+        Ok(res) => res,
+        Err(_) => {
+            let clean: Vec<u8> = raw.iter().copied().filter(|b| !b.is_ascii_whitespace()).collect();
+            match decode_base64_bytes_slice(&clean) {
+                Ok(res) => res,
+                Err(_) => Err(("invalid_base64", "Invalid Base64 character")),
+            }
+        }
+    }
 }
 
 pub fn decode_base64(s: &str) -> Obj {
-    let raw = s.as_bytes();
-    match decode_base64_slice(raw) {
-        Ok(obj) => obj,
-        Err(_) => {
-            let clean: Vec<u8> = raw.iter().copied().filter(|b| !b.is_ascii_whitespace()).collect();
-            match decode_base64_slice(&clean) {
-                Ok(obj) => obj,
-                Err(_) => make_crypto_error("invalid_base64", "Invalid Base64 character"),
-            }
-        }
+    match decode_base64_bytes(s) {
+        Ok(out) => match String::from_utf8(out) {
+            Ok(text) => Obj::str(text),
+            Err(e) => make_crypto_error("invalid_utf8", e.to_string()),
+        },
+        Err((kind, msg)) => make_crypto_error(kind, msg),
     }
 }
 

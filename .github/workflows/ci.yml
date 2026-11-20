@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      run_live_tls:
+        description: "Run live HTTPS TLS smoke tests against public hosts"
+        type: boolean
+        default: false
+
+jobs:
+  test:
+    name: test (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
+          - { os: macos-latest, target: aarch64-apple-darwin }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: ${{ matrix.target }}
+
+      - name: Check clippy
+        run: cargo clippy --all-targets --target ${{ matrix.target }} -- -D warnings
+
+      - name: Run unit & E2E tests
+        run: cargo test --target ${{ matrix.target }}
+
+      - name: Run TLS tests (release)
+        run: cargo test --release --target ${{ matrix.target }} --lib native::tls
+
+      - name: Run live HTTPS TLS smoke test
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_live_tls }}
+        run: cargo test --target ${{ matrix.target }} --lib native::tls::tests::live_https_tls_smoke_test -- --ignored
+
+  cross-check:
+    name: cross-check (x86_64-apple-darwin)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Check x86_64-apple-darwin build
+        run: cargo check --all-targets --target x86_64-apple-darwin

@@ -9,6 +9,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
+* **Built-in Zero-Dependency TLS 1.2 / 1.3 Client (`src/native/tls/`)**:
+  * Implemented pure-Rust TLS 1.3 (RFC 8446) and TLS 1.2 (ECDHE + AEAD with mandatory `extended_master_secret`, RFC 7627) client with AES-128/256-GCM (AES-NI / ARMv8 AES + PCLMULQDQ / PMULL + constant-time fallback), ChaCha20-Poly1305, X25519, NIST P-256, P-384, RSA PKCS#1 v1.5 / RSASSA-PSS, X.509 v3 / SAN / RFC 6125 verification, and OS trust store loading (`Security.framework` on macOS, `crypt32.dll` on Windows, system PEM bundles on Linux/BSD).
+  * Integrated native TLS into PostgreSQL (`sslmode=disable|allow|prefer|require|verify-ca|verify-full`, `sslrootcert`, `SCRAM-SHA-256-PLUS`), MySQL (`ssl-mode=disabled|preferred|required|verify_ca|verify_identity`, `sslrootcert`, `caching_sha2_password` full auth over TLS), Redis (`rediss://`, `tls_verify`, `ca_file`), and HTTPS (`http.get` / `http.request`, removing the external `curl` subprocess dependency).
+
 * **`cdt.cache` O(1) Slab-LRU & VM Call Fast-Path**:
   * Replaced `BTreeMap` + `String`-keyed `HashMap` in `src/native/cache.rs` with a flat `CacheSlot` slab, intrusive doubly-linked LRU list (`O(1)` promotion/eviction with zero `get` allocations), `HashMap<Arc<str>, u32>`, and `BTreeSet<(i64, u32)>` TTL index (`O(K log N)` expiration pruning instead of full cache scans).
   * Inlined fast-path stack capacity checks in `Op::CallDirect` and scalar-frame return pops in `Op::ReturnScalar` / `Op::ReturnVoid` (`src/vm/exec.rs`).

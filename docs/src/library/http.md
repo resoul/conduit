@@ -32,7 +32,7 @@ import * as http from "cdt.http"
 | `no_content` | `http.no_content() -> Response` | `204 No Content` empty response. |
 | `response` | `http.response(status: Int, body: String) -> Response` | Custom status code and body. |
 | `response_with` | `http.response_with(status: Int, body: String, headers: Map<String, String>) -> Response` | Custom status code, body, and headers. |
-| `get` | `http.get(url: String) -> Response \| HttpError` | Sends an HTTP `GET` request (follows up to 10 redirects; `http://` via `TcpStream`, `https://` via system `curl`). |
+| `get` | `http.get(url: String) -> Response \| HttpError` | Sends an HTTP/HTTPS `GET` request (follows up to 10 redirects; `http://` and `https://` via built-in TCP/TLS client). |
 | `post` | `http.post(url: String, body: String) -> Response \| HttpError` | Sends an HTTP `POST` request with `body`. |
 | `get_json` | `http.get_json<T>(url: String, query?: Map<String, String>) -> T \| HttpError` | Sends `GET` (`Accept: application/json`), appends optional URL-encoded `query`, and decodes JSON into `T`. |
 | `post_json` | `http.post_json(url: String, body: T) -> Response \| HttpError` | Encodes `body` as JSON and sends `POST` with `Content-Type: application/json`. |

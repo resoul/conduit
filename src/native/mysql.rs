@@ -1,11 +1,14 @@
 use std::collections::{HashMap, VecDeque};
-use std::io::{self, BufReader, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::native::crypto::sha256_bytes;
 use crate::native::db::{Cell, Column, DbErr, QueryResult};
+use crate::native::tls::roots::RootSource;
+use crate::native::tls::{TlsConfig, TlsVersion, Transport, VerifyMode};
 use crate::native::url::percent_decode;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(300);
@@ -17,10 +20,20 @@ const CLIENT_FOUND_ROWS: u32 = 0x0000_0002;
 const CLIENT_LONG_FLAG: u32 = 0x0000_0004;
 const CLIENT_CONNECT_WITH_DB: u32 = 0x0000_0008;
 const CLIENT_PROTOCOL_41: u32 = 0x0000_0200;
+const CLIENT_SSL: u32 = 0x0000_0800;
 const CLIENT_SECURE_CONNECTION: u32 = 0x0000_8000;
 const CLIENT_MULTI_RESULTS: u32 = 0x0002_0000;
 const CLIENT_PLUGIN_AUTH: u32 = 0x0008_0000;
 const CLIENT_DEPRECATE_EOF: u32 = 0x0100_0000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MysqlSslMode {
+    Disabled,
+    Preferred,
+    Required,
+    VerifyCa,
+    VerifyIdentity,
+}
 
 // MySQL field types
 const MYSQL_TYPE_TINY: u8 = 0x01;
@@ -43,6 +56,8 @@ pub struct MysqlConfig {
     pub database: Option<String>,
     pub connect_timeout: Duration,
     pub prepare: bool,
+    pub ssl_mode: MysqlSslMode,
+    pub ssl_root_cert: Option<String>,
 }
 
 fn decode_url_part(text: &str) -> Result<String, String> {
@@ -104,22 +119,47 @@ pub fn parse_mysql_url(url: &str) -> Result<MysqlConfig, String> {
     };
     let mut connect_timeout = Duration::from_secs(10);
     let mut prepare = true;
+    let mut ssl_mode = MysqlSslMode::Disabled;
+    let mut ssl_root_cert = None;
     for pair in query.split('&').filter(|p| !p.is_empty()) {
         let (key, val) = pair.split_once('=').unwrap_or((pair, ""));
         let val = decode_url_part(val)?;
-        if key == "connect_timeout" {
-            let secs: u64 = val
-                .parse()
-                .ok()
-                .filter(|n| (1..=600).contains(n))
-                .ok_or_else(|| format!("Invalid connect_timeout '{}'", val))?;
-            connect_timeout = Duration::from_secs(secs);
-        } else if key == "prepare" {
-            match val.as_str() {
+        match key {
+            "connect_timeout" => {
+                let secs: u64 = val
+                    .parse()
+                    .ok()
+                    .filter(|n| (1..=600).contains(n))
+                    .ok_or_else(|| format!("Invalid connect_timeout '{}'", val))?;
+                connect_timeout = Duration::from_secs(secs);
+            }
+            "prepare" => match val.as_str() {
                 "off" | "false" | "0" => prepare = false,
                 "on" | "true" | "1" => prepare = true,
                 _ => return Err(format!("Invalid prepare '{}' (expected on or off)", val)),
+            },
+            "ssl-mode" | "sslmode" => {
+                ssl_mode = match val.as_str() {
+                    "disabled" | "disable" => MysqlSslMode::Disabled,
+                    "preferred" | "prefer" => MysqlSslMode::Preferred,
+                    "required" | "require" => MysqlSslMode::Required,
+                    "verify_ca" | "verify-ca" => MysqlSslMode::VerifyCa,
+                    "verify_identity" | "verify-full" => MysqlSslMode::VerifyIdentity,
+                    _ => {
+                        return Err(format!(
+                            "Invalid ssl-mode '{}' (expected disabled, preferred, required, verify_ca, or verify_identity)",
+                            val
+                        ));
+                    }
+                };
             }
+            "sslrootcert" | "ssl-ca" => {
+                if val.is_empty() {
+                    return Err("sslrootcert cannot be empty".to_string());
+                }
+                ssl_root_cert = Some(val);
+            }
+            _ => {}
         }
     }
     Ok(MysqlConfig {
@@ -130,6 +170,8 @@ pub fn parse_mysql_url(url: &str) -> Result<MysqlConfig, String> {
         database,
         connect_timeout,
         prepare,
+        ssl_mode,
+        ssl_root_cert,
     })
 }
 
@@ -360,7 +402,7 @@ impl MysqlStmtCache {
 }
 
 struct Conn {
-    reader: BufReader<TcpStream>,
+    reader: BufReader<Transport>,
     seq: u8,
     deprecate_eof: bool,
     pkt_buf: Vec<u8>,
@@ -428,17 +470,7 @@ impl Conn {
         if self.last_active.elapsed() < Duration::from_secs(5) {
             return self.reader.buffer().is_empty();
         }
-        let stream = self.reader.get_ref();
-        if stream.set_nonblocking(true).is_err() {
-            return false;
-        }
-        let mut probe = [0u8; 1];
-        let alive = match stream.peek(&mut probe) {
-            Ok(_) => false,
-            Err(e) => e.kind() == io::ErrorKind::WouldBlock,
-        };
-        let _ = stream.set_nonblocking(false);
-        alive && self.reader.buffer().is_empty()
+        self.reader.buffer().is_empty() && self.reader.get_mut().is_alive_probe()
     }
 }
 
@@ -907,6 +939,22 @@ fn read_resultset(conn: &mut Conn, binary: bool) -> Result<(u64, u64, QueryResul
     Ok((0, 0, QueryResult { columns, rows }))
 }
 
+fn read_initial_handshake_raw(stream: &mut TcpStream) -> Result<(u8, Vec<u8>), String> {
+    let mut hdr = [0u8; 4];
+    stream
+        .read_exact(&mut hdr)
+        .map_err(|e| format!("Failed to read MySQL handshake header: {e}"))?;
+    let len = usize::from(hdr[0]) | (usize::from(hdr[1]) << 8) | (usize::from(hdr[2]) << 16);
+    if len == 0 || len > MAX_PACKET {
+        return Err("Invalid MySQL initial handshake packet length".to_string());
+    }
+    let mut body = vec![0u8; len];
+    stream
+        .read_exact(&mut body)
+        .map_err(|e| format!("Failed to read MySQL handshake body: {e}"))?;
+    Ok((hdr[3].wrapping_add(1), body))
+}
+
 fn open_connection(config: &MysqlConfig) -> Result<Conn, String> {
     let target = format!("{}:{}", config.host, config.port);
     let addresses = target
@@ -923,7 +971,7 @@ fn open_connection(config: &MysqlConfig) -> Result<Conn, String> {
             Err(e) => last_error = Some(e),
         }
     }
-    let stream = stream.ok_or_else(|| match last_error {
+    let mut stream = stream.ok_or_else(|| match last_error {
         Some(e) => format!("Failed to connect to MySQL '{target}': {e}"),
         None => format!("No addresses resolved for '{target}'"),
     })?;
@@ -935,17 +983,7 @@ fn open_connection(config: &MysqlConfig) -> Result<Conn, String> {
         .set_write_timeout(Some(IO_TIMEOUT))
         .map_err(|e| e.to_string())?;
 
-    let mut conn = Conn {
-        reader: BufReader::with_capacity(64 * 1024, stream),
-        seq: 0,
-        deprecate_eof: false,
-        pkt_buf: Vec::with_capacity(4096),
-        write_buf: Vec::with_capacity(1024),
-        last_active: std::time::Instant::now(),
-        stmt_cache: MysqlStmtCache::default(),
-    };
-
-    let hs = conn.read_packet()?;
+    let (mut seq, hs) = read_initial_handshake_raw(&mut stream)?;
     if hs.first() == Some(&0xff) {
         return Err(parse_err_packet(&hs).message);
     }
@@ -980,7 +1018,6 @@ fn open_connection(config: &MysqlConfig) -> Result<Conn, String> {
     };
 
     let deprecate_eof = (server_caps & CLIENT_DEPRECATE_EOF) != 0;
-    conn.deprecate_eof = deprecate_eof;
 
     let mut client_caps = CLIENT_LONG_PASSWORD
         | CLIENT_FOUND_ROWS
@@ -995,6 +1032,58 @@ fn open_connection(config: &MysqlConfig) -> Result<Conn, String> {
     if config.database.is_some() {
         client_caps |= CLIENT_CONNECT_WITH_DB;
     }
+
+    let transport = if config.ssl_mode != MysqlSslMode::Disabled {
+        if (server_caps & CLIENT_SSL) == 0 {
+            if config.ssl_mode != MysqlSslMode::Preferred {
+                return Err("MySQL server does not support TLS".to_string());
+            }
+            Transport::Plain(stream)
+        } else {
+            client_caps |= CLIENT_SSL;
+            let mut ssl_req = Vec::with_capacity(36);
+            ssl_req.extend_from_slice(&32u32.to_le_bytes()[..3]);
+            ssl_req.push(seq);
+            seq = seq.wrapping_add(1);
+            ssl_req.extend_from_slice(&client_caps.to_le_bytes());
+            ssl_req.extend_from_slice(&(16 * 1024 * 1024u32).to_le_bytes());
+            ssl_req.push(45);
+            ssl_req.extend_from_slice(&[0u8; 23]);
+            stream
+                .write_all(&ssl_req)
+                .and_then(|_| stream.flush())
+                .map_err(|e| format!("Failed to write MySQL SSLRequest: {e}"))?;
+
+            let verify = match config.ssl_mode {
+                MysqlSslMode::Preferred | MysqlSslMode::Required => VerifyMode::Disable,
+                MysqlSslMode::VerifyCa => VerifyMode::VerifyCa,
+                MysqlSslMode::VerifyIdentity => VerifyMode::VerifyFull,
+                MysqlSslMode::Disabled => return Err("internal error: invalid TLS mode".to_string()),
+            };
+            let mut tls_cfg = TlsConfig::new(&config.host);
+            tls_cfg.verify = verify;
+            tls_cfg.min_version = TlsVersion::Tls12;
+            tls_cfg.handshake_timeout = config.connect_timeout;
+            if let Some(ca_path) = &config.ssl_root_cert {
+                tls_cfg.roots = RootSource::File(PathBuf::from(ca_path));
+            }
+            let tls_stream = crate::native::tls::connect(stream, &tls_cfg)
+                .map_err(|e| format!("MySQL TLS handshake failed: {e}"))?;
+            Transport::Tls(Box::new(tls_stream))
+        }
+    } else {
+        Transport::Plain(stream)
+    };
+
+    let mut conn = Conn {
+        reader: BufReader::with_capacity(64 * 1024, transport),
+        seq,
+        deprecate_eof,
+        pkt_buf: Vec::with_capacity(4096),
+        write_buf: Vec::with_capacity(1024),
+        last_active: std::time::Instant::now(),
+        stmt_cache: MysqlStmtCache::default(),
+    };
 
     let auth_resp = if plugin_name == "caching_sha2_password" {
         caching_sha2_password_scramble(&config.password, &scramble)
@@ -1029,9 +1118,16 @@ fn open_connection(config: &MysqlConfig) -> Result<Conn, String> {
                 match pkt.get(1) {
                     Some(0x03) => {} // fast auth succeeded; wait for OK_Packet
                     Some(0x04) => {
-                        return Err(
-                            "MySQL caching_sha2_password requires RSA/TLS full auth (connect via TLS proxy or use mysql_native_password / cached user)".to_string(),
-                        );
+                        if matches!(conn.reader.get_ref(), Transport::Tls(_)) {
+                            let mut pw_nul = Vec::with_capacity(config.password.len() + 1);
+                            pw_nul.extend_from_slice(config.password.as_bytes());
+                            pw_nul.push(0);
+                            conn.write_packet(&pw_nul)?;
+                        } else {
+                            return Err(
+                                "MySQL caching_sha2_password requires TLS full auth (enable ssl-mode=required or use mysql_native_password / cached user)".to_string(),
+                            );
+                        }
                     }
                     _ => return Err("Unexpected MySQL AuthMoreData packet".to_string()),
                 }
@@ -1068,6 +1164,15 @@ mod tests {
         assert_eq!(cfg.user, "root");
         assert_eq!(cfg.password, "p@ss");
         assert_eq!(cfg.host, "127.0.0.1");
+        assert_eq!(cfg.ssl_mode, MysqlSslMode::Disabled);
+
+        let cfg2 = parse_mysql_url(
+            "mysql://root:pw@db.example.com/app?ssl-mode=verify_identity&sslrootcert=/tmp/ca.pem",
+        )
+        .unwrap();
+        assert_eq!(cfg2.ssl_mode, MysqlSslMode::VerifyIdentity);
+        assert_eq!(cfg2.ssl_root_cert.as_deref(), Some("/tmp/ca.pem"));
+        assert!(parse_mysql_url("mysql://root@localhost/app?ssl-mode=invalid").is_err());
         assert_eq!(cfg.port, 3307);
         assert_eq!(cfg.database.as_deref(), Some("app"));
         assert_eq!(cfg.connect_timeout, Duration::from_secs(3));
