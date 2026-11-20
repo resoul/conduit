@@ -1,10 +1,7 @@
-//! NIST P-256 (secp256r1): constant-time ECDH and ECDSA signature verification.
-
 use super::Zeroize;
 use super::bigint::BigUint;
 use super::p384::parse_der_ecdsa_sig;
 
-/// P-256 field prime p = 2^256 - 2^224 + 2^192 + 2^96 - 1 (little-endian u32 words).
 const P_U32: [u32; 8] = [
     0xffff_ffff, 0xffff_ffff, 0xffff_ffff, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0001,
     0xffff_ffff,
@@ -30,7 +27,6 @@ const GY_BE: [u8; 32] = [
     0x2b, 0xce, 0x33, 0x57, 0x6b, 0x31, 0x5e, 0xce, 0xcb, 0xb6, 0x40, 0x68, 0x37, 0xbf, 0x51, 0xf5,
 ];
 
-/// Field element mod P-256 in 8 little-endian u32 limbs.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Fe([u32; 8]);
 
@@ -51,7 +47,6 @@ impl Fe {
             *limb = u32::from_be_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]]);
         }
         let fe = Self(limbs);
-        // Check fe < p
         let (_, borrow) = sub_raw(&fe.0, &P_U32);
         if borrow == 0 {
             return None;
@@ -61,9 +56,9 @@ impl Fe {
 
     fn to_be_bytes(self) -> [u8; 32] {
         let mut out = [0u8; 32];
-        for i in 0..8 {
+        for (i, &limb) in self.0.iter().enumerate() {
             let off = (7 - i) * 4;
-            out[off..off + 4].copy_from_slice(&self.0[i].to_be_bytes());
+            out[off..off + 4].copy_from_slice(&limb.to_be_bytes());
         }
         out
     }
@@ -74,7 +69,7 @@ impl Fe {
         for &w in &self.0 {
             acc |= w;
         }
-        // Returns 1 if zero, 0 otherwise
+
         ((acc | acc.wrapping_neg()) >> 31) ^ 1
     }
 

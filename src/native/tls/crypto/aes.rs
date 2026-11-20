@@ -1,12 +1,7 @@
-//! AES-128 / AES-256 block cipher with AES-NI (x86_64), ARMv8 AES (aarch64),
-//! and a portable constant-time bitsliced fallback (zero secret-dependent table lookups).
-
 use super::Zeroize;
 
 const RCON: [u8; 11] = [0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36];
 
-/// Bitsliced AES S-box (Boyar-Peralta, constant-time) applied to 16 bytes simultaneously.
-/// Bit ordering: `u0` is MSB (bit 7), `u7` is LSB (bit 0).
 #[inline]
 fn bitslice_sbox_16(block: &mut [u8; 16]) {
     let mut u = [0u16; 8];
@@ -18,7 +13,6 @@ fn bitslice_sbox_16(block: &mut [u8; 16]) {
 
     let [x0, x1, x2, x3, x4, x5, x6, x7] = u;
 
-    // Top linear transformation
     let y14 = x3 ^ x5;
     let y13 = x0 ^ x6;
     let y9 = x0 ^ x3;
@@ -43,7 +37,6 @@ fn bitslice_sbox_16(block: &mut [u8; 16]) {
     let y21 = y13 ^ y16;
     let y18 = x0 ^ y16;
 
-    // Middle non-linear GF(2^4) inversion
     let t2 = y12 & y15;
     let t3 = y3 & y6;
     let t4 = t3 ^ t2;
@@ -109,7 +102,6 @@ fn bitslice_sbox_16(block: &mut [u8; 16]) {
     let z16 = t45 & y14;
     let z17 = t41 & y8;
 
-    // Bottom linear transformation
     let t46 = z15 ^ z16;
     let t47 = z10 ^ z11;
     let t48 = z5 ^ z13;
@@ -309,11 +301,11 @@ impl AesKey {
 
     fn encrypt_block_portable(&self, block: &mut [u8; 16]) {
         add_round_key(block, &self.round_keys[0]);
-        for r in 1..self.rounds {
+        for rk in &self.round_keys[1..self.rounds] {
             bitslice_sbox_16(block);
             shift_rows(block);
             mix_columns(block);
-            add_round_key(block, &self.round_keys[r]);
+            add_round_key(block, rk);
         }
         bitslice_sbox_16(block);
         shift_rows(block);
@@ -328,8 +320,8 @@ impl AesKey {
             let mut m = _mm_loadu_si128(block.as_ptr() as *const __m128i);
             let k0 = _mm_loadu_si128(self.round_keys[0].as_ptr() as *const __m128i);
             m = _mm_xor_si128(m, k0);
-            for r in 1..self.rounds {
-                let rk = _mm_loadu_si128(self.round_keys[r].as_ptr() as *const __m128i);
+            for rk_bytes in &self.round_keys[1..self.rounds] {
+                let rk = _mm_loadu_si128(rk_bytes.as_ptr() as *const __m128i);
                 m = _mm_aesenc_si128(m, rk);
             }
             let k_last = _mm_loadu_si128(self.round_keys[self.rounds].as_ptr() as *const __m128i);
@@ -344,8 +336,8 @@ impl AesKey {
         use std::arch::aarch64::*;
         unsafe {
             let mut m = vld1q_u8(block.as_ptr());
-            for r in 0..(self.rounds - 1) {
-                let rk = vld1q_u8(self.round_keys[r].as_ptr());
+            for rk_bytes in &self.round_keys[..self.rounds - 1] {
+                let rk = vld1q_u8(rk_bytes.as_ptr());
                 m = vaesmcq_u8(vaeseq_u8(m, rk));
             }
             let rk_pen = vld1q_u8(self.round_keys[self.rounds - 1].as_ptr());

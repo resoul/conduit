@@ -126,8 +126,8 @@ impl BigUint {
         }
         let mut out = Vec::with_capacity(self.limbs.len());
         let mut borrow = 0u128;
-        for i in 0..self.limbs.len() {
-            let a = self.limbs[i] as u128;
+        for (i, &limb) in self.limbs.iter().enumerate() {
+            let a = limb as u128;
             let b = other.limbs.get(i).copied().unwrap_or(0) as u128;
             let sub = b + borrow;
             if a >= sub {
