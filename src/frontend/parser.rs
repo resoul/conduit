@@ -189,6 +189,7 @@ impl Parser {
             TokenKind::Ident(kw) if kw == "router" => self.parse_router_item(is_exported),
             TokenKind::Ident(kw) if kw == "schedule" => self.parse_schedule_item(is_exported),
             TokenKind::Ident(kw) if kw == "migration" => self.parse_migration_item(),
+            TokenKind::Ident(kw) if kw == "query" => self.parse_query_item(is_exported),
             TokenKind::Ident(kw) if kw == "test" => self.parse_test_item(is_exported, export_span),
             TokenKind::KwImport => {
                 if is_exported {

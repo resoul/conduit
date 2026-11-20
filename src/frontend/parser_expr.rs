@@ -90,6 +90,10 @@ impl Parser {
         self.parse_binary_op(Self::parse_equality, &[(TokenKind::And, BinaryOp::And)])
     }
 
+    pub(super) fn parse_query_value_expr(&mut self) -> Result<Expr, ParserError> {
+        self.parse_equality()
+    }
+
     fn parse_equality(&mut self) -> Result<Expr, ParserError> {
         self.parse_binary_op(
             Self::parse_comparison,

@@ -597,6 +597,244 @@ impl Parser {
         item.doc = about;
         Ok(item)
     }
+
+    pub(super) fn parse_query_item(&mut self, is_exported: bool) -> Result<Item, ParserError> {
+        let start_span = self.bump().span; // consume 'query'
+        let (name, _) = self.expect_ident()?;
+        let (params, return_type) = self.parse_params_and_return_type()?;
+        self.expect(&TokenKind::LBrace)?;
+
+        let mut model_name: Option<(String, Span)> = None;
+        let mut select_fields: Vec<(String, Span)> = Vec::new();
+        let mut where_pred: Option<QueryPredicate> = None;
+        let mut order_by: Vec<QueryOrderItem> = Vec::new();
+        let mut limit: Option<Expr> = None;
+        let mut offset: Option<Expr> = None;
+        let mut mode: Option<QueryModeAst> = None;
+
+        while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
+            if self.check(&TokenKind::RBrace) {
+                break;
+            }
+            let tok = self.peek().clone();
+            let kw = match &tok.kind {
+                TokenKind::Ident(s) => s.clone(),
+                _ => {
+                    return Err(ParserError {
+                        message: format!(
+                            "Expected query clause ('from', 'select', 'where', 'order_by', 'limit', 'offset', 'first', 'count', 'exists', 'delete'), got '{:?}'",
+                            tok.kind
+                        ),
+                        span: tok.span,
+                    });
+                }
+            };
+            self.bump();
+            match kw.as_str() {
+                "from" => {
+                    if model_name.is_some() {
+                        return Err(ParserError {
+                            message: "Duplicate 'from' clause in query".to_string(),
+                            span: tok.span,
+                        });
+                    }
+                    let (m_name, m_span) = self.expect_ident()?;
+                    model_name = Some((m_name, m_span));
+                }
+                "select" => {
+                    loop {
+                        let (f_name, f_span) = self.expect_ident()?;
+                        select_fields.push((f_name, f_span));
+                        if !self.match_token(&TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                }
+                "where" => {
+                    let pred = self.parse_query_where_or()?;
+                    where_pred = Some(match where_pred {
+                        Some(existing) => QueryPredicate::And(Box::new(existing), Box::new(pred)),
+                        None => pred,
+                    });
+                }
+                "order_by" => {
+                    loop {
+                        let (f_name, f_span) = self.expect_ident()?;
+                        let dir_tok = self.peek().clone();
+                        let desc = match &dir_tok.kind {
+                            TokenKind::Ident(d) if d.eq_ignore_ascii_case("asc") => {
+                                self.bump();
+                                false
+                            }
+                            TokenKind::Ident(d) if d.eq_ignore_ascii_case("desc") => {
+                                self.bump();
+                                true
+                            }
+                            _ => false,
+                        };
+                        order_by.push(QueryOrderItem {
+                            field: f_name,
+                            field_span: f_span,
+                            desc,
+                        });
+                        if !self.match_token(&TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                }
+                "limit" => {
+                    if limit.is_some() {
+                        return Err(ParserError {
+                            message: "Duplicate 'limit' clause in query".to_string(),
+                            span: tok.span,
+                        });
+                    }
+                    limit = Some(self.parse_expr()?);
+                }
+                "offset" => {
+                    if offset.is_some() {
+                        return Err(ParserError {
+                            message: "Duplicate 'offset' clause in query".to_string(),
+                            span: tok.span,
+                        });
+                    }
+                    offset = Some(self.parse_expr()?);
+                }
+                "all" | "first" | "count" | "exists" | "delete" => {
+                    if mode.is_some() {
+                        return Err(ParserError {
+                            message: "Duplicate query mode ('all', 'first', 'count', 'exists', 'delete')".to_string(),
+                            span: tok.span,
+                        });
+                    }
+                    mode = Some(match kw.as_str() {
+                        "first" => QueryModeAst::First,
+                        "count" => QueryModeAst::Count,
+                        "exists" => QueryModeAst::Exists,
+                        "delete" => QueryModeAst::Delete,
+                        _ => QueryModeAst::All,
+                    });
+                }
+                other => {
+                    return Err(ParserError {
+                        message: format!(
+                            "Unknown query clause '{}' (expected 'from', 'select', 'where', 'order_by', 'limit', 'offset', 'first', 'count', 'exists', or 'delete')",
+                            other
+                        ),
+                        span: tok.span,
+                    });
+                }
+            }
+        }
+        self.expect(&TokenKind::RBrace)?;
+
+        let Some((model_name, model_span)) = model_name else {
+            return Err(ParserError {
+                message: format!("Query '{}' must contain a 'from <Model>' clause", name),
+                span: start_span,
+            });
+        };
+
+        Ok(Item::new_exported(
+            ItemKind::Query(Box::new(QuerySpec {
+                name,
+                params,
+                return_type,
+                model_name,
+                model_span,
+                select_fields,
+                where_pred,
+                order_by,
+                limit,
+                offset,
+                mode: mode.unwrap_or(QueryModeAst::All),
+            })),
+            start_span,
+            is_exported,
+        ))
+    }
+
+    fn parse_query_where_or(&mut self) -> Result<QueryPredicate, ParserError> {
+        let mut left = self.parse_query_where_and()?;
+        while self.match_token(&TokenKind::Or) {
+            let right = self.parse_query_where_and()?;
+            left = QueryPredicate::Or(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn parse_query_where_and(&mut self) -> Result<QueryPredicate, ParserError> {
+        let mut left = self.parse_query_where_atom()?;
+        while self.match_token(&TokenKind::And) {
+            let right = self.parse_query_where_atom()?;
+            left = QueryPredicate::And(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn parse_query_where_atom(&mut self) -> Result<QueryPredicate, ParserError> {
+        if self.match_token(&TokenKind::LParen) {
+            let inner = self.parse_query_where_or()?;
+            self.expect(&TokenKind::RParen)?;
+            return Ok(inner);
+        }
+        let (field, field_span) = self.expect_ident()?;
+        let op_tok = self.peek().clone();
+        let op = match &op_tok.kind {
+            TokenKind::Eq => {
+                self.bump();
+                QueryWhereOp::Eq
+            }
+            TokenKind::NotEq => {
+                self.bump();
+                QueryWhereOp::Ne
+            }
+            TokenKind::Gt => {
+                self.bump();
+                QueryWhereOp::Gt
+            }
+            TokenKind::GtEq => {
+                self.bump();
+                QueryWhereOp::Ge
+            }
+            TokenKind::Lt => {
+                self.bump();
+                QueryWhereOp::Lt
+            }
+            TokenKind::LtEq => {
+                self.bump();
+                QueryWhereOp::Le
+            }
+            TokenKind::KwIn => {
+                self.bump();
+                QueryWhereOp::In
+            }
+            TokenKind::Ident(s) if s.eq_ignore_ascii_case("like") => {
+                self.bump();
+                QueryWhereOp::Like
+            }
+            TokenKind::Ident(s) if s.eq_ignore_ascii_case("ilike") => {
+                self.bump();
+                QueryWhereOp::ILike
+            }
+            _ => {
+                return Err(ParserError {
+                    message: format!(
+                        "Expected comparison operator ('==', '!=', '>', '>=', '<', '<=', 'in', 'like', 'ilike') after '{}', got '{:?}'",
+                        field, op_tok.kind
+                    ),
+                    span: op_tok.span,
+                });
+            }
+        };
+        let value = self.parse_query_value_expr()?;
+        Ok(QueryPredicate::Cmp {
+            field,
+            field_span,
+            op,
+            value: Box::new(value),
+        })
+    }
 }
 
 fn join_route_prefix(prefix: &str, pat: &str) -> String {

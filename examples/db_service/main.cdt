@@ -28,6 +28,13 @@ migration 2 "seed_admin" {
     }
 }
 
+query FindActiveUsers(conn: db.Connection, max_rows: Int = 20) -> [User] {
+    from User
+    where active == true
+    order_by id asc
+    limit max_rows
+}
+
 export func main() -> Void | db.DbError | crypto.CryptoError | env.EnvError | validation.ValidationError | time.TimeError {
     dsn := env.require("DATABASE_URL")?
     conn := db.connect(dsn)?
@@ -76,6 +83,14 @@ export func main() -> Void | db.DbError | crypto.CryptoError | env.EnvError | va
 
     total := conn.count<User>()?
     print("Total users in table: {total}")
+
+    // Declarative query block + Fluent Query Builder
+    active_users := FindActiveUsers(conn)?
+    fluent_count := conn.from<User>()
+        .where_eq("active", true)
+        .where_not_null("bio")
+        .count()?
+    print("Active users: {active_users.len()}, with bio: {fluent_count}")
 
     users := conn.all<User>()?
     for u in users {

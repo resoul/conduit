@@ -935,16 +935,27 @@ impl Module {
                                     check_o(a, &ctx)?;
                                     check_s(b, &ctx)?;
                                 }
-                                7 | 8 | 15 | 26 => {
+                                7 | 8 | 15 | 26 | 28..=33 | 36 | 37 | 40 | 43 => {
                                     check_o(a, &ctx)?;
                                     check_o(b, &ctx)?;
                                     check_o(c, &ctx)?;
+                                }
+                                38 | 39 | 41 | 42 => {
+                                    check_o(a, &ctx)?;
+                                    check_o(b, &ctx)?;
+                                }
+                                34 | 35 => {
+                                    check_o(a, &ctx)?;
+                                    check_o(b, &ctx)?;
+                                    if c > 5 {
+                                        return Err(format!("Invalid db query mode {}", c));
+                                    }
                                 }
                                 13 => {
                                     check_s(a, &ctx)?;
                                     check_o(b, &ctx)?;
                                 }
-                                16 | 17 | 19 | 24 => {
+                                16 | 17 | 19 | 24 | 27 => {
                                     check_o(a, &ctx)?;
                                     check_o(b, &ctx)?;
                                     if (c as usize) >= self.db_models.len() {

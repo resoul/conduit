@@ -1258,6 +1258,23 @@ impl Checker<'_> {
                 }
                 Ok(Type::union(vec![db_conn, db_err]))
             }
+            "pool" => {
+                if !type_args.is_empty() || !named_args.is_empty() || args.is_empty() || args.len() > 3 {
+                    return Err("db.pool(url, max_conns?, idle_timeout_ms?) expects 1 to 3 arguments".to_string());
+                }
+                self.check_expr(&mut args[0], Some(&Type::String))?;
+                if args[0].ty != Type::String {
+                    return Err(format!("db.pool() url must be String, got {}", args[0].ty));
+                }
+                for (idx, a) in args.iter_mut().enumerate().skip(1) {
+                    self.check_expr(a, Some(&Type::Int))?;
+                    if a.ty != Type::Int {
+                        return Err(format!("db.pool() argument {} must be Int, got {}", idx + 1, a.ty));
+                    }
+                }
+                let db_pool = Type::Custom(TypeId::native("cdt.db", "Pool"));
+                Ok(Type::union(vec![db_pool, db_err]))
+            }
             "null" => {
                 if !type_args.is_empty() || !named_args.is_empty() || !args.is_empty() {
                     return Err("db.null() takes 0 arguments".to_string());
@@ -1343,10 +1360,64 @@ impl Checker<'_> {
         type_args: &[TypeExpr],
         args: &mut [Expr],
     ) -> Result<Type, String> {
+        let db_err = Type::Custom(TypeId::native("cdt.db", "DbError"));
+        if type_name == "Pool" {
+            if !type_args.is_empty() {
+                return Err(format!("db.Pool.{}() does not accept type arguments", method));
+            }
+            let db_conn = Type::Custom(TypeId::native("cdt.db", "Connection"));
+            return match method {
+                "acquire" => {
+                    if !args.is_empty() {
+                        return Err("Pool.acquire() expects 0 arguments".to_string());
+                    }
+                    Ok(Type::union(vec![db_conn, db_err]))
+                }
+                "with" => {
+                    if args.len() != 1 {
+                        return Err("Pool.with(cb) expects 1 callback argument".to_string());
+                    }
+                    let expected_cb = Type::Function {
+                        params: vec![db_conn.clone()],
+                        return_type: Box::new(Type::Any),
+                    };
+                    self.check_expr(&mut args[0], Some(&expected_cb))?;
+                    let Type::Function { params, return_type } = args[0].ty.clone() else {
+                        return Err(format!("Pool.with() expects (Connection) -> R, got {}", args[0].ty));
+                    };
+                    if params.len() != 1 || params[0] != db_conn {
+                        return Err("Pool.with() callback must accept (db.Connection)".to_string());
+                    }
+                    let ret = (*return_type).clone();
+                    if matches!(ret, Type::Void) {
+                        Ok(Type::union(vec![Type::Void, db_err]))
+                    } else if let Type::Union(mut vars) = ret {
+                        if !vars.contains(&db_err) {
+                            vars.push(db_err);
+                        }
+                        Ok(Type::Union(vars))
+                    } else {
+                        Ok(Type::union(vec![ret, db_err]))
+                    }
+                }
+                "stats" => {
+                    if !args.is_empty() {
+                        return Err("Pool.stats() expects 0 arguments".to_string());
+                    }
+                    Ok(Type::Map(Box::new(Type::String), Box::new(Type::Int)))
+                }
+                "close" => {
+                    if !args.is_empty() {
+                        return Err("Pool.close() expects 0 arguments".to_string());
+                    }
+                    Ok(Type::Void)
+                }
+                other => Err(format!("db.Pool has no method '.{}()'", other)),
+            };
+        }
         if type_name != "Connection" {
             return Err(format!("Type 'db.{}' has no method '.{}()'", type_name, method));
         }
-        let db_err = Type::Custom(TypeId::native("cdt.db", "DbError"));
         match method {
             "exec" => {
                 if !type_args.is_empty() {
@@ -1494,6 +1565,25 @@ impl Checker<'_> {
                 self.check_expr(&mut args[0], None)?;
                 Ok(Type::union(vec![Type::Int, db_err]))
             }
+            "insert_all" => {
+                if type_args.len() != 1 || args.len() != 1 {
+                    return Err("Connection.insert_all<T>(rows) expects 1 type argument and 1 argument".to_string());
+                }
+                let target_ty = self.checked.resolve_type_mut(&type_args[0])?;
+                let Type::Custom(tid) = &target_ty else {
+                    return Err(format!("Connection.insert_all<T>() requires a struct type, got {}", target_ty));
+                };
+                if tid.module != ModuleId::Program || !self.checked.struct_by_name.contains_key(&tid.name) {
+                    return Err(format!("Connection.insert_all<T>() requires a program struct type, got {}", target_ty));
+                }
+                ensure_db_model_plan(self.checked, &tid.name)?;
+                let list_ty = Type::List(Box::new(target_ty));
+                self.check_expr(&mut args[0], Some(&list_ty))?;
+                if args[0].ty != list_ty {
+                    return Err(format!("Connection.insert_all<T> expects {}, got {}", list_ty, args[0].ty));
+                }
+                Ok(Type::union(vec![Type::Int, db_err]))
+            }
             "update" => {
                 if type_args.len() != 1 || args.len() != 1 {
                     return Err("Connection.update<T>(row: T) expects 1 type argument and 1 argument".to_string());
@@ -1549,7 +1639,210 @@ impl Checker<'_> {
                 self.check_expr(&mut v_slice[0], None)?;
                 Ok(Type::union(vec![Type::List(Box::new(target_ty)), db_err]))
             }
+            "from" => {
+                if type_args.len() != 1 || !args.is_empty() {
+                    return Err("Connection.from<T>() expects 1 type argument and 0 arguments".to_string());
+                }
+                let target_ty = self.checked.resolve_type_mut(&type_args[0])?;
+                let Type::Custom(tid) = &target_ty else {
+                    return Err(format!("Connection.from<T>() requires a struct type, got {}", target_ty));
+                };
+                if tid.module != ModuleId::Program || !self.checked.struct_by_name.contains_key(&tid.name) {
+                    return Err(format!("Connection.from<T>() requires a program struct type, got {}", target_ty));
+                }
+                ensure_db_model_plan(self.checked, &tid.name)?;
+                Ok(Type::Generic {
+                    type_id: TypeId::native("cdt.db", "Query"),
+                    type_args: vec![target_ty],
+                })
+            }
             other => Err(format!("db.Connection has no method '.{}()'", other)),
+        }
+    }
+
+    pub(crate) fn check_db_query_method(
+        &mut self,
+        target_type_args: &[Type],
+        method: &str,
+        type_args: &[TypeExpr],
+        args: &mut [Expr],
+    ) -> Result<Type, String> {
+        if !type_args.is_empty() {
+            return Err(format!("db.Query.{}() does not accept type arguments", method));
+        }
+        let model_ty = target_type_args
+            .first()
+            .cloned()
+            .unwrap_or(Type::Any);
+        let query_ty = Type::Generic {
+            type_id: TypeId::native("cdt.db", "Query"),
+            type_args: target_type_args.to_vec(),
+        };
+        let db_err = Type::Custom(TypeId::native("cdt.db", "DbError"));
+        match method {
+            "select" => {
+                if args.len() != 1 {
+                    return Err("Query.select(columns) expects 1 argument".to_string());
+                }
+                let str_list = Type::List(Box::new(Type::String));
+                self.check_expr(&mut args[0], Some(&str_list))?;
+                if args[0].ty != str_list {
+                    return Err(format!("Query.select() expects [String], got {}", args[0].ty));
+                }
+                Ok(query_ty)
+            }
+            "where_eq" | "or_where_eq" => {
+                if args.len() != 2 {
+                    return Err(format!("Query.{}(column, value) expects 2 arguments", method));
+                }
+                let (c_slice, v_slice) = args.split_at_mut(1);
+                self.check_expr(&mut c_slice[0], Some(&Type::String))?;
+                if c_slice[0].ty != Type::String {
+                    return Err(format!("Query.{}() column must be String, got {}", method, c_slice[0].ty));
+                }
+                self.check_expr(&mut v_slice[0], None)?;
+                Ok(query_ty)
+            }
+            "where" | "or_where" => {
+                if args.len() != 3 {
+                    return Err(format!("Query.{}(column, op, value) expects 3 arguments", method));
+                }
+                let (c_slice, rest) = args.split_at_mut(1);
+                let (op_slice, v_slice) = rest.split_at_mut(1);
+                self.check_expr(&mut c_slice[0], Some(&Type::String))?;
+                if c_slice[0].ty != Type::String {
+                    return Err(format!("Query.{}() column must be String, got {}", method, c_slice[0].ty));
+                }
+                self.check_expr(&mut op_slice[0], Some(&Type::String))?;
+                if op_slice[0].ty != Type::String {
+                    return Err(format!("Query.{}() operator must be String, got {}", method, op_slice[0].ty));
+                }
+                self.check_expr(&mut v_slice[0], None)?;
+                Ok(query_ty)
+            }
+            "where_in" | "or_where_in" => {
+                if args.len() != 2 {
+                    return Err(format!("Query.{}(column, values) expects 2 arguments", method));
+                }
+                let (c_slice, v_slice) = args.split_at_mut(1);
+                self.check_expr(&mut c_slice[0], Some(&Type::String))?;
+                if c_slice[0].ty != Type::String {
+                    return Err(format!("Query.{}() column must be String, got {}", method, c_slice[0].ty));
+                }
+                self.check_expr(&mut v_slice[0], None)?;
+                if !matches!(v_slice[0].ty, Type::List(_)) {
+                    return Err(format!("Query.{}() values must be a List, got {}", method, v_slice[0].ty));
+                }
+                Ok(query_ty)
+            }
+            "where_null" | "where_not_null" | "or_where_null" | "or_where_not_null" => {
+                if args.len() != 1 {
+                    return Err(format!("Query.{}(column) expects 1 argument", method));
+                }
+                self.check_expr(&mut args[0], Some(&Type::String))?;
+                if args[0].ty != Type::String {
+                    return Err(format!("Query.{}() column must be String, got {}", method, args[0].ty));
+                }
+                Ok(query_ty)
+            }
+            "order_by" => {
+                if args.is_empty() || args.len() > 2 {
+                    return Err("Query.order_by(column, dir?) expects 1 or 2 arguments".to_string());
+                }
+                self.check_expr(&mut args[0], Some(&Type::String))?;
+                if args[0].ty != Type::String {
+                    return Err(format!("Query.order_by() column must be String, got {}", args[0].ty));
+                }
+                if args.len() == 2 {
+                    self.check_expr(&mut args[1], Some(&Type::String))?;
+                    if args[1].ty != Type::String {
+                        return Err(format!("Query.order_by() direction must be String, got {}", args[1].ty));
+                    }
+                }
+                Ok(query_ty)
+            }
+            "limit" | "offset" => {
+                if args.len() != 1 {
+                    return Err(format!("Query.{}(n) expects 1 argument", method));
+                }
+                self.check_expr(&mut args[0], Some(&Type::Int))?;
+                if args[0].ty != Type::Int {
+                    return Err(format!("Query.{}() expects Int, got {}", method, args[0].ty));
+                }
+                Ok(query_ty)
+            }
+            "paginate" => {
+                if args.len() != 2 {
+                    return Err("Query.paginate(page, per_page) expects 2 arguments".to_string());
+                }
+                let (p_slice, pp_slice) = args.split_at_mut(1);
+                self.check_expr(&mut p_slice[0], Some(&Type::Int))?;
+                self.check_expr(&mut pp_slice[0], Some(&Type::Int))?;
+                if p_slice[0].ty != Type::Int || pp_slice[0].ty != Type::Int {
+                    return Err("Query.paginate(page, per_page) expects Int arguments".to_string());
+                }
+                Ok(query_ty)
+            }
+            "and_query" | "or_query" => {
+                if args.len() != 1 {
+                    return Err(format!("Query.{}(sub_query) expects 1 argument", method));
+                }
+                self.check_expr(&mut args[0], Some(&query_ty))?;
+                if args[0].ty != query_ty {
+                    return Err(format!("Query.{}() expects {}, got {}", method, query_ty, args[0].ty));
+                }
+                Ok(query_ty)
+            }
+            "to_sql" => {
+                if args.len() > 1 {
+                    return Err("Query.to_sql(mode?) expects 0 or 1 argument".to_string());
+                }
+                if args.len() == 1 {
+                    self.check_expr(&mut args[0], Some(&Type::String))?;
+                    if args[0].ty != Type::String {
+                        return Err(format!("Query.to_sql() mode must be String, got {}", args[0].ty));
+                    }
+                }
+                Ok(Type::String)
+            }
+            "all" => {
+                if !args.is_empty() {
+                    return Err("Query.all() expects 0 arguments".to_string());
+                }
+                Ok(Type::union(vec![Type::List(Box::new(model_ty)), db_err]))
+            }
+            "first" => {
+                if !args.is_empty() {
+                    return Err("Query.first() expects 0 arguments".to_string());
+                }
+                Ok(Type::union(vec![Type::Optional(Box::new(model_ty)), db_err]))
+            }
+            "count" => {
+                if !args.is_empty() {
+                    return Err("Query.count() expects 0 arguments".to_string());
+                }
+                Ok(Type::union(vec![Type::Int, db_err]))
+            }
+            "exists" => {
+                if !args.is_empty() {
+                    return Err("Query.exists() expects 0 arguments".to_string());
+                }
+                Ok(Type::union(vec![Type::Bool, db_err]))
+            }
+            "delete" => {
+                if !args.is_empty() {
+                    return Err("Query.delete() expects 0 arguments".to_string());
+                }
+                Ok(Type::union(vec![Type::Int, db_err]))
+            }
+            "rows" => {
+                if !args.is_empty() {
+                    return Err("Query.rows() expects 0 arguments".to_string());
+                }
+                let row_ty = Type::Map(Box::new(Type::String), Box::new(Type::Any));
+                Ok(Type::union(vec![Type::List(Box::new(row_ty)), db_err]))
+            }
+            other => Err(format!("db.Query has no method '.{}()'", other)),
         }
     }
 

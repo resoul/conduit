@@ -54,6 +54,9 @@ fn collect_local_defs(items: &[Item]) -> HashSet<String> {
             | ItemKind::Error { name, .. } => {
                 defs.insert(name.clone());
             }
+            ItemKind::Query(q) => {
+                defs.insert(q.name.clone());
+            }
             ItemKind::Import { .. }
             | ItemKind::ExportList { .. }
             | ItemKind::Migration { .. }
@@ -73,6 +76,11 @@ fn rename_item_decl(item: &mut Item, rename: &HashMap<String, String>) {
         | ItemKind::Error { name, .. } => {
             if let Some(new_name) = rename.get(name) {
                 *name = new_name.clone();
+            }
+        }
+        ItemKind::Query(q) => {
+            if let Some(new_name) = rename.get(&q.name) {
+                q.name = new_name.clone();
             }
         }
         ItemKind::Import { .. }
@@ -260,6 +268,9 @@ fn load_module(
                 | ItemKind::Error { name, .. } => {
                     exports.insert(name.clone(), local_to_global[name].clone());
                 }
+                ItemKind::Query(q) => {
+                    exports.insert(q.name.clone(), local_to_global[&q.name].clone());
+                }
                 ItemKind::ExportList { names } => {
                     for spec in names {
                         let resolved = local_to_global
@@ -427,6 +438,32 @@ fn rewrite_items(items: &mut [Item], env: &RewriteEnv) -> Result<(), String> {
             ItemKind::Test { body, .. } => {
                 let mut scopes = Vec::new();
                 rewrite_block_stmts(body, env, &mut scopes)?;
+            }
+            ItemKind::Query(q) => {
+                let mut scopes = vec![HashSet::new()];
+                for p in &mut q.params {
+                    rewrite_type_expr(&mut p.ty, env)?;
+                    if let Some(def) = &mut p.default {
+                        let mut empty = Vec::new();
+                        rewrite_expr(def, env, &mut empty)?;
+                    }
+                    scopes[0].insert(p.name.clone());
+                }
+                if let Some(rt) = &mut q.return_type {
+                    rewrite_type_expr(rt, env)?;
+                }
+                if let Some(mapped) = env.sym_map.get(q.model_name.as_str()) {
+                    q.model_name = mapped.clone();
+                }
+                if let Some(pred) = &mut q.where_pred {
+                    rewrite_query_pred(pred, env, &mut scopes)?;
+                }
+                if let Some(lim) = &mut q.limit {
+                    rewrite_expr(lim, env, &mut scopes)?;
+                }
+                if let Some(off) = &mut q.offset {
+                    rewrite_expr(off, env, &mut scopes)?;
+                }
             }
             ItemKind::Enum { variants, .. } => {
                 for v in variants {
@@ -875,4 +912,18 @@ fn rewrite_interp_string(
         out.push('}');
     }
     out
+}
+
+fn rewrite_query_pred(
+    pred: &mut QueryPredicate,
+    env: &RewriteEnv,
+    scopes: &mut Vec<HashSet<String>>,
+) -> Result<(), String> {
+    match pred {
+        QueryPredicate::And(l, r) | QueryPredicate::Or(l, r) => {
+            rewrite_query_pred(l, env, scopes)?;
+            rewrite_query_pred(r, env, scopes)
+        }
+        QueryPredicate::Cmp { value, .. } => rewrite_expr(value, env, scopes),
+    }
 }

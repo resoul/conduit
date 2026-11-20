@@ -37,6 +37,7 @@ use crate::vm::value::{
     SCHEMA_BOXED_BOOL, SCHEMA_BOXED_FLOAT, SCHEMA_BOXED_INT, SCHEMA_CACHE_ERROR,
     SCHEMA_CACHE_HANDLE, SCHEMA_CLI_ERROR, SCHEMA_CRON_ERROR, SCHEMA_CRON_SCHEDULER,
     SCHEMA_CRYPTO_ERROR, SCHEMA_CSV_ERROR, SCHEMA_DB_CONN, SCHEMA_DB_ERROR, SCHEMA_DB_PARAM,
+    SCHEMA_DB_POOL,
     SCHEMA_EMPTY_TAG, SCHEMA_ENV_ERROR, SCHEMA_FS_ERROR, SCHEMA_FS_READER, SCHEMA_FS_WRITER,
     SCHEMA_HTTP_BINARY_RESPONSE, SCHEMA_HTTP_ERROR, SCHEMA_HTTP_REQUEST, SCHEMA_HTTP_RESPONSE,
     SCHEMA_HTTP_ROUTER, SCHEMA_INDEX_ERROR, SCHEMA_JSON_DECODE_ERROR, SCHEMA_JSON_ENCODE_ERROR,
@@ -104,6 +105,7 @@ pub(crate) fn type_tag_for_switch(ty: &Type, checked: &CheckedProgram) -> Result
                 ("cdt.http", "Router") => Ok(SCHEMA_HTTP_ROUTER),
                 ("cdt.db", "DbError") => Ok(SCHEMA_DB_ERROR),
                 ("cdt.db", "Connection") => Ok(SCHEMA_DB_CONN),
+                ("cdt.db", "Pool") => Ok(SCHEMA_DB_POOL),
                 ("cdt.db", "Param") => Ok(SCHEMA_DB_PARAM),
                 ("cdt.cron", "CronError") => Ok(SCHEMA_CRON_ERROR),
                 ("cdt.cron", "Scheduler") => Ok(SCHEMA_CRON_SCHEDULER),
@@ -2147,6 +2149,39 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 });
                 Ok(a)
             }
+            "pool" => {
+                let url_reg = self.lower_obj(&args[0])?;
+                let max_reg = self.alloc_temp_s();
+                if args.len() >= 2 {
+                    let r = self.lower_scalar(&args[1])?;
+                    self.ops.push(Op::MoveScalar { dst: max_reg, src: r });
+                } else {
+                    self.load_int_into(max_reg, 16)?;
+                }
+                let idle_reg = self.alloc_temp_s();
+                if args.len() >= 3 {
+                    let r = self.lower_scalar(&args[2])?;
+                    self.ops.push(Op::MoveScalar { dst: idle_reg, src: r });
+                } else {
+                    self.load_int_into(idle_reg, 300_000)?;
+                }
+                let desc_idx = self.mc.intern_record_desc(RecordDesc {
+                    schema_id: SCHEMA_DB_PARAM,
+                    scalar_regs: Box::new([max_reg, idle_reg]),
+                    obj_regs: Box::new([url_reg]),
+                })?;
+                let packed = self.alloc_temp_o();
+                self.ops.push(Op::NewRecord { dst_obj: packed, desc_idx });
+                let a = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_DB_OP,
+                    aux: DB_POOL_OPEN,
+                    a,
+                    b: packed,
+                    c: 0,
+                });
+                Ok(a)
+            }
             "null" => {
                 let a = self.alloc_temp_o();
                 self.ops.push(Op::ExtOp {
@@ -2289,6 +2324,74 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
         args: &[Expr],
     ) -> Result<u16, String> {
         use crate::vm::exec_db::*;
+        if type_name == "Query" {
+            return self.lower_db_query_method(target, method, args);
+        }
+        if type_name == "Pool" {
+            let pool_reg = self.lower_obj(target)?;
+            let dst_obj = self.alloc_temp_o();
+            return match method {
+                "acquire" => {
+                    self.ops.push(Op::ExtOp {
+                        kind: EXT_DB_OP,
+                        aux: DB_POOL_ACQUIRE,
+                        a: dst_obj,
+                        b: pool_reg,
+                        c: 0,
+                    });
+                    Ok(dst_obj)
+                }
+                "with" => {
+                    let cb_reg = self.lower_obj(&args[0])?;
+                    let ret_tag = match &args[0].ty {
+                        Type::Function { return_type, .. } => match return_type.as_ref() {
+                            Type::Float => 2i64,
+                            Type::Bool => 3i64,
+                            _ => 1i64,
+                        },
+                        _ => 1i64,
+                    };
+                    let tag_reg = self.alloc_temp_s();
+                    self.load_int_into(tag_reg, ret_tag)?;
+                    let desc_idx = self.mc.intern_record_desc(RecordDesc {
+                        schema_id: SCHEMA_DB_PARAM,
+                        scalar_regs: Box::new([tag_reg]),
+                        obj_regs: Box::new([cb_reg]),
+                    })?;
+                    let packed = self.alloc_temp_o();
+                    self.ops.push(Op::NewRecord { dst_obj: packed, desc_idx });
+                    self.ops.push(Op::ExtOp {
+                        kind: EXT_DB_OP,
+                        aux: DB_POOL_WITH,
+                        a: dst_obj,
+                        b: pool_reg,
+                        c: packed,
+                    });
+                    Ok(dst_obj)
+                }
+                "stats" => {
+                    self.ops.push(Op::ExtOp {
+                        kind: EXT_DB_OP,
+                        aux: DB_POOL_STATS,
+                        a: dst_obj,
+                        b: pool_reg,
+                        c: 0,
+                    });
+                    Ok(dst_obj)
+                }
+                "close" => {
+                    self.ops.push(Op::ExtOp {
+                        kind: EXT_DB_OP,
+                        aux: DB_POOL_CLOSE,
+                        a: dst_obj,
+                        b: pool_reg,
+                        c: 0,
+                    });
+                    Ok(dst_obj)
+                }
+                _ => Err(format!("Unsupported db.Pool method '{}'", method)),
+            };
+        }
         if type_name != "Connection" {
             return Err(format!("Unsupported db method '{}.{}()'", type_name, method));
         }
@@ -2378,11 +2481,12 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 });
                 Ok(dst_obj)
             }
-            "insert" | "update" | "find" | "delete" => {
+            "insert" | "insert_all" | "update" | "find" | "delete" => {
                 let model_idx = self.resolve_db_model_idx(&type_args[0])?;
                 let packed = self.pack_db_model_arg(model_idx, &args[0])?;
                 let aux = match method {
                     "insert" => DB_INSERT,
+                    "insert_all" => DB_INSERT_ALL,
                     "update" => DB_UPDATE,
                     "find" => DB_FIND,
                     _ => DB_DELETE,
@@ -2418,7 +2522,242 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 });
                 Ok(dst_obj)
             }
+            "from" => {
+                let model_idx = self.resolve_db_model_idx(&type_args[0])?;
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_DB_OP,
+                    aux: DB_QUERY_FROM,
+                    a: dst_obj,
+                    b: conn_reg,
+                    c: model_idx,
+                });
+                Ok(dst_obj)
+            }
             _ => Err(format!("Unsupported db.Connection method '{}'", method)),
+        }
+    }
+
+    fn lower_db_query_method(
+        &mut self,
+        target: &Expr,
+        method: &str,
+        args: &[Expr],
+    ) -> Result<u16, String> {
+        use crate::vm::exec_db::*;
+        let q_reg = self.lower_obj(target)?;
+        let is_terminal = matches!(
+            method,
+            "to_sql" | "all" | "first" | "count" | "exists" | "delete" | "rows"
+        );
+        let dst_obj = if !is_terminal && !matches!(target.kind, ExprKind::Ident(_)) {
+            q_reg
+        } else {
+            self.alloc_temp_o()
+        };
+        match method {
+            "select" => {
+                let cols_reg = self.lower_obj(&args[0])?;
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_DB_OP,
+                    aux: DB_QUERY_SELECT,
+                    a: dst_obj,
+                    b: q_reg,
+                    c: cols_reg,
+                });
+                Ok(dst_obj)
+            }
+            "where_eq" | "or_where_eq" | "where" | "or_where" => {
+                let is_or = i64::from(method.starts_with("or_"));
+                let is_or_reg = self.alloc_temp_s();
+                self.load_int_into(is_or_reg, is_or)?;
+                let col_reg = self.lower_obj(&args[0])?;
+                let (op_reg, val_reg) = if method.ends_with("_eq") {
+                    let eq_reg = self.alloc_temp_o();
+                    let s_idx = self.mc.intern_str("=")?;
+                    self.ops.push(Op::LoadConstObj { dst_obj: eq_reg, idx: s_idx });
+                    (eq_reg, self.lower_obj(&args[1])?)
+                } else {
+                    (self.lower_obj(&args[1])?, self.lower_obj(&args[2])?)
+                };
+                let desc_idx = self.mc.intern_record_desc(RecordDesc {
+                    schema_id: SCHEMA_DB_PARAM,
+                    scalar_regs: Box::new([is_or_reg]),
+                    obj_regs: Box::new([col_reg, op_reg, val_reg]),
+                })?;
+                let packed = self.alloc_temp_o();
+                self.ops.push(Op::NewRecord { dst_obj: packed, desc_idx });
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_DB_OP,
+                    aux: DB_QUERY_WHERE,
+                    a: dst_obj,
+                    b: q_reg,
+                    c: packed,
+                });
+                Ok(dst_obj)
+            }
+            "where_in" | "or_where_in" => {
+                let is_or = i64::from(method.starts_with("or_"));
+                let is_or_reg = self.alloc_temp_s();
+                self.load_int_into(is_or_reg, is_or)?;
+                let col_reg = self.lower_obj(&args[0])?;
+                let list_reg = self.lower_obj(&args[1])?;
+                let desc_idx = self.mc.intern_record_desc(RecordDesc {
+                    schema_id: SCHEMA_DB_PARAM,
+                    scalar_regs: Box::new([is_or_reg]),
+                    obj_regs: Box::new([col_reg, list_reg]),
+                })?;
+                let packed = self.alloc_temp_o();
+                self.ops.push(Op::NewRecord { dst_obj: packed, desc_idx });
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_DB_OP,
+                    aux: DB_QUERY_WHERE_IN,
+                    a: dst_obj,
+                    b: q_reg,
+                    c: packed,
+                });
+                Ok(dst_obj)
+            }
+            "where_null" | "where_not_null" | "or_where_null" | "or_where_not_null" => {
+                let is_or = i64::from(method.starts_with("or_"));
+                let is_not_null = i64::from(method.contains("_not_null"));
+                let r0 = self.alloc_temp_s();
+                let r1 = self.alloc_temp_s();
+                self.load_int_into(r0, is_or)?;
+                self.load_int_into(r1, is_not_null)?;
+                let col_reg = self.lower_obj(&args[0])?;
+                let desc_idx = self.mc.intern_record_desc(RecordDesc {
+                    schema_id: SCHEMA_DB_PARAM,
+                    scalar_regs: Box::new([r0, r1]),
+                    obj_regs: Box::new([col_reg]),
+                })?;
+                let packed = self.alloc_temp_o();
+                self.ops.push(Op::NewRecord { dst_obj: packed, desc_idx });
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_DB_OP,
+                    aux: DB_QUERY_WHERE_NULL,
+                    a: dst_obj,
+                    b: q_reg,
+                    c: packed,
+                });
+                Ok(dst_obj)
+            }
+            "order_by" => {
+                let col_reg = self.lower_obj(&args[0])?;
+                let dir_reg = if args.len() == 2 {
+                    self.lower_obj(&args[1])?
+                } else {
+                    let r = self.alloc_temp_o();
+                    let s_idx = self.mc.intern_str("asc")?;
+                    self.ops.push(Op::LoadConstObj { dst_obj: r, idx: s_idx });
+                    r
+                };
+                let desc_idx = self.mc.intern_record_desc(RecordDesc {
+                    schema_id: SCHEMA_DB_PARAM,
+                    scalar_regs: Box::new([]),
+                    obj_regs: Box::new([col_reg, dir_reg]),
+                })?;
+                let packed = self.alloc_temp_o();
+                self.ops.push(Op::NewRecord { dst_obj: packed, desc_idx });
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_DB_OP,
+                    aux: DB_QUERY_ORDER_BY,
+                    a: dst_obj,
+                    b: q_reg,
+                    c: packed,
+                });
+                Ok(dst_obj)
+            }
+            "limit" | "offset" | "paginate" => {
+                let kind = match method {
+                    "limit" => 0i64,
+                    "offset" => 1i64,
+                    _ => 2i64,
+                };
+                let k_reg = self.alloc_temp_s();
+                self.load_int_into(k_reg, kind)?;
+                let a1_reg = self.lower_scalar(&args[0])?;
+                let a2_reg = if method == "paginate" {
+                    self.lower_scalar(&args[1])?
+                } else {
+                    let r = self.alloc_temp_s();
+                    self.load_int_into(r, 0)?;
+                    r
+                };
+                let desc_idx = self.mc.intern_record_desc(RecordDesc {
+                    schema_id: SCHEMA_DB_PARAM,
+                    scalar_regs: Box::new([k_reg, a1_reg, a2_reg]),
+                    obj_regs: Box::new([]),
+                })?;
+                let packed = self.alloc_temp_o();
+                self.ops.push(Op::NewRecord { dst_obj: packed, desc_idx });
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_DB_OP,
+                    aux: DB_QUERY_LIMIT_OFFSET,
+                    a: dst_obj,
+                    b: q_reg,
+                    c: packed,
+                });
+                Ok(dst_obj)
+            }
+            "and_query" | "or_query" => {
+                let sub_reg = self.lower_obj(&args[0])?;
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_DB_OP,
+                    aux: if method == "and_query" {
+                        DB_QUERY_COMBINE_AND
+                    } else {
+                        DB_QUERY_COMBINE_OR
+                    },
+                    a: dst_obj,
+                    b: q_reg,
+                    c: sub_reg,
+                });
+                Ok(dst_obj)
+            }
+            "to_sql" => {
+                let mode: u16 = if args.is_empty() {
+                    0
+                } else if let ExprKind::String(s) = &args[0].kind {
+                    match s.as_str() {
+                        "all" => 0,
+                        "first" => 1,
+                        "count" => 2,
+                        "exists" => 3,
+                        "delete" => 4,
+                        "rows" => 5,
+                        _ => return Err(format!("Unsupported Query.to_sql() mode '{}'", s)),
+                    }
+                } else {
+                    0
+                };
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_DB_OP,
+                    aux: DB_QUERY_TO_SQL,
+                    a: dst_obj,
+                    b: q_reg,
+                    c: mode,
+                });
+                Ok(dst_obj)
+            }
+            "all" | "first" | "count" | "exists" | "delete" | "rows" => {
+                let mode: u16 = match method {
+                    "all" => 0,
+                    "first" => 1,
+                    "count" => 2,
+                    "exists" => 3,
+                    "delete" => 4,
+                    _ => 5,
+                };
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_DB_OP,
+                    aux: DB_QUERY_EXEC,
+                    a: dst_obj,
+                    b: q_reg,
+                    c: mode,
+                });
+                Ok(dst_obj)
+            }
+            _ => Err(format!("Unsupported db.Query method '{}'", method)),
         }
     }
 

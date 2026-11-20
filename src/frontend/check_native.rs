@@ -109,8 +109,8 @@ pub const NATIVE_MODULES: &[NativeModuleSpec] = &[
     },
     NativeModuleSpec {
         name: "cdt.db",
-        fns: &["connect", "int", "float", "bool", "text", "null", "ddl"],
-        types: &["Connection", "Param", "DbError"],
+        fns: &["connect", "pool", "int", "float", "bool", "text", "null", "ddl"],
+        types: &["Connection", "Pool", "Param", "DbError"],
     },
     NativeModuleSpec {
         name: "cdt.cron",

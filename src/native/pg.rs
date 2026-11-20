@@ -1,3 +1,4 @@
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Mutex;
@@ -24,6 +25,7 @@ pub struct PgConfig {
     pub application_name: String,
     pub connect_timeout: Duration,
     pub search_path: Option<String>,
+    pub prepare: bool,
 }
 
 fn decode_url_part(text: &str) -> Result<String, String> {
@@ -95,6 +97,7 @@ pub fn parse_pg_url(url: &str) -> Result<PgConfig, String> {
     let mut application_name = "conduit".to_string();
     let mut connect_timeout = Duration::from_secs(10);
     let mut search_path = None;
+    let mut prepare = true;
     for pair in query.split('&').filter(|p| !p.is_empty()) {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
         let value = decode_url_part(value)?;
@@ -127,9 +130,18 @@ pub fn parse_pg_url(url: &str) -> Result<PgConfig, String> {
                     })?;
                 connect_timeout = Duration::from_secs(seconds);
             }
+            "prepare" => match value.as_str() {
+                "off" | "false" | "0" => prepare = false,
+                "on" | "true" | "1" => prepare = true,
+                _ => {
+                    return Err(format!(
+                        "prepare={value}: expected 'on' or 'off'"
+                    ));
+                }
+            },
             other => {
                 return Err(format!(
-                    "Unknown PostgreSQL URL parameter '{}'; supported: sslmode, application_name, connect_timeout, search_path",
+                    "Unknown PostgreSQL URL parameter '{}'; supported: sslmode, application_name, connect_timeout, search_path, prepare",
                     other
                 ));
             }
@@ -145,6 +157,7 @@ pub fn parse_pg_url(url: &str) -> Result<PgConfig, String> {
         application_name,
         connect_timeout,
         search_path,
+        prepare,
     })
 }
 
@@ -404,29 +417,32 @@ impl ScramClient {
 }
 
 pub fn translate_placeholders(sql: &str) -> (String, usize) {
-    let chars: Vec<char> = sql.chars().collect();
+    let bytes = sql.as_bytes();
+    if !bytes
+        .iter()
+        .any(|&b| matches!(b, b'?' | b'\'' | b'"' | b'-' | b'/' | b'$'))
+    {
+        return (sql.to_string(), 0);
+    }
     let mut out = String::with_capacity(sql.len() + 8);
-    let mut count = 0;
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        match c {
-            '\'' => {
+    let mut count = 0usize;
+    let mut i = 0usize;
+    let mut copy_start = 0usize;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => {
                 let escape = i > 0
-                    && matches!(chars[i - 1], 'E' | 'e')
-                    && (i < 2 || !(chars[i - 2].is_alphanumeric() || chars[i - 2] == '_'));
-                out.push(c);
+                    && matches!(bytes[i - 1], b'E' | b'e')
+                    && (i < 2 || !(bytes[i - 2].is_ascii_alphanumeric() || bytes[i - 2] == b'_'));
                 i += 1;
-                while i < chars.len() {
-                    out.push(chars[i]);
-                    if escape && chars[i] == '\\' && i + 1 < chars.len() {
-                        out.push(chars[i + 1]);
+                while i < bytes.len() {
+                    if escape && bytes[i] == b'\\' && i + 1 < bytes.len() {
                         i += 2;
                         continue;
                     }
-                    if chars[i] == '\'' {
-                        if i + 1 < chars.len() && chars[i + 1] == '\'' {
-                            out.push('\'');
+                    if bytes[i] == b'\'' {
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
                             i += 2;
                             continue;
                         }
@@ -436,14 +452,11 @@ pub fn translate_placeholders(sql: &str) -> (String, usize) {
                     i += 1;
                 }
             }
-            '"' => {
-                out.push(c);
+            b'"' => {
                 i += 1;
-                while i < chars.len() {
-                    out.push(chars[i]);
-                    if chars[i] == '"' {
-                        if i + 1 < chars.len() && chars[i + 1] == '"' {
-                            out.push('"');
+                while i < bytes.len() {
+                    if bytes[i] == b'"' {
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
                             i += 2;
                             continue;
                         }
@@ -453,74 +466,75 @@ pub fn translate_placeholders(sql: &str) -> (String, usize) {
                     i += 1;
                 }
             }
-            '-' if chars.get(i + 1) == Some(&'-') => {
-                while i < chars.len() && chars[i] != '\n' {
-                    out.push(chars[i]);
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
                     i += 1;
                 }
             }
-            '/' if chars.get(i + 1) == Some(&'*') => {
-                let mut depth = 0;
-                while i < chars.len() {
-                    if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                let mut depth = 0usize;
+                while i < bytes.len() {
+                    if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
                         depth += 1;
-                        out.push_str("/*");
                         i += 2;
-                    } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                    } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
                         depth -= 1;
-                        out.push_str("*/");
                         i += 2;
                         if depth == 0 {
                             break;
                         }
                     } else {
-                        out.push(chars[i]);
                         i += 1;
                     }
                 }
             }
-            '$' => {
+            b'$' => {
                 let mut j = i + 1;
-                while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') {
-                    j += 1;
+                while j < bytes.len() {
+                    let b = bytes[j];
+                    if b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80 {
+                        j += 1;
+                    } else {
+                        break;
+                    }
                 }
-                let tag: String = chars[i..j.min(chars.len())].iter().collect();
-                let is_dollar_quote = chars.get(j) == Some(&'$')
-                    && !chars.get(i + 1).is_some_and(|d| d.is_ascii_digit());
+                let is_dollar_quote = bytes.get(j) == Some(&b'$')
+                    && !bytes.get(i + 1).is_some_and(|d| d.is_ascii_digit());
                 if is_dollar_quote {
-                    let delimiter = format!("{tag}$");
-                    out.push_str(&delimiter);
+                    let delimiter = &bytes[i..=j];
                     i = j + 1;
-                    let closing: Vec<char> = delimiter.chars().collect();
-                    while i < chars.len() {
-                        if chars[i..].starts_with(&closing) {
-                            out.push_str(&delimiter);
-                            i += closing.len();
+                    while i < bytes.len() {
+                        if bytes[i..].starts_with(delimiter) {
+                            i += delimiter.len();
                             break;
                         }
-                        out.push(chars[i]);
                         i += 1;
                     }
                 } else {
-                    out.push(c);
                     i += 1;
                 }
             }
-            '?' => {
-                if chars.get(i + 1) == Some(&'?') {
+            b'?' => {
+                out.push_str(&sql[copy_start..i]);
+                if bytes.get(i + 1) == Some(&b'?') {
                     out.push('?');
                     i += 2;
                 } else {
                     count += 1;
-                    out.push_str(&format!("${count}"));
+                    out.push('$');
+                    out.push_str(&count.to_string());
                     i += 1;
                 }
+                copy_start = i;
             }
             _ => {
-                out.push(c);
                 i += 1;
             }
         }
+    }
+    if copy_start < sql.len() {
+        out.push_str(&sql[copy_start..]);
     }
     (out, count)
 }
@@ -539,18 +553,22 @@ fn decode_cell(type_oid: u32, bytes: Option<&[u8]>) -> Cell {
     let Some(bytes) = bytes else {
         return Cell::Null;
     };
-    let text = String::from_utf8_lossy(bytes);
     match type_oid {
-        oid::BOOL => Cell::Bool(text == "t"),
-        oid::INT2 | oid::INT4 | oid::INT8 | oid::OID => text
-            .parse::<i64>()
+        oid::BOOL => Cell::Bool(bytes == b"t"),
+        oid::INT2 | oid::INT4 | oid::INT8 | oid::OID => std::str::from_utf8(bytes)
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
             .map(Cell::Int)
-            .unwrap_or_else(|_| Cell::Text(text.into_owned())),
-        oid::FLOAT4 | oid::FLOAT8 => text
-            .parse::<f64>()
+            .unwrap_or_else(|| Cell::Text(String::from_utf8_lossy(bytes).into_owned())),
+        oid::FLOAT4 | oid::FLOAT8 => std::str::from_utf8(bytes)
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
             .map(Cell::Float)
-            .unwrap_or_else(|_| Cell::Text(text.into_owned())),
-        _ => Cell::Text(text.into_owned()),
+            .unwrap_or_else(|| Cell::Text(String::from_utf8_lossy(bytes).into_owned())),
+        _ => Cell::Text(
+            String::from_utf8(bytes.to_vec())
+                .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()),
+        ),
     }
 }
 
@@ -587,8 +605,69 @@ fn affected_rows(tag: &str) -> u64 {
     }
 }
 
+const PG_STMT_CACHE_CAP: usize = 128;
+
+#[derive(Clone)]
+struct CachedPgStmt {
+    name: String,
+    placeholders: usize,
+    columns: Vec<(String, u32)>,
+}
+
+#[derive(Default)]
+struct PgStmtCache {
+    map: HashMap<String, CachedPgStmt>,
+    order: VecDeque<String>,
+    next_id: u64,
+}
+
+impl PgStmtCache {
+    fn alloc_name(&mut self) -> String {
+        self.next_id += 1;
+        format!("__cdt_s{}", self.next_id)
+    }
+
+    fn get(&mut self, sql: &str) -> Option<CachedPgStmt> {
+        let entry = self.map.get(sql).cloned()?;
+        if self.order.back().map(String::as_str) != Some(sql) {
+            if let Some(pos) = self.order.iter().position(|k| k == sql) {
+                self.order.remove(pos);
+            }
+            self.order.push_back(sql.to_string());
+        }
+        Some(entry)
+    }
+
+    fn insert(&mut self, sql: String, stmt: CachedPgStmt) -> Option<String> {
+        let mut evicted_name = None;
+        if let Some(prev) = self.map.insert(sql.clone(), stmt) {
+            if let Some(pos) = self.order.iter().position(|k| k == &sql) {
+                self.order.remove(pos);
+            }
+            evicted_name = Some(prev.name);
+        } else if self.order.len() >= PG_STMT_CACHE_CAP
+            && let Some(oldest) = self.order.pop_front()
+            && let Some(old_stmt) = self.map.remove(&oldest)
+        {
+            evicted_name = Some(old_stmt.name);
+        }
+        self.order.push_back(sql);
+        evicted_name
+    }
+
+    fn remove(&mut self, sql: &str) -> Option<String> {
+        if let Some(pos) = self.order.iter().position(|k| k == sql) {
+            self.order.remove(pos);
+        }
+        self.map.remove(sql).map(|s| s.name)
+    }
+}
+
 struct Conn {
     reader: BufReader<TcpStream>,
+    msg_buf: Vec<u8>,
+    last_active: std::time::Instant,
+    stmt_cache: PgStmtCache,
 }
 
 impl Conn {
@@ -600,19 +679,29 @@ impl Conn {
             .map_err(|e| format!("Failed to write to PostgreSQL: {e}"))
     }
 
-    fn read_message(&mut self) -> Result<(u8, Vec<u8>), String> {
+    fn read_message_into(&mut self) -> Result<u8, String> {
         let mut header = [0u8; 5];
         self.reader.read_exact(&mut header).map_err(io_error)?;
         let length = i32::from_be_bytes([header[1], header[2], header[3], header[4]]);
         if length < 4 || length as usize - 4 > MAX_MESSAGE {
             return Err(format!("Invalid PostgreSQL message length ({length})"));
         }
-        let mut body = vec![0u8; length as usize - 4];
-        self.reader.read_exact(&mut body).map_err(io_error)?;
-        Ok((header[0], body))
+        let body_len = length as usize - 4;
+        self.msg_buf.resize(body_len, 0);
+        self.reader.read_exact(&mut self.msg_buf).map_err(io_error)?;
+        self.last_active = std::time::Instant::now();
+        Ok(header[0])
+    }
+
+    fn read_message(&mut self) -> Result<(u8, Vec<u8>), String> {
+        let tag = self.read_message_into()?;
+        Ok((tag, self.msg_buf.clone()))
     }
 
     fn is_alive(&mut self) -> bool {
+        if self.last_active.elapsed() < Duration::from_secs(5) {
+            return self.reader.buffer().is_empty();
+        }
         let stream = self.reader.get_ref();
         if stream.set_nonblocking(true).is_err() {
             return false;
@@ -707,7 +796,7 @@ impl PgConn {
             .conn
             .as_mut()
             .ok_or_else(|| DbErr::new("closed", "PostgreSQL connection is closed", ""))?;
-        let outcome = run_statement(conn, sql, params, want_rows);
+        let outcome = run_statement(conn, self.config.prepare, sql, params, want_rows);
         if let Err(Failure::Broken(_)) = &outcome {
             state.conn = None;
         }
@@ -739,11 +828,11 @@ impl From<String> for Failure {
 
 fn run_statement(
     conn: &mut Conn,
+    prepare: bool,
     sql: &str,
     params: &[Cell],
     want_rows: bool,
 ) -> Result<Exchange, Failure> {
-    let mut request: Vec<u8> = Vec::new();
     if params.is_empty() && !want_rows {
         let (translated, placeholders) = translate_placeholders(sql);
         if placeholders > 0 {
@@ -754,20 +843,23 @@ fn run_statement(
         }
         let mut message = Out::message(b'Q');
         message.cstr(&translated);
-        request = message.finish(true);
-    } else {
-        let (translated, placeholders) = translate_placeholders(sql);
-        if placeholders != params.len() {
+        conn.send(&message.finish(true))?;
+        return read_response(conn, None).map(|(ex, _)| ex);
+    }
+
+    if params.len() > 65_535 {
+        return Err(Failure::Msg(
+            "PostgreSQL supports at most 65535 parameters".to_string(),
+        ));
+    }
+
+    if prepare && let Some(cached) = conn.stmt_cache.get(sql) {
+        if cached.placeholders != params.len() {
             return Err(Failure::Msg(format!(
                 "Query has {} '?' placeholder(s) but {} parameter(s) were given",
-                placeholders,
+                cached.placeholders,
                 params.len()
             )));
-        }
-        if params.len() > 65_535 {
-            return Err(Failure::Msg(
-                "PostgreSQL supports at most 65535 parameters".to_string(),
-            ));
         }
         let encoded: Vec<Option<Vec<u8>>> = params
             .iter()
@@ -775,12 +867,9 @@ fn run_statement(
             .collect::<Result<_, _>>()
             .map_err(Failure::Msg)?;
 
-        let mut parse = Out::message(b'P');
-        parse.cstr("").cstr(&translated).i16(0);
-        request.extend(parse.finish(true));
-
+        let mut request = Vec::with_capacity(128);
         let mut bind = Out::message(b'B');
-        bind.cstr("").cstr("").i16(0).i16(encoded.len() as i16);
+        bind.cstr("").cstr(&cached.name).i16(0).i16(encoded.len() as i16);
         for value in &encoded {
             match value {
                 None => {
@@ -794,30 +883,122 @@ fn run_statement(
         bind.i16(0);
         request.extend(bind.finish(true));
 
-        let mut describe = Out::message(b'D');
-        describe.byte(b'P').cstr("");
-        request.extend(describe.finish(true));
-
         let mut execute = Out::message(b'E');
         execute.cstr("").i32(0);
         request.extend(execute.finish(true));
         request.extend(Out::message(b'S').finish(true));
+
+        conn.send(&request)?;
+        return match read_response(conn, Some(&cached.columns)) {
+            Ok((ex, _)) => Ok(ex),
+            Err(Failure::Server(err)) if err.code == "26000" || err.code == "0A000" => {
+                conn.stmt_cache.remove(sql);
+                Err(Failure::Server(err))
+            }
+            Err(e) => Err(e),
+        };
     }
+
+    let (translated, placeholders) = translate_placeholders(sql);
+    if placeholders != params.len() {
+        return Err(Failure::Msg(format!(
+            "Query has {} '?' placeholder(s) but {} parameter(s) were given",
+            placeholders,
+            params.len()
+        )));
+    }
+    let encoded: Vec<Option<Vec<u8>>> = params
+        .iter()
+        .map(encode_param)
+        .collect::<Result<_, _>>()
+        .map_err(Failure::Msg)?;
+
+    let stmt_name = if prepare {
+        conn.stmt_cache.alloc_name()
+    } else {
+        String::new()
+    };
+
+    let mut request: Vec<u8> = Vec::with_capacity(128 + translated.len());
+    let mut parse = Out::message(b'P');
+    parse.cstr(&stmt_name).cstr(&translated).i16(0);
+    request.extend(parse.finish(true));
+
+    let mut bind = Out::message(b'B');
+    bind.cstr("").cstr(&stmt_name).i16(0).i16(encoded.len() as i16);
+    for value in &encoded {
+        match value {
+            None => {
+                bind.i32(-1);
+            }
+            Some(bytes) => {
+                bind.i32(bytes.len() as i32).raw(bytes);
+            }
+        }
+    }
+    bind.i16(0);
+    request.extend(bind.finish(true));
+
+    let mut describe = Out::message(b'D');
+    if prepare {
+        describe.byte(b'S').cstr(&stmt_name);
+    } else {
+        describe.byte(b'P').cstr("");
+    }
+    request.extend(describe.finish(true));
+
+    let mut execute = Out::message(b'E');
+    execute.cstr("").i32(0);
+    request.extend(execute.finish(true));
+    request.extend(Out::message(b'S').finish(true));
+
     conn.send(&request)?;
-    read_response(conn)
+    let (ex, cols) = read_response(conn, None)?;
+    if prepare
+        && let Some(evicted) = conn.stmt_cache.insert(
+            sql.to_string(),
+            CachedPgStmt {
+                name: stmt_name,
+                placeholders,
+                columns: cols,
+            },
+        )
+    {
+        let mut close = Out::message(b'C');
+        close.byte(b'S').cstr(&evicted);
+        let mut flush = close.finish(true);
+        flush.extend(Out::message(b'S').finish(true));
+        if conn.send(&flush).is_ok() {
+            let _ = read_response(conn, None);
+        }
+    }
+    Ok(ex)
 }
 
-fn read_response(conn: &mut Conn) -> Result<Exchange, Failure> {
-    let mut columns: Vec<(String, u32)> = Vec::new();
+fn read_response(
+    conn: &mut Conn,
+    preset_cols: Option<&[(String, u32)]>,
+) -> Result<(Exchange, Vec<(String, u32)>), Failure> {
+    let mut columns: Vec<(String, u32)> = preset_cols.map(|c| c.to_vec()).unwrap_or_default();
     let mut result = QueryResult::default();
+    if !columns.is_empty() {
+        result.columns = columns
+            .iter()
+            .map(|(name, type_oid)| Column {
+                name: name.clone(),
+                is_bool: *type_oid == oid::BOOL,
+            })
+            .collect();
+    }
     let mut affected = 0u64;
     let mut server_error: Option<PgError> = None;
 
     loop {
-        let (tag, body) = conn.read_message()?;
+        let tag = conn.read_message_into()?;
+        let body = &conn.msg_buf;
         match tag {
             b'T' => {
-                let mut reader = Reader::new(&body);
+                let mut reader = Reader::new(body);
                 let count = reader.i16()? as usize;
                 columns.clear();
                 for _ in 0..count {
@@ -836,7 +1017,7 @@ fn read_response(conn: &mut Conn) -> Result<Exchange, Failure> {
                     .collect();
             }
             b'D' => {
-                let mut reader = Reader::new(&body);
+                let mut reader = Reader::new(body);
                 let count = reader.i16()? as usize;
                 if count != columns.len() {
                     return Err(Failure::Broken(format!(
@@ -857,10 +1038,10 @@ fn read_response(conn: &mut Conn) -> Result<Exchange, Failure> {
                 result.rows.push(row);
             }
             b'C' => {
-                let tag_text = Reader::new(&body).cstr()?;
+                let tag_text = Reader::new(body).cstr()?;
                 affected += affected_rows(&tag_text);
             }
-            b'E' => server_error = Some(PgError::parse(&body)),
+            b'E' => server_error = Some(PgError::parse(body)),
             b'Z' => break,
             _ => {}
         }
@@ -868,7 +1049,7 @@ fn read_response(conn: &mut Conn) -> Result<Exchange, Failure> {
 
     match server_error {
         Some(error) => Err(Failure::Server(error)),
-        None => Ok(Exchange { result, affected }),
+        None => Ok((Exchange { result, affected }, columns)),
     }
 }
 
@@ -876,7 +1057,7 @@ fn run_simple(conn: &mut Conn, sql: &str) -> Result<(), String> {
     let mut message = Out::message(b'Q');
     message.cstr(sql);
     conn.send(&message.finish(true))?;
-    read_response(conn).map(|_| ()).map_err(|f| match f {
+    read_response(conn, None).map(|_| ()).map_err(|f| match f {
         Failure::Server(e) => e.text(),
         Failure::Msg(m) | Failure::Broken(m) => m,
     })
@@ -910,7 +1091,10 @@ fn open_connection(config: &PgConfig) -> Result<Conn, String> {
         .set_write_timeout(Some(IO_TIMEOUT))
         .map_err(|e| e.to_string())?;
     let mut conn = Conn {
-        reader: BufReader::new(stream),
+        reader: BufReader::with_capacity(64 * 1024, stream),
+        msg_buf: Vec::with_capacity(4096),
+        last_active: std::time::Instant::now(),
+        stmt_cache: PgStmtCache::default(),
     };
 
     let mut startup = Out::startup();

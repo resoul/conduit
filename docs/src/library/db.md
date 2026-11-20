@@ -34,12 +34,13 @@ func main() -> Void | db.DbError {
 
 | Backend | URL Format | Notes |
 | :--- | :--- | :--- |
-| PostgreSQL | `postgres://user:pass@host:5432/dbname` / `postgresql://...` | Native v3.0 wire protocol (SCRAM-SHA-256, MD5, cleartext); translates `?` to `$1, $2, ...` |
-| MySQL | `mysql://user:pass@host:3306/dbname` | Native Protocol v10 (`mysql_native_password`, `caching_sha2_password` fast auth); prepared statements |
+| PostgreSQL | `postgres://user:pass@host:5432/dbname` / `postgresql://...` | Native v3.0 wire protocol (SCRAM-SHA-256, LRU prepared statement cache with `?prepare=off` for PgBouncer); translates `?` to `$1, $2, ...` |
+| MySQL | `mysql://user:pass@host:3306/dbname` | Native Protocol v10 (`mysql_native_password`, `caching_sha2_password` fast auth); LRU prepared statement cache (`?prepare=off` to disable) |
 
 ## Types
 
 * `Connection` — Active database connection handle
+* `Pool` — Thread-safe database connection pool (`acquire`, `with`, `stats`, `close`)
 * `Param` — Typed SQL bind parameter (`db.null()`, `db.int(v)`, `db.float(v)`, `db.bool(v)`, `db.text(v)`)
 * `DbError { kind: String, message: String, code: String }` (`"connect_error"`, `"invalid_url"`, `"query_error"`, `"protocol"`, `"decode"`, `"tx"`, `"migration"`, `"closed"`)
 
@@ -48,6 +49,7 @@ func main() -> Void | db.DbError {
 | Function | Signature | Description |
 | :--- | :--- | :--- |
 | `connect` | `(url: String) -> Connection \| DbError` | Opens a PostgreSQL or MySQL connection |
+| `pool` | `(url: String, max_conns?: Int, idle_timeout_ms?: Int) -> Pool \| DbError` | Opens a thread-safe connection pool (defaults: `max_conns = 16`, `idle_timeout_ms = 300000`) |
 | `null` | `() -> Param` | SQL `NULL` parameter |
 | `int` | `(v: Int) -> Param` | 64-bit integer parameter |
 | `float` | `(v: Float) -> Param` | 64-bit float parameter |
@@ -72,12 +74,84 @@ func main() -> Void | db.DbError {
 | `create_table<T>` | `() -> Void \| DbError` | Creates table & indexes from `@db.*` struct model `T` |
 | `drop_table<T>` | `() -> Void \| DbError` | Executes `DROP TABLE IF EXISTS` for model `T` |
 | `insert<T>` | `(row: T) -> Int \| DbError` | Inserts struct `T` (omits `@db.auto` field if `0`) |
+| `insert_all<T>` | `(rows: [T]) -> Int \| DbError` | Batch-inserts multiple structs `T` in chunked multi-row `INSERT` statements |
 | `update<T>` | `(row: T) -> Int \| DbError` | Updates non-PK columns of `T` matching `@db.pk` (or `id`), returns affected count |
 | `count<T>` | `() -> Int \| DbError` | Returns total row count (`SELECT COUNT(*)`) for model `T`'s table |
 | `all<T>` | `() -> [T] \| DbError` | Selects all rows from model `T`'s table |
 | `find<T>` | `(id: Any) -> T? \| DbError` | Finds a row by `@db.pk` (or `id`) |
 | `find_by<T>` | `(column: String, value: Any) -> [T] \| DbError` | Queries rows where validated model column matches `value` |
 | `delete<T>` | `(id: Any) -> Int \| DbError` | Deletes a row by `@db.pk` (or `id`) |
+| `from<T>` | `() -> Query<T>` | Starts a fluent typed query builder for `@db.table` model `T` |
+
+## Connection Pool (`db.Pool`)
+
+For concurrent HTTP services and workers, use `db.pool()` to reuse persistent PostgreSQL or MySQL connections safely across threads:
+
+```conduit
+pool := db.pool("postgres://conduit:secret@127.0.0.1:5432/app", 16, 300000)?
+defer pool.close()
+
+// Automatic acquire + release via callback
+total := pool.with(conn => conn.count<User>())?
+
+// Or manual acquire + defer close (returns connection to pool)
+conn := pool.acquire()?
+defer conn.close()
+```
+
+| Method | Signature | Description |
+| :--- | :--- | :--- |
+| `acquire` | `() -> Connection \| DbError` | Acquires a connection (calling `conn.close()` returns it to the pool) |
+| `with` | `(cb: (Connection) -> R) -> R \| DbError` | Runs `cb(conn)` and always returns `conn` to the pool |
+| `stats` | `() -> Map<String, Int>` | Returns `{"idle": ..., "in_use": ..., "max": ...}` |
+| `close` | `() -> Void` | Closes all idle connections and marks the pool closed |
+
+## Fluent Query Builder (`conn.from<T>()`)
+
+For dynamic queries (e.g. conditional HTTP search filters), `conn.from<T>()` returns a chainable `Query<T>` that validates all column names against model `T` and binds all values as safe SQL parameters:
+
+```conduit
+func search_users(conn: db.Connection, role: String?, page: Int) -> [User] | db.DbError {
+    q := conn.from<User>()
+        .where_eq("active", true)
+        .where("age", ">=", 18)
+        .order_by("id", "desc")
+        .paginate(page, 20)
+
+    if role != nil {
+        q = q.where_eq("role", role)
+    }
+    return q.all()
+}
+```
+
+Available `Query<T>` methods:
+* **Projection:** `.select([cols])`
+* **Filters:** `.where_eq(col, val)`, `.or_where_eq(col, val)`, `.where(col, op, val)` (`=`, `!=`, `>`, `>=`, `<`, `<=`, `LIKE`, `ILIKE`), `.or_where(col, op, val)`, `.where_in(col, [vals])`, `.or_where_in(col, [vals])`, `.where_null(col)`, `.where_not_null(col)`, `.or_where_null(col)`, `.or_where_not_null(col)`, `.and_query(sub)`, `.or_query(sub)`
+* **Ordering & Pagination:** `.order_by(col, dir?)` (`"asc"` | `"desc"`), `.limit(n)`, `.offset(n)`, `.paginate(page, per_page)`
+* **Execution:** `.all() -> [T] | DbError`, `.first() -> T? | DbError`, `.count() -> Int | DbError`, `.exists() -> Bool | DbError`, `.delete() -> Int | DbError`, `.rows() -> [Map<String, Any>] | DbError`, `.to_sql(mode?) -> String`
+
+## Declarative `query` Blocks
+
+For static queries with full **compile-time** field and type verification, define top-level `query` blocks:
+
+```conduit
+query FindAdultUsers(conn: db.Connection, min_age: Int, max_rows: Int = 20) -> [User] {
+    from User
+    where active == true && (age >= min_age || role in ["admin", "owner"]) && bio != nil
+    order_by age desc, id asc
+    limit max_rows
+    offset 0
+}
+
+query CountActiveUsers(conn: db.Connection) -> Int {
+    from User
+    where active == true
+    count
+}
+```
+
+Supported clauses: `from <Model>`, `select <fields...>`, `where <pred>` (`==`, `!=`, `>`, `>=`, `<`, `<=`, `in`, `like`, `ilike`, `&&`, `||`, parentheses), `order_by <field> [asc|desc]`, `limit <expr>`, `offset <expr>`, and optional mode `all` (default), `first` (`T?`), `count` (`Int`), `exists` (`Bool`), or `delete` (`Int`). Call them like normal functions: `users := FindAdultUsers(conn, 18)?`.
 
 ## Table & Model Schemas (`@db.*`)
 

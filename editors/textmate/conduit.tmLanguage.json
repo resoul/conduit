@@ -283,6 +283,10 @@
         },
         {
           "name": "keyword.other.dsl.block.conduit",
+          "match": "(?<!\\.)\\b(query)\\b(?=\\s+[A-Za-z_][A-Za-z0-9_]*\\s*\\()"
+        },
+        {
+          "name": "keyword.other.dsl.block.conduit",
           "match": "(?<!\\.)\\b(migration)\\b(?=\\s+[0-9])"
         },
         {
@@ -298,6 +302,16 @@
         {
           "name": "keyword.other.dsl.clause.conduit",
           "match": "(?<!\\.)\\b(up|down)\\b(?=\\s*\\{)"
+        },
+        {
+          "match": "^\\s*(select|where|order_by|limit|offset|first|count|exists|delete)\\b",
+          "captures": {
+            "1": { "name": "keyword.other.dsl.clause.conduit" }
+          }
+        },
+        {
+          "name": "keyword.operator.word.conduit",
+          "match": "(?<!\\.)\\b(like|ilike|asc|desc)\\b"
         },
         {
           "match": "^\\s*(static|cors|every)\\b(?=\\s+\")",

@@ -4,13 +4,21 @@ use crate::ir::Module;
 use crate::native::db::{
     Cell, DbErr, Dialect, SqlConn, any_obj_to_cell, build_count_sql, build_create_table_sqls,
     build_delete_sql, build_drop_table_sql, build_find_by_sql, build_find_sql,
-    build_insert_and_cells, build_select_all_sql, build_update_and_cells, extract_count_cell,
+    build_insert_all_and_cells, build_insert_and_cells, build_select_all_sql,
+    build_update_and_cells, extract_count_cell,
     make_db_conn, make_db_error, make_db_param_bool, make_db_param_float, make_db_param_int,
     make_db_param_null, make_db_param_text, obj_to_cell, query_result_to_maps,
     query_result_to_structs,
 };
+use crate::native::db_pool::{DbPoolState, make_db_pool};
+use crate::native::db_query::{
+    DbQueryBuilder, OrderDir, QueryMode, WhereNode, WhereOp, cell_list_from_obj, make_db_query,
+};
 use crate::vm::exec_cold::err_msg;
-use crate::vm::value::{ListStorage, Obj, SCHEMA_DB_CONN, SCHEMA_DB_ERROR, SCHEMA_DB_PARAM};
+use crate::vm::value::{
+    ListStorage, MapKey, MapVal, Obj, OrderedMap, SCHEMA_DB_CONN, SCHEMA_DB_ERROR,
+    SCHEMA_DB_PARAM, SCHEMA_DB_POOL,
+};
 use crate::vm::{ExecResult, RuntimeError, Vm};
 
 pub const DB_CONNECT: u8 = 0;
@@ -40,16 +48,81 @@ pub const DB_UPDATE: u8 = 23;
 pub const DB_COUNT: u8 = 24;
 pub const DB_FIND_BY: u8 = 25;
 pub const DB_QUERY_ONE: u8 = 26;
+pub const DB_QUERY_FROM: u8 = 27;
+pub const DB_QUERY_SELECT: u8 = 28;
+pub const DB_QUERY_WHERE: u8 = 29;
+pub const DB_QUERY_WHERE_IN: u8 = 30;
+pub const DB_QUERY_WHERE_NULL: u8 = 31;
+pub const DB_QUERY_ORDER_BY: u8 = 32;
+pub const DB_QUERY_LIMIT_OFFSET: u8 = 33;
+pub const DB_QUERY_TO_SQL: u8 = 34;
+pub const DB_QUERY_EXEC: u8 = 35;
+pub const DB_QUERY_COMBINE_AND: u8 = 36;
+pub const DB_QUERY_COMBINE_OR: u8 = 37;
+pub const DB_POOL_OPEN: u8 = 38;
+pub const DB_POOL_ACQUIRE: u8 = 39;
+pub const DB_POOL_WITH: u8 = 40;
+pub const DB_POOL_STATS: u8 = 41;
+pub const DB_POOL_CLOSE: u8 = 42;
+pub const DB_INSERT_ALL: u8 = 43;
+
+fn query_mode_from_u16(v: u16) -> Result<QueryMode, RuntimeError> {
+    match v {
+        0 => Ok(QueryMode::All),
+        1 => Ok(QueryMode::First),
+        2 => Ok(QueryMode::Count),
+        3 => Ok(QueryMode::Exists),
+        4 => Ok(QueryMode::Delete),
+        5 => Ok(QueryMode::Rows),
+        _ => Err(err_msg("Invalid QueryMode")),
+    }
+}
 
 impl Vm {
-    fn extract_db_handle(&self, obj: &Obj) -> Result<usize, RuntimeError> {
+    fn extract_db_handle(&self, obj: &Obj) -> Result<u64, RuntimeError> {
         let Obj::Record(rec) = obj else {
             return Err(err_msg("Expected db.Connection"));
         };
         if rec.schema_id != SCHEMA_DB_CONN {
             return Err(err_msg("Expected db.Connection"));
         }
-        Ok(rec.get_scalar(0) as usize)
+        Ok(rec.get_scalar(0))
+    }
+
+    fn take_or_clone_db_query(
+        &mut self,
+        o_base: usize,
+        a: u16,
+        b: u16,
+    ) -> Result<std::sync::Arc<DbQueryBuilder>, RuntimeError> {
+        if a == b {
+            match std::mem::take(&mut self.objs[o_base + b as usize]) {
+                Obj::DbQuery(q) => Ok(q),
+                _ => Err(err_msg("Expected db.Query")),
+            }
+        } else {
+            match &self.objs[o_base + b as usize] {
+                Obj::DbQuery(q) => Ok(std::sync::Arc::clone(q)),
+                _ => Err(err_msg("Expected db.Query")),
+            }
+        }
+    }
+
+    fn extract_db_query_ref<'a>(&self, obj: &'a Obj) -> Result<&'a DbQueryBuilder, RuntimeError> {
+        let Obj::DbQuery(q) = obj else {
+            return Err(err_msg("Expected db.Query"));
+        };
+        Ok(q.as_ref())
+    }
+
+    fn extract_db_pool_handle(&self, obj: &Obj) -> Result<u64, RuntimeError> {
+        let Obj::Record(rec) = obj else {
+            return Err(err_msg("Expected db.Pool"));
+        };
+        if rec.schema_id != SCHEMA_DB_POOL {
+            return Err(err_msg("Expected db.Pool"));
+        }
+        Ok(rec.get_scalar(0))
     }
 
     fn extract_sql_and_params(
@@ -133,8 +206,7 @@ impl Vm {
                 let url = self.sys_str(o_base, b, "db.connect()")?;
                 let res = match SqlConn::open(&url) {
                     Ok(conn) => {
-                        let id = self.host.db_conns.len();
-                        self.host.db_conns.push(Some(conn));
+                        let id = self.host.insert_db_conn(conn, None);
                         make_db_conn(id as i64)
                     }
                     Err(e) => e.into_obj(),
@@ -165,7 +237,7 @@ impl Vm {
             }
             DB_DIALECT => {
                 let id = self.extract_db_handle(&self.objs[o_base + b as usize])?;
-                let name = match self.host.db_conns.get(id).and_then(|s| s.as_ref()) {
+                let name = match self.host.get_db_conn(id) {
                     Some(c) => c.dialect().name(),
                     None => "closed",
                 };
@@ -175,26 +247,26 @@ impl Vm {
                 let id = self.extract_db_handle(&self.objs[o_base + b as usize])?;
                 let last_id = self
                     .host
-                    .db_conns
-                    .get(id)
-                    .and_then(|s| s.as_ref())
+                    .get_db_conn(id)
                     .map(|c| c.last_insert_id())
                     .unwrap_or(0);
                 self.scalars[s_base + a as usize] = last_id as u64;
             }
             DB_CLOSE => {
                 let id = self.extract_db_handle(&self.objs[o_base + b as usize])?;
-                if let Some(slot) = self.host.db_conns.get_mut(id)
-                    && let Some(conn) = slot.take()
-                {
-                    conn.close();
+                if let Some((conn, owner)) = self.host.take_db_conn(id) {
+                    if let Some(pool) = owner {
+                        pool.release(conn);
+                    } else {
+                        conn.close();
+                    }
                 }
                 self.objs[o_base + a as usize] = Obj::Empty;
             }
             DB_EXEC => {
                 let id = self.extract_db_handle(&self.objs[o_base + b as usize])?;
                 let (sql, params, _) = self.extract_sql_and_params(&self.objs[o_base + c as usize])?;
-                let res = match self.host.db_conns.get(id).and_then(|s| s.as_ref()) {
+                let res = match self.host.get_db_conn(id) {
                     Some(conn) => match conn.execute(&sql, &params) {
                         Ok(n) => Obj::boxed_int(n as i64),
                         Err(e) => e.into_obj(),
@@ -206,9 +278,9 @@ impl Vm {
             DB_QUERY_ROWS => {
                 let id = self.extract_db_handle(&self.objs[o_base + b as usize])?;
                 let (sql, params, _) = self.extract_sql_and_params(&self.objs[o_base + c as usize])?;
-                let res = match self.host.db_conns.get(id).and_then(|s| s.as_ref()) {
+                let res = match self.host.get_db_conn(id) {
                     Some(conn) => match conn.query(&sql, &params) {
-                        Ok(qr) => query_result_to_maps(&qr),
+                        Ok(qr) => query_result_to_maps(qr),
                         Err(e) => e.into_obj(),
                     },
                     None => make_db_error("closed", "Database connection is closed", ""),
@@ -222,13 +294,13 @@ impl Vm {
                 let schema = schema_idx
                     .and_then(|idx| module.struct_schemas.get(idx))
                     .ok_or_else(|| err_msg("Missing struct schema in db.query<T>()"))?;
-                let res = match self.host.db_conns.get(id).and_then(|s| s.as_ref()) {
+                let res = match self.host.get_db_conn(id) {
                     Some(conn) => match conn.query(&sql, &params) {
                         Ok(qr) => {
                             if aux == DB_QUERY_ONE && qr.rows.is_empty() {
                                 Obj::Empty
                             } else {
-                                match query_result_to_structs(&qr, schema) {
+                                match query_result_to_structs(qr, schema) {
                                     Ok(Obj::List(ListStorage::Obj(items))) if aux == DB_QUERY_ONE => {
                                         items.first().cloned().unwrap_or(Obj::Empty)
                                     }
@@ -245,7 +317,7 @@ impl Vm {
             }
             DB_BEGIN | DB_COMMIT | DB_ROLLBACK => {
                 let id = self.extract_db_handle(&self.objs[o_base + b as usize])?;
-                let res = match self.host.db_conns.get(id).and_then(|s| s.as_ref()) {
+                let res = match self.host.get_db_conn(id) {
                     Some(conn) => {
                         let r = match aux {
                             DB_BEGIN => conn.begin(),
@@ -263,7 +335,7 @@ impl Vm {
             }
             DB_MIGRATE => {
                 let id = self.extract_db_handle(&self.objs[o_base + b as usize])?;
-                let res = match run_db_migrations_at(self, module, id, s_top, o_top, false) {
+                let res = match run_db_migrations_at(self, module, id as usize, s_top, o_top, false) {
                     Ok(applied) => Obj::boxed_int(applied.len() as i64),
                     Err(EitherMigErr::Db(e)) => e.into_obj(),
                     Err(EitherMigErr::Vm(e)) => return Err(e),
@@ -295,7 +367,7 @@ impl Vm {
                     .iter()
                     .find(|s| s.schema_id == model.schema_id)
                     .ok_or_else(|| err_msg("Missing struct schema for db model op"))?;
-                let res = match self.host.db_conns.get(id).and_then(|s| s.as_ref()) {
+                let res = match self.host.get_db_conn(id) {
                     Some(conn) => match aux {
                         DB_CREATE_TABLE => {
                             let sqls = build_create_table_sqls(model, schema, conn.dialect());
@@ -320,7 +392,7 @@ impl Vm {
                             Err(e) => e.into_obj(),
                         },
                         _ => match conn.query(&build_select_all_sql(model), &[]) {
-                            Ok(qr) => match query_result_to_structs(&qr, schema) {
+                            Ok(qr) => match query_result_to_structs(qr, schema) {
                                 Ok(list) => list,
                                 Err(msg) => make_db_error("decode_error", &msg, ""),
                             },
@@ -331,7 +403,7 @@ impl Vm {
                 };
                 self.objs[o_base + a as usize] = res;
             }
-            DB_INSERT | DB_UPDATE | DB_FIND | DB_DELETE => {
+            DB_INSERT | DB_INSERT_ALL | DB_UPDATE | DB_FIND | DB_DELETE => {
                 let id = self.extract_db_handle(&self.objs[o_base + b as usize])?;
                 let Obj::Record(packed) = &self.objs[o_base + c as usize] else {
                     return Err(err_msg("Expected packed model arg"));
@@ -344,7 +416,7 @@ impl Vm {
                     .iter()
                     .find(|s| s.schema_id == model.schema_id)
                     .ok_or_else(|| err_msg("Missing struct schema for db model op"))?;
-                let res = match self.host.db_conns.get(id).and_then(|s| s.as_ref()) {
+                let res = match self.host.get_db_conn(id) {
                     Some(conn) => match aux {
                         DB_INSERT => {
                             let Obj::Record(row_rec) = &arg_obj else {
@@ -358,6 +430,35 @@ impl Vm {
                                     }
                                     Err(e) => e.into_obj(),
                                 },
+                                Err(msg) => make_db_error("query_error", &msg, ""),
+                            }
+                        }
+                        DB_INSERT_ALL => {
+                            let Obj::List(ListStorage::Obj(items)) = &arg_obj else {
+                                return Err(err_msg("Expected [T] in db.insert_all()"));
+                            };
+                            let mut recs = Vec::with_capacity(items.len());
+                            for item in items.iter() {
+                                let Obj::Record(rec) = item else {
+                                    return Err(err_msg("Expected struct records in db.insert_all()"));
+                                };
+                                recs.push(rec.as_ref());
+                            }
+                            match build_insert_all_and_cells(model, schema, &recs) {
+                                Ok(batches) => {
+                                    let mut total = 0i64;
+                                    let mut err_obj = None;
+                                    for (sql, cells) in batches {
+                                        match conn.execute(&sql, &cells) {
+                                            Ok(n) => total += n as i64,
+                                            Err(e) => {
+                                                err_obj = Some(e.into_obj());
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    err_obj.unwrap_or_else(|| Obj::boxed_int(total))
+                                }
                                 Err(msg) => make_db_error("query_error", &msg, ""),
                             }
                         }
@@ -379,7 +480,7 @@ impl Vm {
                                     if qr.rows.is_empty() {
                                         Obj::Empty
                                     } else {
-                                        match query_result_to_structs(&qr, schema) {
+                                        match query_result_to_structs(qr, schema) {
                                             Ok(Obj::List(ListStorage::Obj(items))) => {
                                                 items.first().cloned().unwrap_or(Obj::Empty)
                                             }
@@ -421,10 +522,10 @@ impl Vm {
                     .iter()
                     .find(|s| s.schema_id == model.schema_id)
                     .ok_or_else(|| err_msg("Missing struct schema for db.find_by()"))?;
-                let res = match self.host.db_conns.get(id).and_then(|s| s.as_ref()) {
+                let res = match self.host.get_db_conn(id) {
                     Some(conn) => match (build_find_by_sql(model, col_name), any_obj_to_cell(val_obj)) {
                         (Ok(sql), Ok(cell)) => match conn.query(&sql, &[cell]) {
-                            Ok(qr) => match query_result_to_structs(&qr, schema) {
+                            Ok(qr) => match query_result_to_structs(qr, schema) {
                                 Ok(list) => list,
                                 Err(msg) => make_db_error("decode_error", &msg, ""),
                             },
@@ -435,6 +536,393 @@ impl Vm {
                     None => make_db_error("closed", "Database connection is closed", ""),
                 };
                 self.objs[o_base + a as usize] = res;
+            }
+            DB_QUERY_FROM => {
+                let conn_handle = self.extract_db_handle(&self.objs[o_base + b as usize])?;
+                let model_idx = c as usize;
+                self.objs[o_base + a as usize] =
+                    make_db_query(DbQueryBuilder::new(conn_handle, model_idx));
+            }
+            DB_QUERY_SELECT => {
+                let cols = match &self.objs[o_base + c as usize] {
+                    Obj::List(ListStorage::Obj(items)) => items
+                        .iter()
+                        .map(|o| match o {
+                            Obj::Str(s) => Ok(s.as_str().to_string()),
+                            _ => Err("Query.select() expects [String]".to_string()),
+                        })
+                        .collect::<Result<Vec<_>, _>>(),
+                    _ => Err("Query.select() expects [String]".to_string()),
+                };
+                let mut q_arc = self.take_or_clone_db_query(o_base, a, b)?;
+                let builder = std::sync::Arc::make_mut(&mut q_arc);
+                if builder.error.is_none() {
+                    match cols {
+                        Ok(list) => builder.select_cols = list,
+                        Err(e) => builder.error = Some(e),
+                    }
+                }
+                self.objs[o_base + a as usize] = Obj::DbQuery(q_arc);
+            }
+            DB_QUERY_WHERE => {
+                let Obj::Record(packed) = self.objs[o_base + c as usize].clone() else {
+                    return Err(err_msg("Expected packed Query.where args"));
+                };
+                let is_or = packed.get_scalar(0) != 0;
+                let col_name = match packed.get_obj(0) {
+                    Obj::Str(s) => s.as_str().to_string(),
+                    _ => return Err(err_msg("Expected String column name in Query.where()")),
+                };
+                let op_str = match packed.get_obj(1) {
+                    Obj::Str(s) => s.as_str(),
+                    _ => return Err(err_msg("Expected String operator in Query.where()")),
+                };
+                let val_obj = packed.get_obj(2);
+                let parsed = (WhereOp::parse_str(op_str), any_obj_to_cell(val_obj));
+                let mut q_arc = self.take_or_clone_db_query(o_base, a, b)?;
+                let builder = std::sync::Arc::make_mut(&mut q_arc);
+                if builder.error.is_none() {
+                    match parsed {
+                        (Ok(WhereOp::Eq), Ok(Cell::Null)) => {
+                            builder.push_where(
+                                is_or,
+                                WhereNode::Cond {
+                                    col_name,
+                                    op: WhereOp::IsNull,
+                                    param_count: 0,
+                                },
+                            );
+                        }
+                        (Ok(WhereOp::Ne), Ok(Cell::Null)) => {
+                            builder.push_where(
+                                is_or,
+                                WhereNode::Cond {
+                                    col_name,
+                                    op: WhereOp::IsNotNull,
+                                    param_count: 0,
+                                },
+                            );
+                        }
+                        (Ok(op), Ok(cell)) => {
+                            builder.params.push(cell);
+                            builder.push_where(
+                                is_or,
+                                WhereNode::Cond {
+                                    col_name,
+                                    op,
+                                    param_count: 1,
+                                },
+                            );
+                        }
+                        (Err(e), _) | (_, Err(e)) => builder.error = Some(e),
+                    }
+                }
+                self.objs[o_base + a as usize] = Obj::DbQuery(q_arc);
+            }
+            DB_QUERY_WHERE_IN => {
+                let Obj::Record(packed) = self.objs[o_base + c as usize].clone() else {
+                    return Err(err_msg("Expected packed Query.where_in args"));
+                };
+                let is_or = packed.get_scalar(0) != 0;
+                let col_name = match packed.get_obj(0) {
+                    Obj::Str(s) => s.as_str().to_string(),
+                    _ => return Err(err_msg("Expected String column name in Query.where_in()")),
+                };
+                let cells_res = cell_list_from_obj(packed.get_obj(1));
+                let mut q_arc = self.take_or_clone_db_query(o_base, a, b)?;
+                let builder = std::sync::Arc::make_mut(&mut q_arc);
+                if builder.error.is_none() {
+                    match cells_res {
+                        Ok(cells) => {
+                            let param_count = cells.len();
+                            builder.params.extend(cells);
+                            builder.push_where(
+                                is_or,
+                                WhereNode::Cond {
+                                    col_name,
+                                    op: WhereOp::In,
+                                    param_count,
+                                },
+                            );
+                        }
+                        Err(e) => builder.error = Some(e),
+                    }
+                }
+                self.objs[o_base + a as usize] = Obj::DbQuery(q_arc);
+            }
+            DB_QUERY_WHERE_NULL => {
+                let Obj::Record(packed) = self.objs[o_base + c as usize].clone() else {
+                    return Err(err_msg("Expected packed Query.where_null args"));
+                };
+                let is_or = packed.get_scalar(0) != 0;
+                let is_not_null = packed.get_scalar(1) != 0;
+                let col_name = match packed.get_obj(0) {
+                    Obj::Str(s) => s.as_str().to_string(),
+                    _ => return Err(err_msg("Expected String column name in Query.where_null()")),
+                };
+                let mut q_arc = self.take_or_clone_db_query(o_base, a, b)?;
+                let builder = std::sync::Arc::make_mut(&mut q_arc);
+                if builder.error.is_none() {
+                    builder.push_where(
+                        is_or,
+                        WhereNode::Cond {
+                            col_name,
+                            op: if is_not_null {
+                                WhereOp::IsNotNull
+                            } else {
+                                WhereOp::IsNull
+                            },
+                            param_count: 0,
+                        },
+                    );
+                }
+                self.objs[o_base + a as usize] = Obj::DbQuery(q_arc);
+            }
+            DB_QUERY_ORDER_BY => {
+                let Obj::Record(packed) = self.objs[o_base + c as usize].clone() else {
+                    return Err(err_msg("Expected packed Query.order_by args"));
+                };
+                let col_name = match packed.get_obj(0) {
+                    Obj::Str(s) => s.as_str().to_string(),
+                    _ => return Err(err_msg("Expected String column name in Query.order_by()")),
+                };
+                let dir_str = match packed.get_obj(1) {
+                    Obj::Str(s) => s.as_str(),
+                    _ => return Err(err_msg("Expected String direction in Query.order_by()")),
+                };
+                let dir_res = OrderDir::parse_str(dir_str);
+                let mut q_arc = self.take_or_clone_db_query(o_base, a, b)?;
+                let builder = std::sync::Arc::make_mut(&mut q_arc);
+                if builder.error.is_none() {
+                    match dir_res {
+                        Ok(dir) => builder.order_by.push((col_name, dir)),
+                        Err(e) => builder.error = Some(e),
+                    }
+                }
+                self.objs[o_base + a as usize] = Obj::DbQuery(q_arc);
+            }
+            DB_QUERY_LIMIT_OFFSET => {
+                let Obj::Record(packed) = self.objs[o_base + c as usize].clone() else {
+                    return Err(err_msg("Expected packed Query limit/offset args"));
+                };
+                let kind = packed.get_scalar(0);
+                let arg1 = packed.get_scalar(1) as i64;
+                let arg2 = packed.get_scalar(2) as i64;
+                let mut q_arc = self.take_or_clone_db_query(o_base, a, b)?;
+                let builder = std::sync::Arc::make_mut(&mut q_arc);
+                if builder.error.is_none() {
+                    match kind {
+                        0 => {
+                            if arg1 < 0 {
+                                builder.error = Some(format!("Query.limit() must be non-negative, got {}", arg1));
+                            } else {
+                                builder.limit = Some(arg1);
+                            }
+                        }
+                        1 => {
+                            if arg1 < 0 {
+                                builder.error = Some(format!("Query.offset() must be non-negative, got {}", arg1));
+                            } else {
+                                builder.offset = Some(arg1);
+                            }
+                        }
+                        _ => {
+                            if arg1 < 1 || arg2 < 1 {
+                                builder.error = Some(format!(
+                                    "Query.paginate(page, per_page) requires positive integers, got ({}, {})",
+                                    arg1, arg2
+                                ));
+                            } else {
+                                builder.limit = Some(arg2);
+                                builder.offset = Some((arg1 - 1).saturating_mul(arg2));
+                            }
+                        }
+                    }
+                }
+                self.objs[o_base + a as usize] = Obj::DbQuery(q_arc);
+            }
+            DB_QUERY_TO_SQL => {
+                let mode = query_mode_from_u16(c)?;
+                let builder = self.extract_db_query_ref(&self.objs[o_base + b as usize])?;
+                let model = &module.db_models[builder.model_idx];
+                let dialect = self
+                    .host
+                    .get_db_conn(builder.conn_handle)
+                    .map(|conn| match conn.dialect() {
+                        Dialect::Postgres => "postgres",
+                        Dialect::Mysql => "mysql",
+                    })
+                    .unwrap_or("postgres");
+                let sql = builder.build_sql(model, mode, dialect).map_err(|e| err_msg(&e))?;
+                self.objs[o_base + a as usize] = Obj::str(sql);
+            }
+            DB_QUERY_EXEC => {
+                let mode = query_mode_from_u16(c)?;
+                let builder = self.extract_db_query_ref(&self.objs[o_base + b as usize])?;
+                let model = &module.db_models[builder.model_idx];
+                let schema = module
+                    .struct_schemas
+                    .iter()
+                    .find(|s| s.schema_id == model.schema_id)
+                    .ok_or_else(|| err_msg("Missing struct schema for db.Query"))?;
+                let res = match self.host.get_db_conn(builder.conn_handle) {
+                    Some(conn) => {
+                        let dialect = match conn.dialect() {
+                            Dialect::Postgres => "postgres",
+                            Dialect::Mysql => "mysql",
+                        };
+                        match builder.build_sql(model, mode, dialect) {
+                            Ok(sql) => match mode {
+                                QueryMode::Delete => match conn.execute(&sql, &builder.params) {
+                                    Ok(n) => Obj::boxed_int(n as i64),
+                                    Err(e) => e.into_obj(),
+                                },
+                                QueryMode::Count => match conn.query(&sql, &builder.params) {
+                                    Ok(qr) => match extract_count_cell(&qr) {
+                                        Ok(n) => Obj::boxed_int(n),
+                                        Err(msg) => make_db_error("decode_error", &msg, ""),
+                                    },
+                                    Err(e) => e.into_obj(),
+                                },
+                                QueryMode::Exists => match conn.query(&sql, &builder.params) {
+                                    Ok(qr) => Obj::boxed_bool(!qr.rows.is_empty()),
+                                    Err(e) => e.into_obj(),
+                                },
+                                QueryMode::First => match conn.query(&sql, &builder.params) {
+                                    Ok(qr) => {
+                                        if qr.rows.is_empty() {
+                                            Obj::Empty
+                                        } else {
+                                            match query_result_to_structs(qr, schema) {
+                                                Ok(Obj::List(ListStorage::Obj(items))) => {
+                                                    items.first().cloned().unwrap_or(Obj::Empty)
+                                                }
+                                                Ok(_) => Obj::Empty,
+                                                Err(msg) => make_db_error("decode_error", &msg, ""),
+                                            }
+                                        }
+                                    }
+                                    Err(e) => e.into_obj(),
+                                },
+                                QueryMode::All => match conn.query(&sql, &builder.params) {
+                                    Ok(qr) => match query_result_to_structs(qr, schema) {
+                                        Ok(list) => list,
+                                        Err(msg) => make_db_error("decode_error", &msg, ""),
+                                    },
+                                    Err(e) => e.into_obj(),
+                                },
+                                QueryMode::Rows => match conn.query(&sql, &builder.params) {
+                                    Ok(qr) => query_result_to_maps(qr),
+                                    Err(e) => e.into_obj(),
+                                },
+                            },
+                            Err(msg) => make_db_error("query_error", &msg, ""),
+                        }
+                    }
+                    None => make_db_error("closed", "Database connection is closed", ""),
+                };
+                self.objs[o_base + a as usize] = res;
+            }
+            DB_QUERY_COMBINE_AND | DB_QUERY_COMBINE_OR => {
+                let sub = self.extract_db_query_ref(&self.objs[o_base + c as usize])?.clone();
+                let mut q_arc = self.take_or_clone_db_query(o_base, a, b)?;
+                let builder = std::sync::Arc::make_mut(&mut q_arc);
+                if builder.error.is_none() {
+                    if let Some(err) = sub.error {
+                        builder.error = Some(err);
+                    } else if let Some(sub_where) = sub.where_root {
+                        let is_or = aux == DB_QUERY_COMBINE_OR;
+                        builder.push_where(is_or, sub_where);
+                        builder.params.extend(sub.params);
+                    }
+                }
+                self.objs[o_base + a as usize] = Obj::DbQuery(q_arc);
+            }
+            DB_POOL_OPEN => {
+                let Obj::Record(packed) = &self.objs[o_base + b as usize] else {
+                    return Err(err_msg("Expected packed db.pool() args"));
+                };
+                let url = match packed.get_obj(0) {
+                    Obj::Str(s) => s.as_str().to_string(),
+                    _ => return Err(err_msg("Expected String url in db.pool()")),
+                };
+                let max_conns = packed.get_scalar(0) as i64;
+                let idle_timeout_ms = packed.get_scalar(1) as i64;
+                let res = match DbPoolState::open(&url, max_conns, idle_timeout_ms) {
+                    Ok(pool) => {
+                        let pid = self.host.insert_db_pool(pool);
+                        make_db_pool(pid)
+                    }
+                    Err(e) => e.into_obj(),
+                };
+                self.objs[o_base + a as usize] = res;
+            }
+            DB_POOL_ACQUIRE => {
+                let pid = self.extract_db_pool_handle(&self.objs[o_base + b as usize])?;
+                let pool_opt = self.host.get_db_pool(pid);
+                let res = match pool_opt {
+                    Some(pool) => match pool.acquire() {
+                        Ok(conn) => {
+                            let cid = self.host.insert_db_conn(conn, Some(pool));
+                            make_db_conn(cid as i64)
+                        }
+                        Err(e) => e.into_obj(),
+                    },
+                    None => make_db_error("closed", "Database pool is closed", ""),
+                };
+                self.objs[o_base + a as usize] = res;
+            }
+            DB_POOL_WITH => {
+                let pid = self.extract_db_pool_handle(&self.objs[o_base + b as usize])?;
+                let Obj::Record(packed) = &self.objs[o_base + c as usize] else {
+                    return Err(err_msg("Expected packed db.Pool.with() args"));
+                };
+                let ret_tag = packed.get_scalar(0) as u8;
+                let cb = packed.get_obj(0).clone();
+                let pool_opt = self.host.get_db_pool(pid);
+                let res = match pool_opt {
+                    Some(pool) => match pool.acquire() {
+                        Ok(conn) => {
+                            let cid = self
+                                .host
+                                .insert_db_conn(conn, Some(std::sync::Arc::clone(&pool)));
+                            let conn_obj = make_db_conn(cid as i64);
+                            let cb_res = self.invoke_one_obj_arg_cb(
+                                module, s_top, o_top, &cb, conn_obj, ret_tag,
+                            );
+                            if let Some((c, owner)) = self.host.take_db_conn(cid) {
+                                if let Some(owner) = owner {
+                                    owner.release(c);
+                                } else {
+                                    pool.release(c);
+                                }
+                            }
+                            cb_res?
+                        }
+                        Err(e) => e.into_obj(),
+                    },
+                    None => make_db_error("closed", "Database pool is closed", ""),
+                };
+                self.objs[o_base + a as usize] = res;
+            }
+            DB_POOL_STATS => {
+                let pid = self.extract_db_pool_handle(&self.objs[o_base + b as usize])?;
+                let (idle, in_use, max) = match self.host.get_db_pool(pid) {
+                    Some(pool) => pool.stats(),
+                    None => (0, 0, 0),
+                };
+                let mut m = OrderedMap::with_capacity(3);
+                m.set(MapKey::Str(std::sync::Arc::new("idle".into())), MapVal::Scalar(idle as u64));
+                m.set(MapKey::Str(std::sync::Arc::new("in_use".into())), MapVal::Scalar(in_use as u64));
+                m.set(MapKey::Str(std::sync::Arc::new("max".into())), MapVal::Scalar(max as u64));
+                self.objs[o_base + a as usize] = Obj::Map(std::sync::Arc::new(m));
+            }
+            DB_POOL_CLOSE => {
+                let pid = self.extract_db_pool_handle(&self.objs[o_base + b as usize])?;
+                if let Some(pool) = self.host.take_db_pool(pid) {
+                    pool.close();
+                }
+                self.objs[o_base + a as usize] = Obj::Empty;
             }
             _ => return Err(err_msg("Unknown db sub-op")),
         }
@@ -532,9 +1020,8 @@ fn now_millis() -> i64 {
 }
 
 fn db_conn_ref(vm: &Vm, cid: usize) -> Result<&SqlConn, DbErr> {
-    vm.host.db_conns
-        .get(cid)
-        .and_then(|s| s.as_ref())
+    vm.host
+        .get_db_conn(cid as u64)
         .ok_or_else(|| DbErr::new("closed", "Database connection is closed", ""))
 }
 

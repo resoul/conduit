@@ -704,6 +704,12 @@ impl<'a> Checker<'a> {
             (Type::Custom(tid), m) if matches!(tid.module, ModuleId::Native(_)) => {
                 self.check_native_method(tid, m, type_args, args)
             }
+            (Type::Generic { type_id: tid, type_args: target_targs }, m)
+                if tid.module == ModuleId::Native("cdt.db".to_string()) && tid.name == "Query" =>
+            {
+                let target_targs = target_targs.clone();
+                self.check_db_query_method(&target_targs, m, type_args, args)
+            }
             (ty, m) => Err(format!("Type {} has no method '.{}()'", ty, m)),
         }
     }

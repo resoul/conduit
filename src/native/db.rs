@@ -93,6 +93,10 @@ impl SqlConn {
         }
     }
 
+    pub fn ping(&mut self) -> Result<(), DbErr> {
+        self.query("SELECT 1", &[]).map(|_| ())
+    }
+
     pub fn execute(&self, sql: &str, params: &[Cell]) -> Result<u64, DbErr> {
         match self {
             SqlConn::Postgres(pg) => pg.execute(sql, params),
@@ -253,21 +257,22 @@ pub fn obj_to_cell(obj: &Obj) -> Result<Cell, String> {
     }
 }
 
-pub fn query_result_to_maps(res: &QueryResult) -> Obj {
+pub fn query_result_to_maps(res: QueryResult) -> Obj {
     let col_keys: Vec<Arc<VmString>> = res
         .columns
-        .iter()
-        .map(|c| Arc::new(VmString::from(c.name.as_str())))
+        .into_iter()
+        .map(|c| Arc::new(VmString::from(c.name)))
         .collect();
     let mut out = Vec::with_capacity(res.rows.len());
-    for row in &res.rows {
+    for row in res.rows {
         let mut map = OrderedMap::with_capacity(col_keys.len());
-        for (i, cell) in row.iter().enumerate() {
+        for (i, cell) in row.into_iter().enumerate() {
             if let Some(key) = col_keys.get(i) {
-                map.set(
-                    MapKey::Str(Arc::clone(key)),
-                    MapVal::Obj(Obj::str(cell.to_display_string())),
-                );
+                let s = match cell {
+                    Cell::Text(s) => s,
+                    other => other.to_display_string(),
+                };
+                map.set(MapKey::Str(Arc::clone(key)), MapVal::Obj(Obj::str(s)));
             }
         }
         out.push(Obj::Map(Arc::new(map)));
@@ -315,27 +320,28 @@ fn cell_to_bool(cell: &Cell) -> Result<bool, String> {
     }
 }
 
-fn cell_to_obj_for_type(cell: &Cell, ty: &JsonType) -> Result<Obj, String> {
+fn cell_into_obj_for_type(cell: Cell, ty: &JsonType) -> Result<Obj, String> {
     match ty {
         JsonType::Optional(inner) => {
             if matches!(cell, Cell::Null) {
                 Ok(Obj::Empty)
             } else {
-                cell_to_obj_for_type(cell, inner)
+                cell_into_obj_for_type(cell, inner)
             }
         }
-        JsonType::Int => Ok(Obj::boxed_int(cell_to_int(cell)?)),
-        JsonType::Float => Ok(Obj::boxed_float(cell_to_float(cell)?.to_bits())),
-        JsonType::Bool => Ok(Obj::boxed_bool(cell_to_bool(cell)?)),
+        JsonType::Int => Ok(Obj::boxed_int(cell_to_int(&cell)?)),
+        JsonType::Float => Ok(Obj::boxed_float(cell_to_float(&cell)?.to_bits())),
+        JsonType::Bool => Ok(Obj::boxed_bool(cell_to_bool(&cell)?)),
         JsonType::String => match cell {
             Cell::Null => Err("Unexpected NULL for non-optional String field".to_string()),
+            Cell::Text(s) => Ok(Obj::str(s)),
             other => Ok(Obj::str(other.to_display_string())),
         },
         other => Err(format!("Unsupported column mapping target type {:?}", other)),
     }
 }
 
-pub fn query_result_to_structs(res: &QueryResult, schema: &StructSchema) -> Result<Obj, String> {
+pub fn query_result_to_structs(mut res: QueryResult, schema: &StructSchema) -> Result<Obj, String> {
     let mut col_map: Vec<Option<usize>> = Vec::with_capacity(schema.fields.len());
     for f in schema.fields.iter() {
         let pos = res
@@ -352,7 +358,7 @@ pub fn query_result_to_structs(res: &QueryResult, schema: &StructSchema) -> Resu
     }
 
     let mut out = Vec::with_capacity(res.rows.len());
-    for row in &res.rows {
+    for row in &mut res.rows {
         let mut s = StructData::new(schema.schema_id, schema.scalar_len, schema.obj_len);
         for (fi, f) in schema.fields.iter().enumerate() {
             let Some(col_idx) = col_map[fi] else {
@@ -361,13 +367,13 @@ pub fn query_result_to_structs(res: &QueryResult, schema: &StructSchema) -> Resu
                 }
                 continue;
             };
-            let cell = &row[col_idx];
+            let cell = std::mem::replace(&mut row[col_idx], Cell::Null);
             match f.slot {
                 FieldSlot::Scalar { kind, slot } => {
                     let raw = match kind {
-                        ScalarKind::Int => cell_to_int(cell)? as u64,
-                        ScalarKind::Float => cell_to_float(cell)?.to_bits(),
-                        ScalarKind::Bool => u64::from(cell_to_bool(cell)?),
+                        ScalarKind::Int => cell_to_int(&cell)? as u64,
+                        ScalarKind::Float => cell_to_float(&cell)?.to_bits(),
+                        ScalarKind::Bool => u64::from(cell_to_bool(&cell)?),
                     };
                     s.set_scalar(slot as usize, raw);
                 }
@@ -382,7 +388,7 @@ pub fn query_result_to_structs(res: &QueryResult, schema: &StructSchema) -> Resu
                             ));
                         }
                     } else {
-                        let val = cell_to_obj_for_type(cell, &f.ty)?;
+                        let val = cell_into_obj_for_type(cell, &f.ty)?;
                         s.set_obj(slot as usize, val);
                     }
                 }
@@ -531,6 +537,64 @@ pub fn build_insert_and_cells(
         placeholders.join(", ")
     );
     Ok((sql, cells))
+}
+
+pub fn build_insert_all_and_cells(
+    model: &crate::ir::DbModelMeta,
+    schema: &StructSchema,
+    recs: &[&StructData],
+) -> Result<Vec<(String, Vec<Cell>)>, String> {
+    if recs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut active_cols = Vec::new();
+    for col in &model.columns {
+        let Some(f) = schema.fields.iter().find(|f| f.name == col.field_name) else {
+            continue;
+        };
+        if col.is_auto {
+            let mut any_nonzero = false;
+            for rec in recs {
+                if field_value_to_cell(schema, f, rec, true, true, "insert_all")?.is_some() {
+                    any_nonzero = true;
+                    break;
+                }
+            }
+            if !any_nonzero {
+                continue;
+            }
+        }
+        active_cols.push((col, f));
+    }
+    if active_cols.is_empty() {
+        return Err(format!(
+            "No insertable columns found for model '{}'",
+            model.table_name
+        ));
+    }
+    let col_names: Vec<&str> = active_cols.iter().map(|(c, _)| c.col_name.as_str()).collect();
+    let row_ph = format!("({})", vec!["?"; active_cols.len()].join(", "));
+    let max_rows = (65_535 / active_cols.len()).max(1);
+    let mut batches = Vec::with_capacity(recs.len().div_ceil(max_rows));
+    for chunk in recs.chunks(max_rows) {
+        let mut cells = Vec::with_capacity(chunk.len() * active_cols.len());
+        for rec in chunk {
+            for (_, f) in &active_cols {
+                let cell = field_value_to_cell(schema, f, rec, false, true, "insert_all")?
+                    .unwrap_or(Cell::Null);
+                cells.push(cell);
+            }
+        }
+        let values_list = vec![row_ph.as_str(); chunk.len()].join(", ");
+        let sql = format!(
+            "INSERT INTO {} ({}) VALUES {}",
+            model.table_name,
+            col_names.join(", "),
+            values_list
+        );
+        batches.push((sql, cells));
+    }
+    Ok(batches)
 }
 
 pub fn build_update_and_cells(

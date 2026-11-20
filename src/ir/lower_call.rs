@@ -338,6 +338,11 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             {
                 return self.lower_native_method_obj(tid, target, field, type_args, args);
             }
+            if let Type::Generic { type_id: tid, .. } = &target.ty
+                && tid.module != ModuleId::Program
+            {
+                return self.lower_native_method_obj(tid, target, field, type_args, args);
+            }
         }
 
         if let ExprKind::Ident(name) = &callee.kind

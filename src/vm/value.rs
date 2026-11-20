@@ -251,6 +251,8 @@ pub const SCHEMA_LOCK_GUARD: u32 = 0xFFFF_004F;
 pub const SCHEMA_CACHE_HANDLE: u32 = 0xFFFF_0050;
 pub const SCHEMA_REDIS_CLIENT: u32 = 0xFFFF_0051;
 pub const SCHEMA_REDIS_LOCK: u32 = 0xFFFF_0052;
+pub const SCHEMA_DB_QUERY: u32 = 0xFFFF_0053;
+pub const SCHEMA_DB_POOL: u32 = 0xFFFF_0054;
 
 #[inline]
 pub fn is_builtin_error_schema(schema_id: u32) -> bool {
@@ -679,6 +681,7 @@ pub enum Obj {
     Record(Arc<StructData>),
     Map(Arc<OrderedMap>),
     Closure(Arc<ClosureData>),
+    DbQuery(Arc<crate::native::db_query::DbQueryBuilder>),
     Func(u32),
 }
 
@@ -755,6 +758,7 @@ impl Obj {
                 format!("[{}]", parts.join(", "))
             }
             Obj::Map(_) => "<map>".to_string(),
+            Obj::DbQuery(_) => "<query>".to_string(),
             Obj::Closure(_) | Obj::Func(_) => "<func>".to_string(),
         }
     }
@@ -774,6 +778,7 @@ impl PartialEq for Obj {
             (Obj::Record(a), Obj::Record(b)) => Arc::ptr_eq(a, b) || a.as_ref() == b.as_ref(),
             (Obj::Map(a), Obj::Map(b)) => Arc::ptr_eq(a, b) || a.as_ref() == b.as_ref(),
             (Obj::Closure(a), Obj::Closure(b)) => Arc::ptr_eq(a, b) || a.as_ref() == b.as_ref(),
+            (Obj::DbQuery(a), Obj::DbQuery(b)) => Arc::ptr_eq(a, b),
             (Obj::Func(a), Obj::Func(b)) => a == b,
             _ => false,
         }

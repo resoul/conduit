@@ -1,3 +1,4 @@
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Mutex;
@@ -41,6 +42,7 @@ pub struct MysqlConfig {
     pub password: String,
     pub database: Option<String>,
     pub connect_timeout: Duration,
+    pub prepare: bool,
 }
 
 fn decode_url_part(text: &str) -> Result<String, String> {
@@ -101,6 +103,7 @@ pub fn parse_mysql_url(url: &str) -> Result<MysqlConfig, String> {
         Some(decode_url_part(path)?)
     };
     let mut connect_timeout = Duration::from_secs(10);
+    let mut prepare = true;
     for pair in query.split('&').filter(|p| !p.is_empty()) {
         let (key, val) = pair.split_once('=').unwrap_or((pair, ""));
         let val = decode_url_part(val)?;
@@ -111,6 +114,12 @@ pub fn parse_mysql_url(url: &str) -> Result<MysqlConfig, String> {
                 .filter(|n| (1..=600).contains(n))
                 .ok_or_else(|| format!("Invalid connect_timeout '{}'", val))?;
             connect_timeout = Duration::from_secs(secs);
+        } else if key == "prepare" {
+            match val.as_str() {
+                "off" | "false" | "0" => prepare = false,
+                "on" | "true" | "1" => prepare = true,
+                _ => return Err(format!("Invalid prepare '{}' (expected on or off)", val)),
+            }
         }
     }
     Ok(MysqlConfig {
@@ -120,6 +129,7 @@ pub fn parse_mysql_url(url: &str) -> Result<MysqlConfig, String> {
         password,
         database,
         connect_timeout,
+        prepare,
     })
 }
 
@@ -298,16 +308,72 @@ fn push_lenenc_int(buf: &mut Vec<u8>, v: u64) {
     }
 }
 
+const MYSQL_STMT_CACHE_CAP: usize = 128;
+
+#[derive(Clone, Copy)]
+struct CachedMysqlStmt {
+    stmt_id: u32,
+    num_params: usize,
+}
+
+#[derive(Default)]
+struct MysqlStmtCache {
+    map: HashMap<String, CachedMysqlStmt>,
+    order: VecDeque<String>,
+}
+
+impl MysqlStmtCache {
+    fn get(&mut self, sql: &str) -> Option<CachedMysqlStmt> {
+        let entry = *self.map.get(sql)?;
+        if self.order.back().map(String::as_str) != Some(sql) {
+            if let Some(pos) = self.order.iter().position(|k| k == sql) {
+                self.order.remove(pos);
+            }
+            self.order.push_back(sql.to_string());
+        }
+        Some(entry)
+    }
+
+    fn insert(&mut self, sql: String, stmt: CachedMysqlStmt) -> Option<u32> {
+        let mut evicted_id = None;
+        if let Some(prev) = self.map.insert(sql.clone(), stmt) {
+            if let Some(pos) = self.order.iter().position(|k| k == &sql) {
+                self.order.remove(pos);
+            }
+            evicted_id = Some(prev.stmt_id);
+        } else if self.order.len() >= MYSQL_STMT_CACHE_CAP
+            && let Some(oldest) = self.order.pop_front()
+            && let Some(old_stmt) = self.map.remove(&oldest)
+        {
+            evicted_id = Some(old_stmt.stmt_id);
+        }
+        self.order.push_back(sql);
+        evicted_id
+    }
+
+    fn remove(&mut self, sql: &str) {
+        if let Some(pos) = self.order.iter().position(|k| k == sql) {
+            self.order.remove(pos);
+        }
+        self.map.remove(sql);
+    }
+}
+
 struct Conn {
     reader: BufReader<TcpStream>,
     seq: u8,
     deprecate_eof: bool,
+    pkt_buf: Vec<u8>,
+    write_buf: Vec<u8>,
+    last_active: std::time::Instant,
+    stmt_cache: MysqlStmtCache,
 }
 
 impl Conn {
     fn write_packet(&mut self, payload: &[u8]) -> Result<(), String> {
         let mut offset = 0usize;
-        let stream = self.reader.get_mut();
+        self.write_buf.clear();
+        self.write_buf.reserve(payload.len() + 4);
         loop {
             let chunk_len = (payload.len() - offset).min(MAX_PACKET);
             let hdr = [
@@ -317,22 +383,23 @@ impl Conn {
                 self.seq,
             ];
             self.seq = self.seq.wrapping_add(1);
-            stream
-                .write_all(&hdr)
-                .and_then(|_| stream.write_all(&payload[offset..offset + chunk_len]))
-                .map_err(|e| format!("Failed to write to MySQL: {e}"))?;
+            self.write_buf.extend_from_slice(&hdr);
+            self.write_buf
+                .extend_from_slice(&payload[offset..offset + chunk_len]);
             offset += chunk_len;
             if chunk_len < MAX_PACKET {
                 break;
             }
         }
+        let stream = self.reader.get_mut();
         stream
-            .flush()
-            .map_err(|e| format!("Failed to flush MySQL stream: {e}"))
+            .write_all(&self.write_buf)
+            .and_then(|_| stream.flush())
+            .map_err(|e| format!("Failed to write to MySQL: {e}"))
     }
 
-    fn read_packet(&mut self) -> Result<Vec<u8>, String> {
-        let mut out = Vec::new();
+    fn read_packet_into(&mut self) -> Result<&[u8], String> {
+        self.pkt_buf.clear();
         loop {
             let mut hdr = [0u8; 4];
             self.reader
@@ -340,19 +407,27 @@ impl Conn {
                 .map_err(|e| format!("Failed to read MySQL packet header: {e}"))?;
             let len = usize::from(hdr[0]) | (usize::from(hdr[1]) << 8) | (usize::from(hdr[2]) << 16);
             self.seq = hdr[3].wrapping_add(1);
-            let start = out.len();
-            out.resize(start + len, 0);
+            let start = self.pkt_buf.len();
+            self.pkt_buf.resize(start + len, 0);
             self.reader
-                .read_exact(&mut out[start..])
+                .read_exact(&mut self.pkt_buf[start..])
                 .map_err(|e| format!("Failed to read MySQL packet body: {e}"))?;
             if len < MAX_PACKET {
                 break;
             }
         }
-        Ok(out)
+        self.last_active = std::time::Instant::now();
+        Ok(&self.pkt_buf)
+    }
+
+    fn read_packet(&mut self) -> Result<Vec<u8>, String> {
+        Ok(self.read_packet_into()?.to_vec())
     }
 
     fn is_alive(&mut self) -> bool {
+        if self.last_active.elapsed() < Duration::from_secs(5) {
+            return self.reader.buffer().is_empty();
+        }
         let stream = self.reader.get_ref();
         if stream.set_nonblocking(true).is_err() {
             return false;
@@ -435,25 +510,26 @@ fn decode_text_cell(col: &MysqlCol, bytes: Option<&[u8]>) -> Cell {
     let Some(bytes) = bytes else {
         return Cell::Null;
     };
-    let s = String::from_utf8_lossy(bytes);
     match col.col_type {
-        MYSQL_TYPE_TINY => {
-            if let Ok(v) = s.parse::<i64>() {
-                Cell::Int(v)
-            } else {
-                Cell::Text(s.into_owned())
-            }
-        }
-        MYSQL_TYPE_SHORT | MYSQL_TYPE_LONG | MYSQL_TYPE_LONGLONG | MYSQL_TYPE_INT24
-        | MYSQL_TYPE_YEAR => s
-            .parse::<i64>()
+        MYSQL_TYPE_TINY
+        | MYSQL_TYPE_SHORT
+        | MYSQL_TYPE_LONG
+        | MYSQL_TYPE_LONGLONG
+        | MYSQL_TYPE_INT24
+        | MYSQL_TYPE_YEAR => std::str::from_utf8(bytes)
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
             .map(Cell::Int)
-            .unwrap_or_else(|_| Cell::Text(s.into_owned())),
-        MYSQL_TYPE_FLOAT | MYSQL_TYPE_DOUBLE => s
-            .parse::<f64>()
+            .unwrap_or_else(|| Cell::Text(String::from_utf8_lossy(bytes).into_owned())),
+        MYSQL_TYPE_FLOAT | MYSQL_TYPE_DOUBLE => std::str::from_utf8(bytes)
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
             .map(Cell::Float)
-            .unwrap_or_else(|_| Cell::Text(s.into_owned())),
-        _ => Cell::Text(s.into_owned()),
+            .unwrap_or_else(|| Cell::Text(String::from_utf8_lossy(bytes).into_owned())),
+        _ => Cell::Text(
+            String::from_utf8(bytes.to_vec())
+                .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()),
+        ),
     }
 }
 
@@ -566,7 +642,7 @@ impl MysqlConn {
         let outcome = if params.is_empty() {
             run_text_query(conn, sql)
         } else {
-            run_prepared_query(conn, sql, params)
+            run_prepared_query(conn, self.config.prepare, sql, params)
         };
         match outcome {
             Ok((affected, last_id, res)) => {
@@ -612,48 +688,68 @@ fn run_text_query(conn: &mut Conn, sql: &str) -> Result<(u64, u64, QueryResult),
 
 fn run_prepared_query(
     conn: &mut Conn,
+    prepare: bool,
     sql: &str,
     params: &[Cell],
 ) -> Result<(u64, u64, QueryResult), MysqlFail> {
-    conn.seq = 0;
-    let mut prep = Vec::with_capacity(1 + sql.len());
-    prep.push(0x16); // COM_STMT_PREPARE
-    prep.extend_from_slice(sql.as_bytes());
-    conn.write_packet(&prep)?;
+    let (stmt_id, num_params, from_cache) = if prepare
+        && let Some(cached) = conn.stmt_cache.get(sql)
+    {
+        (cached.stmt_id, cached.num_params, true)
+    } else {
+        conn.seq = 0;
+        let mut prep = Vec::with_capacity(1 + sql.len());
+        prep.push(0x16); // COM_STMT_PREPARE
+        prep.extend_from_slice(sql.as_bytes());
+        conn.write_packet(&prep)?;
 
-    let ok = conn.read_packet()?;
-    if ok.first() == Some(&0xff) {
-        return Err(MysqlFail::Server(parse_err_packet(&ok)));
-    }
-    if ok.first() != Some(&0x00) {
-        return Err(MysqlFail::Broken("Unexpected MySQL prepare response".to_string()));
-    }
-    let mut r = PktReader::new(&ok[1..]);
-    let stmt_id = r.u32()?;
-    let num_cols = r.u16()? as usize;
-    let num_params = r.u16()? as usize;
+        let ok = conn.read_packet()?;
+        if ok.first() == Some(&0xff) {
+            return Err(MysqlFail::Server(parse_err_packet(&ok)));
+        }
+        if ok.first() != Some(&0x00) {
+            return Err(MysqlFail::Broken("Unexpected MySQL prepare response".to_string()));
+        }
+        let mut r = PktReader::new(&ok[1..]);
+        let stmt_id = r.u32()?;
+        let num_cols = r.u16()? as usize;
+        let num_params = r.u16()? as usize;
 
-    // Drain param defs
-    if num_params > 0 {
-        for _ in 0..num_params {
-            let _ = conn.read_packet()?;
+        if num_params > 0 {
+            for _ in 0..num_params {
+                let _ = conn.read_packet_into()?;
+            }
+            if !conn.deprecate_eof {
+                let _ = conn.read_packet_into()?;
+            }
         }
-        if !conn.deprecate_eof {
-            let _ = conn.read_packet()?;
+        if num_cols > 0 {
+            for _ in 0..num_cols {
+                let _ = conn.read_packet_into()?;
+            }
+            if !conn.deprecate_eof {
+                let _ = conn.read_packet_into()?;
+            }
         }
-    }
-    // Drain col defs
-    if num_cols > 0 {
-        for _ in 0..num_cols {
-            let _ = conn.read_packet()?;
+
+        if prepare
+            && let Some(evicted_id) = conn.stmt_cache.insert(
+                sql.to_string(),
+                CachedMysqlStmt {
+                    stmt_id,
+                    num_params,
+                },
+            )
+        {
+            close_stmt(conn, evicted_id);
         }
-        if !conn.deprecate_eof {
-            let _ = conn.read_packet()?;
-        }
-    }
+        (stmt_id, num_params, false)
+    };
 
     if num_params != params.len() {
-        close_stmt(conn, stmt_id);
+        if !prepare {
+            close_stmt(conn, stmt_id);
+        }
         return Err(MysqlFail::Server(DbErr::new(
             "query_error",
             format!(
@@ -722,7 +818,11 @@ fn run_prepared_query(
 
     conn.write_packet(&exec)?;
     let res = read_resultset(conn, true);
-    close_stmt(conn, stmt_id);
+    if !prepare {
+        close_stmt(conn, stmt_id);
+    } else if from_cache && matches!(&res, Err(MysqlFail::Server(e)) if e.message.contains("(1243)")) {
+        conn.stmt_cache.remove(sql);
+    }
     res
 }
 
@@ -735,24 +835,24 @@ fn close_stmt(conn: &mut Conn, stmt_id: u32) {
 }
 
 fn read_resultset(conn: &mut Conn, binary: bool) -> Result<(u64, u64, QueryResult), MysqlFail> {
-    let first = conn.read_packet()?;
+    let first = conn.read_packet_into()?;
     if first.first() == Some(&0xff) {
-        return Err(MysqlFail::Server(parse_err_packet(&first)));
+        return Err(MysqlFail::Server(parse_err_packet(first)));
     }
     if first.first() == Some(&0x00) {
-        let (aff, last_id) = parse_ok_packet(&first)?;
+        let (aff, last_id) = parse_ok_packet(first)?;
         return Ok((aff, last_id, QueryResult::default()));
     }
-    let mut r = PktReader::new(&first);
+    let mut r = PktReader::new(first);
     let col_count = r.lenenc_int()?.unwrap_or(0) as usize;
     let mut cols = Vec::with_capacity(col_count);
     for _ in 0..col_count {
-        let col_pkt = conn.read_packet()?;
-        cols.push(parse_col_def(&col_pkt)?);
+        let col_pkt = conn.read_packet_into()?;
+        cols.push(parse_col_def(col_pkt)?);
     }
     if !conn.deprecate_eof {
-        let eof = conn.read_packet()?;
-        if !is_eof_packet(&eof) {
+        let eof = conn.read_packet_into()?;
+        if !is_eof_packet(eof) {
             return Err(MysqlFail::Broken("Expected EOF after MySQL columns".to_string()));
         }
     }
@@ -764,14 +864,15 @@ fn read_resultset(conn: &mut Conn, binary: bool) -> Result<(u64, u64, QueryResul
             is_bool: c.col_type == MYSQL_TYPE_TINY,
         })
         .collect();
+    let deprecate_eof = conn.deprecate_eof;
     let mut rows = Vec::new();
     loop {
-        let row_pkt = conn.read_packet()?;
+        let row_pkt = conn.read_packet_into()?;
         if row_pkt.first() == Some(&0xff) {
-            return Err(MysqlFail::Server(parse_err_packet(&row_pkt)));
+            return Err(MysqlFail::Server(parse_err_packet(row_pkt)));
         }
-        if is_eof_packet(&row_pkt)
-            || (conn.deprecate_eof && row_pkt.first() == Some(&0xfe) && row_pkt.len() >= 7)
+        if is_eof_packet(row_pkt)
+            || (deprecate_eof && row_pkt.first() == Some(&0xfe) && row_pkt.len() >= 7)
         {
             break;
         }
@@ -794,7 +895,7 @@ fn read_resultset(conn: &mut Conn, binary: bool) -> Result<(u64, u64, QueryResul
             }
             rows.push(row);
         } else {
-            let mut rr = PktReader::new(&row_pkt);
+            let mut rr = PktReader::new(row_pkt);
             let mut row = Vec::with_capacity(col_count);
             for col in &cols {
                 let val = rr.lenenc_bytes()?;
@@ -835,9 +936,13 @@ fn open_connection(config: &MysqlConfig) -> Result<Conn, String> {
         .map_err(|e| e.to_string())?;
 
     let mut conn = Conn {
-        reader: BufReader::new(stream),
+        reader: BufReader::with_capacity(64 * 1024, stream),
         seq: 0,
         deprecate_eof: false,
+        pkt_buf: Vec::with_capacity(4096),
+        write_buf: Vec::with_capacity(1024),
+        last_active: std::time::Instant::now(),
+        stmt_cache: MysqlStmtCache::default(),
     };
 
     let hs = conn.read_packet()?;

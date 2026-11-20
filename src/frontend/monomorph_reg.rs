@@ -359,7 +359,57 @@ pub(crate) fn register_program_types(
                 defaults,
                 return_type: ret_ty,
             });
+        } else if let ItemKind::Query(q) = &item.kind {
+            let name = &q.name;
+            let params = &q.params;
+            let return_type = &q.return_type;
+            let model_name = &q.model_name;
+            let mode = q.mode;
+            if checked.generic_funcs.contains_key(name) {
+                return Err(format!("Duplicate function '{}'", name));
+            }
+            let fid = checked.funcs.len() as u32;
+            if checked.func_by_name.insert(name.clone(), fid).is_some() {
+                return Err(format!("Duplicate function '{}'", name));
+            }
+            let mut p_tys = Vec::with_capacity(params.len());
+            for p in params {
+                p_tys.push(checked.resolve_type_mut(&p.ty)?);
+            }
+            let (base_ret, full_ret) = query_return_types(model_name, mode);
+            let ret_ty = match return_type {
+                Some(rt) => {
+                    let resolved = checked.resolve_type_mut(rt)?;
+                    if resolved == base_ret {
+                        full_ret
+                    } else {
+                        resolved
+                    }
+                }
+                None => full_ret,
+            };
+            let defaults = vec![None; p_tys.len()];
+            checked.funcs.push(FuncSig {
+                name: name.clone(),
+                params: p_tys,
+                defaults,
+                return_type: ret_ty,
+            });
         }
     }
     Ok(())
+}
+
+pub(crate) fn query_return_types(model_name: &str, mode: QueryModeAst) -> (Type, Type) {
+    use crate::frontend::types::TypeId;
+    let model_ty = Type::Custom(TypeId::program(model_name));
+    let base = match mode {
+        QueryModeAst::All => Type::List(Box::new(model_ty)),
+        QueryModeAst::First => Type::Optional(Box::new(model_ty)),
+        QueryModeAst::Count | QueryModeAst::Delete => Type::Int,
+        QueryModeAst::Exists => Type::Bool,
+    };
+    let db_err = Type::Custom(TypeId::native("cdt.db", "DbError"));
+    let full = Type::union(vec![base.clone(), db_err]);
+    (base, full)
 }

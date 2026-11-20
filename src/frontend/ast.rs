@@ -298,6 +298,63 @@ pub enum ItemKind {
         name: String,
         body: Block,
     },
+    Query(Box<QuerySpec>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuerySpec {
+    pub name: String,
+    pub params: Vec<Param>,
+    pub return_type: Option<TypeExpr>,
+    pub model_name: String,
+    pub model_span: Span,
+    pub select_fields: Vec<(String, Span)>,
+    pub where_pred: Option<QueryPredicate>,
+    pub order_by: Vec<QueryOrderItem>,
+    pub limit: Option<Expr>,
+    pub offset: Option<Expr>,
+    pub mode: QueryModeAst,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryModeAst {
+    All,
+    First,
+    Count,
+    Exists,
+    Delete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryWhereOp {
+    Eq,
+    Ne,
+    Gt,
+    Ge,
+    Lt,
+    Le,
+    Like,
+    ILike,
+    In,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum QueryPredicate {
+    And(Box<QueryPredicate>, Box<QueryPredicate>),
+    Or(Box<QueryPredicate>, Box<QueryPredicate>),
+    Cmp {
+        field: String,
+        field_span: Span,
+        op: QueryWhereOp,
+        value: Box<Expr>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueryOrderItem {
+    pub field: String,
+    pub field_span: Span,
+    pub desc: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

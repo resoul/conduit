@@ -452,6 +452,14 @@ pub(crate) fn expand_program_aliases(
             | ItemKind::ExportList { .. }
             | ItemKind::Migration { .. } => {}
             ItemKind::Test { body, .. } => expand_block_aliases(body, aliases)?,
+            ItemKind::Query(q) => {
+                for p in &mut q.params {
+                    expand_type_expr(&mut p.ty, aliases, 0)?;
+                }
+                if let Some(rt) = &mut q.return_type {
+                    expand_type_expr(rt, aliases, 0)?;
+                }
+            }
         }
     }
     Ok(())

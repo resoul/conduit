@@ -124,7 +124,7 @@ fn with_span(span: crate::frontend::lexer::Span, err: String) -> String {
     }
 }
 
-fn format_check_err(
+pub(crate) fn format_check_err(
     span: crate::frontend::lexer::Span,
     source_file: Option<&str>,
     err: String,
@@ -179,6 +179,7 @@ pub fn check_program_with_roots(
     check_validator_contracts(program, &mut checked)?;
     let mut all_errors: Vec<String> = Vec::new();
     check_default_exprs(program, &mut checked, &mut all_errors);
+    crate::frontend::check_query::check_and_desugar_queries(program, &mut checked, &mut all_errors);
 
     let mut idx = 0usize;
     while idx < program.items.len() {
@@ -379,6 +380,46 @@ pub fn check_program_with_roots(
     Ok(checked)
 }
 
+fn check_param_defaults(
+    name: &str,
+    params: &mut [Param],
+    checked: &mut CheckedProgram,
+    source_file: &Option<String>,
+    all_errors: &mut Vec<String>,
+) {
+    let fid = checked.func_by_name[name] as usize;
+    for (i, p) in params.iter_mut().enumerate() {
+        if let Some(def_expr) = &mut p.default {
+            let expected = checked.funcs[fid].params[i].clone();
+            let mut tc = Checker {
+                checked,
+                scopes: vec![HashMap::new()],
+                current_return: Type::Void,
+                loop_depth: 0,
+                in_defer: false,
+                errors: Vec::new(),
+                source_file: source_file.clone(),
+            };
+            let res = tc.check_expr(def_expr, Some(&expected));
+            all_errors.extend(tc.errors);
+            if let Err(e) = res {
+                all_errors.push(format_check_err(p.span, source_file.as_deref(), e));
+            } else if !def_expr.ty.is_assignable_to(&expected) {
+                all_errors.push(format_check_err(
+                    def_expr.span,
+                    source_file.as_deref(),
+                    format!(
+                        "Default value for parameter '{}' of '{}' expected {}, got {}",
+                        p.name, name, expected, def_expr.ty
+                    ),
+                ));
+            } else {
+                checked.funcs[fid].defaults[i] = Some(def_expr.clone());
+            }
+        }
+    }
+}
+
 fn check_default_exprs(
     program: &mut Program,
     checked: &mut CheckedProgram,
@@ -425,41 +466,10 @@ fn check_default_exprs(
                 }
             }
             ItemKind::Func { name, type_params, params, .. } if type_params.is_empty() => {
-                let fid = checked.func_by_name[name] as usize;
-                for (i, p) in params.iter_mut().enumerate() {
-                    if let Some(def_expr) = &mut p.default {
-                        let expected = checked.funcs[fid].params[i].clone();
-                        let mut tc = Checker {
-                            checked,
-                            scopes: vec![HashMap::new()],
-                            current_return: Type::Void,
-                            loop_depth: 0,
-                            in_defer: false,
-                            errors: Vec::new(),
-                            source_file: source_file.clone(),
-                        };
-                        let res = tc.check_expr(def_expr, Some(&expected));
-                        all_errors.extend(tc.errors);
-                        if let Err(e) = res {
-                            all_errors.push(format_check_err(
-                                p.span,
-                                source_file.as_deref(),
-                                e,
-                            ));
-                        } else if !def_expr.ty.is_assignable_to(&expected) {
-                            all_errors.push(format_check_err(
-                                def_expr.span,
-                                source_file.as_deref(),
-                                format!(
-                                    "Default value for parameter '{}' of '{}' expected {}, got {}",
-                                    p.name, name, expected, def_expr.ty
-                                ),
-                            ));
-                        } else {
-                            checked.funcs[fid].defaults[i] = Some(def_expr.clone());
-                        }
-                    }
-                }
+                check_param_defaults(name, params, checked, &source_file, all_errors);
+            }
+            ItemKind::Query(q) => {
+                check_param_defaults(&q.name, &mut q.params, checked, &source_file, all_errors);
             }
             ItemKind::Enum { name, variants } => {
                 if let Some(dvars) = checked.data_enums.get(name).cloned() {
@@ -578,7 +588,7 @@ pub(crate) fn resolve_data_enum_bindings<'a>(
 
 pub(crate) struct Checker<'a> {
     pub(crate) checked: &'a mut CheckedProgram,
-    scopes: Vec<HashMap<String, Type>>,
+    pub(crate) scopes: Vec<HashMap<String, Type>>,
     pub(crate) current_return: Type,
     pub(crate) loop_depth: usize,
     pub(crate) in_defer: bool,

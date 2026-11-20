@@ -5,6 +5,8 @@ pub mod cron;
 pub mod crypto;
 pub mod csv;
 pub mod db;
+pub mod db_pool;
+pub mod db_query;
 pub mod env;
 pub mod fs;
 pub mod http;

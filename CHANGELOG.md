@@ -5,6 +5,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
+## [Unreleased]
+
+### Added
+
+* **`cdt.cache` O(1) Slab-LRU & VM Call Fast-Path**:
+  * Replaced `BTreeMap` + `String`-keyed `HashMap` in `src/native/cache.rs` with a flat `CacheSlot` slab, intrusive doubly-linked LRU list (`O(1)` promotion/eviction with zero `get` allocations), `HashMap<Arc<str>, u32>`, and `BTreeSet<(i64, u32)>` TTL index (`O(K log N)` expiration pruning instead of full cache scans).
+  * Inlined fast-path stack capacity checks in `Op::CallDirect` and scalar-frame return pops in `Op::ReturnScalar` / `Op::ReturnVoid` (`src/vm/exec.rs`).
+* **Database Driver Performance, Prepared Statement Cache & Batch Insert (`conn.insert_all<T>()`)**:
+  * Added per-connection LRU prepared statement caches (128 entries) in `src/native/pg.rs` (skipping `Parse` and `Describe` on cache hit) and `src/native/mysql.rs` (keeping `stmt_id` open across `COM_STMT_EXECUTE` calls to eliminate extra round-trips), plus `?prepare=off` URL parameter support (e.g. for PgBouncer transaction pooling).
+  * Added `conn.insert_all<T>(rows: [T]) -> Int | DbError` (`build_insert_all_and_cells` in `src/native/db.rs`, `DB_INSERT_ALL` in `src/vm/exec_db.rs`) for chunked multi-row `INSERT INTO ... VALUES (...), (...)` batches.
+  * Eliminated `host.db_queries` and `host.db_conns`/`host.db_pools` slot leaks (`Obj::DbQuery` with `Arc::make_mut` in-place chaining, generation-tagged free-lists in `src/vm/mod.rs`), moved `db.Pool` ping/close I/O outside `Mutex` (`src/native/db_pool.rs`), raised `BufReader` to 64 KB with reusable read/write buffers, and reduced syscalls/copies in `is_alive()`, `translate_placeholders`, and result decoding.
+* **Thread-Safe Database Connection Pool (`db.pool()`, `db.Pool`)**:
+  * Added `src/native/db_pool.rs` (`DbPoolState`, `make_db_pool`), `SqlConn::ping()`, and `DB_POOL_*` VM sub-ops (`src/vm/exec_db.rs`, `SCHEMA_DB_POOL`) supporting configurable `max_conns` (default `16`) and `idle_timeout_ms` (default `300000`), idle connection health-checking/expiry, `Condvar` backpressure waiting, and automatic pool return on `conn.close()`.
+  * Added `db.pool(url, max_conns?, idle_timeout_ms?) -> Pool | DbError` and `Pool` methods `.acquire() -> Connection | DbError`, `.with(cb) -> R | DbError`, `.stats() -> Map<String, Int>`, and `.close() -> Void` (`src/frontend/{check_native,check_sys}.rs`, `src/ir/{mod,lower_native}.rs`, `src/lsp_docs.rs`, `docs/src/library/db.md`).
+* **Fluent & Declarative SQL Query Builders (`conn.from<T>()`, `query ...`)**:
+  * Added `src/native/db_query.rs` (`DbQueryBuilder`, `WhereNode`, `WhereOp`, `OrderDir`, `QueryMode`, `build_query_sql`) and `DB_QUERY_*` VM sub-ops (`src/vm/exec_db.rs`, `SCHEMA_DB_QUERY`) supporting dialect-aware PostgreSQL/MySQL SQL generation with model column validation and parameterized bindings.
+  * Added Fluent `conn.from<T>() -> Query<T>` chainable API (`.select`, `.where_eq`, `.or_where_eq`, `.where`, `.or_where`, `.where_in`, `.or_where_in`, `.where_null`, `.where_not_null`, `.or_where_null`, `.or_where_not_null`, `.and_query`, `.or_query`, `.order_by`, `.limit`, `.offset`, `.paginate`, `.to_sql`, `.all`, `.first`, `.count`, `.exists`, `.delete`, `.rows`).
+  * Added top-level declarative `query Name(conn: db.Connection, ...) -> Ret { from Model; select ...; where ...; order_by ...; limit ...; offset ...; [first|count|exists|delete] }` syntax (`src/frontend/{ast,parser,parser_cli,linker,monomorph_reg,check,check_query,reachability}.rs`) with compile-time field/type checking and desugaring to typed functions, plus updated `docs/src/library/db.md` and `src/lsp_docs.rs`.
+
 ## [0.3.3] - 2026-11-20
 
 ### Added

@@ -340,10 +340,11 @@ impl Vm {
                     s_base += arg_base_s as usize;
                     o_base += arg_base_o as usize;
                     cur_closure_slot = usize::MAX;
-                    self.ensure_capacity(
-                        s_base + func.num_scalars as usize,
-                        o_base + func.num_objs as usize,
-                    );
+                    let s_needed = s_base + func.num_scalars as usize;
+                    let o_needed = o_base + func.num_objs as usize;
+                    if s_needed > self.scalars.len() || o_needed > self.objs.len() {
+                        self.ensure_capacity(s_needed, o_needed);
+                    }
                     sync_frame_ptrs!();
                 }
                 Op::CallCallable {
@@ -401,9 +402,13 @@ impl Vm {
                 }
                 Op::ReturnScalar { src } => {
                     let val = s_get!(src);
-                    let Some(frame) = self.finish_return_frame(o_base, func.num_objs, base_frame_depth) else {
+                    if func.num_objs > 0 {
+                        self.clear_obj_range(o_base, func.num_objs as usize);
+                    }
+                    if self.frames.len() == base_frame_depth {
                         return Ok(ExecResult::Scalar(val));
-                    };
+                    }
+                    let frame = unsafe { self.frames.pop().unwrap_unchecked() };
                     func_id = frame.func_id;
                     func = unsafe { module.functions.get_unchecked(func_id as usize) };
                     ops_ptr = func.ops.as_ptr();
@@ -419,9 +424,13 @@ impl Vm {
                     return_obj_val!(val);
                 }
                 Op::ReturnVoid => {
-                    let Some(frame) = self.finish_return_frame(o_base, func.num_objs, base_frame_depth) else {
+                    if func.num_objs > 0 {
+                        self.clear_obj_range(o_base, func.num_objs as usize);
+                    }
+                    if self.frames.len() == base_frame_depth {
                         return Ok(ExecResult::Void);
-                    };
+                    }
+                    let frame = unsafe { self.frames.pop().unwrap_unchecked() };
                     func_id = frame.func_id;
                     func = unsafe { module.functions.get_unchecked(func_id as usize) };
                     ops_ptr = func.ops.as_ptr();

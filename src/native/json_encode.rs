@@ -181,7 +181,7 @@ pub fn encode_obj(val: &Obj, schemas: &[StructSchema], out: &mut Vec<u8>) -> Res
             }
             out.push(b'}');
         }
-        Obj::Closure(_) | Obj::Func(_) => {
+        Obj::Closure(_) | Obj::Func(_) | Obj::DbQuery(_) => {
             return Err(JsonError::root(
                 "Value of type 'Function' is not JSON-serializable",
             ));

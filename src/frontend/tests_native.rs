@@ -3011,3 +3011,355 @@ func handle_event(req: http.Request, body: Msg) -> http.Response {
     assert!(spec.contains("\"Msg_Ping\""), "{}", spec);
     assert!(spec.contains("\"mapping\""), "{}", spec);
 }
+
+#[test]
+fn cdt_db_fluent_query_builder_sql_and_bundle_e2e() {
+    use crate::native::db_query::{OrderDir, QueryMode, WhereNode, WhereOp, build_query_sql};
+
+    let src = r#"
+import * as db from "cdt.db"
+
+@db.table("users")
+struct User {
+    id: Int @db.pk @db.auto
+    email: String @db.unique
+    role: String
+    age: Int
+    active: Bool = true
+    bio: String? = nil
+}
+
+export func build_sql_cases(conn: db.Connection) -> String {
+    sub := conn.from<User>()
+        .where_eq("role", "admin")
+        .or_where_eq("role", "owner")
+    q := conn.from<User>()
+        .select(["id", "email"])
+        .where_eq("active", true)
+        .where("age", ">=", 18)
+        .where_in("role", ["admin", "owner", "mod"])
+        .where_not_null("bio")
+        .and_query(sub)
+        .order_by("age", "desc")
+        .order_by("id", "asc")
+        .paginate(2, 10)
+    s1 := q.to_sql("all")
+    s2 := q.to_sql("count")
+    s3 := q.to_sql("exists")
+    s4 := q.to_sql("first")
+    s5 := q.to_sql("delete")
+    return s1 + "\n" + s2 + "\n" + s3 + "\n" + s4 + "\n" + s5
+}
+
+export func dummy_exec(conn: db.Connection) -> [User] | db.DbError {
+    return conn.from<User>().where_eq("active", true).limit(5).all()
+}
+"#;
+    let module = crate::frontend::compile_source(src).unwrap();
+    let model = &module.db_models[0];
+
+    let where_root = WhereNode::And(vec![
+        WhereNode::Cond {
+            col_name: "active".to_string(),
+            op: WhereOp::Eq,
+            param_count: 1,
+        },
+        WhereNode::Or(vec![
+            WhereNode::Cond {
+                col_name: "role".to_string(),
+                op: WhereOp::Eq,
+                param_count: 1,
+            },
+            WhereNode::Cond {
+                col_name: "email".to_string(),
+                op: WhereOp::ILike,
+                param_count: 1,
+            },
+        ]),
+        WhereNode::Cond {
+            col_name: "id".to_string(),
+            op: WhereOp::In,
+            param_count: 0,
+        },
+    ]);
+    let pg_sql = build_query_sql(
+        model,
+        &["id".to_string(), "email".to_string()],
+        Some(&where_root),
+        &[("age".to_string(), OrderDir::Desc)],
+        Some(10),
+        Some(20),
+        QueryMode::All,
+        "postgres",
+    )
+    .unwrap();
+    assert_eq!(
+        pg_sql,
+        "SELECT id, email FROM users WHERE active = ? AND (role = ? OR email ILIKE ?) AND 1 = 0 ORDER BY age DESC LIMIT 10 OFFSET 20"
+    );
+
+    let mysql_sql = build_query_sql(
+        model,
+        &[],
+        Some(&where_root),
+        &[],
+        None,
+        None,
+        QueryMode::All,
+        "mysql",
+    )
+    .unwrap();
+    assert!(mysql_sql.contains("LOWER(email) LIKE LOWER(?)"), "{}", mysql_sql);
+
+    assert!(
+        build_query_sql(
+            model,
+            &["id = 1; DROP TABLE users".to_string()],
+            None,
+            &[],
+            None,
+            None,
+            QueryMode::All,
+            "postgres",
+        )
+        .is_err()
+    );
+
+    // Bundle roundtrip check
+    let bytes = crate::ir::bundle::encode_bundle(&module, 0, 0).unwrap();
+    let (decoded, _, _) = crate::ir::bundle::decode_bundle(&bytes).unwrap();
+    assert_eq!(decoded.db_models.len(), 1);
+}
+
+#[test]
+fn cdt_db_declarative_query_blocks_typecheck_desugar_and_errors_e2e() {
+    let ok_src = r#"
+import * as db from "cdt.db"
+
+@db.table("users")
+struct User {
+    id: Int @db.pk @db.auto
+    email: String @db.unique
+    role: String
+    age: Int
+    active: Bool = true
+    bio: String? = nil
+}
+
+export query FindAdults(conn: db.Connection, min_age: Int, max_rows: Int = 20) -> [User] {
+    from User
+    where active == true && (age >= min_age || role in ["admin", "owner"]) && bio != nil
+    order_by age desc, id asc
+    limit max_rows
+    offset 0
+}
+
+query FindByEmail(conn: db.Connection, target_email: String) -> User? | db.DbError {
+    from User
+    where email ilike target_email
+    first
+}
+
+query CountActive(conn: db.Connection) -> Int {
+    from User
+    where active == true
+    count
+}
+
+query HasRole(conn: db.Connection, target_role: String) -> Bool {
+    from User
+    where role == target_role
+    exists
+}
+
+query PurgeInactive(conn: db.Connection) -> Int {
+    from User
+    where active == false
+    delete
+}
+
+export func caller(conn: db.Connection) -> Int | db.DbError {
+    adults := FindAdults(conn, 18)?
+    one := FindByEmail(conn, "%@example.com")?
+    n := CountActive(conn)?
+    ok := HasRole(conn, "admin")?
+    del := PurgeInactive(conn)?
+    if one != nil && ok {
+        return adults.len() + n + del
+    }
+    return n
+}
+"#;
+    let module = crate::frontend::compile_source(ok_src).unwrap();
+    assert!(module.functions.iter().any(|f| f.name == "FindAdults"));
+    assert!(module.functions.iter().any(|f| f.name == "FindByEmail"));
+    assert!(module.functions.iter().any(|f| f.name == "CountActive"));
+    assert!(module.functions.iter().any(|f| f.name == "HasRole"));
+    assert!(module.functions.iter().any(|f| f.name == "PurgeInactive"));
+
+    // Compile-time errors: unknown field, type mismatch, missing Connection param
+    let bad_field_src = r#"
+import * as db from "cdt.db"
+@db.table("users")
+struct User { id: Int @db.pk }
+query BadField(conn: db.Connection) -> [User] {
+    from User
+    where nonexistent == 1
+}
+"#;
+    let err = crate::frontend::compile_source(bad_field_src).unwrap_err();
+    assert!(err.contains("unknown field 'nonexistent'"), "{}", err);
+
+    let bad_type_src = r#"
+import * as db from "cdt.db"
+@db.table("users")
+struct User { id: Int @db.pk, age: Int }
+query BadType(conn: db.Connection) -> [User] {
+    from User
+    where age >= "eighteen"
+}
+"#;
+    let err = crate::frontend::compile_source(bad_type_src).unwrap_err();
+    assert!(err.contains("cannot compare"), "{}", err);
+
+    let bad_conn_src = r#"
+import * as db from "cdt.db"
+@db.table("users")
+struct User { id: Int @db.pk }
+query BadConn(x: Int) -> [User] {
+    from User
+}
+"#;
+    let err = crate::frontend::compile_source(bad_conn_src).unwrap_err();
+    assert!(err.contains("db.Connection"), "{}", err);
+}
+
+#[test]
+fn cdt_db_pool_typecheck_config_and_bundle_e2e() {
+    use crate::native::db_pool::DbPoolState;
+
+    assert!(DbPoolState::open("postgres://u:p@127.0.0.1:5432/app", 0, 1000).is_err());
+    assert!(DbPoolState::open("postgres://u:p@127.0.0.1:5432/app", 4, -1).is_err());
+
+    let src = r#"
+import * as db from "cdt.db"
+
+@db.table("items")
+struct Item {
+    id: Int @db.pk @db.auto
+    name: String
+}
+
+export func run() -> String {
+    res := db.pool("sqlite://invalid", 8, 60000)
+    switch res {
+        case db.DbError(e):
+            return e.kind
+        case db.Pool(p):
+            defer p.close()
+            _st := p.stats()
+            return "ok"
+    }
+}
+
+export func use_pool_helpers(p: db.Pool) -> Int | db.DbError {
+    c := p.acquire()?
+    defer c.close()
+    n := p.with(conn => conn.count<Item>())?
+    return n + c.count<Item>()?
+}
+"#;
+    let module = crate::frontend::compile_source(src).unwrap();
+    let mut vm = crate::vm::Vm::new();
+    let run_fid = module
+        .functions
+        .iter()
+        .position(|f| f.name == "run")
+        .unwrap() as u32;
+    let out = vm.call(&module, run_fid, &[], &[]).unwrap();
+    assert_eq!(out, crate::vm::ExecResult::Obj(crate::vm::value::Obj::str("invalid_url")));
+
+    let bytes = crate::ir::bundle::encode_bundle(&module, 0, 0).unwrap();
+    let _decoded = crate::ir::bundle::decode_bundle(&bytes).unwrap();
+
+    // Verify Obj::DbQuery cow/in-place chaining does not allocate any host table entries
+    let vm_q = crate::vm::Vm::new();
+    let sql_fid = module
+        .functions
+        .iter()
+        .position(|f| f.name == "use_pool_helpers")
+        .unwrap();
+    assert!(sql_fid < module.functions.len());
+    assert_eq!(vm_q.host.db_conns.len(), 0);
+}
+
+#[test]
+fn cdt_db_prepared_url_flags_and_insert_all_e2e() {
+    use crate::native::db::{Cell, build_insert_all_and_cells};
+    use crate::native::mysql::parse_mysql_url;
+    use crate::native::pg::parse_pg_url;
+    use crate::vm::value::{Obj, StructData};
+
+    let pg_default = parse_pg_url("postgres://u:p@127.0.0.1:5432/app").unwrap();
+    assert!(pg_default.prepare);
+    let pg_off = parse_pg_url("postgres://u:p@127.0.0.1:5432/app?prepare=off").unwrap();
+    assert!(!pg_off.prepare);
+
+    let my_default = parse_mysql_url("mysql://u:p@127.0.0.1:3306/app").unwrap();
+    assert!(my_default.prepare);
+    let my_off = parse_mysql_url("mysql://u:p@127.0.0.1:3306/app?prepare=off").unwrap();
+    assert!(!my_off.prepare);
+
+    let src = r#"
+import * as db from "cdt.db"
+
+@db.table("accounts")
+struct Account {
+    id: Int @db.pk @db.auto
+    email: String @db.unique
+    age: Int
+}
+
+export func bulk(conn: db.Connection) -> Int | db.DbError {
+    rows := [
+        Account(id: 0, email: "a@x.com", age: 20),
+        Account(id: 0, email: "b@x.com", age: 30),
+    ]
+    return conn.insert_all<Account>(rows)
+}
+"#;
+    let module = crate::frontend::compile_source(src).unwrap();
+    let model = &module.db_models[0];
+    let schema = module
+        .struct_schemas
+        .iter()
+        .find(|s| s.schema_id == model.schema_id)
+        .unwrap();
+
+    let mut r1 = StructData::new(schema.schema_id, schema.scalar_len, schema.obj_len);
+    r1.set_scalar(0, 0);
+    r1.set_scalar(1, 20);
+    r1.set_obj(0, Obj::str("a@x.com"));
+
+    let mut r2 = StructData::new(schema.schema_id, schema.scalar_len, schema.obj_len);
+    r2.set_scalar(0, 0);
+    r2.set_scalar(1, 30);
+    r2.set_obj(0, Obj::str("b@x.com"));
+
+    let batches = build_insert_all_and_cells(model, schema, &[&r1, &r2]).unwrap();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(
+        batches[0].0,
+        "INSERT INTO accounts (email, age) VALUES (?, ?), (?, ?)"
+    );
+    assert_eq!(
+        batches[0].1,
+        vec![
+            Cell::Text("a@x.com".to_string()),
+            Cell::Int(20),
+            Cell::Text("b@x.com".to_string()),
+            Cell::Int(30),
+        ]
+    );
+    assert!(build_insert_all_and_cells(model, schema, &[]).unwrap().is_empty());
+}

@@ -5,6 +5,7 @@ pub(crate) mod check_cli;
 pub(crate) mod check_ext;
 pub(crate) mod check_fs;
 pub(crate) mod check_native;
+pub(crate) mod check_query;
 pub(crate) mod check_sys;
 pub(crate) mod check_validation;
 pub mod lexer;
