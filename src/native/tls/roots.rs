@@ -56,15 +56,9 @@ impl RootStore {
 
     pub fn load(source: &RootSource) -> Result<std::borrow::Cow<'static, RootStore>, TlsError> {
         match source {
-            RootSource::File(path) => {
-                let bytes = fs::read(path).map_err(|e| {
-                    TlsError::CertificateError(format!(
-                        "failed to read CA file '{}': {e}",
-                        path.display()
-                    ))
-                })?;
-                Ok(std::borrow::Cow::Owned(Self::from_pem(&bytes)?))
-            }
+            RootSource::File(path) => Ok(std::borrow::Cow::Owned(Self::from_pem(&read_ca_file(
+                path,
+            )?)?)),
             RootSource::Inline(pem) => Ok(std::borrow::Cow::Owned(Self::from_pem(pem)?)),
             RootSource::System => {
                 let res = SYSTEM_ROOTS.get_or_init(|| load_system_roots().map_err(|e| e.to_string()));
@@ -75,6 +69,12 @@ impl RootStore {
             }
         }
     }
+}
+
+pub(super) fn read_ca_file(path: &std::path::Path) -> Result<Vec<u8>, TlsError> {
+    fs::read(path).map_err(|e| {
+        TlsError::CertificateError(format!("failed to read CA file '{}': {e}", path.display()))
+    })
 }
 
 fn load_system_roots() -> Result<RootStore, TlsError> {

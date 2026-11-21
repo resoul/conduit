@@ -44,7 +44,10 @@ pub const EXT_EC_POINT_FORMATS: u16 = 0x000b;
 pub const EXT_SIGNATURE_ALGORITHMS: u16 = 0x000d;
 pub const EXT_ALPN: u16 = 0x0010;
 pub const EXT_EXTENDED_MASTER_SECRET: u16 = 0x0017;
+const EXT_PRE_SHARED_KEY: u16 = 0x0029;
+const EXT_EARLY_DATA: u16 = 0x002a;
 pub const EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
+const EXT_PSK_KEY_EXCHANGE_MODES: u16 = 0x002d;
 pub const EXT_KEY_SHARE: u16 = 0x0033;
 pub const EXT_RENEGOTIATION_INFO: u16 = 0xff01;
 
@@ -225,6 +228,37 @@ pub fn build_client_hello(
     key_share_pub: &[u8],
     allow_tls12: bool,
 ) -> Vec<u8> {
+    build_client_hello_inner(
+        random,
+        legacy_session_id,
+        server_name,
+        alpn,
+        key_share_group,
+        key_share_pub,
+        allow_tls12,
+        false,
+        None,
+    )
+}
+
+pub(super) struct PskOffer<'a> {
+    pub(super) identity: &'a [u8],
+    pub(super) obfuscated_age: u32,
+    pub(super) binder_len: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_client_hello_inner(
+    random: &[u8; 32],
+    legacy_session_id: &[u8],
+    server_name: &str,
+    alpn: &[&[u8]],
+    key_share_group: u16,
+    key_share_pub: &[u8],
+    allow_tls12: bool,
+    enable_resumption: bool,
+    psk: Option<PskOffer<'_>>,
+) -> Vec<u8> {
     let mut body = Vec::with_capacity(256);
     body.extend_from_slice(&0x0303u16.to_be_bytes()); // legacy_version = TLS 1.2
     body.extend_from_slice(random);
@@ -342,6 +376,26 @@ pub fn build_client_hello(
         });
     }
 
+    if enable_resumption {
+        // Offer psk_dhe_ke. Every resumed handshake uses a fresh key share.
+        push_ext(&mut exts, EXT_PSK_KEY_EXCHANGE_MODES, |b| {
+            b.extend_from_slice(&[1, 1])
+        });
+    }
+    if let Some(psk) = psk {
+        // pre_shared_key goes last. The final ClientHello lengths already
+        // include the binder when the caller hashes the prefix.
+        push_ext(&mut exts, EXT_PRE_SHARED_KEY, |b| {
+            b.extend_from_slice(&((psk.identity.len() + 6) as u16).to_be_bytes());
+            b.extend_from_slice(&(psk.identity.len() as u16).to_be_bytes());
+            b.extend_from_slice(psk.identity);
+            b.extend_from_slice(&psk.obfuscated_age.to_be_bytes());
+            b.extend_from_slice(&((psk.binder_len + 1) as u16).to_be_bytes());
+            b.push(psk.binder_len as u8);
+            b.resize(b.len() + psk.binder_len, 0);
+        });
+    }
+
     body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
     body.extend_from_slice(&exts);
 
@@ -370,6 +424,12 @@ pub struct ServerHello {
 }
 
 pub fn parse_server_hello(body: &[u8]) -> Result<ServerHello, TlsError> {
+    parse_server_hello_with_psk(body).map(|(hello, _)| hello)
+}
+
+pub(super) fn parse_server_hello_with_psk(
+    body: &[u8],
+) -> Result<(ServerHello, Option<u16>), TlsError> {
     if body.len() < 38 {
         return Err(TlsError::DecodeError("ServerHello too short"));
     }
@@ -402,6 +462,7 @@ pub fn parse_server_hello(body: &[u8]) -> Result<ServerHello, TlsError> {
     let mut hrr_selected_group = None;
     let mut extended_master_secret = false;
     let mut renegotiation_info_empty = false;
+    let mut selected_psk = None;
 
     if pos < body.len() {
         if pos + 2 > body.len() {
@@ -427,6 +488,12 @@ pub fn parse_server_hello(body: &[u8]) -> Result<ServerHello, TlsError> {
             pos += ext_len;
 
             match ext_type {
+                EXT_PRE_SHARED_KEY => {
+                    if is_hrr || selected_psk.is_some() || ext.len() != 2 {
+                        return Err(TlsError::DecodeError("invalid ServerHello pre_shared_key"));
+                    }
+                    selected_psk = Some(u16::from_be_bytes([ext[0], ext[1]]));
+                }
                 EXT_SUPPORTED_VERSIONS => {
                     if ext.len() != 2 {
                         return Err(TlsError::DecodeError("invalid supported_versions"));
@@ -469,7 +536,12 @@ pub fn parse_server_hello(body: &[u8]) -> Result<ServerHello, TlsError> {
         }
     }
 
-    Ok(ServerHello {
+    if selected_psk.is_some() && selected_version != 0x0304 {
+        return Err(TlsError::ProtocolError(
+            "pre_shared_key outside TLS 1.3 ServerHello".to_string(),
+        ));
+    }
+    let hello = ServerHello {
         random,
         session_id,
         cipher_suite,
@@ -479,7 +551,8 @@ pub fn parse_server_hello(body: &[u8]) -> Result<ServerHello, TlsError> {
         hrr_selected_group,
         extended_master_secret,
         renegotiation_info_empty,
-    })
+    };
+    Ok((hello, selected_psk))
 }
 
 pub fn parse_encrypted_extensions(body: &[u8]) -> Result<Option<Vec<u8>>, TlsError> {
@@ -504,8 +577,13 @@ pub fn parse_encrypted_extensions(body: &[u8]) -> Result<Option<Vec<u8>>, TlsErr
         }
         let ext = &body[pos..pos + ext_len];
         pos += ext_len;
+        if ext_type == EXT_EARLY_DATA {
+            return Err(TlsError::ProtocolError(
+                "server offered unrequested early_data".to_string(),
+            ));
+        }
         if ext_type == EXT_ALPN {
-            if ext.len() < 4 {
+            if alpn.is_some() || ext.len() < 4 {
                 return Err(TlsError::DecodeError("invalid ALPN extension"));
             }
             let list_len = u16::from_be_bytes([ext[0], ext[1]]) as usize;
@@ -517,6 +595,60 @@ pub fn parse_encrypted_extensions(body: &[u8]) -> Result<Option<Vec<u8>>, TlsErr
         }
     }
     Ok(alpn)
+}
+
+pub(super) struct NewSessionTicket<'a> {
+    pub lifetime: u32,
+    pub age_add: u32,
+    pub nonce: &'a [u8],
+    pub ticket: &'a [u8],
+}
+
+pub(super) fn parse_new_session_ticket(body: &[u8]) -> Result<NewSessionTicket<'_>, TlsError> {
+    let invalid = TlsError::DecodeError("invalid NewSessionTicket");
+    let (header, rest) = body.split_first_chunk::<9>().ok_or(invalid)?;
+    let lifetime = u32::from_be_bytes(header[..4].try_into().unwrap());
+    let age_add = u32::from_be_bytes(header[4..8].try_into().unwrap());
+    let (nonce, rest) = rest
+        .split_at_checked(header[8] as usize)
+        .ok_or(TlsError::DecodeError("truncated ticket nonce"))?;
+    let (length, rest) = rest
+        .split_first_chunk::<2>()
+        .ok_or(TlsError::DecodeError("missing ticket length"))?;
+    let (ticket, rest) = rest
+        .split_at_checked(u16::from_be_bytes(*length) as usize)
+        .ok_or(TlsError::DecodeError("truncated ticket"))?;
+    let (length, extensions) = rest
+        .split_first_chunk::<2>()
+        .ok_or(TlsError::DecodeError("missing ticket extensions"))?;
+    if ticket.is_empty() || extensions.len() != u16::from_be_bytes(*length) as usize {
+        return Err(TlsError::DecodeError("invalid ticket or extensions length"));
+    }
+    let mut body = extensions;
+    let mut saw_early_data = false;
+    while !body.is_empty() {
+        let (header, rest) = body
+            .split_first_chunk::<4>()
+            .ok_or(TlsError::DecodeError("truncated ticket extension"))?;
+        let kind = u16::from_be_bytes([header[0], header[1]]);
+        let len = u16::from_be_bytes([header[2], header[3]]) as usize;
+        let (_, rest) = rest
+            .split_at_checked(len)
+            .ok_or(TlsError::DecodeError("truncated ticket extension body"))?;
+        if kind == EXT_EARLY_DATA {
+            if len != 4 || saw_early_data {
+                return Err(TlsError::DecodeError("invalid ticket early_data extension"));
+            }
+            saw_early_data = true;
+        }
+        body = rest;
+    }
+    Ok(NewSessionTicket {
+        lifetime,
+        age_add,
+        nonce,
+        ticket,
+    })
 }
 
 pub fn parse_tls13_certificate(body: &[u8]) -> Result<Vec<Vec<u8>>, TlsError> {

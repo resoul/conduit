@@ -2744,11 +2744,8 @@ mod tests {
     }
 
     #[test]
-    fn http_reactor_slowloris_keepalive_pipelining_loopback_e2e() {
-        use std::io::{Read, Write};
-        use std::net::TcpStream;
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
+    fn http_keepalive_pipelining_and_header_timeout_loopback_e2e() {
+        use std::io::{BufRead, BufReader, Read, Write};
 
         let src = r#"
             import * as http from "cdt.http"
@@ -2756,7 +2753,7 @@ mod tests {
             export func setup_router() -> http.Router {
                 r := http.router()
                 r.workers(2)
-                r.timeouts(250, 450, 450)
+                r.timeouts(1500, 1000, 1000)
                 r.get("/hello", (_req: http.Request) -> http.Response => {
                     return http.text("hi")
                 })
@@ -2767,7 +2764,7 @@ mod tests {
             }
         "#;
 
-        let module = crate::frontend::compile_source(src).expect("compile reactor test router");
+        let module = crate::frontend::compile_source(src).expect("compile HTTP test router");
         let setup_fid = module.func_id("setup_router").unwrap();
         let mut init_vm = Vm::new();
         let router_obj = init_vm.call_obj(&module, setup_fid, &[], &[]).unwrap();
@@ -2800,29 +2797,50 @@ mod tests {
             );
         });
 
-        // 1. Open 8 Slowloris connections (4x worker count) and leave partial headers stalled.
+        // The reactor can hold more stalled sockets than workers. The blocking
+        // backend needs one worker free to handle the other requests.
+        let stalled_connections = if cfg!(any(
+            target_os = "macos",
+            target_os = "ios",
+            all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))
+        )) {
+            8
+        } else {
+            1
+        };
         let mut slow_conns = Vec::new();
-        for _ in 0..8 {
+        for _ in 0..stalled_connections {
             let mut s = TcpStream::connect(addr).unwrap();
             s.write_all(b"GET /hello HTTP/1.1\r\nHost: 127.0.0.1\r\n").unwrap();
             slow_conns.push(s);
         }
 
-        // 2. While all 8 slow sockets are held open, a normal keep-alive connection must respond immediately.
+        // A normal connection can serve repeated requests while the slow sockets are open.
         {
-            let mut fast = TcpStream::connect(addr).unwrap();
+            let fast = TcpStream::connect(addr).unwrap();
             fast.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut fast = BufReader::new(fast);
             for _ in 0..2 {
-                fast.write_all(b"GET /hello HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                fast.get_mut()
+                    .write_all(b"GET /hello HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
                     .unwrap();
-                let mut buf = [0u8; 512];
-                let n = fast.read(&mut buf).unwrap();
-                let txt = String::from_utf8_lossy(&buf[..n]);
-                assert!(txt.contains("HTTP/1.1 200 OK") && txt.ends_with("\r\n\r\nhi"), "got: {txt}");
+                let mut line = String::new();
+                fast.read_line(&mut line).unwrap();
+                assert_eq!(line, "HTTP/1.1 200 OK\r\n");
+                loop {
+                    line.clear();
+                    assert_ne!(fast.read_line(&mut line).unwrap(), 0, "incomplete response headers");
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let mut body = [0u8; 2];
+                fast.read_exact(&mut body).unwrap();
+                assert_eq!(&body, b"hi");
             }
 
-            // 3. HTTP pipelining: two requests sent in a single write arrive back in order.
-            fast.write_all(
+            // Two pipelined requests arrive back in order.
+            fast.get_mut().write_all(
                 b"GET /hello HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\nPOST /echo HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 4\r\nConnection: close\r\n\r\nping",
             )
             .unwrap();
@@ -2833,7 +2851,7 @@ mod tests {
             assert!(combined.ends_with("\r\n\r\nping"), "pipelined resp 2: {combined}");
         }
 
-        // 4. Split POST body sent across two writes with a short pause.
+        // A POST body can span multiple writes.
         {
             let mut split = TcpStream::connect(addr).unwrap();
             split.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
@@ -2849,7 +2867,7 @@ mod tests {
             assert!(all.contains("200 OK") && all.ends_with("\r\n\r\nabcdef"), "split body: {all}");
         }
 
-        // 5. Slowloris partial-header socket receives 408 Request Timeout after header_timeout (~450ms).
+        // An incomplete request receives 408 when its header deadline expires.
         slow_conns[0]
             .set_read_timeout(Some(Duration::from_secs(3)))
             .unwrap();
@@ -2861,13 +2879,9 @@ mod tests {
         );
         drop(slow_conns);
 
-        // 6. Stop signal shuts down reactor cleanly and promptly.
-        let stopped_cleanly = Arc::new(AtomicBool::new(false));
         stop_flag.store(true, Ordering::Release);
         wake_socket_addr(addr);
         srv_thread.join().unwrap();
-        stopped_cleanly.store(true, Ordering::Release);
-        assert!(stopped_cleanly.load(Ordering::Acquire));
     }
 
     #[test]

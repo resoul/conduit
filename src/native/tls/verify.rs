@@ -32,6 +32,16 @@ pub fn verify_server_cert(
     check_hostname: bool,
     now: i64,
 ) -> Result<(), TlsError> {
+    verify_server_cert_validity(cert_chain_der, roots, server_name, check_hostname, now).map(|_| ())
+}
+
+pub(super) fn verify_server_cert_validity(
+    cert_chain_der: &[Vec<u8>],
+    roots: &RootStore,
+    server_name: &str,
+    check_hostname: bool,
+    now: i64,
+) -> Result<std::ops::RangeInclusive<i64>, TlsError> {
     if cert_chain_der.is_empty() {
         return Err(TlsError::CertificateError("server sent empty certificate chain".to_string()));
     }
@@ -63,7 +73,7 @@ pub fn verify_server_cert(
     visited[0] = true;
     let mut path_indices = vec![0usize];
     let mut sig_checks_left = MAX_SIG_CHECKS;
-    if !build_and_verify_path(
+    build_and_verify_path(
         leaf,
         leaf,
         &parsed,
@@ -73,12 +83,12 @@ pub fn verify_server_cert(
         0,
         now,
         &mut sig_checks_left,
-    )? {
-        return Err(TlsError::CertificateError(
+    )?
+    .ok_or_else(|| {
+        TlsError::CertificateError(
             "unable to verify certificate chain against any trusted root CA".to_string(),
-        ));
-    }
-    Ok(())
+        )
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -92,9 +102,9 @@ fn build_and_verify_path<'a>(
     ca_depth: usize,
     now: i64,
     sig_checks_left: &mut usize,
-) -> Result<bool, TlsError> {
+) -> Result<Option<std::ops::RangeInclusive<i64>>, TlsError> {
     if path_indices.len() > MAX_CHAIN_LEN {
-        return Ok(false);
+        return Ok(None);
     }
 
     // 1. Check if `current` is directly signed by a trust anchor in `roots`
@@ -118,7 +128,9 @@ fn build_and_verify_path<'a>(
             if let Some(nc) = &root.name_constraints {
                 check_name_constraints_on_leaf(nc, leaf.san.as_slice())?;
             }
-            return Ok(true);
+            return Ok(Some(
+                current.not_before.max(root.not_before)..=current.not_after.min(root.not_after),
+            ));
         }
     }
 
@@ -147,7 +159,7 @@ fn build_and_verify_path<'a>(
         }
         visited[idx] = true;
         path_indices.push(idx);
-        if build_and_verify_path(
+        if let Some(validity) = build_and_verify_path(
             leaf,
             cand,
             intermediates,
@@ -158,13 +170,15 @@ fn build_and_verify_path<'a>(
             now,
             sig_checks_left,
         )? {
-            return Ok(true);
+            return Ok(Some(
+                current.not_before.max(*validity.start())..=current.not_after.min(*validity.end()),
+            ));
         }
         path_indices.pop();
         visited[idx] = false;
     }
 
-    Ok(false)
+    Ok(None)
 }
 
 fn check_validity(cert: &X509Cert<'_>, now: i64) -> Result<(), TlsError> {

@@ -62,6 +62,8 @@ For `301`, `302`, and `303`, the client sends non-`HEAD` requests as `GET` and r
 
 `http.Client` reuses idle HTTP/1.1 TCP and TLS connections per `(host, port, tls)` across requests, with up to 8 idle connections per host and a 60-second idle TTL.
 
+When a fresh TCP connection is needed, HTTPS automatically attempts TLS 1.3 session resumption if the server previously sent a valid ticket. If the server declines the ticket, the client performs a full handshake. Requests are sent after the handshake completes.
+
 If a pooled request fails while sending the request or parsing the response, the client can retry once on a fresh connection for `GET`, `HEAD`, `OPTIONS`, `TRACE`, `PUT`, and `DELETE`. For other methods such as `POST` and `PATCH`, the client returns the error. The server may already have processed the request by then.
 
 | Method | Signature | Description |

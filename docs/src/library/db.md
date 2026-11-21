@@ -197,6 +197,8 @@ conduit db rollback app.cdt --url postgres://conduit:secret@127.0.0.1:5432/app [
 
 Conduit includes a built-in zero-dependency TLS 1.2 / 1.3 client used by PostgreSQL, MySQL, Redis (`rediss://`), and HTTPS (`http.get` / `http.request`).
 
+New TLS 1.3 connections can resume a previous session using a server-issued ticket cached in memory for the same host, port, ALPN settings, and trust configuration. Resumed sessions use a fresh ephemeral key exchange. The client sends database credentials and commands after the handshake completes.
+
 - **PostgreSQL URL parameters:** `sslmode=disable|allow|prefer|require|verify-ca|verify-full` (current default: `disable`), `sslrootcert=/path/to/ca.pem`. Note: `allow` is simplified to try TLS first (like `prefer`) and fall back to plaintext if the server refuses SSL (`'N'`). When TLS is active and the server advertises `SCRAM-SHA-256-PLUS`, `tls-server-end-point` channel binding is automatically negotiated.
   With `sslmode=disable`, `allow`, `prefer`, or `require` without `sslrootcert`, Conduit emits a one-time warning per host on non-loopback addresses (including RFC 1918 private networks and Docker hostnames such as `db`); **Conduit 0.4.0 will default non-loopback connections to `verify-full`**. Use `sslmode=verify-full` for verified TLS with SAN checks, `sslmode=verify-ca&sslrootcert=/path/to/ca.pem` for internal certificates without a hostname SAN, or explicit `sslmode=disable` only on a trusted network.
 - Prepared PostgreSQL queries request binary results for integers, booleans, double-precision floats, and UUIDs

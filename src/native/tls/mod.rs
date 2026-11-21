@@ -7,6 +7,7 @@ pub mod handshake;
 pub mod pem;
 pub mod record;
 pub mod roots;
+mod session;
 pub mod tls12;
 pub mod tls13;
 pub mod verify;
@@ -23,8 +24,10 @@ use crate::native::tls::record::{CT_ALERT, CT_APPLICATION_DATA, CT_HANDSHAKE, Re
 
 const MAX_TLS13_KEY_UPDATES: u32 = 32;
 use crate::native::tls::roots::RootSource;
+use crate::native::tls::session::{Resumption, SessionKey, store_ticket, take_ticket};
 use crate::native::tls::tls13::{
-    Tls13Secrets, connect_tls_handshake, derive_next_app_secret, make_tls13_cipher_state,
+    Tls13Secrets, connect_tls_handshake_with_ticket, derive_next_app_secret,
+    make_tls13_cipher_state,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +77,8 @@ pub struct TlsStream<S: Read + Write> {
     leaf_cert_der: Option<Vec<u8>>,
     tls13_secrets: Option<Tls13Secrets>,
     peer_key_updates: u32,
+    session: Option<(SessionKey, Resumption)>,
+    resumed: bool,
 }
 
 impl<S: Read + Write> Drop for TlsStream<S> {
@@ -85,6 +90,11 @@ impl<S: Read + Write> Drop for TlsStream<S> {
 impl<S: Read + Write> TlsStream<S> {
     pub fn alpn_protocol(&self) -> Option<&[u8]> {
         self.alpn.as_deref()
+    }
+
+    /// Whether the server authenticated this connection via a TLS 1.3 session ticket.
+    pub fn is_resumed(&self) -> bool {
+        self.resumed
     }
 
     pub fn leaf_cert_der(&self) -> Option<&[u8]> {
@@ -104,7 +114,15 @@ impl<S: Read + Write> TlsStream<S> {
         while let Some((mt, raw)) = self.hs_reader.next_message()? {
             match mt {
                 HT_NEW_SESSION_TICKET => {
-                    // Ignored (stateless client)
+                    if let Some((key, resumption)) = &mut self.session
+                        && let Some(secrets) = &self.tls13_secrets
+                    {
+                        store_ticket(key, resumption, secrets.suite, &raw[4..])?;
+                        resumption.remaining_tickets -= 1;
+                        if resumption.remaining_tickets == 0 {
+                            self.session = None;
+                        }
+                    }
                 }
                 HT_KEY_UPDATE => {
                     if raw.len() != 5 {
@@ -288,7 +306,20 @@ pub fn connect(tcp: TcpStream, cfg: &TlsConfig) -> Result<TlsStream<TcpStream>, 
     let _ = tcp.set_read_timeout(Some(cfg.handshake_timeout));
     let _ = tcp.set_write_timeout(Some(cfg.handshake_timeout));
 
-    let res = connect_stream(tcp, cfg);
+    let port = tcp.peer_addr().ok().map(|addr| addr.port());
+    let cfg_with_roots = if port.is_some()
+        && cfg.verify != VerifyMode::Disable
+        && let RootSource::File(path) = &cfg.roots
+    {
+        let mut snapshot = cfg.clone();
+        snapshot.roots = RootSource::Inline(roots::read_ca_file(path)?);
+        Some(snapshot)
+    } else {
+        None
+    };
+    let cfg = cfg_with_roots.as_ref().unwrap_or(cfg);
+    let key = port.map(|port| SessionKey::new(cfg, port));
+    let res = connect_stream_inner(tcp, cfg, key);
     if let Ok(ref s) = res {
         let _ = s.get_ref().set_read_timeout(prev_read);
         let _ = s.get_ref().set_write_timeout(prev_write);
@@ -342,10 +373,24 @@ fn warn_if_insecure_disable(cfg: &TlsConfig) {
     }
 }
 
-pub fn connect_stream<S: Read + Write>(mut stream: S, cfg: &TlsConfig) -> Result<TlsStream<S>, TlsError> {
+pub fn connect_stream<S: Read + Write>(
+    stream: S,
+    cfg: &TlsConfig,
+) -> Result<TlsStream<S>, TlsError> {
+    connect_stream_inner(stream, cfg, None)
+}
+
+fn connect_stream_inner<S: Read + Write>(
+    mut stream: S,
+    cfg: &TlsConfig,
+    key: Option<SessionKey>,
+) -> Result<TlsStream<S>, TlsError> {
     warn_if_insecure_disable(cfg);
     let allow_tls12 = cfg.min_version == TlsVersion::Tls12;
-    let outcome = connect_tls_handshake(&mut stream, cfg, allow_tls12)?;
+    let ticket = key.as_ref().and_then(take_ticket);
+    let connection =
+        connect_tls_handshake_with_ticket(&mut stream, cfg, allow_tls12, key.is_some(), ticket)?;
+    let outcome = connection.outcome;
     Ok(TlsStream {
         inner: stream,
         record: outcome.record,
@@ -357,6 +402,8 @@ pub fn connect_stream<S: Read + Write>(mut stream: S, cfg: &TlsConfig) -> Result
         leaf_cert_der: outcome.leaf_cert_der,
         tls13_secrets: outcome.tls13_secrets,
         peer_key_updates: 0,
+        session: key.zip(connection.resumption),
+        resumed: connection.resumed,
     })
 }
 
@@ -570,6 +617,8 @@ mod tests {
             leaf_cert_der: None,
             tls13_secrets: None,
             peer_key_updates: 0,
+            session: None,
+            resumed: false,
         };
         tls_eof.record.read_state = CipherState::Tls13 {
             cipher: cipher.clone(),
@@ -598,6 +647,8 @@ mod tests {
             leaf_cert_der: None,
             tls13_secrets: None,
             peer_key_updates: 0,
+            session: None,
+            resumed: false,
         };
         tls_mac.record.read_state = CipherState::Tls13 {
             cipher: cipher.clone(),
@@ -623,6 +674,8 @@ mod tests {
             leaf_cert_der: None,
             tls13_secrets: None,
             peer_key_updates: 0,
+            session: None,
+            resumed: false,
         };
         tls13_forged.record.read_state = CipherState::Tls13 {
             cipher: cipher.clone(),
@@ -648,6 +701,8 @@ mod tests {
             leaf_cert_der: None,
             tls13_secrets: None,
             peer_key_updates: 0,
+            session: None,
+            resumed: false,
         };
         tls12_forged.record.read_state = CipherState::Tls12 {
             cipher: cipher.clone(),
@@ -709,6 +764,8 @@ mod tests {
             leaf_cert_der: None,
             tls13_secrets: None,
             peer_key_updates: 0,
+            session: None,
+            resumed: false,
         };
         let single_ku = wrap_handshake(HT_KEY_UPDATE, &[0]);
         for _ in 0..MAX_TLS13_KEY_UPDATES {
@@ -778,71 +835,139 @@ mod tests {
         };
         drop(probe);
 
-        for (ver_flag, min_ver, cipher_flag) in [
-            ("-tls1_3", TlsVersion::Tls13, ("-ciphersuites", "TLS_AES_128_GCM_SHA256")),
-            ("-tls1_3", TlsVersion::Tls13, ("-ciphersuites", "TLS_CHACHA20_POLY1305_SHA256")),
-            ("-tls1_2", TlsVersion::Tls12, ("-cipher", "ECDHE-ECDSA-AES128-GCM-SHA256")),
-            ("-tls1_2", TlsVersion::Tls12, ("-cipher", "ECDHE-ECDSA-CHACHA20-POLY1305")),
+        struct OpenSslServer(std::process::Child);
+        impl Drop for OpenSslServer {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        for (ver_flag, min_ver, cipher_flag, group) in [
+            (
+                "-tls1_3",
+                TlsVersion::Tls13,
+                ("-ciphersuites", "TLS_AES_128_GCM_SHA256"),
+                "X25519",
+            ),
+            (
+                "-tls1_3",
+                TlsVersion::Tls13,
+                ("-ciphersuites", "TLS_AES_256_GCM_SHA384"),
+                "P-256",
+            ),
+            (
+                "-tls1_3",
+                TlsVersion::Tls13,
+                ("-ciphersuites", "TLS_CHACHA20_POLY1305_SHA256"),
+                "X25519",
+            ),
+            (
+                "-tls1_2",
+                TlsVersion::Tls12,
+                ("-cipher", "ECDHE-ECDSA-AES128-GCM-SHA256"),
+                "X25519",
+            ),
+            (
+                "-tls1_2",
+                TlsVersion::Tls12,
+                ("-cipher", "ECDHE-ECDSA-CHACHA20-POLY1305"),
+                "X25519",
+            ),
         ] {
             let port = {
                 let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
                 l.local_addr().unwrap().port()
             };
-            let mut child = Command::new("openssl")
-                .args([
-                    "s_server",
-                    "-accept", &format!("127.0.0.1:{port}"),
-                    "-cert", crt_path.to_str().unwrap(),
-                    "-key", key_path.to_str().unwrap(),
-                    "-www",
-                    ver_flag,
-                    cipher_flag.0, cipher_flag.1,
-                ])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("spawn openssl s_server");
-
-            // Wait briefly for s_server to bind
-            let mut tcp = None;
-            let mut perm_denied = false;
-            for _ in 0..30 {
-                match TcpStream::connect(format!("127.0.0.1:{port}")) {
-                    Ok(s) => {
-                        tcp = Some(s);
-                        break;
+            let address = format!("127.0.0.1:{port}");
+            let start_server = || {
+                OpenSslServer(
+                    Command::new("openssl")
+                        .args(["s_server", "-accept", &address, "-cert"])
+                        .arg(&crt_path)
+                        .arg("-key")
+                        .arg(&key_path)
+                        .args([
+                            "-www",
+                            ver_flag,
+                            cipher_flag.0,
+                            cipher_flag.1,
+                            "-groups",
+                            group,
+                            "-alpn",
+                            "http/1.1,example",
+                        ])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .expect("spawn openssl s_server"),
+                )
+            };
+            let connect_tcp = || {
+                for _ in 0..50 {
+                    match TcpStream::connect(&address) {
+                        Ok(tcp) => {
+                            tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                            return tcp;
+                        }
+                        Err(_) => std::thread::sleep(Duration::from_millis(50)),
                     }
-                    Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-                        perm_denied = true;
-                        break;
-                    }
-                    Err(_) => {}
                 }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            if perm_denied {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = std::fs::remove_dir_all(&tmp);
-                return;
-            }
-            let tcp = tcp.expect("connect to openssl s_server");
+                panic!("connect to OpenSSL at {address}");
+            };
+            let request = |cfg: &TlsConfig, resumed, alpn| {
+                let mut tls = connect(connect_tcp(), cfg).unwrap_or_else(|e| {
+                    panic!(
+                        "handshake failed for {ver_flag} {} ({group}): {e}",
+                        cipher_flag.1
+                    )
+                });
+                assert_eq!(
+                    tls.is_resumed(),
+                    resumed,
+                    "{ver_flag} {} ({group})",
+                    cipher_flag.1
+                );
+                assert_eq!(tls.alpn_protocol(), alpn);
+                tls.write_all(b"GET / HTTP/1.0\r\n\r\n").unwrap();
+                let mut resp = String::new();
+                tls.read_to_string(&mut resp).unwrap();
+                assert!(
+                    resp.contains("HTTP/1.0 200 ok"),
+                    "unexpected response: {resp}"
+                );
+                tls.leaf_cert_der().unwrap().to_vec()
+            };
+
             let mut cfg = TlsConfig::new("localhost");
             cfg.roots = RootSource::File(crt_path.clone());
             cfg.min_version = min_ver;
-            let mut tls = connect(tcp, &cfg)
-                .unwrap_or_else(|e| panic!("handshake failed for {ver_flag} {}: {e}", cipher_flag.1));
-            tls.write_all(b"GET / HTTP/1.0\r\n\r\n").unwrap();
-            let mut resp = Vec::new();
-            let _ = tls.read_to_end(&mut resp);
-            let text = String::from_utf8_lossy(&resp);
-            assert!(
-                text.contains("HTTP/1.0 200 ok"),
-                "unexpected response for {ver_flag} {}: {text}",
-                cipher_flag.1
-            );
-            let _ = child.kill();
-            let _ = child.wait();
+            cfg.alpn.push(b"http/1.1");
+            let server = start_server();
+            let is_tls13 = min_ver == TlsVersion::Tls13;
+            // TLS 1.2 ALPN is not exposed by this client.
+            let alpn = is_tls13.then_some(b"http/1.1".as_slice());
+            let original_leaf = request(&cfg, false, alpn);
+            assert_eq!(request(&cfg, is_tls13, alpn), original_leaf);
+
+            if cipher_flag.1 == "TLS_AES_128_GCM_SHA256" {
+                let mut other = cfg.clone();
+                other.verify = VerifyMode::VerifyCa;
+                request(&other, false, alpn);
+                other = cfg.clone();
+                other.alpn = vec![b"example"];
+                request(&other, false, Some(b"example"));
+                other = cfg.clone();
+                other.roots = RootSource::Inline(Vec::new());
+                assert!(connect(connect_tcp(), &other).is_err());
+
+                // A new server process cannot decrypt the old ticket.
+                // It should perform a full certificate handshake on the same socket.
+                drop(server);
+                let _server = start_server();
+                assert_eq!(request(&cfg, false, alpn), original_leaf);
+                assert_eq!(request(&cfg, true, alpn), original_leaf);
+            }
         }
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -942,6 +1067,8 @@ mod tests {
                 leaf_cert_der: None,
                 tls13_secrets: None,
                 peer_key_updates: 0,
+                session: None,
+                resumed: false,
             };
             tls_small.record.read_state = state.clone();
             let mut got_small = Vec::new();
@@ -971,6 +1098,8 @@ mod tests {
                 leaf_cert_der: None,
                 tls13_secrets: None,
                 peer_key_updates: 0,
+                session: None,
+                resumed: false,
             };
             tls_large.record.read_state = state;
             let mut got_large = Vec::new();
