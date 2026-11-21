@@ -239,6 +239,9 @@ unsafe fn sha256_compress_x86_64(h: &mut [u32; 8], blocks: &[[u8; 64]]) {
 }
 
 fn sha256_compress_kernel() -> fn(&mut [u32; 8], &[[u8; 64]]) {
+    if cfg!(miri) {
+        return sha256_compress_scalar;
+    }
     #[cfg(target_arch = "aarch64")]
     if std::arch::is_aarch64_feature_detected!("sha2") {
         fn aarch64_wrap(h: &mut [u32; 8], blocks: &[[u8; 64]]) {

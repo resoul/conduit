@@ -106,9 +106,8 @@ impl Vm {
                 cur_closure_slot = frame.unpack_closure_slot();
                 let caller_s_base = frame.s_base as usize;
                 if frame.func_id == func_id && func.num_objs == 0 {
-                    // SAFETY: `s_base >= caller_s_base` and both frames lie within `self.scalars`.
-                    s_ptr = unsafe { s_ptr.sub(s_base - caller_s_base) };
                     s_base = caller_s_base;
+                    sync_frame_ptrs!();
                 } else {
                     func_id = frame.func_id;
                     // SAFETY: `frame.func_id` came from a validated `module.functions` entry.
@@ -529,12 +528,8 @@ impl Vm {
                     let o_needed = o_base + usize::from(func.num_objs);
                     if s_needed > self.scalars.len() || o_needed > self.objs.len() {
                         self.ensure_capacity(s_needed, o_needed);
-                        sync_frame_ptrs!();
-                    } else {
-                        // SAFETY: Capacity check above ensures the new self-call frame fits within live buffers.
-                        s_ptr = unsafe { s_ptr.add(usize::from(arg_s)) };
-                        o_ptr = unsafe { o_ptr.add(usize::from(arg_o)) };
                     }
+                    sync_frame_ptrs!();
                 }
                 Op::CallDirect {
                     func_id: callee_id,
@@ -562,12 +557,8 @@ impl Vm {
                     let o_needed = o_base + func.num_objs as usize;
                     if s_needed > self.scalars.len() || o_needed > self.objs.len() {
                         self.ensure_capacity(s_needed, o_needed);
-                        sync_frame_ptrs!();
-                    } else {
-                        // SAFETY: Capacity check above ensures the callee frame fits within live buffers.
-                        s_ptr = unsafe { s_ptr.add(arg_base_s as usize) };
-                        o_ptr = unsafe { o_ptr.add(arg_base_o as usize) };
                     }
+                    sync_frame_ptrs!();
                 }
                 Op::CallCallable {
                     callee_obj,
@@ -608,6 +599,7 @@ impl Vm {
                         Some(Obj::Closure(c)) => c.get_scalar(idx as usize),
                         _ => return Err(err_msg("Missing active closure for scalar upvalue")),
                     };
+                    sync_frame_ptrs!();
                     s_set!(dst, val);
                 }
                 Op::LoadUpvalueObj { dst, idx } => {
@@ -615,6 +607,7 @@ impl Vm {
                         Some(Obj::Closure(c)) => c.get_obj(idx as usize).clone(),
                         _ => return Err(err_msg("Missing active closure for obj upvalue")),
                     };
+                    sync_frame_ptrs!();
                     *o_mut!(dst) = val;
                 }
                 Op::LoadFuncObj {
@@ -765,7 +758,11 @@ impl Vm {
                             }
                         }
                         _ => {
-                            if !self.exec_for_list_float_next(s_base, o_base, list_obj, idx_s, elem_s)? {
+                            let next = self.exec_for_list_float_next(
+                                s_base, o_base, list_obj, idx_s, elem_s,
+                            )?;
+                            sync_frame_ptrs!();
+                            if !next {
                                 ip = exit_target as usize;
                             }
                         }
@@ -800,7 +797,11 @@ impl Vm {
                             }
                         }
                         _ => {
-                            if self.exec_for_list_float_next(s_base, o_base, list_obj, idx_s, elem_s)? {
+                            let next = self.exec_for_list_float_next(
+                                s_base, o_base, list_obj, idx_s, elem_s,
+                            )?;
+                            sync_frame_ptrs!();
+                            if next {
                                 ip = target as usize;
                             }
                         }
@@ -956,7 +957,10 @@ impl Vm {
                 | Op::ListEnumerate { .. }
                 | Op::ListJoin { .. }
                 | Op::TupleGetScalar { .. }
-                | Op::TupleGetObj { .. }) => self.exec_ext_op(s_base, o_base, op)?,
+                | Op::TupleGetObj { .. }) => {
+                    self.exec_ext_op(s_base, o_base, op)?;
+                    sync_frame_ptrs!();
+                }
                 Op::ExtOp { kind, aux, a, b, c } => {
                     self.exec_ext_dispatch(
                         module,

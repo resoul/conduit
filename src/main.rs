@@ -14,7 +14,7 @@ use conduit::ir::bundle::{
     extract_bundle_from_exe, write_standalone_binary,
 };
 use conduit::ir::lower::compile_program;
-use conduit::vm::{ExecResult, Vm};
+use conduit::vm::{ExecResult, PermissionsBuilder, Vm};
 
 fn print_exec_result(res: ExecResult, ret_tag: u8) {
     match res {
@@ -125,7 +125,7 @@ fn main() {
         }
         Some("--help" | "-h" | "help") => {
             println!(
-                "Conduit v{}\n\nUsage:\n  conduit bench [--filter <pat>] [--strict]\n  conduit build <file.cdt> [-o <output>]\n  conduit check <file.cdt>\n  conduit cron <list|print|run> <file.cdt> [job]\n  conduit db <migrate|rollback|status> <file.cdt> [--url <dsn>] [--steps <n>] [--dry-run]\n  conduit disasm <file.cdt>\n  conduit env example <file.cdt> [-o <file>]\n  conduit fmt <file_or_dir> [--check]\n  conduit openapi <file.cdt> [--router <name>] [--title <str>] [--version <str>] [--server <url>] [-o <file>]\n  conduit routes <file.cdt> [--router <name>]\n  conduit run <file.cdt> [-- args...]\n  conduit test [file_or_dir] [--filter <pat>] [--fail-fast]\n  conduit watch <file.cdt> [-- args...]\n  conduit lsp\n  conduit --version, -V\n  conduit --help, -h",
+                "Conduit v{}\n\nUsage:\n  conduit bench [--filter <pat>] [--strict]\n  conduit build <file.cdt> [-o <output>]\n  conduit check <file.cdt>\n  conduit cron <list|print|run> [perm-flags...] <file.cdt> [job]\n  conduit db <migrate|rollback|status> <file.cdt> [--url <dsn>] [--steps <n>] [--dry-run]\n  conduit disasm <file.cdt>\n  conduit env example <file.cdt> [-o <file>]\n  conduit fmt <file_or_dir> [--check]\n  conduit openapi <file.cdt> [--router <name>] [--title <str>] [--version <str>] [--server <url>] [-o <file>]\n  conduit routes <file.cdt> [--router <name>]\n  conduit run [perm-flags...] <file.cdt|file.cdtb> [-- args...]\n  conduit test [file_or_dir] [perm-flags...] [--filter <pat>] [--fail-fast]\n  conduit watch [perm-flags...] <file.cdt> [args...]\n  conduit lsp\n  conduit --version, -V\n  conduit --help, -h\n\nPermission flags (opt-in sandbox; bare invocations allow all):\n  --sandbox, --deny-all, --no-permissions\n  --allow-all, -A\n  --allow-read[=paths]   --deny-read[=paths]\n  --allow-write[=paths]  --deny-write[=paths]\n  --allow-net[=hosts]    --deny-net[=hosts]\n  --allow-run[=cmds]     --deny-run[=cmds]\n  --allow-env[=vars]     --deny-env[=vars]",
                 env!("CARGO_PKG_VERSION")
             );
         }
@@ -349,45 +349,108 @@ fn run_disasm_cmd(arg: Option<&String>) {
     }
 }
 
-fn run_exec_cmd(args: &[String]) {
-    let path = require_path_arg(args.first(), "run");
-    let extra = args.get(1..).unwrap_or(&[]);
-    let script_args: Vec<String> = if extra.first().map(|s| s.as_str()) == Some("--") {
+fn parse_exec_args(args: &[String]) -> Result<(conduit::vm::Permissions, PathBuf, Vec<String>), String> {
+    let mut perms_builder = PermissionsBuilder::new();
+    let mut file_idx = None;
+    for (idx, arg) in args.iter().enumerate() {
+        if perms_builder.apply_flag(arg)? {
+            continue;
+        }
+        if arg.starts_with('-') {
+            return Err(format!(
+                "Unknown option '{}' in conduit run.\nUsage: conduit run [perm-flags...] <file.cdt|file.cdtb> [-- args...]",
+                arg
+            ));
+        }
+        file_idx = Some(idx);
+        break;
+    }
+    let Some(idx) = file_idx else {
+        return Err("Usage: conduit run [perm-flags...] <file.cdt|file.cdtb> [-- args...]".to_string());
+    };
+    let path = PathBuf::from(&args[idx]);
+    let extra = &args[idx + 1..];
+    let script_args = if extra.first().map(|s| s.as_str()) == Some("--") {
         extra[1..].to_vec()
     } else {
         extra.to_vec()
     };
-    let (program, checked) = match frontend::check_file(path) {
+    Ok((perms_builder.build(), path, script_args))
+}
+
+fn is_cdtb_bundle(path: &Path) -> bool {
+    if path.extension().and_then(|e| e.to_str()) == Some("cdtb") {
+        return true;
+    }
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 4];
+    std::io::Read::read_exact(&mut f, &mut magic).is_ok() && &magic == b"CDTB"
+}
+
+fn run_exec_cmd(args: &[String]) {
+    let (perms, path_buf, script_args) = match parse_exec_args(args) {
         Ok(res) => res,
-        Err(e) => {
-            print_check_error(path, &e);
-            process::exit(1);
+        Err(msg) => {
+            eprintln!("{}", msg);
+            process::exit(2);
         }
     };
-    let module = match compile_program(&program, &checked) {
-        Ok(m) => {
-            if let Err(e) = m.validate() {
-                eprintln!("Validation error: {}", e);
+    let path = path_buf.as_path();
+    let (module, fid, ret_tag) = if is_cdtb_bundle(path) {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("Failed to read bundle '{}': {}", path.display(), e);
                 process::exit(1);
             }
-            m
-        }
-        Err(e) => {
-            eprintln!("Compile error: {}", e);
+        };
+        let (module, fid, ret_tag) = match decode_bundle(&bytes) {
+            Ok(res) => res,
+            Err(e) => {
+                eprintln!("Bundle error: {}", e);
+                process::exit(1);
+            }
+        };
+        if let Err(e) = module.validate() {
+            eprintln!("Validation error: {}", e);
             process::exit(1);
         }
+        (module, fid, ret_tag)
+    } else {
+        let (program, checked) = match frontend::check_file(path) {
+            Ok(res) => res,
+            Err(e) => {
+                print_check_error(path, &e);
+                process::exit(1);
+            }
+        };
+        let module = match compile_program(&program, &checked) {
+            Ok(m) => {
+                if let Err(e) = m.validate() {
+                    eprintln!("Validation error: {}", e);
+                    process::exit(1);
+                }
+                m
+            }
+            Err(e) => {
+                eprintln!("Compile error: {}", e);
+                process::exit(1);
+            }
+        };
+        let Some(fid) = checked.func_by_name.get("main").copied() else {
+            eprintln!("No 'main' function found");
+            process::exit(1);
+        };
+        let sig = &checked.funcs[fid as usize];
+        if !sig.params.is_empty() {
+            eprintln!("'main' must take 0 parameters for CLI run");
+            process::exit(1);
+        }
+        (module, fid, type_to_ret_tag(&sig.return_type))
     };
-    let Some(fid) = checked.func_by_name.get("main").copied() else {
-        eprintln!("No 'main' function found");
-        process::exit(1);
-    };
-    let sig = &checked.funcs[fid as usize];
-    if !sig.params.is_empty() {
-        eprintln!("'main' must take 0 parameters for CLI run");
-        process::exit(1);
-    }
-    let ret_tag = type_to_ret_tag(&sig.return_type);
-    let mut vm = Vm::new();
+    let mut vm = Vm::with_permissions(perms);
     vm.script_args = Some(script_args);
     match vm.call(&module, fid, &[], &[]) {
         Ok(res) => print_exec_result(res, ret_tag),
@@ -502,19 +565,55 @@ fn run_build_cmd(args: &[String]) {
     );
 }
 
+fn parse_cron_run_tail(args: &[String]) -> Result<(conduit::vm::Permissions, String, String), String> {
+    let mut perms_builder = PermissionsBuilder::new();
+    let mut positional: Vec<String> = Vec::new();
+    for arg in args {
+        if positional.is_empty() {
+            if perms_builder.apply_flag(arg)? {
+                continue;
+            }
+            if arg.starts_with('-') {
+                return Err(format!(
+                    "Unknown option '{}' in conduit cron run.\nUsage: conduit cron run [perm-flags...] <file.cdt> <job_name>",
+                    arg
+                ));
+            }
+        }
+        positional.push(arg.clone());
+    }
+    if positional.len() != 2 {
+        return Err("Usage: conduit cron run [perm-flags...] <file.cdt> <job_name>".to_string());
+    }
+    let job_name = positional.pop().unwrap();
+    let file = positional.pop().unwrap();
+    Ok((perms_builder.build(), file, job_name))
+}
+
 fn run_cron_cmd(args: &[String]) {
     let Some(sub) = args.first().map(String::as_str) else {
-        eprintln!("Usage: conduit cron <list|print|run> <file.cdt> [job_name]");
+        eprintln!("Usage: conduit cron <list|print|run> [perm-flags...] <file.cdt> [job_name]");
         process::exit(2);
     };
-    let Some(file) = args.get(1) else {
-        eprintln!("Usage: conduit cron {} <file.cdt> [job_name]", sub);
-        process::exit(2);
+    let (perms, file, job_name_opt) = if sub == "run" {
+        match parse_cron_run_tail(&args[1..]) {
+            Ok((perms, f, job_name)) => (perms, f, Some(job_name)),
+            Err(msg) => {
+                eprintln!("{}", msg);
+                process::exit(2);
+            }
+        }
+    } else {
+        let Some(f) = args.get(1) else {
+            eprintln!("Usage: conduit cron {} <file.cdt> [job_name]", sub);
+            process::exit(2);
+        };
+        (conduit::vm::Permissions::allow_all(), f.clone(), args.get(2).cloned())
     };
-    let (program, checked) = match frontend::check_file(Path::new(file)) {
+    let (program, checked) = match frontend::check_file(Path::new(&file)) {
         Ok(res) => res,
         Err(e) => {
-            print_check_error(Path::new(file), &e);
+            print_check_error(Path::new(&file), &e);
             process::exit(1);
         }
     };
@@ -539,7 +638,7 @@ fn run_cron_cmd(args: &[String]) {
             }
         }
         "print" => {
-            let abs = std::fs::canonicalize(file).unwrap_or_else(|_| PathBuf::from(file));
+            let abs = std::fs::canonicalize(&file).unwrap_or_else(|_| PathBuf::from(&file));
             for sched in &module.schedules {
                 for job in &sched.jobs {
                     if let Some(expr) = &job.cron_expr {
@@ -549,20 +648,17 @@ fn run_cron_cmd(args: &[String]) {
             }
         }
         "run" => {
-            let Some(job_name) = args.get(2) else {
-                eprintln!("Usage: conduit cron run <file.cdt> <job_name>");
-                process::exit(2);
-            };
+            let job_name = job_name_opt.expect("validated above");
             let Some(job) = module
                 .schedules
                 .iter()
                 .flat_map(|s| s.jobs.iter())
-                .find(|j| j.name == *job_name)
+                .find(|j| j.name == job_name)
             else {
                 eprintln!("Unknown cron job '{}'", job_name);
                 process::exit(1);
             };
-            let mut vm = Vm::new();
+            let mut vm = Vm::with_permissions(perms);
             match vm.call(&module, job.func_id, &[], &[]) {
                 Ok(ExecResult::Obj(obj))
                     if conduit::native::validation::is_err_or_nil_obj(&module, &obj)
@@ -815,5 +911,49 @@ fn run_env_cmd(args: &[String]) {
         }
     } else {
         println!("{}", content);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_exec_args_keeps_script_flags_after_file_and_rejects_unknown_cli_flags() {
+        let bare = ["app.cdt", "--port", "8080"].map(str::to_string);
+        let (perms, file, extra) = parse_exec_args(&bare).unwrap();
+        assert_eq!(file, PathBuf::from("app.cdt"));
+        assert_eq!(extra, vec!["--port", "8080"]);
+        assert_eq!(perms, conduit::vm::Permissions::allow_all());
+
+        let scoped = [
+            "--allow-net=127.0.0.1:8080",
+            "--deny-env=SECRET",
+            "app.cdtb",
+            "--",
+            "--verbose",
+        ]
+        .map(str::to_string);
+        let (perms, file, extra) = parse_exec_args(&scoped).unwrap();
+        assert_eq!(file, PathBuf::from("app.cdtb"));
+        assert_eq!(extra, vec!["--verbose"]);
+        assert!(perms.check_net("127.0.0.1", 8080).is_ok());
+        assert!(perms.check_env("SECRET").is_err());
+
+        let unknown = ["--bogus-flag", "app.cdt"].map(str::to_string);
+        assert!(parse_exec_args(&unknown).is_err());
+    }
+
+    #[test]
+    fn parse_cron_run_tail_parses_permissions_and_positionals() {
+        let args = ["--sandbox", "--allow-read=.", "jobs.cdt", "nightly"].map(str::to_string);
+        let (perms, file, job) = parse_cron_run_tail(&args).unwrap();
+        assert_eq!(file, "jobs.cdt");
+        assert_eq!(job, "nightly");
+        assert!(perms.check_read(".").is_ok());
+        assert!(perms.check_write("out.txt").is_err());
+
+        let unknown = ["--bogus", "jobs.cdt", "nightly"].map(str::to_string);
+        assert!(parse_cron_run_tail(&unknown).is_err());
     }
 }

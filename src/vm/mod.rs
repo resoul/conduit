@@ -14,12 +14,15 @@ pub(crate) mod exec_redis;
 pub(crate) mod exec_sys;
 pub(crate) mod exec_union;
 pub mod opcode;
+pub mod permissions;
 pub mod pipeline;
 pub(crate) mod pipeline_leaf;
 pub mod string;
 pub mod value;
 #[cfg(test)]
 mod tests;
+
+pub use permissions::{NetRule, Permissions, PermissionsBuilder};
 
 use std::sync::Arc;
 use value::{Obj, StructData};
@@ -134,7 +137,6 @@ impl SpawnTracker {
     }
 }
 
-#[derive(Default)]
 pub(crate) struct VmHostState {
     pub(crate) fs_readers: Vec<Option<std::io::BufReader<std::fs::File>>>,
     pub(crate) fs_writers: Vec<Option<std::io::BufWriter<std::fs::File>>>,
@@ -151,6 +153,30 @@ pub(crate) struct VmHostState {
     pub(crate) shared_module: Option<Arc<Module>>,
     pub(crate) lifecycle_started: bool,
     pub(crate) lifecycle_stopped: bool,
+    pub(crate) permissions: Arc<Permissions>,
+}
+
+impl Default for VmHostState {
+    fn default() -> Self {
+        Self {
+            fs_readers: Vec::new(),
+            fs_writers: Vec::new(),
+            routers: Vec::new(),
+            http_clients: Vec::new(),
+            db_conns: Vec::new(),
+            db_conn_free: Vec::new(),
+            db_pools: Vec::new(),
+            db_pool_free: Vec::new(),
+            cron_schedulers: Vec::new(),
+            app_handles: Vec::new(),
+            cached_http_req: None,
+            spawn_tracker: Arc::default(),
+            shared_module: None,
+            lifecycle_started: false,
+            lifecycle_stopped: false,
+            permissions: Arc::new(Permissions::allow_all()),
+        }
+    }
 }
 
 impl VmHostState {
@@ -270,14 +296,31 @@ pub struct Vm {
 
 impl Vm {
     pub fn new() -> Self {
+        Self::with_permissions(Permissions::allow_all())
+    }
+
+    /// Creates a VM instance enforcing the given runtime capability [`Permissions`].
+    pub fn with_permissions(permissions: Permissions) -> Self {
+        let mut host = Box::<VmHostState>::default();
+        host.permissions = Arc::new(permissions);
         Self {
             scalars: vec![0u64; 4096],
             objs: vec![Obj::Empty; 4096],
             frames: Box::new([CallFrame::default(); MAX_CALL_DEPTH]),
             frame_depth: 0,
             script_args: None,
-            host: Box::default(),
+            host,
         }
+    }
+
+    /// Replaces the VM's capability policy.
+    pub fn set_permissions(&mut self, permissions: Permissions) {
+        self.host.permissions = Arc::new(permissions);
+    }
+
+    /// Returns a reference to the active runtime capability policy.
+    pub fn permissions(&self) -> &Permissions {
+        &self.host.permissions
     }
 
     #[inline(always)]

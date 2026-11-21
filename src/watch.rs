@@ -43,9 +43,18 @@ pub fn collect_cdt_snapshots(root_file: &Path) -> FileSnapshot {
     out
 }
 
-fn spawn_run(exe: &Path, file: &Path, extra_args: &[String]) -> Option<Child> {
+fn spawn_run(
+    exe: &Path,
+    perm_flags: &[String],
+    file: &Path,
+    extra_args: &[String],
+) -> Option<Child> {
     let mut cmd = Command::new(exe);
-    cmd.arg("run").arg(file);
+    cmd.arg("run");
+    for flag in perm_flags {
+        cmd.arg(flag);
+    }
+    cmd.arg(file);
     for arg in extra_args {
         cmd.arg(arg);
     }
@@ -68,16 +77,39 @@ fn stop_child(child: &mut Option<Child>) {
 }
 
 pub fn run_watch_cmd(args: &[String]) {
-    let Some(file_arg) = args.first() else {
-        eprintln!("Usage: conduit watch <file.cdt> [args...]");
+    let mut perms_builder = conduit::vm::PermissionsBuilder::new();
+    let mut perm_flags = Vec::new();
+    let mut file_idx = None;
+    for (idx, arg) in args.iter().enumerate() {
+        match perms_builder.apply_flag(arg) {
+            Ok(true) => perm_flags.push(arg.clone()),
+            Ok(false) => {
+                if arg.starts_with('-') {
+                    eprintln!(
+                        "Unknown option '{}' in conduit watch.\nUsage: conduit watch [perm-flags...] <file.cdt> [args...]",
+                        arg
+                    );
+                    process::exit(2);
+                }
+                file_idx = Some(idx);
+                break;
+            }
+            Err(e) => {
+                eprintln!("Permission flag error: {}", e);
+                process::exit(2);
+            }
+        }
+    }
+    let Some(idx) = file_idx else {
+        eprintln!("Usage: conduit watch [perm-flags...] <file.cdt> [args...]");
         process::exit(2);
     };
-    let file = Path::new(file_arg);
+    let file = Path::new(&args[idx]);
     if !file.exists() {
         eprintln!("File not found: {}", file.display());
         process::exit(1);
     }
-    let extra_args = &args[1..];
+    let extra_args = &args[idx + 1..];
     let exe = match env::current_exe() {
         Ok(p) => p,
         Err(e) => {
@@ -88,7 +120,7 @@ pub fn run_watch_cmd(args: &[String]) {
 
     println!("[conduit watch] watching '{}' (Ctrl+C to stop)...", file.display());
     let mut prev = collect_cdt_snapshots(file);
-    let mut child = spawn_run(&exe, file, extra_args);
+    let mut child = spawn_run(&exe, &perm_flags, file, extra_args);
 
     loop {
         if let Some(c) = child.as_mut()
@@ -103,7 +135,7 @@ pub fn run_watch_cmd(args: &[String]) {
             prev = next;
             stop_child(&mut child);
             println!("[conduit watch] change detected, reloading '{}'...", file.display());
-            child = spawn_run(&exe, file, extra_args);
+            child = spawn_run(&exe, &perm_flags, file, extra_args);
         }
     }
 }

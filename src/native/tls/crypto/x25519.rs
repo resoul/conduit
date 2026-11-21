@@ -404,4 +404,60 @@ mod tests {
         // Low-order point yields all-zero -> None
         assert!(x25519_shared(&a_priv, &[0u8; 32]).is_none());
     }
+
+    #[test]
+    fn wycheproof_x25519_low_order_noncanonical_and_twist_cases() {
+        let a_priv = decode_hex_32("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
+        let b_priv = decode_hex_32("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb");
+
+        // All Curve25519 small-order points (plus bit-255 set & p/p+-1 encodings) yield 0 -> None.
+        let low_order_hex = [
+            "0000000000000000000000000000000000000000000000000000000000000000", // 0
+            "0100000000000000000000000000000000000000000000000000000000000000", // 1
+            "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800", // order 8
+            "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157", // order 8
+            "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f", // p - 1
+            "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f", // p
+            "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f", // p + 1
+        ];
+        for hx in low_order_hex {
+            let pt = decode_hex_32(hx);
+            assert_eq!(x25519_raw(&a_priv, &pt), [0u8; 32], "pt {hx} not zeroed");
+            assert!(x25519_shared(&a_priv, &pt).is_none());
+
+            let mut pt_hi = pt;
+            pt_hi[31] |= 0x80;
+            assert_eq!(x25519_raw(&a_priv, &pt_hi), [0u8; 32], "pt_hi {hx} not zeroed");
+            assert!(x25519_shared(&a_priv, &pt_hi).is_none());
+        }
+
+        // Non-canonical u encodings (bit 255 set and u + p for u < 19) match canonical DH output.
+        let b_pub = x25519_public(&b_priv);
+        let mut b_pub_hi = b_pub;
+        b_pub_hi[31] |= 0x80;
+        assert_eq!(x25519_shared(&a_priv, &b_pub_hi), x25519_shared(&a_priv, &b_pub));
+
+        // 9 + p = 2^255 - 10 = [0xf6, 0xff, ..., 0xff, 0x7f]
+        let mut nine_plus_p = [0xffu8; 32];
+        nine_plus_p[0] = 0xf6;
+        nine_plus_p[31] = 0x7f;
+        assert_eq!(x25519_raw(&a_priv, &nine_plus_p), x25519_public(&a_priv));
+        nine_plus_p[31] |= 0x80;
+        assert_eq!(x25519_raw(&a_priv, &nine_plus_p), x25519_public(&a_priv));
+
+        // Scalar clamping invariants + twist point DH commutativity (RFC 7748 Montgomery ladder).
+        let mut unmasked = a_priv;
+        unmasked[0] |= 0x07;
+        unmasked[31] |= 0x80;
+        unmasked[31] &= !0x40;
+        assert_eq!(x25519_public(&unmasked), x25519_public(&a_priv));
+        assert!(x25519_shared(&[0u8; 32], &b_pub).is_some());
+        assert!(x25519_shared(&[0xffu8; 32], &b_pub).is_some());
+
+        let mut twist_2 = [0u8; 32];
+        twist_2[0] = 2;
+        let ta = x25519_shared(&a_priv, &twist_2).unwrap();
+        let tb = x25519_shared(&b_priv, &twist_2).unwrap();
+        assert_eq!(x25519_shared(&a_priv, &tb), x25519_shared(&b_priv, &ta));
+    }
 }

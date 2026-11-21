@@ -61,18 +61,20 @@ impl Vm {
                         let _g = write_blocking(&key);
                         self.invoke_zero_arg_cb(module, s_top, o_top, &cb, ret_tag)?
                     }
-                    LOCK_FILE => match file_lock_exclusive(Path::new(&key)) {
-                        Ok(_g) => self.invoke_zero_arg_cb(module, s_top, o_top, &cb, ret_tag)?,
-                        Err((k, msg)) => make_lock_error(k, msg),
-                    },
-                    LOCK_FILE_TRY => match file_try_lock_exclusive(Path::new(&key)) {
-                        Ok(_g) => self.invoke_zero_arg_cb(module, s_top, o_top, &cb, ret_tag)?,
-                        Err((k, msg)) => make_lock_error(k, msg),
-                    },
-                    _ => match file_lock_shared(Path::new(&key)) {
-                        Ok(_g) => self.invoke_zero_arg_cb(module, s_top, o_top, &cb, ret_tag)?,
-                        Err((k, msg)) => make_lock_error(k, msg),
-                    },
+                    LOCK_FILE | LOCK_FILE_TRY | LOCK_FILE_SHARED => {
+                        self.host.permissions.check_read(&key).map_err(|e| err_msg(&e))?;
+                        self.host.permissions.check_write(&key).map_err(|e| err_msg(&e))?;
+                        let guard_res = match aux {
+                            LOCK_FILE => file_lock_exclusive(Path::new(&key)),
+                            LOCK_FILE_TRY => file_try_lock_exclusive(Path::new(&key)),
+                            _ => file_lock_shared(Path::new(&key)),
+                        };
+                        match guard_res {
+                            Ok(_g) => self.invoke_zero_arg_cb(module, s_top, o_top, &cb, ret_tag)?,
+                            Err((k, msg)) => make_lock_error(k, msg),
+                        }
+                    }
+                    _ => unreachable!(),
                 };
                 self.objs[o_base + a as usize] = res;
             }
@@ -110,6 +112,8 @@ impl Vm {
             }
             LOCK_FILE_ACQUIRE => {
                 let path = self.sys_str(o_base, b, "lock.file_acquire()")?;
+                self.host.permissions.check_read(path.as_str()).map_err(|e| err_msg(&e))?;
+                self.host.permissions.check_write(path.as_str()).map_err(|e| err_msg(&e))?;
                 self.objs[o_base + a as usize] = match file_lock_exclusive(Path::new(path.as_str()))
                 {
                     Ok(g) => make_lock_guard(register_guard(HeldGuard::File(g))),
@@ -118,6 +122,8 @@ impl Vm {
             }
             LOCK_FILE_TRY_ACQUIRE => {
                 let path = self.sys_str(o_base, b, "lock.file_try_acquire()")?;
+                self.host.permissions.check_read(path.as_str()).map_err(|e| err_msg(&e))?;
+                self.host.permissions.check_write(path.as_str()).map_err(|e| err_msg(&e))?;
                 self.objs[o_base + a as usize] =
                     match file_try_lock_exclusive(Path::new(path.as_str())) {
                         Ok(g) => make_lock_guard(register_guard(HeldGuard::File(g))),

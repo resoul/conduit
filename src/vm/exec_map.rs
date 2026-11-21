@@ -42,7 +42,7 @@ pub(crate) fn flush_stdout() {
 
 use crate::vm::exec_cold::{err_msg, err_overflow};
 use crate::native::cli::{exec_cli_parse, format_cli_help};
-use crate::native::env::{exec_env_load, make_env_error};
+use crate::native::env::{exec_env_load_checked, make_env_error};
 use crate::vm::exec_union::list_get_or_index;
 use crate::vm::opcode::{
     EXT_ASSERT, EXT_CACHE_OP, EXT_CHAN_OP, EXT_CLI_HELP, EXT_CLI_PARSE, EXT_CLI_PARSE_ARGS,
@@ -203,6 +203,10 @@ impl Vm {
                 let Obj::Str(name) = &self.objs[o_base + b as usize] else {
                     return Err(err_msg("Expected String in cdt.env"));
                 };
+                self.host
+                    .permissions
+                    .check_env(name.as_str())
+                    .map_err(|e| err_msg(&e))?;
                 let res = match std::env::var(name.as_str()) {
                     Ok(v) if kind == EXT_ENV_GET || !v.is_empty() => Obj::str(v),
                     _ if kind == EXT_ENV_GET => Obj::Empty,
@@ -222,7 +226,8 @@ impl Vm {
                     .env_plans
                     .get(b as usize)
                     .ok_or_else(|| err_msg("Missing EnvLoadPlan"))?;
-                self.objs[o_base + a as usize] = exec_env_load(plan);
+                self.objs[o_base + a as usize] =
+                    exec_env_load_checked(plan, &self.host.permissions).map_err(|e| err_msg(&e))?;
             }
             EXT_CLI_PARSE => {
                 let plan = module
@@ -402,6 +407,7 @@ impl Vm {
                 let http_clients = self.host.http_clients.clone();
                 let db_pools = self.host.db_pools.clone();
                 let db_pool_free = self.host.db_pool_free.clone();
+                let permissions = Arc::clone(&self.host.permissions);
                 flush_stdout();
                 tracker.on_spawn();
                 std::thread::spawn(move || {
@@ -415,6 +421,7 @@ impl Vm {
                         child_vm.host.db_pool_free = db_pool_free;
                         child_vm.host.spawn_tracker = tracker;
                         child_vm.host.shared_module = Some(Arc::clone(&mod_arc));
+                        child_vm.host.permissions = permissions;
                         if let Err(e) = child_vm.invoke_zero_arg_cb(&mod_arc, 0, 0, &callee, 0) {
                             eprintln!("[spawn] {}", e.message);
                         }

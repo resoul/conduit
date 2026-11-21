@@ -11,7 +11,7 @@ use crate::native::cron::{
 use crate::native::validation::is_err_or_nil_obj;
 use crate::vm::exec_cold::err_msg;
 use crate::vm::value::{Obj, SCHEMA_CRON_SCHEDULER};
-use crate::vm::{ExecResult, RuntimeError, SpawnTracker, Vm};
+use crate::vm::{ExecResult, Permissions, RuntimeError, SpawnTracker, Vm};
 
 pub const CRON_RUN: u8 = 0;
 pub const CRON_START: u8 = 1;
@@ -69,6 +69,7 @@ pub(crate) fn start_cron_scheduler(
     module: Arc<Module>,
     plan: &SchedulePlan,
     spawn_tracker: Option<Arc<SpawnTracker>>,
+    permissions: Arc<Permissions>,
 ) -> Result<CronSchedulerState, String> {
     let jobs = build_compiled_jobs(plan)?;
     let stop = Arc::new(AtomicBool::new(false));
@@ -76,7 +77,7 @@ pub(crate) fn start_cron_scheduler(
     let stop_bg = Arc::clone(&stop);
     let running_bg = Arc::clone(&running);
     let handle = std::thread::spawn(move || {
-        scheduler_loop(module, jobs, stop_bg, running_bg, spawn_tracker);
+        scheduler_loop(module, jobs, stop_bg, running_bg, spawn_tracker, permissions);
     });
     Ok(CronSchedulerState {
         stop,
@@ -92,8 +93,14 @@ pub(crate) fn stop_cron_scheduler(mut st: CronSchedulerState) {
     }
 }
 
-fn run_job_in_fresh_vm(module: &Module, job_name: &str, func_id: u32) -> Result<(), String> {
+fn run_job_in_fresh_vm(
+    module: &Module,
+    job_name: &str,
+    func_id: u32,
+    permissions: &Arc<Permissions>,
+) -> Result<(), String> {
     let mut vm = Vm::new();
+    vm.host.permissions = Arc::clone(permissions);
     match vm.call(module, func_id, &[], &[]) {
         Ok(ExecResult::Obj(obj)) if is_err_or_nil_obj(module, &obj) && !matches!(obj, Obj::Empty) => {
             Err(format!("cron job '{}' returned error: {}", job_name, obj.format_obj()))
@@ -123,6 +130,7 @@ pub(crate) fn scheduler_loop(
     stop: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
     spawn_tracker: Option<Arc<SpawnTracker>>,
+    permissions: Arc<Permissions>,
 ) {
     running.store(true, Ordering::Release);
     while !stop.load(Ordering::Acquire) {
@@ -170,13 +178,14 @@ pub(crate) fn scheduler_loop(
                 let fid = job.func_id;
                 let flag = Arc::clone(&job.in_flight);
                 let tracker = spawn_tracker.clone();
+                let perms = Arc::clone(&permissions);
                 if let Some(ref t) = tracker {
                     t.on_spawn();
                 }
                 std::thread::spawn(move || {
                     let _guard = CronJobGuard { flag, tracker };
                     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        run_job_in_fresh_vm(&m, &jname, fid)
+                        run_job_in_fresh_vm(&m, &jname, fid, &perms)
                     })) {
                         Ok(Ok(())) => {}
                         Ok(Err(msg)) => eprintln!("[cdt.cron] {}", msg),
@@ -235,6 +244,7 @@ impl Vm {
                             stop,
                             running,
                             Some(Arc::clone(&self.host.spawn_tracker)),
+                            Arc::clone(&self.host.permissions),
                         );
                         self.objs[o_base + a as usize] = Obj::Empty;
                     }
@@ -249,6 +259,7 @@ impl Vm {
                     Arc::new(module.clone()),
                     plan,
                     Some(Arc::clone(&self.host.spawn_tracker)),
+                    Arc::clone(&self.host.permissions),
                 ) {
                     Ok(state) => {
                         let id = self.host.cron_schedulers.len();
@@ -266,7 +277,12 @@ impl Vm {
                     return Err(err_msg("Expected String job name in cron.run_once()"));
                 };
                 let res = match plan.jobs.iter().find(|j| j.name == job_name.as_str()) {
-                    Some(job) => match run_job_in_fresh_vm(module, &job.name, job.func_id) {
+                    Some(job) => match run_job_in_fresh_vm(
+                        module,
+                        &job.name,
+                        job.func_id,
+                        &self.host.permissions,
+                    ) {
                         Ok(()) => Obj::Empty,
                         Err(msg) => make_cron_error("job_failed", &msg),
                     },

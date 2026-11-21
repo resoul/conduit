@@ -62,6 +62,14 @@ impl Vm {
                 let Obj::Str(path) = packed.get_obj(1) else {
                     return Err(err_msg("Expected String path in cache.open_file()"));
                 };
+                self.host
+                    .permissions
+                    .check_read(path.as_str())
+                    .map_err(|e| err_msg(&e))?;
+                self.host
+                    .permissions
+                    .check_write(path.as_str())
+                    .map_err(|e| err_msg(&e))?;
                 self.objs[o_base + a as usize] =
                     match open_cache_file(name.as_str(), path.as_str(), max_entries) {
                         Ok(id) => make_cache_handle(id),
@@ -327,6 +335,10 @@ impl Vm {
                     return Ok(());
                 };
                 let path = self.sys_str(o_base, c, "Cache.save()")?;
+                self.host
+                    .permissions
+                    .check_write(path.as_str())
+                    .map_err(|e| err_msg(&e))?;
                 self.objs[o_base + a as usize] = match store.save_snapshot(Path::new(path.as_str()))
                 {
                     Ok(n) => Obj::boxed_int(n as i64),
@@ -340,6 +352,10 @@ impl Vm {
                     return Ok(());
                 };
                 let path = self.sys_str(o_base, c, "Cache.load()")?;
+                self.host
+                    .permissions
+                    .check_read(path.as_str())
+                    .map_err(|e| err_msg(&e))?;
                 self.objs[o_base + a as usize] = match store.load_snapshot(Path::new(path.as_str()))
                 {
                     Ok(n) => Obj::boxed_int(n as i64),

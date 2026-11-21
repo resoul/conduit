@@ -306,15 +306,20 @@ fn encode_json_type(ty: &JsonType, w: &mut Writer) {
     }
 }
 
-fn decode_json_type(r: &mut Reader<'_>) -> Result<JsonType, String> {
+const MAX_BUNDLE_NESTING_DEPTH: usize = 64;
+
+fn decode_json_type(r: &mut Reader<'_>, depth: usize) -> Result<JsonType, String> {
+    if depth > MAX_BUNDLE_NESTING_DEPTH {
+        return Err("Bundle type nesting depth exceeded".to_string());
+    }
     match r.u8()? {
         0 => Ok(JsonType::Int),
         1 => Ok(JsonType::Float),
         2 => Ok(JsonType::Bool),
         3 => Ok(JsonType::String),
-        4 => Ok(JsonType::Optional(Box::new(decode_json_type(r)?))),
-        5 => Ok(JsonType::List(Box::new(decode_json_type(r)?))),
-        6 => Ok(JsonType::Map(Box::new(decode_json_type(r)?))),
+        4 => Ok(JsonType::Optional(Box::new(decode_json_type(r, depth + 1)?))),
+        5 => Ok(JsonType::List(Box::new(decode_json_type(r, depth + 1)?))),
+        6 => Ok(JsonType::Map(Box::new(decode_json_type(r, depth + 1)?))),
         7 => Ok(JsonType::Struct(r.u32()?)),
         8 => {
             let name = r.str()?;
@@ -348,11 +353,14 @@ fn encode_nested_val(n: &NestedValidation, w: &mut Writer) {
     }
 }
 
-fn decode_nested_val(r: &mut Reader<'_>) -> Result<NestedValidation, String> {
+fn decode_nested_val(r: &mut Reader<'_>, depth: usize) -> Result<NestedValidation, String> {
+    if depth > MAX_BUNDLE_NESTING_DEPTH {
+        return Err("Bundle type nesting depth exceeded".to_string());
+    }
     match r.u8()? {
         0 => Ok(NestedValidation::None),
         1 => Ok(NestedValidation::Struct(r.u32()?)),
-        2 => Ok(NestedValidation::List(Box::new(decode_nested_val(r)?))),
+        2 => Ok(NestedValidation::List(Box::new(decode_nested_val(r, depth + 1)?))),
         tag => Err(format!("Invalid NestedValidation tag {} in bundle", tag)),
     }
 }
@@ -713,13 +721,13 @@ pub fn decode_bundle(bytes: &[u8]) -> Result<(Module, u32, u8), String> {
         let field_defs = r.vec(|r| Ok(StructFieldDef {
             name: r.str()?,
             json_name: r.str()?,
-            ty: decode_json_type(r)?,
+            ty: decode_json_type(r, 0)?,
         }))?;
         let mut schema = StructSchema::with_flags(schema_id, type_name, field_defs, is_error, enum_tag);
         schema.http_status = http_status;
         Ok(schema)
     })?;
-    let json_roots = r.vec(decode_json_type)?;
+    let json_roots = r.vec(|r| decode_json_type(r, 0))?;
     module.json_plans = json_roots
         .iter()
         .map(|ty| JsonDecodePlan::compile(ty, &module.struct_schemas))
@@ -734,7 +742,7 @@ pub fn decode_bundle(bytes: &[u8]) -> Result<(Module, u32, u8), String> {
                 is_optional: r.bool()?,
                 slot_idx: r.u16()?,
                 rules: r.vec(decode_val_rule)?,
-                nested: decode_nested_val(r)?,
+                nested: decode_nested_val(r, 0)?,
             }))?,
         })
     })?;
@@ -1013,4 +1021,127 @@ pub fn write_standalone_binary(base_exe: &Path, out_path: &Path, bundle_bytes: &
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sign_payload(mut payload: Vec<u8>) -> Vec<u8> {
+        let digest = crate::native::crypto::sha256_bytes(&payload);
+        payload.extend_from_slice(&digest);
+        payload
+    }
+
+    #[test]
+    fn fuzz_decode_bundle_and_validate_never_panics() {
+        let src = r#"
+            import * as json from "cdt.json"
+            import * as validation from "cdt.validation"
+
+            enum Mode { Fast, Safe }
+            struct Profile { score: Float, tag: String? }
+            struct Item {
+                id: Int @validation.min(1)
+                name: String @validation.not_empty
+                mode: Mode
+                profile: Profile?
+                nested: [Profile]
+            }
+
+            export func main() -> Int {
+                offset := 3
+                nums := [1, 2, 3] |> map((x) => x + offset) |> filter((x) => x > 4)
+                raw := "{\"id\":1,\"name\":\"a\",\"mode\":\"Fast\",\"profile\":null,\"nested\":[]}"
+                parsed := json.decode<Item>(raw)
+                switch parsed {
+                    case Item(v):
+                        return v.id + nums.len()
+                    case _:
+                        return 0
+                }
+            }
+        "#;
+        let module = crate::frontend::compile_source(src).unwrap();
+        let main_fid = module.func_id("main").unwrap();
+        let valid_bundle = encode_bundle(&module, main_fid, RET_INT).unwrap();
+        assert!(decode_bundle(&valid_bundle).is_ok());
+
+        // Every truncated prefix must error cleanly without panic.
+        for cut in 0..valid_bundle.len() {
+            assert!(
+                std::panic::catch_unwind(|| decode_bundle(&valid_bundle[..cut]).is_err())
+                    .is_ok_and(|is_err| is_err),
+                "bundle prefix len={cut} failed unexpectedly"
+            );
+        }
+
+        // Crafted deeply nested JsonType (>64 List tags) with valid checksum must reject cleanly.
+        let base_payload = &valid_bundle[..valid_bundle.len() - 32];
+        let mut w = Writer(Vec::new());
+        w.0.extend_from_slice(BUNDLE_MAGIC);
+        w.u32(0); // main_fid
+        w.u8(RET_VOID);
+        w.u32(0); // functions
+        w.u32(0); // int_consts
+        w.u32(0); // float_consts
+        w.u32(0); // obj_consts
+        w.u32(0); // closures
+        w.u32(0); // records
+        w.u32(0); // pipelines
+        w.u32(0); // struct_schemas
+        w.u32(1); // json_roots count = 1
+        for _ in 0..100 {
+            w.u8(5); // JsonType::List
+        }
+        w.u8(0); // JsonType::Int
+        let deep_bundle = sign_payload(w.0);
+        let deep_err = decode_bundle(&deep_bundle).unwrap_err();
+        assert!(deep_err.contains("nesting depth"), "{deep_err}");
+
+        // 1,000 deterministic mutations with recomputed valid SHA-256 footer so parser/validator are exercised.
+        let mut rng = 0xa076_1d64_78bd_642fu64;
+        let mut next_u64 = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+
+        for iter in 0..1000usize {
+            let mut payload = base_payload.to_vec();
+            match next_u64() % 4 {
+                0 => {
+                    // Single or multi-byte flip after header.
+                    let count = ((next_u64() % 4) + 1) as usize;
+                    for _ in 0..count {
+                        let idx = (next_u64() as usize) % payload.len().max(1);
+                        payload[idx] ^= (next_u64() & 0xff) as u8;
+                    }
+                }
+                1 => {
+                    // Inject 0xFF_FF_FF_FF length / index word inside payload body.
+                    if payload.len() > 16 {
+                        let off = 8 + ((next_u64() as usize) % (payload.len() - 12));
+                        payload[off..off + 4].copy_from_slice(&[0xff, 0xff, 0xff, 0xff]);
+                    }
+                }
+                2 => {
+                    // Truncated signed payload (down to magic header..payload.len()).
+                    let keep = 8 + ((next_u64() as usize) % payload.len().saturating_sub(8).max(1));
+                    payload.truncate(keep);
+                }
+                _ => {
+                    // Random corruption of magic or body bytes.
+                    let off = (next_u64() as usize) % payload.len().max(1);
+                    payload[off] = (next_u64() & 0xff) as u8;
+                }
+            }
+            let signed = sign_payload(payload);
+            let res = std::panic::catch_unwind(|| {
+                let _ = decode_bundle(&signed);
+            });
+            assert!(res.is_ok(), "decode_bundle panicked on signed mutation iter {iter}");
+        }
+    }
 }

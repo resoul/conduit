@@ -174,6 +174,21 @@ pub fn resolve_static_file(
     method: &str,
     path: &str,
 ) -> Option<ResolvedStaticFile> {
+    resolve_static_file_checked(
+        statics,
+        method,
+        path,
+        &crate::vm::Permissions::allow_all(),
+    )
+}
+
+/// Resolves a static asset path if it falls cleanly under a mounted static root and passes `permissions`.
+pub fn resolve_static_file_checked(
+    statics: &[(Box<str>, Box<str>)],
+    method: &str,
+    path: &str,
+    permissions: &crate::vm::Permissions,
+) -> Option<ResolvedStaticFile> {
     if method != "GET" && method != "HEAD" {
         return None;
     }
@@ -196,7 +211,7 @@ pub fn resolve_static_file(
         let Ok(canon) = std::fs::canonicalize(&candidate) else {
             continue;
         };
-        if !canon.starts_with(&base_dir) {
+        if !canon.starts_with(&base_dir) || !permissions.is_read_allowed(&canon) {
             return None;
         }
         let content_type = content_type_for_path(&canon);
@@ -1147,21 +1162,66 @@ impl DeadlineState {
     }
 }
 
+#[cfg(windows)]
+fn wait_readable_windows(stream: &TcpStream, timeout: Duration) -> io::Result<()> {
+    use std::os::windows::io::AsRawSocket as _;
+
+    #[repr(C)]
+    struct WsaPollFd {
+        fd: usize,
+        events: i16,
+        revents: i16,
+    }
+
+    #[link(name = "ws2_32")]
+    unsafe extern "system" {
+        fn WSAPoll(fdarray: *mut WsaPollFd, nfds: u32, timeout: i32) -> i32;
+        fn WSAGetLastError() -> i32;
+    }
+
+    const POLLRDNORM: i16 = 0x0100;
+    let timeout_ms = timeout.as_millis().clamp(1, i32::MAX as u128) as i32;
+    let mut pollfd = WsaPollFd {
+        fd: stream.as_raw_socket() as usize,
+        events: POLLRDNORM,
+        revents: 0,
+    };
+    // SAFETY: `pollfd` points to one live `SOCKET`; polling avoids canceling a blocking `recv` via `SO_RCVTIMEO`.
+    let rc = unsafe { WSAPoll(&mut pollfd, 1, timeout_ms) };
+    if rc == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "HTTP request deadline exceeded",
+        ));
+    }
+    if rc < 0 {
+        // SAFETY: Called immediately after `WSAPoll` returned `SOCKET_ERROR` (-1) on the current thread.
+        let code = unsafe { WSAGetLastError() };
+        return Err(io::Error::from_raw_os_error(code));
+    }
+    Ok(())
+}
+
 pub struct TcpDeadlineStream {
     inner: TcpStream,
     state: DeadlineState,
+    #[cfg(not(windows))]
     last_timeout_ms: Option<u64>,
 }
 
 impl TcpDeadlineStream {
     pub fn new(inner: TcpStream, initial_idle: Duration) -> Self {
+        #[cfg(windows)]
+        let _ = inner.set_read_timeout(None);
         Self {
             inner,
             state: DeadlineState::new(initial_idle),
+            #[cfg(not(windows))]
             last_timeout_ms: None,
         }
     }
 
+    #[cfg(not(windows))]
     fn apply_timeout(&mut self, dur: Duration) {
         let ms = dur.as_millis().clamp(1, u64::MAX as u128) as u64;
         if self.last_timeout_ms != Some(ms) {
@@ -1174,11 +1234,13 @@ impl TcpDeadlineStream {
 impl DeadlineSource for TcpDeadlineStream {
     fn set_idle(&mut self, idle_timeout: Duration, header_timeout: Duration) {
         self.state.set_idle(idle_timeout, header_timeout);
+        #[cfg(not(windows))]
         self.apply_timeout(idle_timeout);
     }
 
     fn arm_deadline(&mut self, timeout: Duration) {
         self.state.arm_deadline(timeout);
+        #[cfg(not(windows))]
         self.apply_timeout(timeout);
     }
 
@@ -1190,6 +1252,9 @@ impl DeadlineSource for TcpDeadlineStream {
 impl Read for TcpDeadlineStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let timeout = self.state.next_read_timeout()?;
+        #[cfg(windows)]
+        wait_readable_windows(&self.inner, timeout)?;
+        #[cfg(not(windows))]
         self.apply_timeout(timeout);
         let n = self.inner.read(buf)?;
         self.state.on_read_ok(n);
@@ -2371,6 +2436,18 @@ fn can_retry_pooled_request(method: &str) -> bool {
     matches!(method, "GET" | "HEAD" | "OPTIONS" | "TRACE" | "PUT" | "DELETE")
 }
 
+enum HttpClientFailure {
+    HttpErr(Obj),
+    PermissionDenied(String),
+}
+
+impl From<Obj> for HttpClientFailure {
+    fn from(obj: Obj) -> Self {
+        Self::HttpErr(obj)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn tcp_http_request_once(
     method: &str,
     parsed: &ParsedUrl,
@@ -2379,7 +2456,13 @@ fn tcp_http_request_once(
     timeout: Duration,
     pool: Option<&HttpConnPool>,
     deny_private_addrs: bool,
-) -> Result<RawHttpResponse, Obj> {
+    permissions: Option<&crate::vm::Permissions>,
+) -> Result<RawHttpResponse, HttpClientFailure> {
+    if let Some(perms) = permissions {
+        perms
+            .check_net(&parsed.host, parsed.port)
+            .map_err(HttpClientFailure::PermissionDenied)?;
+    }
     check_target_host_allowed(parsed, deny_private_addrs)?;
     let want_keep_alive = pool.is_some();
     let req = build_http_request_bytes(method, parsed, body, headers, want_keep_alive)?;
@@ -2403,7 +2486,7 @@ fn tcp_http_request_once(
                 return Ok(resp);
             }
             // The peer may already have handled the request before the error.
-            Err(err) if !can_retry_pooled_request(method) => return Err(err),
+            Err(err) if !can_retry_pooled_request(method) => return Err(err.into()),
             Err(_) => {}
         }
     }
@@ -2419,6 +2502,7 @@ fn tcp_http_request_once(
     Ok(resp)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn http_client_request_raw(
     method: &str,
     url: &str,
@@ -2427,9 +2511,10 @@ fn http_client_request_raw(
     timeout_ms: i64,
     pool: Option<&HttpConnPool>,
     deny_private_addrs: bool,
-) -> Result<RawHttpResponse, Obj> {
+    permissions: Option<&crate::vm::Permissions>,
+) -> Result<RawHttpResponse, HttpClientFailure> {
     if timeout_ms <= 0 {
-        return Err(make_http_error("invalid_timeout", "timeout_ms must be > 0"));
+        return Err(make_http_error("invalid_timeout", "timeout_ms must be > 0").into());
     }
     let timeout = Duration::from_millis(timeout_ms as u64);
     let mut cur_method = method.trim().to_ascii_uppercase();
@@ -2441,9 +2526,11 @@ fn http_client_request_raw(
         return Err(make_http_error(
             "invalid_method",
             format!("invalid HTTP method: {:?}", method),
-        ));
+        )
+        .into());
     }
-    let mut parsed = parse_http_url(url).map_err(|err| make_http_error("invalid_url", err))?;
+    let mut parsed =
+        parse_http_url(url).map_err(|err| HttpClientFailure::HttpErr(make_http_error("invalid_url", err)))?;
     let mut cur_body = body;
     let mut cur_headers = Cow::Borrowed(headers);
 
@@ -2456,6 +2543,7 @@ fn http_client_request_raw(
             timeout,
             pool,
             deny_private_addrs,
+            permissions,
         )?;
         if matches!(resp.status, 301..=303 | 307 | 308)
             && let Some((_, loc)) = resp.headers.iter().find(|(k, _)| k == "location")
@@ -2464,16 +2552,18 @@ fn http_client_request_raw(
                 return Err(make_http_error(
                     "too_many_redirects",
                     format!("exceeded {} redirects", MAX_REDIRECTS),
-                ));
+                )
+                .into());
             }
             let next_url = resolve_redirect_url(&parsed, loc);
-            let next =
-                parse_http_url(&next_url).map_err(|err| make_http_error("invalid_url", err))?;
+            let next = parse_http_url(&next_url)
+                .map_err(|err| HttpClientFailure::HttpErr(make_http_error("invalid_url", err)))?;
             if parsed.is_https && !next.is_https {
                 return Err(make_http_error(
                     "tls_error",
                     "refusing insecure redirect from https:// to http://",
-                ));
+                )
+                .into());
             }
             let discard_body = matches!(resp.status, 301..=303) && cur_method != "HEAD";
             cur_headers = redirect_headers(cur_headers, &parsed, &next, discard_body);
@@ -2490,7 +2580,19 @@ fn http_client_request_raw(
     Err(make_http_error(
         "too_many_redirects",
         format!("exceeded {} redirects", MAX_REDIRECTS),
-    ))
+    )
+    .into())
+}
+
+fn finish_http_client_result<F: FnOnce(RawHttpResponse) -> Obj>(
+    res: Result<RawHttpResponse, HttpClientFailure>,
+    on_ok: F,
+) -> Result<Obj, String> {
+    match res {
+        Ok(resp) => Ok(on_ok(resp)),
+        Err(HttpClientFailure::HttpErr(err_obj)) => Ok(err_obj),
+        Err(HttpClientFailure::PermissionDenied(msg)) => Err(msg),
+    }
 }
 
 pub fn http_client_request(
@@ -2502,6 +2604,17 @@ pub fn http_client_request(
     http_client_request_with_timeout(method, url, body, headers, 30_000)
 }
 
+/// Performs an HTTP/HTTPS request while enforcing `permissions` on the target URL and redirects.
+pub fn http_client_request_checked(
+    method: &str,
+    url: &str,
+    body: &str,
+    headers: &[(String, String)],
+    permissions: &crate::vm::Permissions,
+) -> Result<Obj, String> {
+    http_client_request_with_timeout_checked(method, url, body, headers, 30_000, permissions)
+}
+
 pub fn http_client_request_with_timeout(
     method: &str,
     url: &str,
@@ -2509,10 +2622,35 @@ pub fn http_client_request_with_timeout(
     headers: &[(String, String)],
     timeout_ms: i64,
 ) -> Obj {
-    match http_client_request_raw(method, url, body.as_bytes(), headers, timeout_ms, None, false) {
-        Ok(resp) => build_response_obj(resp.status, &resp.body, resp.headers),
-        Err(err_obj) => err_obj,
-    }
+    finish_http_client_result(
+        http_client_request_raw(method, url, body.as_bytes(), headers, timeout_ms, None, false, None),
+        |resp| build_response_obj(resp.status, &resp.body, resp.headers),
+    )
+    .expect("unchecked HTTP client never fails permission check")
+}
+
+/// Performs a timed HTTP/HTTPS request while enforcing `permissions` on the target URL and redirects.
+pub fn http_client_request_with_timeout_checked(
+    method: &str,
+    url: &str,
+    body: &str,
+    headers: &[(String, String)],
+    timeout_ms: i64,
+    permissions: &crate::vm::Permissions,
+) -> Result<Obj, String> {
+    finish_http_client_result(
+        http_client_request_raw(
+            method,
+            url,
+            body.as_bytes(),
+            headers,
+            timeout_ms,
+            None,
+            false,
+            Some(permissions),
+        ),
+        |resp| build_response_obj(resp.status, &resp.body, resp.headers),
+    )
 }
 
 pub fn http_client_pooled_request_with_options(
@@ -2524,18 +2662,47 @@ pub fn http_client_pooled_request_with_options(
     pool: &HttpConnPool,
     deny_private_addrs: bool,
 ) -> Obj {
-    match http_client_request_raw(
-        method,
-        url,
-        body.as_bytes(),
-        headers,
-        timeout_ms,
-        Some(pool),
-        deny_private_addrs,
-    ) {
-        Ok(resp) => build_response_obj(resp.status, &resp.body, resp.headers),
-        Err(err_obj) => err_obj,
-    }
+    finish_http_client_result(
+        http_client_request_raw(
+            method,
+            url,
+            body.as_bytes(),
+            headers,
+            timeout_ms,
+            Some(pool),
+            deny_private_addrs,
+            None,
+        ),
+        |resp| build_response_obj(resp.status, &resp.body, resp.headers),
+    )
+    .expect("unchecked HTTP client never fails permission check")
+}
+
+/// Performs a pooled HTTP/HTTPS request while enforcing `permissions` on the target URL and redirects.
+#[allow(clippy::too_many_arguments)]
+pub fn http_client_pooled_request_with_options_checked(
+    method: &str,
+    url: &str,
+    body: &str,
+    headers: &[(String, String)],
+    timeout_ms: i64,
+    pool: &HttpConnPool,
+    deny_private_addrs: bool,
+    permissions: &crate::vm::Permissions,
+) -> Result<Obj, String> {
+    finish_http_client_result(
+        http_client_request_raw(
+            method,
+            url,
+            body.as_bytes(),
+            headers,
+            timeout_ms,
+            Some(pool),
+            deny_private_addrs,
+            Some(permissions),
+        ),
+        |resp| build_response_obj(resp.status, &resp.body, resp.headers),
+    )
 }
 
 pub fn http_client_pooled_request(
@@ -2556,10 +2723,35 @@ pub fn http_client_bytes_request(
     headers: &[(String, String)],
     timeout_ms: i64,
 ) -> Obj {
-    match http_client_request_raw(method, url, body, headers, timeout_ms, None, false) {
-        Ok(resp) => build_binary_response_obj(resp.status, resp.body, resp.headers),
-        Err(err_obj) => err_obj,
-    }
+    finish_http_client_result(
+        http_client_request_raw(method, url, body, headers, timeout_ms, None, false, None),
+        |resp| build_binary_response_obj(resp.status, resp.body, resp.headers),
+    )
+    .expect("unchecked HTTP client never fails permission check")
+}
+
+/// Performs a binary HTTP/HTTPS request while enforcing `permissions` on the target URL and redirects.
+pub fn http_client_bytes_request_checked(
+    method: &str,
+    url: &str,
+    body: &[u8],
+    headers: &[(String, String)],
+    timeout_ms: i64,
+    permissions: &crate::vm::Permissions,
+) -> Result<Obj, String> {
+    finish_http_client_result(
+        http_client_request_raw(
+            method,
+            url,
+            body,
+            headers,
+            timeout_ms,
+            None,
+            false,
+            Some(permissions),
+        ),
+        |resp| build_binary_response_obj(resp.status, resp.body, resp.headers),
+    )
 }
 
 #[cfg(test)]
@@ -3297,5 +3489,72 @@ mod tests {
         eprintln!(
             "[bench mixed routes N=1000] linear median={linear_mixed_us:.3}us | indexed median={indexed_mixed_us:.3}us"
         );
+    }
+
+    #[test]
+    fn fuzz_http_parser_never_panics() {
+        let seeds: &[&[u8]] = &[
+            b"GET /hello?a=1&b=2 HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n",
+            b"POST /items HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nContent-Type: text/plain\r\n\r\nhello",
+            b"GET /legacy HTTP/1.0\r\n\r\n",
+            b"HEAD /assets/logo.png HTTP/1.1\r\nHost: a\r\nX-Custom: v\r\n\r\n",
+            b"POST /bad HTTP/1.1\r\nHost: a\r\nContent-Length: 99999999999999999999999\r\n\r\n",
+        ];
+
+        for &edge in &[
+            b"GET / HTTP/1.1\r\nHost: a\r\nContent-Length: -1\r\n\r\n".as_slice(),
+            b"GET / HTTP/1.1\r\nHost: a\r\nContent-Length: 0\r\n\r\n".as_slice(),
+            b"GET / HTTP/1.1\r\nHost: a\r\nContent-Length: 99999999999999999999999\r\n\r\n".as_slice(),
+            b"GET / HTTP/1.1\nHost: a\r\n\r\n".as_slice(),
+            b"\r\n\r\n".as_slice(),
+            b"".as_slice(),
+        ] {
+            let _ = parse_http_head(edge);
+            let mut br = BufReader::new(Cursor::new(edge));
+            let _ = read_http_request(&mut br);
+        }
+
+        let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next_u64 = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let bytes_pool: &[u8] = b"\r\n :;/019aAzZ-_%?&=!\x00\xff";
+        for iter in 0..2000usize {
+            let mut data = seeds[iter % seeds.len()].to_vec();
+            match next_u64() % 4 {
+                0 => {
+                    let cut = (next_u64() as usize) % (data.len() + 1);
+                    data.truncate(cut);
+                }
+                1 => {
+                    let pos = (next_u64() as usize) % data.len().max(1);
+                    data[pos] = bytes_pool[(next_u64() as usize) % bytes_pool.len()];
+                }
+                2 => {
+                    let other = seeds[(next_u64() as usize) % seeds.len()];
+                    let mid = (next_u64() as usize) % (data.len() + 1);
+                    let o_mid = (next_u64() as usize) % (other.len() + 1);
+                    let mut spliced = data[..mid].to_vec();
+                    spliced.extend_from_slice(&other[o_mid..]);
+                    data = spliced;
+                }
+                _ => {
+                    let flips = ((next_u64() % 4) + 1) as usize;
+                    for _ in 0..flips {
+                        let pos = (next_u64() as usize) % data.len().max(1);
+                        data[pos] ^= 1u8 << ((next_u64() % 8) as u8);
+                    }
+                }
+            }
+            let ok = std::panic::catch_unwind(|| {
+                let _ = parse_http_head(&data);
+                let mut br = BufReader::new(Cursor::new(data.as_slice()));
+                let _ = read_http_request(&mut br);
+            });
+            assert!(ok.is_ok(), "HTTP parser panicked on mutation iter {iter}");
+        }
     }
 }

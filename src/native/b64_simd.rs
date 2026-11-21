@@ -10,6 +10,9 @@ use std::arch::x86_64::*;
 
 #[inline]
 pub(crate) fn available() -> bool {
+    if cfg!(miri) {
+        return false;
+    }
     #[cfg(target_arch = "aarch64")]
     {
         true

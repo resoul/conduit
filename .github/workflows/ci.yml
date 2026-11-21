@@ -60,3 +60,41 @@ jobs:
 
       - name: Check x86_64-apple-darwin build
         run: cargo check --all-targets --target x86_64-apple-darwin
+
+  miri:
+    name: miri (VM & crypto UB check)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust Nightly + Miri
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+
+      - name: Run Miri on VM, IR, and pure-Rust crypto tests
+        run: |
+          cargo +nightly miri test --lib -- \
+            vm::opcode \
+            vm::string \
+            vm::value \
+            vm::pipeline::tests \
+            vm::tests::checked_int_overflow_and_div_zero \
+            vm::tests::closure_captures_snapshot_and_isolation \
+            vm::tests::cow_list_and_map_isolation \
+            vm::tests::cross_scalar_obj_pipeline_map \
+            vm::tests::json_lists_maps_scalars_and_escaping \
+            vm::tests::large_struct_inline_and_overflow_slots \
+            vm::tests::list_sum_min_max_methods \
+            vm::tests::list_reduce_and_number_methods_e2e \
+            vm::tests::non_leaf_and_float_pipelines \
+            vm::tests::optional_chaining_and_defaults_e2e \
+            vm::tests::pipeline_cmp_minmax_and_float_fast_paths \
+            vm::tests::pipeline_reduce_fast_path_matches_interpreter_on_edge_cases \
+            vm::tests::recursive_fib_and_call_depth_limit \
+            vm::tests::reduce_sum_overflow_is_error_not_wrap \
+            vm::tests::string_methods_e2e \
+            ir::tests \
+            native::tls::asn1 \
+            native::tls::crypto::gcm \
+            native::tls::crypto::chacha_poly

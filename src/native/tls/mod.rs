@@ -777,27 +777,98 @@ mod tests {
     #[test]
     fn fuzz_like_parsers_never_panic() {
         let mut seed = 0x1234_5678_9abc_def0u64;
-        let mut next_byte = || {
+        let mut next_u64 = || -> u64 {
             seed ^= seed << 13;
             seed ^= seed >> 7;
             seed ^= seed << 17;
-            (seed & 0xff) as u8
+            seed
+        };
+        let run_all = |data: &[u8]| {
+            assert!(std::panic::catch_unwind(|| {
+                let _ = crate::native::tls::handshake::parse_server_hello(data);
+                let _ = crate::native::tls::handshake::parse_encrypted_extensions(data);
+                let _ = crate::native::tls::handshake::parse_tls13_certificate(data);
+                let _ = crate::native::tls::handshake::parse_certificate_verify(data);
+                let _ = crate::native::tls::x509::parse_x509(data);
+                let mut dr = crate::native::tls::asn1::DerReader::new(data);
+                let _ = dr.read_tlv();
+                let _ = crate::native::tls::pem::decode_pem_certificates(data);
+                let _ = crate::native::tls::pem::decode_pem_blocks(data, "PUBLIC KEY");
+            })
+            .is_ok());
         };
 
         for iter in 0..500 {
             let len = (iter % 128) + 1;
-            let data: Vec<u8> = (0..len).map(|_| next_byte()).collect();
-            assert!(std::panic::catch_unwind(|| {
-                let _ = crate::native::tls::handshake::parse_server_hello(&data);
-                let _ = crate::native::tls::handshake::parse_encrypted_extensions(&data);
-                let _ = crate::native::tls::handshake::parse_tls13_certificate(&data);
-                let _ = crate::native::tls::handshake::parse_certificate_verify(&data);
-                let _ = crate::native::tls::x509::parse_x509(&data);
-                let mut dr = crate::native::tls::asn1::DerReader::new(&data);
-                let _ = dr.read_tlv();
-            })
-            .is_ok());
+            let data: Vec<u8> = (0..len).map(|_| (next_u64() & 0xff) as u8).collect();
+            run_all(&data);
         }
+
+        const LEAF_PEM: &[u8] = b"-----BEGIN CERTIFICATE-----
+MIICTTCCATWgAwIBAgIUUyga0QIGoICm57u1SK6sHSMtwn0wDQYJKoZIhvcNAQEL
+BQAwHzEdMBsGA1UEAwwUVGVzdCBJbnRlcm1lZGlhdGUgQ0EwHhcNMjYxMTIwMDk1
+OTA2WhcNMjcxMTIwMDk1OTA2WjAfMR0wGwYDVQQDDBR3cm9uZy1jbi5leGFtcGxl
+LmNvbTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABGLj42fKG35KYOPFQhAkMZHp
+lTCFecF8CRImk646wW4ovPesV0z9EFUGeLk+L1c/d0kNwdILrBGj+jKl8FHfwS+j
+TDBKMDMGA1UdEQQsMCqCD2FwaS5leGFtcGxlLmNvbYIRKi5zdmMuZXhhbXBsZS5j
+b22HBH8AAAEwEwYDVR0lBAwwCgYIKwYBBQUHAwEwDQYJKoZIhvcNAQELBQADggEB
+AJqhNeu4JKXhlib1OjpGZpWNsDfd2dc/69g3a57EylNQUo6dKHiAL256yaBugNzE
+zR3bJkA3P2xABDNYIYvAAoH8wUWV50BbKxsk+hAya1MqkW9DPKLqmcoasq3oggRn
+fecqvi104iPGM86+vV7/J1pq6nGehVws++FFQkIfSSkrpdrzO6jgoa2R2WbDDTuB
+4RIf6gyHFqbQCHx4+pewdSysMEOeLIwb/FhfDFVLf9BfzArgGqbODEVbhYZPolLr
+Q6AKUwv0rmkneLZwLAAzELbiMeCpnk4DBmDjcua3zkj9g9Xph2wZAmw9q5fZD2YR
+WXzLvyx+jgyLFnWKSF7Qj3o=
+-----END CERTIFICATE-----";
+        let leaf_der = crate::native::tls::pem::decode_pem_certificates(LEAF_PEM)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let pubkey_pem = b"-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE\n-----END PUBLIC KEY-----\n";
+        let server_hello_seed: Vec<u8> = vec![
+            0x03, 0x03, // legacy_version TLS 1.2
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+            17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+            0x00, // session_id_len
+            0x13, 0x01, // TLS_AES_128_GCM_SHA256
+            0x00, // compression
+            0x00, 0x06, // extensions len
+            0x00, 0x2b, 0x00, 0x02, 0x03, 0x04, // supported_versions = TLS 1.3
+        ];
+        let mut deep_seq = vec![0x04u8, 0x01, 0x00];
+        for _ in 0..32 {
+            let mut next = vec![0x30u8, deep_seq.len() as u8];
+            next.extend_from_slice(&deep_seq);
+            deep_seq = next;
+        }
+
+        let structured_seeds: [&[u8]; 4] = [&leaf_der, LEAF_PEM, &server_hello_seed, &deep_seq];
+        let mut pem_pool = Vec::with_capacity(structured_seeds.len() + 1);
+        pem_pool.extend_from_slice(&structured_seeds);
+        pem_pool.push(pubkey_pem.as_slice());
+
+        for iter in 0..1000usize {
+            let base = pem_pool[iter % pem_pool.len()];
+            let mut mutated = base.to_vec();
+            match next_u64() % 3 {
+                0 => {
+                    let cut = (next_u64() as usize) % (mutated.len() + 1);
+                    mutated.truncate(cut);
+                }
+                1 => {
+                    let flips = ((next_u64() % 4) + 1) as usize;
+                    for _ in 0..flips {
+                        let idx = (next_u64() as usize) % mutated.len().max(1);
+                        mutated[idx] ^= 1u8 << ((next_u64() % 8) as u8);
+                    }
+                }
+                _ => {
+                    let idx = (next_u64() as usize) % mutated.len().max(1);
+                    mutated[idx] = (next_u64() & 0xff) as u8;
+                }
+            }
+            run_all(&mutated);
+        }
+        run_all(&deep_seq);
     }
 
     #[test]

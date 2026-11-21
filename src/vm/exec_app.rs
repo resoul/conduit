@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use crate::ir::{AppPlan, Module};
 use crate::native::cron::CronSchedulerState;
-use crate::native::env::exec_env_load;
+use crate::native::env::exec_env_load_checked;
 use crate::native::validation::is_err_or_nil_obj;
 use crate::vm::exec_cold::err_msg;
 use crate::vm::exec_cron::{start_cron_scheduler, stop_cron_scheduler};
@@ -101,7 +101,8 @@ impl Vm {
             .env_plans
             .get(env_idx as usize)
             .ok_or_else(|| err_msg("Missing EnvLoadPlan in app"))?;
-        let cfg_obj = exec_env_load(env_plan);
+        let cfg_obj = exec_env_load_checked(env_plan, &self.host.permissions)
+            .map_err(|e| err_msg(&e))?;
         if let Obj::Record(rec) = &cfg_obj
             && rec.schema_id == SCHEMA_ENV_ERROR
         {
@@ -286,6 +287,14 @@ impl Vm {
                     .shared_module
                     .get_or_insert_with(|| Arc::new(module.clone()))
                     .clone();
+                let perms = Arc::clone(&self.host.permissions);
+
+                if let (Some(_), Some(addr)) = (rid, &plan.http_addr) {
+                    self.host
+                        .permissions
+                        .check_net_addr(addr.as_str())
+                        .map_err(|e| err_msg(&e))?;
+                }
 
                 let cron_state = if let Some(sched_idx) = plan.schedule_idx {
                     let sched = &module.schedules[sched_idx as usize];
@@ -293,6 +302,7 @@ impl Vm {
                         Arc::clone(&shared_mod),
                         sched,
                         Some(Arc::clone(&self.host.spawn_tracker)),
+                        Arc::clone(&perms),
                     ) {
                         Ok(st) => Some(st),
                         Err(msg) => {
@@ -331,6 +341,7 @@ impl Vm {
                             self.host.db_pool_free.clone(),
                             Arc::clone(&self.host.spawn_tracker),
                             self.script_args.clone(),
+                            Arc::clone(&perms),
                             r_id,
                             l,
                             stop_flag,
@@ -369,6 +380,7 @@ impl Vm {
                         let db_pool_free = self.host.db_pool_free.clone();
                         let spawn_tracker = Arc::clone(&self.host.spawn_tracker);
                         let script_args = self.script_args.clone();
+                        let perms_bg = Arc::clone(&perms);
                         let mod_bg = Arc::clone(&shared_mod);
                         let handle = std::thread::spawn(move || {
                             serve_http_listener(
@@ -379,6 +391,7 @@ impl Vm {
                                 db_pool_free,
                                 spawn_tracker,
                                 script_args,
+                                perms_bg,
                                 r_id,
                                 l,
                                 stop_bg,

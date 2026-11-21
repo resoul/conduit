@@ -47,42 +47,52 @@ impl Vm {
         match aux {
             FS_READ_TEXT => {
                 let path = self.extract_str(o_base, b, "fs.read_text()")?;
+                self.host.permissions.check_read(path.as_str()).map_err(|e| err_msg(&e))?;
                 self.objs[o_base + a as usize] = read_text(&path);
             }
             FS_READ_LINES => {
                 let path = self.extract_str(o_base, b, "fs.read_lines()")?;
+                self.host.permissions.check_read(path.as_str()).map_err(|e| err_msg(&e))?;
                 self.objs[o_base + a as usize] = read_lines(&path);
             }
             FS_EXISTS => {
                 let path = self.extract_str(o_base, b, "fs.exists()")?;
+                self.host.permissions.check_read(path.as_str()).map_err(|e| err_msg(&e))?;
                 self.scalars[s_base + a as usize] = u64::from(Path::new(path.as_str()).exists());
             }
             FS_IS_FILE => {
                 let path = self.extract_str(o_base, b, "fs.is_file()")?;
+                self.host.permissions.check_read(path.as_str()).map_err(|e| err_msg(&e))?;
                 self.scalars[s_base + a as usize] = u64::from(Path::new(path.as_str()).is_file());
             }
             FS_IS_DIR => {
                 let path = self.extract_str(o_base, b, "fs.is_dir()")?;
+                self.host.permissions.check_read(path.as_str()).map_err(|e| err_msg(&e))?;
                 self.scalars[s_base + a as usize] = u64::from(Path::new(path.as_str()).is_dir());
             }
             FS_SIZE => {
                 let path = self.extract_str(o_base, b, "fs.size()")?;
+                self.host.permissions.check_read(path.as_str()).map_err(|e| err_msg(&e))?;
                 self.objs[o_base + a as usize] = size(&path);
             }
             FS_LIST_DIR => {
                 let path = self.extract_str(o_base, b, "fs.list_dir()")?;
+                self.host.permissions.check_read(path.as_str()).map_err(|e| err_msg(&e))?;
                 self.objs[o_base + a as usize] = list_dir(&path);
             }
             FS_MKDIR_ALL => {
                 let path = self.extract_str(o_base, b, "fs.mkdir_all()")?;
+                self.host.permissions.check_write(path.as_str()).map_err(|e| err_msg(&e))?;
                 self.objs[o_base + a as usize] = mkdir_all(&path);
             }
             FS_REMOVE => {
                 let path = self.extract_str(o_base, b, "fs.remove()")?;
+                self.host.permissions.check_write(path.as_str()).map_err(|e| err_msg(&e))?;
                 self.objs[o_base + a as usize] = remove_path(&path);
             }
             FS_OPEN_READ => {
                 let path = self.extract_str(o_base, b, "fs.open_read()")?;
+                self.host.permissions.check_read(path.as_str()).map_err(|e| err_msg(&e))?;
                 let res = match open_buf_reader(&path) {
                     Ok(reader) => {
                         let id = self.host.fs_readers.len();
@@ -95,6 +105,7 @@ impl Vm {
             }
             FS_OPEN_WRITE | FS_OPEN_APPEND => {
                 let path = self.extract_str(o_base, b, "fs.open_write()")?;
+                self.host.permissions.check_write(path.as_str()).map_err(|e| err_msg(&e))?;
                 let append = aux == FS_OPEN_APPEND;
                 let res = match open_buf_writer(&path, append) {
                     Ok(writer) => {
@@ -163,27 +174,35 @@ impl Vm {
         match aux {
             FS_WRITE_TEXT => {
                 let path = self.extract_str(o_base, b, "fs.write_text()")?;
+                self.host.permissions.check_write(path.as_str()).map_err(|e| err_msg(&e))?;
                 let data = self.extract_str(o_base, c, "fs.write_text()")?;
                 self.objs[o_base + a as usize] = write_text(&path, &data);
             }
             FS_APPEND_TEXT => {
                 let path = self.extract_str(o_base, b, "fs.append_text()")?;
+                self.host.permissions.check_write(path.as_str()).map_err(|e| err_msg(&e))?;
                 let data = self.extract_str(o_base, c, "fs.append_text()")?;
                 self.objs[o_base + a as usize] = append_text(&path, &data);
             }
             FS_WRITE_ATOMIC => {
                 let path = self.extract_str(o_base, b, "fs.write_atomic()")?;
+                self.host.permissions.check_write(path.as_str()).map_err(|e| err_msg(&e))?;
                 let data = self.extract_str(o_base, c, "fs.write_atomic()")?;
                 self.objs[o_base + a as usize] = write_atomic(&path, &data);
             }
             FS_COPY => {
                 let src = self.extract_str(o_base, b, "fs.copy()")?;
                 let dst = self.extract_str(o_base, c, "fs.copy()")?;
+                self.host.permissions.check_read(src.as_str()).map_err(|e| err_msg(&e))?;
+                self.host.permissions.check_write(dst.as_str()).map_err(|e| err_msg(&e))?;
                 self.objs[o_base + a as usize] = copy_file(&src, &dst);
             }
             FS_RENAME => {
                 let src = self.extract_str(o_base, b, "fs.rename()")?;
                 let dst = self.extract_str(o_base, c, "fs.rename()")?;
+                self.host.permissions.check_read(src.as_str()).map_err(|e| err_msg(&e))?;
+                self.host.permissions.check_write(src.as_str()).map_err(|e| err_msg(&e))?;
+                self.host.permissions.check_write(dst.as_str()).map_err(|e| err_msg(&e))?;
                 self.objs[o_base + a as usize] = rename_path(&src, &dst);
             }
             FS_WRITER_WRITE | FS_WRITER_WRITE_LINE => {
@@ -257,6 +276,7 @@ impl Vm {
             }
             FS_EACH_LINE => {
                 let path = self.extract_str(o_base, b, "fs.each_line()")?;
+                self.host.permissions.check_read(path.as_str()).map_err(|e| err_msg(&e))?;
                 let cb_slot = o_base + c as usize;
                 let (func_id, closure_slot) = match &self.objs[cb_slot] {
                     Obj::Func(fid) => (*fid, usize::MAX),

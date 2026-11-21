@@ -626,3 +626,111 @@ fn find_field_index(
     }
     found
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fuzz_json_decoder_never_panics() {
+        let src = r#"
+            import * as json from "cdt.json"
+
+            enum Kind { OkVal(code: Int), ErrVal }
+            struct Inner { tag: String?, score: Float }
+            struct Payload {
+                id: Int
+                name: String
+                flags: [Bool]
+                nums: [Int]
+                inner: Inner?
+                meta: Map<String, String>
+                kind: Kind
+            }
+            export func decode_one(raw: String) -> Payload | json.DecodeError {
+                return json.decode<Payload>(raw)
+            }
+        "#;
+        let module = crate::frontend::compile_source(src).unwrap();
+        let plan = &module.json_plans[0];
+
+        let seeds: &[&str] = &[
+            r#"{"id":1,"name":"a","flags":[true,false],"nums":[1,-2,3],"inner":{"tag":null,"score":1.5},"meta":{"k":"v"},"kind":{"type":"OkVal","code":1}}"#,
+            r#"{"id":9223372036854775807,"name":"x\n\t\"\\","flags":[],"nums":[],"inner":null,"meta":{},"kind":{"type":"ErrVal"}}"#,
+            r#"{"id":0,"name":"\u0041\uD83D\uDE00","flags":[false],"nums":[0],"inner":{"tag":"t","score":-0.0},"meta":{},"kind":{"type":"OkVal","code":0}}"#,
+        ];
+
+        for &seed in seeds {
+            let res = decode_json_with_plan(seed, plan);
+            assert!(res.is_ok(), "seed failed `{seed}`: {:?}", res.err());
+        }
+
+        // Explicit adversarial inputs.
+        let deep_arr = "[".repeat(150) + &"]".repeat(150);
+        let deep_obj = "{\"a\":".repeat(150) + "1" + &"}".repeat(150);
+        let adversarial = [
+            "",
+            "{}",
+            "null",
+            &deep_arr,
+            &deep_obj,
+            r#"{"id":9223372036854775808,"name":"a","flags":[],"nums":[],"inner":null,"meta":{},"kind":{"type":"OkVal","code":1}}"#,
+            r#"{"id":-9223372036854775809,"name":"a","flags":[],"nums":[],"inner":null,"meta":{},"kind":{"type":"OkVal","code":1}}"#,
+            r#"{"id":1,"name":"\uD800","flags":[],"nums":[],"inner":null,"meta":{},"kind":{"type":"OkVal","code":1}}"#,
+            r#"{"id":1,"name":"\uDC00","flags":[],"nums":[],"inner":null,"meta":{},"kind":{"type":"OkVal","code":1}}"#,
+            r#"{"id":1,"name":"\uD83D","flags":[],"nums":[],"inner":null,"meta":{},"kind":{"type":"OkVal","code":1}}"#,
+            r#"{"id":1,"name":"\u","flags":[],"nums":[],"inner":null,"meta":{},"kind":{"type":"OkVal","code":1}}"#,
+            "{\"id\":1,\"name\":\"a\0b\",\"flags\":[],\"nums\":[],\"inner\":null,\"meta\":{},\"kind\":{\"type\":\"OkVal\",\"code\":1}}",
+            r#"{"id":1,"name":"a","flags":[],"nums":[],"inner":{"tag":"x","score":1e9999999},"meta":{},"kind":{"type":"OkVal","code":1}}"#,
+            r#"{"id":1,"name":"a","flags":[],"nums":[],"inner":null,"meta":{},"kind":{"type":"OkVal","code":1}} trailing"#,
+        ];
+        for raw in adversarial {
+            assert!(std::panic::catch_unwind(|| {
+                let _ = decode_json_with_plan(raw, plan);
+            })
+            .is_ok());
+        }
+
+        // 2,000 deterministic mutations across bytes/UTF-8 slices of valid JSON seeds.
+        let mut rng = 0x517c_c1b7_2722_0a95u64;
+        let mut next_u64 = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let alphabet: &[u8] = b"{}[]\":,0123456789-eE.+truefalsenull\\uD800 \n\t";
+        for iter in 0..2000usize {
+            let mut raw = seeds[iter % seeds.len()].as_bytes().to_vec();
+            let op = next_u64() % 4;
+            match op {
+                0 => {
+                    let cut = (next_u64() as usize) % (raw.len() + 1);
+                    raw.truncate(cut);
+                }
+                1 => {
+                    let pos = (next_u64() as usize) % raw.len().max(1);
+                    raw[pos] = alphabet[(next_u64() as usize) % alphabet.len()];
+                }
+                2 => {
+                    let pos = (next_u64() as usize) % (raw.len() + 1);
+                    let extra = alphabet[(next_u64() as usize) % alphabet.len()];
+                    raw.insert(pos, extra);
+                }
+                _ => {
+                    let mut out = Vec::with_capacity(96);
+                    for _ in 0..((next_u64() % 96) as usize) {
+                        out.push(alphabet[(next_u64() as usize) % alphabet.len()]);
+                    }
+                    raw = out;
+                }
+            }
+            if let Ok(s) = std::str::from_utf8(&raw) {
+                let res = std::panic::catch_unwind(|| {
+                    let _ = decode_json_with_plan(s, plan);
+                });
+                assert!(res.is_ok(), "decode_json_with_plan panicked at iter {iter}");
+            }
+        }
+    }
+}

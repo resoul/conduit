@@ -19,7 +19,7 @@ use crate::vm::value::{
     ListStorage, MapKey, MapVal, Obj, OrderedMap, SCHEMA_DB_CONN, SCHEMA_DB_ERROR,
     SCHEMA_DB_PARAM, SCHEMA_DB_POOL,
 };
-use crate::vm::{ExecResult, RuntimeError, Vm};
+use crate::vm::{ExecResult, Permissions, RuntimeError, Vm};
 
 pub const DB_CONNECT: u8 = 0;
 pub const DB_PARAM_NULL: u8 = 1;
@@ -76,6 +76,24 @@ fn query_mode_from_u16(v: u16) -> Result<QueryMode, RuntimeError> {
         5 => Ok(QueryMode::Rows),
         _ => Err(err_msg("Invalid QueryMode")),
     }
+}
+
+fn check_db_url_net_permission(url: &str, perms: &Permissions) -> Result<(), RuntimeError> {
+    perms.check_any_net().map_err(|e| err_msg(&e))?;
+    if (url.starts_with("postgres://") || url.starts_with("postgresql://"))
+        && let Ok(cfg) = crate::native::pg::parse_pg_url(url)
+    {
+        perms
+            .check_net(&cfg.host, cfg.port)
+            .map_err(|e| err_msg(&e))?;
+    } else if url.starts_with("mysql://")
+        && let Ok(cfg) = crate::native::mysql::parse_mysql_url(url)
+    {
+        perms
+            .check_net(&cfg.host, cfg.port)
+            .map_err(|e| err_msg(&e))?;
+    }
+    Ok(())
 }
 
 impl Vm {
@@ -204,6 +222,7 @@ impl Vm {
         match aux {
             DB_CONNECT => {
                 let url = self.sys_str(o_base, b, "db.connect()")?;
+                check_db_url_net_permission(&url, &self.host.permissions)?;
                 let res = match SqlConn::open(&url) {
                     Ok(conn) => {
                         let id = self.host.insert_db_conn(conn, None);
@@ -855,6 +874,7 @@ impl Vm {
                 };
                 let max_conns = packed.get_scalar(0) as i64;
                 let idle_timeout_ms = packed.get_scalar(1) as i64;
+                check_db_url_net_permission(&url, &self.host.permissions)?;
                 let res = match DbPoolState::open(&url, max_conns, idle_timeout_ms) {
                     Ok(pool) => {
                         let pid = self.host.insert_db_pool(pool);

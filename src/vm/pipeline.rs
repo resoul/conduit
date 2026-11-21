@@ -1303,33 +1303,35 @@ impl Vm {
                                 }
                                 let o_ptr = o_win.as_mut_ptr();
                                 let mut res = Ok(());
-                                for item in src_arc.iter() {
-                                    // SAFETY: `o0_read_only` guarantees `exec_obj_leaf` never mutates or drops
-                                    // `o_win[0]`, and we restore `Obj::Empty` via `ptr::write` after the loop so no double-drop occurs.
-                                    unsafe {
-                                        std::ptr::copy_nonoverlapping(
-                                            item as *const Obj,
-                                            o_ptr,
-                                            1,
-                                        );
-                                    }
-                                    match unsafe {
-                                        exec_obj_leaf(s_ptr, o_ptr, ops, module, *closure)
-                                    } {
-                                        Ok(ExecResult::Obj(next_obj)) => out.push(next_obj),
-                                        Ok(_) => {
-                                            res = Err(err_msg(
-                                                "Mismatched stage kind/result in Obj pipeline",
-                                            ));
-                                            break;
+                                {
+                                    let _slot_guard = BorrowedObjSlot(o_ptr);
+                                    for item in src_arc.iter() {
+                                        // SAFETY: `o0_read_only` guarantees `exec_obj_leaf` never mutates or drops
+                                        // `o_win[0]`; `_slot_guard` restores `Obj::Empty` via `ptr::write` even on panic.
+                                        unsafe {
+                                            std::ptr::copy_nonoverlapping(
+                                                item as *const Obj,
+                                                o_ptr,
+                                                1,
+                                            );
                                         }
-                                        Err(e) => {
-                                            res = Err(e);
-                                            break;
+                                        match unsafe {
+                                            exec_obj_leaf(s_ptr, o_ptr, ops, module, *closure)
+                                        } {
+                                            Ok(ExecResult::Obj(next_obj)) => out.push(next_obj),
+                                            Ok(_) => {
+                                                res = Err(err_msg(
+                                                    "Mismatched stage kind/result in Obj pipeline",
+                                                ));
+                                                break;
+                                            }
+                                            Err(e) => {
+                                                res = Err(e);
+                                                break;
+                                            }
                                         }
                                     }
                                 }
-                                unsafe { std::ptr::write(o_ptr, Obj::Empty) };
                                 for slot in &mut o_win[1..] {
                                     if !matches!(slot, Obj::Empty) {
                                         *slot = Obj::Empty;
@@ -1349,32 +1351,40 @@ impl Vm {
                             }
                             let o_ptr = o_win.as_mut_ptr();
                             let mut res = Ok(());
-                            for item in src_arc.iter() {
-                                // SAFETY: `o0_read_only` guarantees `exec_obj_leaf` borrows `o_win[0]` without moving/dropping it; `ptr::write(o_ptr, Obj::Empty)` clears the temporary alias after the loop.
-                                unsafe {
-                                    std::ptr::copy_nonoverlapping(item as *const Obj, o_ptr, 1);
-                                }
-                                // SAFETY: Leaf register bounds and constants are verified by `is_obj_leaf_ops` + `ensure_capacity`.
-                                match unsafe { exec_obj_leaf(s_ptr, o_ptr, ops, module, *closure) }
-                                {
-                                    Ok(ExecResult::Scalar(pass)) => {
-                                        if pass != 0 {
-                                            out.push(item.clone());
+                            {
+                                let _slot_guard = BorrowedObjSlot(o_ptr);
+                                for item in src_arc.iter() {
+                                    // SAFETY: `o0_read_only` guarantees `exec_obj_leaf` borrows `o_win[0]` without
+                                    // moving/dropping it; `_slot_guard` clears the temporary alias on exit or panic.
+                                    unsafe {
+                                        std::ptr::copy_nonoverlapping(
+                                            item as *const Obj,
+                                            o_ptr,
+                                            1,
+                                        );
+                                    }
+                                    // SAFETY: Leaf register bounds and constants are verified by `is_obj_leaf_ops` + `ensure_capacity`.
+                                    match unsafe {
+                                        exec_obj_leaf(s_ptr, o_ptr, ops, module, *closure)
+                                    } {
+                                        Ok(ExecResult::Scalar(pass)) => {
+                                            if pass != 0 {
+                                                out.push(item.clone());
+                                            }
                                         }
-                                    }
-                                    Ok(_) => {
-                                        res = Err(err_msg(
-                                            "Mismatched stage kind/result in Obj pipeline",
-                                        ));
-                                        break;
-                                    }
-                                    Err(e) => {
-                                        res = Err(e);
-                                        break;
+                                        Ok(_) => {
+                                            res = Err(err_msg(
+                                                "Mismatched stage kind/result in Obj pipeline",
+                                            ));
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            res = Err(e);
+                                            break;
+                                        }
                                     }
                                 }
                             }
-                            unsafe { std::ptr::write(o_ptr, Obj::Empty) };
                             for slot in &mut o_win[1..] {
                                 if !matches!(slot, Obj::Empty) {
                                     *slot = Obj::Empty;
@@ -1415,14 +1425,19 @@ impl Vm {
                                         for st in &leaf_stages {
                                             let borrowed_item =
                                                 st.o0_read_only && owned_cur.is_none();
-                                            if borrowed_item {
-                                                // SAFETY: `o0_read_only` guarantees `exec_obj_leaf` only reads `o_win[0]`, and we clear the alias right below.
+                                            let res = if borrowed_item {
+                                                // SAFETY: `o0_read_only` guarantees `exec_obj_leaf` only reads `o_win[0]`,
+                                                // and `_slot_guard` clears the alias via `ptr::write` even on panic.
+                                                let _slot_guard = BorrowedObjSlot(o_ptr);
                                                 unsafe {
                                                     std::ptr::copy_nonoverlapping(
                                                         item as *const Obj,
                                                         o_ptr,
                                                         1,
                                                     );
+                                                    exec_obj_leaf(
+                                                        s_ptr, o_ptr, st.ops, module, st.closure,
+                                                    )
                                                 }
                                             } else {
                                                 unsafe {
@@ -1440,17 +1455,11 @@ impl Vm {
                                                             ));
                                                         }
                                                     };
+                                                    exec_obj_leaf(
+                                                        s_ptr, o_ptr, st.ops, module, st.closure,
+                                                    )
                                                 }
-                                            }
-                                            let res = unsafe {
-                                                exec_obj_leaf(
-                                                    s_ptr, o_ptr, st.ops, module, st.closure,
-                                                )
-                                            };
-                                            if borrowed_item {
-                                                unsafe { std::ptr::write(o_ptr, Obj::Empty) };
-                                            }
-                                            let res = res?;
+                                            }?;
                                             match (st.kind, res) {
                                                 (StageKind::MapObj, ExecResult::Obj(next_obj)) => {
                                                     owned_cur = Some(next_obj);
@@ -1861,5 +1870,45 @@ impl Vm {
             ElemKind::Obj => Obj::List(ListStorage::Obj(Arc::new(out_objs))),
         };
         Ok(())
+    }
+}
+
+struct BorrowedObjSlot(*mut Obj);
+
+impl Drop for BorrowedObjSlot {
+    #[inline]
+    fn drop(&mut self) {
+        // SAFETY: Restores `Obj::Empty` without running `Drop` on the borrowed alias,
+        // preventing double-drop even if a leaf stage or allocation panics.
+        unsafe { std::ptr::write(self.0, Obj::Empty) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn borrowed_obj_slot_restores_empty_on_panic_without_double_drop() {
+        let shared = Arc::new(crate::vm::string::VmString::from(
+            "borrowed-slot-panic-safety-test-string",
+        ));
+        let item = Obj::Str(Arc::clone(&shared));
+        let mut win = [Obj::Empty];
+        let o_ptr = win.as_mut_ptr();
+
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = BorrowedObjSlot(o_ptr);
+            unsafe {
+                std::ptr::copy_nonoverlapping(&item as *const Obj, o_ptr, 1);
+            }
+            assert_eq!(Arc::strong_count(&shared), 2);
+            panic!("simulated panic during leaf pipeline stage");
+        }));
+        assert!(res.is_err());
+        assert!(matches!(win[0], Obj::Empty));
+        assert_eq!(Arc::strong_count(&shared), 2);
+        drop(item);
+        assert_eq!(Arc::strong_count(&shared), 1);
     }
 }

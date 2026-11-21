@@ -498,4 +498,36 @@ WXzLvyx+jgyLFnWKSF7Qj3o=
         let garbage = [0x30u8, 0x82, 0xff, 0xff, 0x01, 0x02, 0x03];
         assert!(std::panic::catch_unwind(|| parse_x509(&garbage).is_ok()).is_ok());
     }
+
+    #[test]
+    fn wycheproof_name_constraints_and_hostname_spoofing_cases() {
+        let nc = NameConstraints {
+            permitted_dns: vec!["example.com".to_string(), ".corp.local".to_string()],
+            excluded_dns: vec!["evil.example.com".to_string(), "blocked.corp.local".to_string()],
+        };
+        assert!(check_name_constraints_on_leaf(&nc, &[SanEntry::Dns("api.example.com".into())]).is_ok());
+        assert!(check_name_constraints_on_leaf(&nc, &[SanEntry::Dns("EXAMPLE.COM.".into())]).is_ok());
+        assert!(check_name_constraints_on_leaf(&nc, &[SanEntry::Dns("app.corp.local".into())]).is_ok());
+
+        // Excluded subdomain or suffix spoofing must fail.
+        assert!(check_name_constraints_on_leaf(&nc, &[SanEntry::Dns("evil.example.com".into())]).is_err());
+        assert!(check_name_constraints_on_leaf(&nc, &[SanEntry::Dns("sub.EVIL.example.com.".into())]).is_err());
+        assert!(check_name_constraints_on_leaf(&nc, &[SanEntry::Dns("badexample.com".into())]).is_err());
+        assert!(check_name_constraints_on_leaf(&nc, &[SanEntry::Dns("other.org".into())]).is_err());
+
+        // Hostname wildcard / spoofing boundary checks.
+        assert!(!dns_wildcard_match("*.*.example.com", "a.b.example.com"));
+        assert!(!dns_wildcard_match("a*.example.com", "api.example.com"));
+        assert!(!dns_wildcard_match("*", "localhost"));
+        assert!(!dns_wildcard_match("*.1", "127.0.0.1"));
+        assert!(!dns_matches_constraint("", "example.com"));
+
+        // SAN IP vs DNS separation.
+        let leaf_der = decode_pem_certificates(TEST_LEAF_PEM).unwrap().pop().unwrap();
+        let leaf = parse_x509(&leaf_der).unwrap();
+        assert!(verify_hostname(&leaf, "127.0.0.1").is_ok());
+        assert!(verify_hostname(&leaf, "127.0.0.2").is_err());
+        assert!(verify_hostname(&leaf, "::1").is_err());
+        assert!(verify_hostname(&leaf, "").is_err());
+    }
 }

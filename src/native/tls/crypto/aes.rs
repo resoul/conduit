@@ -234,6 +234,9 @@ impl AesKey {
     }
 
     fn detect_backend() -> Backend {
+        if cfg!(miri) {
+            return Backend::Portable;
+        }
         #[cfg(target_arch = "x86_64")]
         if std::arch::is_x86_feature_detected!("aes")
             && std::arch::is_x86_feature_detected!("sse2")

@@ -12,6 +12,7 @@ pub fn run_test_cmd(args: &[String]) {
     let mut target: Option<String> = None;
     let mut filter: Option<String> = None;
     let mut fail_fast = false;
+    let mut perms_builder = conduit::vm::PermissionsBuilder::new();
 
     let mut i = 0;
     while i < args.len() {
@@ -26,19 +27,29 @@ pub fn run_test_cmd(args: &[String]) {
                 }
             }
             "--fail-fast" => fail_fast = true,
-            arg if !arg.starts_with('-') && target.is_none() => {
-                target = Some(arg.to_string());
-            }
-            other => {
-                eprintln!(
-                    "Usage: conduit test [file_or_dir] [--filter <pat>] [--fail-fast] (unexpected '{}')",
-                    other
-                );
-                process::exit(2);
-            }
+            arg => match perms_builder.apply_flag(arg) {
+                Ok(true) => {}
+                Ok(false) => {
+                    if !arg.starts_with('-') && target.is_none() {
+                        target = Some(arg.to_string());
+                    } else {
+                        eprintln!(
+                            "Usage: conduit test [file_or_dir] [perm-flags...] [--filter <pat>] [--fail-fast] (unexpected '{}')",
+                            arg
+                        );
+                        process::exit(2);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Permission flag error: {}", e);
+                    process::exit(2);
+                }
+            },
         }
         i += 1;
     }
+
+    let perms = perms_builder.build();
 
     let target_path = PathBuf::from(target.as_deref().unwrap_or("."));
     let files = match discover_test_files(&target_path) {
@@ -90,7 +101,7 @@ pub fn run_test_cmd(args: &[String]) {
                 continue;
             }
             let t0 = Instant::now();
-            let mut vm = Vm::new();
+            let mut vm = Vm::with_permissions(perms.clone());
             let res = vm.call(&module, spec.func_id, &[], &[]);
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
             match res {

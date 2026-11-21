@@ -105,4 +105,62 @@ mod tests {
         bad_tag[15] ^= 0x80;
         assert!(!aead.open_in_place(&nonce, &aad, &mut buf, &bad_tag));
     }
+
+    #[test]
+    fn wycheproof_chacha20_poly1305_edge_cases_and_rejections() {
+        let key: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(11).wrapping_add(1));
+        let nonce: [u8; 12] = [0x01, 0x02, 0x03, 0x04, 0, 0, 0, 1, 0xaa, 0xbb, 0xcc, 0xdd];
+        let aead = ChaCha20Poly1305::new(key);
+
+        for &aad_len in &[0usize, 1, 15, 16, 17, 63, 64, 65, 130] {
+            for &pt_len in &[0usize, 1, 15, 16, 17, 63, 64, 65, 130] {
+                let aad: Vec<u8> = (0..aad_len).map(|i| (i * 5 + 1) as u8).collect();
+                let pt: Vec<u8> = (0..pt_len).map(|i| (i * 9 + 2) as u8).collect();
+                let mut ct = pt.clone();
+                let tag = aead.seal_in_place(&nonce, &aad, &mut ct);
+
+                // Bit flip in tag leaves buffer untouched and rejects.
+                let mut bad_tag = tag;
+                bad_tag[0] ^= 1;
+                let mut scratch = ct.clone();
+                assert!(!aead.open_in_place(&nonce, &aad, &mut scratch, &bad_tag));
+                assert_eq!(scratch, ct);
+
+                // Bit flip in AAD or nonce rejects without decrypting.
+                let mut bad_aad = aad.clone();
+                if bad_aad.is_empty() {
+                    bad_aad.push(0);
+                } else {
+                    bad_aad[aad_len / 2] ^= 0x04;
+                }
+                assert!(!aead.open_in_place(&nonce, &bad_aad, &mut scratch, &tag));
+                assert_eq!(scratch, ct);
+
+                let mut bad_nonce = nonce;
+                bad_nonce[0] ^= 0x01;
+                assert!(!aead.open_in_place(&bad_nonce, &aad, &mut scratch, &tag));
+                assert_eq!(scratch, ct);
+
+                // AAD/CT boundary move attack (padding/length block collision guard) must reject.
+                if !aad.is_empty() {
+                    let mut moved_ct = Vec::with_capacity(ct.len() + 1);
+                    moved_ct.push(*aad.last().unwrap());
+                    moved_ct.extend_from_slice(&ct);
+                    let expected = moved_ct.clone();
+                    assert!(!aead.open_in_place(&nonce, &aad[..aad.len() - 1], &mut moved_ct, &tag));
+                    assert_eq!(moved_ct, expected);
+                }
+                if !ct.is_empty() {
+                    let mut bad_ct = ct.clone();
+                    bad_ct[ct.len() - 1] ^= 0x01;
+                    let expected = bad_ct.clone();
+                    assert!(!aead.open_in_place(&nonce, &aad, &mut bad_ct, &tag));
+                    assert_eq!(bad_ct, expected);
+                }
+
+                assert!(aead.open_in_place(&nonce, &aad, &mut scratch, &tag));
+                assert_eq!(scratch, pt);
+            }
+        }
+    }
 }

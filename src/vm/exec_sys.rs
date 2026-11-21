@@ -116,6 +116,10 @@ impl Vm {
             PROC_RUN | PROC_STATUS => {
                 crate::vm::exec_map::flush_stdout();
                 let cmd = self.sys_str(o_base, b, "process")?;
+                self.host
+                    .permissions
+                    .check_run(cmd.as_str())
+                    .map_err(|e| err_msg(&e))?;
                 let res = match &self.objs[o_base + c as usize] {
                     Obj::List(ListStorage::Obj(items)) => {
                         if aux == PROC_RUN {
@@ -130,6 +134,18 @@ impl Vm {
             }
             PROC_PIPE => {
                 crate::vm::exec_map::flush_stdout();
+                if let Obj::List(ListStorage::Obj(stages)) = &self.objs[o_base + b as usize] {
+                    for stage in stages.iter() {
+                        if let Obj::List(ListStorage::Obj(argv)) = stage
+                            && let Some(Obj::Str(cmd0)) = argv.first()
+                        {
+                            self.host
+                                .permissions
+                                .check_run(cmd0.as_str())
+                                .map_err(|e| err_msg(&e))?;
+                        }
+                    }
+                }
                 let res = match &self.objs[o_base + b as usize] {
                     Obj::List(ListStorage::Obj(items)) => proc_pipe(items),
                     _ => make_process_error("invalid_input", "Expected [[String]] commands"),
@@ -137,10 +153,18 @@ impl Vm {
                 self.objs[o_base + a as usize] = res;
             }
             PROC_CWD => {
+                self.host
+                    .permissions
+                    .check_read_cwd()
+                    .map_err(|e| err_msg(&e))?;
                 self.objs[o_base + a as usize] = proc_cwd();
             }
             PROC_SET_CWD => {
                 let dir = self.sys_str(o_base, b, "process.set_cwd()")?;
+                self.host
+                    .permissions
+                    .check_read(dir.as_str())
+                    .map_err(|e| err_msg(&e))?;
                 self.objs[o_base + a as usize] = proc_set_cwd(&dir);
             }
             PROC_PID => {

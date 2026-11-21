@@ -69,6 +69,16 @@ impl Vm {
         match aux {
             REDIS_CONNECT => {
                 let url = self.sys_str(o_base, b, "redis.connect()")?;
+                self.host
+                    .permissions
+                    .check_any_net()
+                    .map_err(|e| err_msg(&e))?;
+                if let Ok(cfg) = crate::native::redis::parse_redis_url(url.as_str()) {
+                    self.host
+                        .permissions
+                        .check_net(&cfg.host, cfg.port)
+                        .map_err(|e| err_msg(&e))?;
+                }
                 self.objs[o_base + a as usize] = match RedisConn::open(url.as_str()) {
                     Ok(conn) => make_redis_client(register_client(conn)),
                     Err(e) => e.into_obj(),

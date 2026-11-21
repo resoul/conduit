@@ -164,4 +164,72 @@ mod tests {
         assert!(gcm.open_in_place(&iv, &[], &mut buf, &tag));
         assert_eq!(buf, [0u8; 16]);
     }
+
+    #[test]
+    fn wycheproof_aes_gcm_edge_cases_and_hw_portable_parity() {
+        for bad_len in [0usize, 15, 17, 24, 31, 33] {
+            let bad_key = vec![0x42u8; bad_len];
+            assert!(AesGcm::new(&bad_key).is_none(), "key len {bad_len} must fail");
+            assert!(AesGcm::new_portable(&bad_key).is_none());
+        }
+
+        let iv: [u8; 12] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc];
+        for key in [vec![0xABu8; 16], vec![0xCDu8; 32]] {
+            let hw = AesGcm::new(&key).unwrap();
+            let sw = AesGcm::new_portable(&key).unwrap();
+            for &aad_len in &[0usize, 1, 15, 16, 17, 31, 32, 65] {
+                for &pt_len in &[0usize, 1, 15, 16, 17, 31, 32, 65] {
+                    let aad: Vec<u8> = (0..aad_len).map(|i| (i * 7 + 3) as u8).collect();
+                    let pt: Vec<u8> = (0..pt_len).map(|i| (i * 13 + 5) as u8).collect();
+
+                    let mut ct_hw = pt.clone();
+                    let mut ct_sw = pt.clone();
+                    let tag_hw = hw.seal_in_place(&iv, &aad, &mut ct_hw);
+                    let tag_sw = sw.seal_in_place(&iv, &aad, &mut ct_sw);
+                    assert_eq!(ct_hw, ct_sw);
+                    assert_eq!(tag_hw, tag_sw);
+
+                    // Tampered tag leaves buffer untouched and returns false.
+                    for flip_idx in [0usize, 15] {
+                        let mut bad_tag = tag_hw;
+                        bad_tag[flip_idx] ^= 0x01;
+                        let mut scratch = ct_hw.clone();
+                        assert!(!hw.open_in_place(&iv, &aad, &mut scratch, &bad_tag));
+                        assert_eq!(scratch, ct_hw);
+                        assert!(!sw.open_in_place(&iv, &aad, &mut scratch, &bad_tag));
+                        assert_eq!(scratch, ct_hw);
+                    }
+
+                    // Tampered ciphertext (when non-empty) leaves buffer unchanged (except the mutated byte) and rejects.
+                    if !ct_hw.is_empty() {
+                        let mut bad_ct = ct_hw.clone();
+                        bad_ct[0] ^= 0x80;
+                        let before = bad_ct.clone();
+                        assert!(!hw.open_in_place(&iv, &aad, &mut bad_ct, &tag_hw));
+                        assert_eq!(bad_ct, before);
+                    }
+
+                    // Tampered AAD or IV must reject and leave ciphertext untouched.
+                    let mut bad_aad = aad.clone();
+                    if bad_aad.is_empty() {
+                        bad_aad.push(0);
+                    } else {
+                        bad_aad[0] ^= 1;
+                    }
+                    let mut scratch = ct_hw.clone();
+                    assert!(!hw.open_in_place(&iv, &bad_aad, &mut scratch, &tag_hw));
+                    assert_eq!(scratch, ct_hw);
+
+                    let mut bad_iv = iv;
+                    bad_iv[11] ^= 1;
+                    assert!(!hw.open_in_place(&bad_iv, &aad, &mut scratch, &tag_hw));
+                    assert_eq!(scratch, ct_hw);
+
+                    // Valid open recovers original plaintext.
+                    assert!(sw.open_in_place(&iv, &aad, &mut scratch, &tag_hw));
+                    assert_eq!(scratch, pt);
+                }
+            }
+        }
+    }
 }

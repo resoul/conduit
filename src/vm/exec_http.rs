@@ -25,11 +25,11 @@ use crate::native::http::{format_error_response_bytes, write_http_response_head}
 use crate::native::http_reactor::ReactorFileBody;
 use crate::native::http::{
     HttpClientState, MatchedParams, RouteEntry, RouterServerOptions, RouterState,
-    StaticFileBody, header_key, http_client_bytes_request,
-    http_client_pooled_request_with_options, http_client_request,
-    http_client_request_with_timeout, make_http_client_obj, make_http_error, make_response_obj,
-    make_response_with_body_obj, make_router_obj, resolve_client_url, resolve_static_file,
-    route_prefix_matches, write_http_response_ext,
+    StaticFileBody, header_key, http_client_bytes_request_checked,
+    http_client_pooled_request_with_options_checked, http_client_request_checked,
+    http_client_request_with_timeout_checked, make_http_client_obj, make_http_error,
+    make_response_obj, make_response_with_body_obj, make_router_obj, resolve_client_url,
+    resolve_static_file_checked, route_prefix_matches, write_http_response_ext,
 };
 #[cfg(not(any(
     target_os = "macos",
@@ -46,7 +46,7 @@ use crate::vm::value::{
     FxBuildHasher, ListStorage, MapKey, MapVal, Obj, OrderedMap, SCHEMA_HTTP_CLIENT,
     SCHEMA_HTTP_REQUEST, SCHEMA_HTTP_RESPONSE, SCHEMA_HTTP_ROUTER, StructData,
 };
-use crate::vm::{ExecResult, RuntimeError, Vm};
+use crate::vm::{ExecResult, Permissions, RuntimeError, Vm};
 
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(3);
 const DEFAULT_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -146,8 +146,14 @@ fn resolve_duration_ms<F: Fn(&str) -> Option<String>>(
 }
 
 impl HttpServerConfig {
-    fn resolve(opts: &RouterServerOptions) -> Self {
-        Self::resolve_with_env(opts, |k| std::env::var(k).ok())
+    fn resolve_for(opts: &RouterServerOptions, permissions: &Permissions) -> Self {
+        Self::resolve_with_env(opts, |k| {
+            if permissions.is_env_allowed(k) {
+                std::env::var(k).ok()
+            } else {
+                None
+            }
+        })
     }
 
     fn resolve_with_env<F: Fn(&str) -> Option<String>>(
@@ -464,6 +470,7 @@ pub(crate) fn serve_http_listener(
     db_pool_free: Vec<usize>,
     spawn_tracker: Arc<crate::vm::SpawnTracker>,
     script_args: Option<Vec<String>>,
+    permissions: Arc<Permissions>,
     rid: usize,
     listener: TcpListener,
     stop_flag: Arc<std::sync::atomic::AtomicBool>,
@@ -480,7 +487,7 @@ pub(crate) fn serve_http_listener(
         SIGNAL_STOP.store(false, Ordering::Release);
         install_signal_handlers();
     }
-    let cfg = HttpServerConfig::resolve(&routers[rid].server_opts);
+    let cfg = HttpServerConfig::resolve_for(&routers[rid].server_opts, &permissions);
     serve_http_listener_impl(
         module,
         routers.clone(),
@@ -489,6 +496,7 @@ pub(crate) fn serve_http_listener(
         db_pool_free,
         spawn_tracker,
         script_args,
+        permissions,
         rid,
         listener,
         bound_addr,
@@ -591,6 +599,7 @@ fn serve_http_listener_impl(
     db_pool_free: Vec<usize>,
     spawn_tracker: Arc<crate::vm::SpawnTracker>,
     script_args: Option<Vec<String>>,
+    permissions: Arc<Permissions>,
     rid: usize,
     listener: TcpListener,
     bound_addr: Option<std::net::SocketAddr>,
@@ -630,6 +639,7 @@ fn serve_http_listener_impl(
             let spawn_tracker = Arc::clone(&spawn_tracker);
             let mod_worker = Arc::clone(&module);
             let script_args = script_args.clone();
+            let worker_perms = Arc::clone(&permissions);
             scope.spawn(move || {
                 let mut worker_vm = Vm::new();
                 worker_vm.script_args = script_args;
@@ -639,6 +649,7 @@ fn serve_http_listener_impl(
                 worker_vm.host.db_pool_free = db_pool_free;
                 worker_vm.host.spawn_tracker = spawn_tracker;
                 worker_vm.host.shared_module = Some(Arc::clone(&mod_worker));
+                worker_vm.host.permissions = worker_perms;
                 loop {
                     let job = {
                         let Ok(guard) = job_rx.lock() else { break };
@@ -745,6 +756,7 @@ fn serve_http_listener_impl(
     db_pool_free: Vec<usize>,
     spawn_tracker: Arc<crate::vm::SpawnTracker>,
     script_args: Option<Vec<String>>,
+    permissions: Arc<Permissions>,
     rid: usize,
     listener: TcpListener,
     bound_addr: Option<std::net::SocketAddr>,
@@ -769,6 +781,7 @@ fn serve_http_listener_impl(
             let spawn_tracker = Arc::clone(&spawn_tracker);
             let mod_worker = Arc::clone(&module);
             let script_args = script_args.clone();
+            let worker_perms = Arc::clone(&permissions);
             scope.spawn(move || {
                 let mut worker_vm = Vm::new();
                 worker_vm.script_args = script_args;
@@ -778,6 +791,7 @@ fn serve_http_listener_impl(
                 worker_vm.host.db_pool_free = db_pool_free;
                 worker_vm.host.spawn_tracker = spawn_tracker;
                 worker_vm.host.shared_module = Some(Arc::clone(&mod_worker));
+                worker_vm.host.permissions = worker_perms;
                 loop {
                     let (stream, permit) = {
                         let Ok(guard) = rx.lock() else { break };
@@ -1177,10 +1191,11 @@ impl Vm {
                         )?
                     }
                     Err(status) => {
-                        if let Some(resolved) = resolve_static_file(
+                        if let Some(resolved) = resolve_static_file_checked(
                             &self.host.routers[router_id].statics,
                             req_method,
                             req_path,
+                            &self.host.permissions,
                         ) {
                             let len = resolved.len();
                             let has_matching_after =
@@ -1564,7 +1579,12 @@ impl Vm {
             HTTP_ROUTE_STATIC => {
                 let rid = self.extract_router_id(&self.objs[o_base + a as usize])?;
                 let url_prefix = self.sys_str(o_base, b, "router static")?.as_str().into();
-                let dir_path = self.sys_str(o_base, c, "router static")?.as_str().into();
+                let dir_str = self.sys_str(o_base, c, "router static")?;
+                self.host
+                    .permissions
+                    .check_read(dir_str.as_str())
+                    .map_err(|e| err_msg(&e))?;
+                let dir_path = dir_str.as_str().into();
                 self.host.routers[rid].statics.push((url_prefix, dir_path));
             }
             HTTP_ROUTE_CORS => {
@@ -1760,7 +1780,14 @@ impl Vm {
                     url.push_str(qs.as_str());
                 }
                 let hdrs = vec![("Accept".to_string(), "application/json".to_string())];
-                let resp = http_client_request("GET", &url, "", &hdrs);
+                let resp = http_client_request_checked(
+                    "GET",
+                    &url,
+                    "",
+                    &hdrs,
+                    &self.host.permissions,
+                )
+                .map_err(|e| err_msg(&e))?;
                 let out = match &resp {
                     Obj::Record(rec) if rec.schema_id == SCHEMA_HTTP_RESPONSE => {
                         let body = match rec.get_obj(0) {
@@ -1788,7 +1815,14 @@ impl Vm {
                             ("Content-Type".to_string(), "application/json".to_string()),
                             ("Accept".to_string(), "application/json".to_string()),
                         ];
-                        http_client_request("POST", url.as_str(), &body, &hdrs)
+                        http_client_request_checked(
+                            "POST",
+                            url.as_str(),
+                            &body,
+                            &hdrs,
+                            &self.host.permissions,
+                        )
+                        .map_err(|e| err_msg(&e))?
                     }
                     Err(e) => make_http_error("encode_error", &e.message),
                 };
@@ -1882,7 +1916,7 @@ impl Vm {
                 let timeout_ms = self.host.http_clients[cid].timeout_ms;
                 let deny_private = self.host.http_clients[cid].deny_private_addrs;
                 let pool = Arc::clone(&self.host.http_clients[cid].pool);
-                let resp = http_client_pooled_request_with_options(
+                let resp = http_client_pooled_request_with_options_checked(
                     &method,
                     &full_url,
                     &body,
@@ -1890,7 +1924,9 @@ impl Vm {
                     timeout_ms,
                     &pool,
                     deny_private,
-                );
+                    &self.host.permissions,
+                )
+                .map_err(|e| err_msg(&e))?;
                 self.objs[o_base + a as usize] = resp;
             }
             HTTP_CLIENT_GET_JSON => {
@@ -1922,7 +1958,7 @@ impl Vm {
                 let timeout_ms = self.host.http_clients[cid].timeout_ms;
                 let deny_private = self.host.http_clients[cid].deny_private_addrs;
                 let pool = Arc::clone(&self.host.http_clients[cid].pool);
-                let resp = http_client_pooled_request_with_options(
+                let resp = http_client_pooled_request_with_options_checked(
                     "GET",
                     &full_url,
                     "",
@@ -1930,7 +1966,9 @@ impl Vm {
                     timeout_ms,
                     &pool,
                     deny_private,
-                );
+                    &self.host.permissions,
+                )
+                .map_err(|e| err_msg(&e))?;
                 let out = match &resp {
                     Obj::Record(rec) if rec.schema_id == SCHEMA_HTTP_RESPONSE => {
                         let body = match rec.get_obj(0) {
@@ -1972,7 +2010,7 @@ impl Vm {
                         let timeout_ms = self.host.http_clients[cid].timeout_ms;
                         let deny_private = self.host.http_clients[cid].deny_private_addrs;
                         let pool = Arc::clone(&self.host.http_clients[cid].pool);
-                        http_client_pooled_request_with_options(
+                        http_client_pooled_request_with_options_checked(
                             "POST",
                             &full_url,
                             &body,
@@ -1980,7 +2018,9 @@ impl Vm {
                             timeout_ms,
                             &pool,
                             deny_private,
+                            &self.host.permissions,
                         )
+                        .map_err(|e| err_msg(&e))?
                     }
                     Err(e) => make_http_error("encode_error", &e.message),
                 };
@@ -2010,6 +2050,10 @@ impl Vm {
             HTTP_SERVE => {
                 let rid = self.extract_router_id(&self.objs[o_base + b as usize])?;
                 let addr = self.sys_str(o_base, c, "router.serve()")?;
+                self.host
+                    .permissions
+                    .check_net_addr(addr.as_str())
+                    .map_err(|e| err_msg(&e))?;
                 if !module.on_start_funcs.is_empty()
                     && !self.host.lifecycle_started
                     && let Err(msg) = self.run_module_on_start(module, s_top, o_top)
@@ -2060,6 +2104,7 @@ impl Vm {
                     self.host.db_pool_free.clone(),
                     Arc::clone(&self.host.spawn_tracker),
                     self.script_args.clone(),
+                    Arc::clone(&self.host.permissions),
                     rid,
                     listener,
                     stop_flag,
@@ -2128,7 +2173,14 @@ impl Vm {
                     Obj::Str(s) => s.as_str().to_string(),
                     _ => return Err(err_msg("http.get expects String url")),
                 };
-                self.objs[o_base + a as usize] = http_client_request("GET", &url, "", &[]);
+                self.objs[o_base + a as usize] = http_client_request_checked(
+                    "GET",
+                    &url,
+                    "",
+                    &[],
+                    &self.host.permissions,
+                )
+                .map_err(|e| err_msg(&e))?;
             }
             HTTP_POST => {
                 let url = match &self.objs[o_base + b as usize] {
@@ -2139,21 +2191,37 @@ impl Vm {
                     Obj::Str(s) => s.as_str().to_string(),
                     _ => return Err(err_msg("http.post expects String body")),
                 };
-                self.objs[o_base + a as usize] = http_client_request("POST", &url, &body, &[]);
+                self.objs[o_base + a as usize] = http_client_request_checked(
+                    "POST",
+                    &url,
+                    &body,
+                    &[],
+                    &self.host.permissions,
+                )
+                .map_err(|e| err_msg(&e))?;
             }
             HTTP_REQUEST | HTTP_REQUEST_TIMEOUT => {
                 let req = extract_packed_request(&self.objs[o_base + b as usize])?;
                 self.objs[o_base + a as usize] = if aux == HTTP_REQUEST_TIMEOUT {
                     let timeout_ms = self.scalars[s_base + c as usize] as i64;
-                    http_client_request_with_timeout(
+                    http_client_request_with_timeout_checked(
                         &req.method,
                         &req.url,
                         &req.body,
                         &req.headers,
                         timeout_ms,
+                        &self.host.permissions,
                     )
+                    .map_err(|e| err_msg(&e))?
                 } else {
-                    http_client_request(&req.method, &req.url, &req.body, &req.headers)
+                    http_client_request_checked(
+                        &req.method,
+                        &req.url,
+                        &req.body,
+                        &req.headers,
+                        &self.host.permissions,
+                    )
+                    .map_err(|e| err_msg(&e))?
                 };
             }
             HTTP_GET_BYTES => {
@@ -2161,8 +2229,15 @@ impl Vm {
                     Obj::Str(s) => s.as_str().to_string(),
                     _ => return Err(err_msg("http.get_bytes expects String url")),
                 };
-                self.objs[o_base + a as usize] =
-                    http_client_bytes_request("GET", &url, &[], &[], 30_000);
+                self.objs[o_base + a as usize] = http_client_bytes_request_checked(
+                    "GET",
+                    &url,
+                    &[],
+                    &[],
+                    30_000,
+                    &self.host.permissions,
+                )
+                .map_err(|e| err_msg(&e))?;
             }
             HTTP_REQUEST_BYTES => {
                 let Obj::Record(sd) = &self.objs[o_base + b as usize] else {
@@ -2202,8 +2277,15 @@ impl Vm {
                     _ => return Err(err_msg("http.request_bytes expects Bytes or [Int] body")),
                 };
                 let hdrs = extract_header_pairs(sd.get_obj(3));
-                self.objs[o_base + a as usize] =
-                    http_client_bytes_request(&method, &url, body_bytes, &hdrs, 30_000);
+                self.objs[o_base + a as usize] = http_client_bytes_request_checked(
+                    &method,
+                    &url,
+                    body_bytes,
+                    &hdrs,
+                    30_000,
+                    &self.host.permissions,
+                )
+                .map_err(|e| err_msg(&e))?;
             }
             _ => return Err(err_msg("Unknown http sub-op")),
         }
@@ -2298,6 +2380,9 @@ fn serve_connection(
     header_timeout: Duration,
     body_timeout: Duration,
 ) {
+    use std::io::Write as _;
+
+    #[cfg(not(windows))]
     let _ = stream.set_read_timeout(Some(header_timeout));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
     let Ok((mut reader, mut writer)) = deadline_reader_writer_pair(stream, header_timeout)
@@ -2384,6 +2469,8 @@ fn serve_connection(
             Err(ReadHttpError::Io(_)) => break,
         }
     }
+    let _ = writer.flush();
+    let _ = writer.get_ref().shutdown(std::net::Shutdown::Write);
 }
 
 fn format_validation_error_response(violations: &[Obj]) -> Obj {
@@ -2775,6 +2862,7 @@ mod tests {
         let stop_flag = Arc::clone(&init_vm.host.routers[rid].stop_flag);
         let routers = init_vm.host.routers.clone();
         let spawn_tracker = Arc::clone(&init_vm.host.spawn_tracker);
+        let permissions = Arc::clone(&init_vm.host.permissions);
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2790,6 +2878,7 @@ mod tests {
                 Vec::new(),
                 spawn_tracker,
                 None,
+                permissions,
                 rid,
                 listener,
                 srv_stop,
@@ -2947,6 +3036,7 @@ mod tests {
         let stop_flag = Arc::clone(&init_vm.host.routers[rid].stop_flag);
         let routers = init_vm.host.routers.clone();
         let spawn_tracker = Arc::clone(&init_vm.host.spawn_tracker);
+        let permissions = Arc::clone(&init_vm.host.permissions);
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2962,6 +3052,7 @@ mod tests {
                 Vec::new(),
                 spawn_tracker,
                 None,
+                permissions,
                 rid,
                 listener,
                 srv_stop,
@@ -3061,5 +3152,153 @@ mod tests {
         wake_socket_addr(addr);
         srv_thread.join().unwrap();
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn http_static_dir_respects_deny_read_subdirectory() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tmp = std::env::temp_dir().join(format!(
+            "conduit_static_perm_{}_{}",
+            std::process::id(),
+            nanos
+        ));
+        let secret_dir = tmp.join("secret");
+        std::fs::create_dir_all(&secret_dir).unwrap();
+        std::fs::write(tmp.join("ok.txt"), b"public").unwrap();
+        std::fs::write(secret_dir.join("key.txt"), b"hidden").unwrap();
+
+        let src = format!(
+            r#"
+            import * as http from "cdt.http"
+            router StaticApi {{
+                static "/assets" => "{root}"
+            }}
+            export func setup() -> http.Router {{
+                return http.build<StaticApi>()
+            }}
+            "#,
+            root = tmp.to_string_lossy().replace('\\', "/"),
+        );
+        let module = crate::frontend::compile_source(&src).unwrap();
+        let setup_fid = module.func_id("setup").unwrap();
+
+        // Registering static_dir without read permission must fail.
+        let mut denied_vm = Vm::with_permissions(Permissions::deny_all());
+        let err = denied_vm.call(&module, setup_fid, &[], &[]).unwrap_err();
+        assert!(err.message.contains("Permission denied:"), "{}", err.message);
+
+        // Registering with --allow-read=<tmp> --deny-read=<tmp>/secret allows ok.txt but blocks secret/key.txt.
+        let mut b = Permissions::builder();
+        assert!(b.apply_flag(&format!("--allow-read={}", tmp.display())).unwrap());
+        assert!(
+            b.apply_flag(&format!("--deny-read={}", secret_dir.display()))
+                .unwrap()
+        );
+        let mut vm = Vm::with_permissions(b.build());
+        let Obj::Record(sd) = vm.call_obj(&module, setup_fid, &[], &[]).unwrap() else {
+            panic!("expected Router");
+        };
+        let rid = sd.get_scalar(0) as usize;
+
+        let req_ok = crate::native::http::read_http_request(
+            &mut b"GET /assets/ok.txt HTTP/1.1\r\nHost: localhost\r\n\r\n".as_slice(),
+        )
+        .unwrap()
+        .into_request_obj();
+        match vm
+            .dispatch_router_request_inner(&module, 0, 0, rid, req_ok, false)
+            .unwrap()
+        {
+            DispatchedHttpResponse::Obj(resp) => {
+                let (status, body, _) = vm.extract_response_fields(&resp).unwrap();
+                assert_eq!(status, 200);
+                assert_eq!(body, "public");
+            }
+            DispatchedHttpResponse::StaticFile { .. } => panic!("unexpected StaticFile"),
+        }
+
+        let req_secret = crate::native::http::read_http_request(
+            &mut b"GET /assets/secret/key.txt HTTP/1.1\r\nHost: localhost\r\n\r\n".as_slice(),
+        )
+        .unwrap()
+        .into_request_obj();
+        match vm
+            .dispatch_router_request_inner(&module, 0, 0, rid, req_secret, false)
+            .unwrap()
+        {
+            DispatchedHttpResponse::Obj(resp) => {
+                let (status, _, _) = vm.extract_response_fields(&resp).unwrap();
+                assert_eq!(status, 404);
+            }
+            DispatchedHttpResponse::StaticFile { .. } => panic!("denied subdirectory was served"),
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn http_redirect_permission_denied_loopback_e2e() {
+        use std::io::Write;
+
+        let l1 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr1 = l1.local_addr().unwrap();
+        let l2 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr2 = l2.local_addr().unwrap();
+        l2.set_nonblocking(true).unwrap();
+
+        let h1 = std::thread::spawn(move || {
+            if let Ok((mut s, _)) = l1.accept() {
+                let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut buf = [0u8; 512];
+                let _ = std::io::Read::read(&mut s, &mut buf);
+                let resp = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{}/secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    addr2.port()
+                );
+                let _ = s.write_all(resp.as_bytes());
+                let _ = s.flush();
+            }
+        });
+
+        let src = format!(
+            r#"
+            import * as http from "cdt.http"
+            export func fetch() -> String | http.HttpError {{
+                r := http.get("http://127.0.0.1:{p1}/start")?
+                return r.body
+            }}
+            "#,
+            p1 = addr1.port(),
+        );
+        let module = crate::frontend::compile_source(&src).unwrap();
+        let fid = module.func_id("fetch").unwrap();
+
+        let mut b = Permissions::builder();
+        assert!(
+            b.apply_flag(&format!("--allow-net=127.0.0.1:{}", addr1.port()))
+                .unwrap()
+        );
+        let mut vm = Vm::with_permissions(b.build());
+        let err = vm.call(&module, fid, &[], &[]).unwrap_err();
+        assert!(
+            err.message
+                .contains(&format!("127.0.0.1:{}", addr2.port())),
+            "expected redirect target port in error, got: {}",
+            err.message
+        );
+        assert!(
+            err.message.starts_with("Permission denied:"),
+            "{}",
+            err.message
+        );
+
+        assert!(
+            l2.accept().is_err(),
+            "redirect target should never receive a connection"
+        );
+        h1.join().unwrap();
     }
 }

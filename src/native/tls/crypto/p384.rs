@@ -383,7 +383,7 @@ pub fn parse_der_ecdsa_sig(sig: &[u8]) -> Option<(&[u8], &[u8])> {
     }
     let (seq_len, mut pos) = if sig[1] & 0x80 == 0 {
         (sig[1] as usize, 2)
-    } else if sig[1] == 0x81 && sig.len() > 2 {
+    } else if sig[1] == 0x81 && sig.len() > 2 && sig[2] >= 128 {
         (sig[2] as usize, 3)
     } else {
         return None;
@@ -391,7 +391,7 @@ pub fn parse_der_ecdsa_sig(sig: &[u8]) -> Option<(&[u8], &[u8])> {
     if pos + seq_len != sig.len() {
         return None;
     }
-    if pos + 2 > sig.len() || sig[pos] != 0x02 {
+    if pos + 2 > sig.len() || sig[pos] != 0x02 || (sig[pos + 1] & 0x80) != 0 {
         return None;
     }
     let r_len = sig[pos + 1] as usize;
@@ -405,7 +405,7 @@ pub fn parse_der_ecdsa_sig(sig: &[u8]) -> Option<(&[u8], &[u8])> {
     let r = &sig[pos..pos + r_len];
     pos += r_len;
 
-    if pos + 2 > sig.len() || sig[pos] != 0x02 {
+    if pos + 2 > sig.len() || sig[pos] != 0x02 || (sig[pos + 1] & 0x80) != 0 {
         return None;
     }
     let s_len = sig[pos + 1] as usize;
@@ -573,5 +573,81 @@ mod tests {
         // Curve order check: n * G == O
         let order_g = scalar_mul_shamir(&P384_N, gx, gy, &[0u8; 48], gx, gy);
         assert!(order_g.is_infinity());
+    }
+
+    #[test]
+    fn wycheproof_p384_ecdsa_der_and_boundary_rejections() {
+        let qx = hex_to_bytes("ec3a4e415b4e19a4568618029f427fa5da9a8bc4ae92e02e06aae5286b300c64def8f0ea9055866064a254515480bc13");
+        let qy = hex_to_bytes("8015d9b72d7d57244ea8ef9ac0c621896708a59367f9dfb9f54ca84b3f1c9db1288b231c3ae0d4fe7344fd2533264720");
+        let r = hex_to_bytes("a419306e90216224bc2a397d9072243fc2fbfc6b9d373438f2d6aa2eca1fd07f5ab9db472df1721edd15401fb348d946");
+        let s = hex_to_bytes("95924bb328035cad8082f436ddd195dcb276692d0c9de05455b69470a641fad3e61e1fc8fb9ee04c728931b5a8616e01");
+        let digest = crate::native::tls::crypto::sha2::sha384_bytes(b"sample");
+        let mut pubkey = vec![0x04];
+        pubkey.extend_from_slice(&qx);
+        pubkey.extend_from_slice(&qy);
+
+        let mut body = Vec::new();
+        push_der_uint(&mut body, &r);
+        push_der_uint(&mut body, &s);
+        let mut der = vec![0x30, body.len() as u8];
+        der.extend_from_slice(&body);
+        assert!(ecdsa_p384_verify_der(&pubkey, &digest, &der));
+
+        // Non-minimal SEQUENCE length 0x30 0x81 <len < 128>.
+        let mut nonmin_seq = vec![0x30, 0x81, body.len() as u8];
+        nonmin_seq.extend_from_slice(&body);
+        assert!(!ecdsa_p384_verify_der(&pubkey, &digest, &nonmin_seq));
+
+        // Indefinite SEQUENCE length 0x30 0x80.
+        let mut indef = vec![0x30, 0x80];
+        indef.extend_from_slice(&body);
+        indef.extend_from_slice(&[0x00, 0x00]);
+        assert!(!ecdsa_p384_verify_der(&pubkey, &digest, &indef));
+
+        // Long-form INTEGER length 0x02 0x81 0x31 ...
+        let mut lf_body = vec![0x02, 0x81, 0x31, 0x00];
+        lf_body.extend_from_slice(&r);
+        push_der_uint(&mut lf_body, &s);
+        let mut lf_der = vec![0x30, lf_body.len() as u8];
+        lf_der.extend_from_slice(&lf_body);
+        assert!(!ecdsa_p384_verify_der(&pubkey, &digest, &lf_der));
+
+        // Negative integer (missing leading 0x00 when MSB=1) and non-minimal leading 0x00.
+        let mut neg_body = vec![0x02, r.len() as u8];
+        neg_body.extend_from_slice(&r);
+        push_der_uint(&mut neg_body, &s);
+        let mut neg_der = vec![0x30, neg_body.len() as u8];
+        neg_der.extend_from_slice(&neg_body);
+        assert!(!ecdsa_p384_verify_der(&pubkey, &digest, &neg_der));
+
+        let mut pad_body = vec![0x02, 0x02, 0x00, 0x01];
+        push_der_uint(&mut pad_body, &s);
+        let mut pad_der = vec![0x30, pad_body.len() as u8];
+        pad_der.extend_from_slice(&pad_body);
+        assert!(!ecdsa_p384_verify_der(&pubkey, &digest, &pad_der));
+
+        // Trailing garbage, truncated prefixes, and wrong tags.
+        let mut extra_out = der.clone();
+        extra_out.push(0x00);
+        assert!(!ecdsa_p384_verify_der(&pubkey, &digest, &extra_out));
+        for len in 0..der.len() {
+            assert!(!ecdsa_p384_verify_der(&pubkey, &digest, &der[..len]));
+        }
+
+        // Scalar boundary checks (s == n, s == n + 1) and invalid pubkey coordinates/prefix/length.
+        let mut n_plus_1 = P384_N;
+        n_plus_1[47] += 1;
+        assert!(!ecdsa_p384_verify_rs(&pubkey, &digest, &r, &P384_N));
+        assert!(!ecdsa_p384_verify_rs(&pubkey, &digest, &r, &n_plus_1));
+
+        let p384_p = hex_to_bytes("fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000ffffffff");
+        let mut bad_x = pubkey.clone();
+        bad_x[1..49].copy_from_slice(&p384_p);
+        assert!(!ecdsa_p384_verify_rs(&bad_x, &digest, &r, &s));
+
+        let mut bad_prefix = pubkey.clone();
+        bad_prefix[0] = 0x02;
+        assert!(!ecdsa_p384_verify_rs(&bad_prefix, &digest, &r, &s));
+        assert!(!ecdsa_p384_verify_rs(&pubkey[..96], &digest, &r, &s));
     }
 }

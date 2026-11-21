@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::vm::Permissions;
 use crate::vm::value::{Obj, SCHEMA_ENV_ERROR, StructData};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,10 +53,18 @@ fn parse_env_bool(raw: &str) -> Option<bool> {
     }
 }
 
+/// Loads typed `@env` configuration using [`Permissions::allow_all`].
 pub fn exec_env_load(plan: &EnvLoadPlan) -> Obj {
+    exec_env_load_checked(plan, &Permissions::allow_all())
+        .expect("allow_all permissions never fail env check")
+}
+
+/// Loads typed `@env` configuration after checking every field against `permissions`.
+pub fn exec_env_load_checked(plan: &EnvLoadPlan, permissions: &Permissions) -> Result<Obj, String> {
     let mut rec = StructData::new(plan.schema_id, plan.scalar_len, plan.obj_len);
 
     for f in plan.fields.iter() {
+        permissions.check_env(&f.env_name)?;
         let slot = f.slot_idx as usize;
         match std::env::var(&f.env_name) {
             Ok(raw) if !raw.is_empty() => {
@@ -65,28 +74,28 @@ pub fn exec_env_load(plan: &EnvLoadPlan) -> Obj {
                         EnvFieldKind::Int => match raw.trim().parse::<i64>() {
                             Ok(v) => Obj::boxed_int(v),
                             Err(_) => {
-                                return make_env_error(
+                                return Ok(make_env_error(
                                     &f.env_name,
                                     format!("Invalid Int in '{}': '{}'", f.env_name, raw),
-                                );
+                                ));
                             }
                         },
                         EnvFieldKind::Float => match raw.trim().parse::<f64>() {
                             Ok(v) if v.is_finite() => Obj::boxed_float(v.to_bits()),
                             _ => {
-                                return make_env_error(
+                                return Ok(make_env_error(
                                     &f.env_name,
                                     format!("Invalid Float in '{}': '{}'", f.env_name, raw),
-                                );
+                                ));
                             }
                         },
                         EnvFieldKind::Bool => match parse_env_bool(&raw) {
                             Some(b) => Obj::boxed_bool(b),
                             None => {
-                                return make_env_error(
+                                return Ok(make_env_error(
                                     &f.env_name,
                                     format!("Invalid Bool in '{}': '{}'", f.env_name, raw),
-                                );
+                                ));
                             }
                         },
                     };
@@ -96,28 +105,28 @@ pub fn exec_env_load(plan: &EnvLoadPlan) -> Obj {
                         EnvFieldKind::Int => match raw.trim().parse::<i64>() {
                             Ok(v) => v as u64,
                             Err(_) => {
-                                return make_env_error(
+                                return Ok(make_env_error(
                                     &f.env_name,
                                     format!("Invalid Int in '{}': '{}'", f.env_name, raw),
-                                );
+                                ));
                             }
                         },
                         EnvFieldKind::Float => match raw.trim().parse::<f64>() {
                             Ok(v) if v.is_finite() => v.to_bits(),
                             _ => {
-                                return make_env_error(
+                                return Ok(make_env_error(
                                     &f.env_name,
                                     format!("Invalid Float in '{}': '{}'", f.env_name, raw),
-                                );
+                                ));
                             }
                         },
                         EnvFieldKind::Bool => match parse_env_bool(&raw) {
                             Some(b) => u64::from(b),
                             None => {
-                                return make_env_error(
+                                return Ok(make_env_error(
                                     &f.env_name,
                                     format!("Invalid Bool in '{}': '{}'", f.env_name, raw),
-                                );
+                                ));
                             }
                         },
                         EnvFieldKind::String => unreachable!(),
@@ -161,16 +170,16 @@ pub fn exec_env_load(plan: &EnvLoadPlan) -> Obj {
                 } else if f.is_optional {
                     rec.set_obj(slot, Obj::Empty);
                 } else {
-                    return make_env_error(
+                    return Ok(make_env_error(
                         &f.env_name,
                         format!("Missing required environment variable '{}'", f.env_name),
-                    );
+                    ));
                 }
             }
         }
     }
 
-    Obj::Record(Arc::new(rec))
+    Ok(Obj::Record(Arc::new(rec)))
 }
 
 /// Generates a `.env.example` template from all `config` blocks and structs with `@env` fields.

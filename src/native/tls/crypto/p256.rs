@@ -708,4 +708,139 @@ mod tests {
         assert_eq!(rx, GX_BE);
         assert_eq!(ry, Fe::ZERO.sub(gy).to_be_bytes());
     }
+
+    #[test]
+    fn wycheproof_p256_ecdh_and_ecdsa_der_rejections() {
+        fn encode_der_int(val: &[u8]) -> Vec<u8> {
+            let mut s = val;
+            while s.len() > 1 && s[0] == 0 {
+                s = &s[1..];
+            }
+            let mut out = vec![0x02];
+            if (s[0] & 0x80) != 0 {
+                out.push((s.len() + 1) as u8);
+                out.push(0x00);
+            } else {
+                out.push(s.len() as u8);
+            }
+            out.extend_from_slice(s);
+            out
+        }
+        fn wrap_seq(body: &[u8]) -> Vec<u8> {
+            let mut out = vec![0x30, body.len() as u8];
+            out.extend_from_slice(body);
+            out
+        }
+
+        let d_a: [u8; 32] = hex_to_bytes("c88f01f510d9ac3f70a292daa2316de544e9aab8afe84049c62a9c57862d1433")
+            .try_into()
+            .unwrap();
+        let pub_a = p256_public_key(&d_a).unwrap();
+
+        // Invalid scalars: 0, n, n + 1, 0xff..ff.
+        let mut n_plus_1 = N_BE;
+        n_plus_1[31] += 1;
+        for bad_s in [[0u8; 32], N_BE, n_plus_1, [0xffu8; 32]] {
+            assert!(p256_public_key(&bad_s).is_none());
+            assert!(p256_ecdh(&bad_s, &pub_a).is_none());
+        }
+
+        // ECDH point rejections: twist/off-curve (0,0), x==p, y==p, compressed 0x02/0x03, hybrid 0x06, bad lengths.
+        let mut zero_xy = vec![0x04];
+        zero_xy.resize(65, 0);
+        assert!(p256_ecdh(&d_a, &zero_xy).is_none());
+
+        let p_be = hex_to_bytes("ffffffff00000001000000000000000000000000ffffffffffffffffffffffff");
+        let mut x_is_p = pub_a;
+        x_is_p[1..33].copy_from_slice(&p_be);
+        assert!(p256_ecdh(&d_a, &x_is_p).is_none());
+
+        let mut y_is_p = pub_a;
+        y_is_p[33..65].copy_from_slice(&p_be);
+        assert!(p256_ecdh(&d_a, &y_is_p).is_none());
+
+        for &prefix in &[0x02u8, 0x03, 0x06] {
+            let mut bad = pub_a;
+            bad[0] = prefix;
+            assert!(p256_ecdh(&d_a, &bad).is_none());
+        }
+        assert!(p256_ecdh(&d_a, &pub_a[..64]).is_none());
+        assert!(p256_ecdh(&d_a, &pub_a[..33]).is_none());
+        let mut too_long = pub_a.to_vec();
+        too_long.push(0);
+        assert!(p256_ecdh(&d_a, &too_long).is_none());
+
+        // Wycheproof ECDSA DER malleability and encoding rejections.
+        let qx = hex_to_bytes("60fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb6");
+        let qy = hex_to_bytes("7903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299");
+        let mut pubkey = vec![0x04];
+        pubkey.extend_from_slice(&qx);
+        pubkey.extend_from_slice(&qy);
+        let digest = sha256_bytes(b"sample");
+        let r = hex_to_bytes("efd48b2aacb6a8fd1140dd9cd45e81d69d2c877b56aaf991c34d0ea84eaf3716");
+        let s = hex_to_bytes("f7cb1c942d657c41d436c7a1b6e29f65f3e900dbb9aff4064dc4ab2f843acda8");
+
+        let mut body = encode_der_int(&r);
+        body.extend_from_slice(&encode_der_int(&s));
+        let der = wrap_seq(&body);
+        assert!(ecdsa_p256_verify_der(&pubkey, &digest, &der));
+
+        // Low-s / malleable (r, n - s) is valid mathematically.
+        let n_minus_s = BigUint::from_be_bytes(&N_BE)
+            .sub_checked(&BigUint::from_be_bytes(&s))
+            .unwrap()
+            .to_be_bytes_padded(32);
+        let mut mal_body = encode_der_int(&r);
+        mal_body.extend_from_slice(&encode_der_int(&n_minus_s));
+        assert!(ecdsa_p256_verify_der(&pubkey, &digest, &wrap_seq(&mal_body)));
+
+        // Non-minimal SEQUENCE length 0x30 0x81 <len < 128>.
+        let mut nonmin_seq = vec![0x30, 0x81, body.len() as u8];
+        nonmin_seq.extend_from_slice(&body);
+        assert!(!ecdsa_p256_verify_der(&pubkey, &digest, &nonmin_seq));
+
+        // Indefinite SEQUENCE length 0x30 0x80.
+        let mut indef = vec![0x30, 0x80];
+        indef.extend_from_slice(&body);
+        indef.extend_from_slice(&[0x00, 0x00]);
+        assert!(!ecdsa_p256_verify_der(&pubkey, &digest, &indef));
+
+        // Long-form INTEGER length 0x02 0x81 0x20 ...
+        let mut lf_body = vec![0x02, 0x81, 0x21, 0x00];
+        lf_body.extend_from_slice(&r);
+        lf_body.extend_from_slice(&encode_der_int(&s));
+        assert!(!ecdsa_p256_verify_der(&pubkey, &digest, &wrap_seq(&lf_body)));
+
+        // Non-minimal leading 0x00 on positive integer (0x00 followed by MSB=0).
+        let mut pad_r_body = vec![0x02, 0x02, 0x00, 0x7f];
+        pad_r_body.extend_from_slice(&encode_der_int(&s));
+        assert!(!ecdsa_p256_verify_der(&pubkey, &digest, &wrap_seq(&pad_r_body)));
+
+        // Negative integer (r has MSB=1 without leading 0x00 sign pad).
+        let mut neg_r_body = vec![0x02, r.len() as u8];
+        neg_r_body.extend_from_slice(&r);
+        neg_r_body.extend_from_slice(&encode_der_int(&s));
+        assert!(!ecdsa_p256_verify_der(&pubkey, &digest, &wrap_seq(&neg_r_body)));
+
+        // Trailing garbage byte inside or outside SEQUENCE, wrong tags, and truncations.
+        let mut extra_in = body.clone();
+        extra_in.push(0x00);
+        assert!(!ecdsa_p256_verify_der(&pubkey, &digest, &wrap_seq(&extra_in)));
+
+        let mut extra_out = der.clone();
+        extra_out.push(0x00);
+        assert!(!ecdsa_p256_verify_der(&pubkey, &digest, &extra_out));
+
+        let mut bad_seq_tag = der.clone();
+        bad_seq_tag[0] = 0x31;
+        assert!(!ecdsa_p256_verify_der(&pubkey, &digest, &bad_seq_tag));
+
+        let mut bad_int_tag = der.clone();
+        bad_int_tag[2] = 0x04;
+        assert!(!ecdsa_p256_verify_der(&pubkey, &digest, &bad_int_tag));
+
+        for len in 0..der.len() {
+            assert!(!ecdsa_p256_verify_der(&pubkey, &digest, &der[..len]));
+        }
+    }
 }

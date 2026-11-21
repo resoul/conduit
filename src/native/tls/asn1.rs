@@ -202,6 +202,9 @@ impl<'a> DerReader<'a> {
         if unused_bits > 7 || (tlv.value.len() == 1 && unused_bits != 0) {
             return Err(TlsError::DecodeError("invalid ASN.1 BIT STRING unused bits"));
         }
+        if unused_bits > 0 && (tlv.value[tlv.value.len() - 1] & ((1u8 << unused_bits) - 1)) != 0 {
+            return Err(TlsError::DecodeError("non-zero ASN.1 BIT STRING unused bits"));
+        }
         Ok((unused_bits, &tlv.value[1..]))
     }
 
@@ -239,5 +242,56 @@ mod tests {
         assert!(DerReader::new(&buf).read_tlv().is_err());
         // Truncated
         assert!(DerReader::new(&[0x04, 0x05, 0x01, 0x02]).read_tlv().is_err());
+    }
+
+    #[test]
+    fn wycheproof_strict_der_primitives_and_depth_limit() {
+        // BIT STRING unused bits must be 0 when unused_bits > 0 (X.690 §11.2.2).
+        assert!(DerReader::new(&[0x03, 0x02, 0x01, 0x01]).read_bit_string().is_err());
+        assert!(DerReader::new(&[0x03, 0x02, 0x07, 0x40]).read_bit_string().is_err());
+        assert!(DerReader::new(&[0x03, 0x02, 0x08, 0x00]).read_bit_string().is_err());
+        assert!(DerReader::new(&[0x03, 0x01, 0x01]).read_bit_string().is_err());
+        assert!(DerReader::new(&[0x03, 0x00]).read_bit_string().is_err());
+        assert_eq!(
+            DerReader::new(&[0x03, 0x02, 0x01, 0xfe]).read_bit_string().unwrap(),
+            (1, &[0xfe][..])
+        );
+        assert_eq!(
+            DerReader::new(&[0x03, 0x01, 0x00]).read_bit_string().unwrap(),
+            (0, &[][..])
+        );
+
+        // Non-DER BOOLEAN values rejected (only 0x00 and 0xff allowed).
+        assert!(!DerReader::new(&[0x01, 0x01, 0x00]).read_boolean().unwrap());
+        assert!(DerReader::new(&[0x01, 0x01, 0xff]).read_boolean().unwrap());
+        assert!(DerReader::new(&[0x01, 0x01, 0x01]).read_boolean().is_err());
+        assert!(DerReader::new(&[0x01, 0x01, 0x7f]).read_boolean().is_err());
+        assert!(DerReader::new(&[0x01, 0x02, 0xff, 0x00]).read_boolean().is_err());
+
+        // Non-minimal, negative, and empty positive INTEGERs rejected.
+        assert!(DerReader::new(&[0x02, 0x00]).read_positive_integer_be().is_err());
+        assert!(DerReader::new(&[0x02, 0x01, 0x80]).read_positive_integer_be().is_err());
+        assert!(DerReader::new(&[0x02, 0x02, 0x00, 0x7f]).read_positive_integer_be().is_err());
+        assert_eq!(
+            DerReader::new(&[0x02, 0x02, 0x00, 0x80]).read_positive_integer_be().unwrap(),
+            &[0x80]
+        );
+
+        // High-tag-number form and >4 byte length octets rejected.
+        assert!(DerReader::new(&[0x1f, 0x01, 0x00]).read_tlv().is_err());
+        assert!(DerReader::new(&[0x04, 0x85, 1, 2, 3, 4, 5]).read_tlv().is_err());
+
+        // Excessive nesting beyond MAX_ASN1_DEPTH (16) rejected without deep recursion.
+        let mut nested = vec![0x04u8, 0x01, 0xaa];
+        for _ in 0..=MAX_ASN1_DEPTH {
+            let mut wrap = vec![TAG_SEQUENCE, nested.len() as u8];
+            wrap.extend_from_slice(&nested);
+            nested = wrap;
+        }
+        let mut cur = DerReader::new(&nested);
+        for _ in 0..MAX_ASN1_DEPTH {
+            cur = cur.read_sequence().unwrap();
+        }
+        assert!(cur.read_sequence().is_err());
     }
 }
