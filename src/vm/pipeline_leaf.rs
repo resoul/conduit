@@ -21,8 +21,12 @@ pub(crate) fn is_scalar_op(op: &Op) -> bool {
             | Op::AddIntImm { .. }
             | Op::SubInt { .. }
             | Op::MulInt { .. }
+            | Op::MulIntImm { .. }
+            | Op::MulAddInt { .. }
+            | Op::MulAddIntImm { .. }
             | Op::DivInt { .. }
             | Op::ModInt { .. }
+            | Op::ModIntConst { .. }
             | Op::ModIntImm { .. }
             | Op::NegInt { .. }
             | Op::AddFloat { .. }
@@ -48,6 +52,11 @@ pub(crate) fn is_scalar_op(op: &Op) -> bool {
             | Op::Jump { .. }
             | Op::JumpIfFalse { .. }
             | Op::JumpIfTrue { .. }
+            | Op::JumpIfLtInt { .. }
+            | Op::JumpIfLtIntImm { .. }
+            | Op::JumpIfEqIntImm { .. }
+            | Op::SwitchIntImm { .. }
+            | Op::ReturnScalarIfLtIntImm { .. }
             | Op::LoadUpvalueScalar { .. }
             | Op::ReturnScalar { .. }
     )
@@ -167,6 +176,20 @@ pub(crate) unsafe fn exec_scalar_leaf(
                 };
                 s_set!(dst, res as u64);
             }
+            Op::MulAddInt { dst, a, b, c } => {
+                let product = (s_get!(a) as i64).checked_mul(s_get!(b) as i64).ok_or_else(err_overflow)?;
+                let result = product.checked_add(s_get!(c) as i64).ok_or_else(err_overflow)?;
+                s_set!(dst, result as u64);
+            }
+            Op::MulAddIntImm { dst, src, mul, add } => {
+                let product = (s_get!(src) as i64).checked_mul(i64::from(mul)).ok_or_else(err_overflow)?;
+                let value = product.checked_add(i64::from(add)).ok_or_else(err_overflow)?;
+                s_set!(dst, value as u64);
+            }
+            Op::MulIntImm { dst, a, imm } => {
+                let result = (s_get!(a) as i64).checked_mul(i64::from(imm)).ok_or_else(err_overflow)?;
+                s_set!(dst, result as u64);
+            }
             Op::DivInt { dst, a, b } => {
                 let rhs = s_get!(b) as i64;
                 if rhs == 0 {
@@ -186,6 +209,12 @@ pub(crate) unsafe fn exec_scalar_leaf(
                     return Err(err_overflow());
                 };
                 s_set!(dst, res as u64);
+            }
+            Op::ModIntConst { dst, a, divisor, magic_idx, shift } => {
+                // SAFETY: Module validation checks the reciprocal and its constant index.
+                let magic = unsafe { *int_consts.add(usize::from(magic_idx)) };
+                let rem = crate::vm::opcode::remainder_by_constant(s_get!(a) as i64, divisor, magic, shift);
+                s_set!(dst, rem as u64);
             }
             Op::ModIntImm { dst, a, imm } => {
                 let rhs = imm as i64;
@@ -278,11 +307,38 @@ pub(crate) unsafe fn exec_scalar_leaf(
                     ip = target as usize;
                 }
             }
+            Op::JumpIfLtInt { a, b, target, when_true } => {
+                if ((s_get!(a) as i64) < (s_get!(b) as i64)) == when_true {
+                    ip = target as usize;
+                }
+            }
+            Op::JumpIfEqIntImm { a, imm, target, when_true } => {
+                if ((s_get!(a) as i64) == i64::from(imm)) == when_true {
+                    ip = target as usize;
+                }
+            }
+            Op::SwitchIntImm { src, first, count } => {
+                let slot = s_get!(src).wrapping_sub(i64::from(first) as u64);
+                let offset = if slot < u64::from(count) { slot as usize + 1 } else { 0 };
+                if let Op::Jump { target } = ops[ip + offset] {
+                    ip = target as usize;
+                }
+            }
+            Op::JumpIfLtIntImm { a, imm, target, when_true } => {
+                if ((s_get!(a) as i64) < i64::from(imm)) == when_true {
+                    ip = target as usize;
+                }
+            }
             Op::LoadUpvalueScalar { dst, idx } => {
                 let Some(c) = closure else {
                     return Err(err_msg("Missing active closure"));
                 };
                 s_set!(dst, c.get_scalar(idx as usize));
+            }
+            Op::ReturnScalarIfLtIntImm { a, imm, src } => {
+                if (s_get!(a) as i64) < i64::from(imm) {
+                    return Ok(s_get!(src));
+                }
             }
             Op::ReturnScalar { src } => return Ok(s_get!(src)),
             _ => return Err(err_msg("Unexpected op in scalar leaf pipeline")),
@@ -369,6 +425,20 @@ pub(crate) unsafe fn exec_obj_leaf(
                 };
                 s_set!(dst, res as u64);
             }
+            Op::MulAddInt { dst, a, b, c } => {
+                let product = (s_get!(a) as i64).checked_mul(s_get!(b) as i64).ok_or_else(err_overflow)?;
+                let result = product.checked_add(s_get!(c) as i64).ok_or_else(err_overflow)?;
+                s_set!(dst, result as u64);
+            }
+            Op::MulAddIntImm { dst, src, mul, add } => {
+                let product = (s_get!(src) as i64).checked_mul(i64::from(mul)).ok_or_else(err_overflow)?;
+                let value = product.checked_add(i64::from(add)).ok_or_else(err_overflow)?;
+                s_set!(dst, value as u64);
+            }
+            Op::MulIntImm { dst, a, imm } => {
+                let result = (s_get!(a) as i64).checked_mul(i64::from(imm)).ok_or_else(err_overflow)?;
+                s_set!(dst, result as u64);
+            }
             Op::DivInt { dst, a, b } => {
                 let rhs = s_get!(b) as i64;
                 if rhs == 0 {
@@ -388,6 +458,12 @@ pub(crate) unsafe fn exec_obj_leaf(
                     return Err(err_overflow());
                 };
                 s_set!(dst, res as u64);
+            }
+            Op::ModIntConst { dst, a, divisor, magic_idx, shift } => {
+                // SAFETY: Module validation checks the reciprocal and its constant index.
+                let magic = unsafe { *int_consts.add(usize::from(magic_idx)) };
+                let rem = crate::vm::opcode::remainder_by_constant(s_get!(a) as i64, divisor, magic, shift);
+                s_set!(dst, rem as u64);
             }
             Op::ModIntImm { dst, a, imm } => {
                 let rhs = imm as i64;
@@ -480,6 +556,28 @@ pub(crate) unsafe fn exec_obj_leaf(
                     ip = target as usize;
                 }
             }
+            Op::JumpIfLtInt { a, b, target, when_true } => {
+                if ((s_get!(a) as i64) < (s_get!(b) as i64)) == when_true {
+                    ip = target as usize;
+                }
+            }
+            Op::JumpIfEqIntImm { a, imm, target, when_true } => {
+                if ((s_get!(a) as i64) == i64::from(imm)) == when_true {
+                    ip = target as usize;
+                }
+            }
+            Op::SwitchIntImm { src, first, count } => {
+                let slot = s_get!(src).wrapping_sub(i64::from(first) as u64);
+                let offset = if slot < u64::from(count) { slot as usize + 1 } else { 0 };
+                if let Op::Jump { target } = ops[ip + offset] {
+                    ip = target as usize;
+                }
+            }
+            Op::JumpIfLtIntImm { a, imm, target, when_true } => {
+                if ((s_get!(a) as i64) < i64::from(imm)) == when_true {
+                    ip = target as usize;
+                }
+            }
             Op::LoadUpvalueScalar { dst, idx } => {
                 let Some(c) = closure else {
                     return Err(err_msg("Missing active closure"));
@@ -498,6 +596,7 @@ pub(crate) unsafe fn exec_obj_leaf(
             Op::ListLen { dst_s, list_obj } => {
                 let len = match o_ref!(list_obj) {
                     Obj::List(l) => l.len() as u64,
+                    Obj::Bytes(bytes) => bytes.len() as u64,
                     _ => return Err(err_msg("Expected List in ListLen")),
                 };
                 s_set!(dst_s, len);
@@ -512,6 +611,15 @@ pub(crate) unsafe fn exec_obj_leaf(
             Op::MapLen { dst_s, map_obj } => {
                 let len = match o_ref!(map_obj) {
                     Obj::Map(m) => m.len() as u64,
+                    Obj::DeferredField(df) => {
+                        if df.as_single_map_entry().is_some() {
+                            1
+                        } else if let Obj::Map(m) = df.value() {
+                            m.len() as u64
+                        } else {
+                            return Err(err_msg("Expected Map in MapLen"));
+                        }
+                    }
                     _ => return Err(err_msg("Expected Map in MapLen")),
                 };
                 s_set!(dst_s, len);
@@ -547,7 +655,7 @@ pub(crate) unsafe fn exec_obj_leaf(
                 field_idx,
             } => {
                 let val = match o_ref!(rec_obj) {
-                    Obj::Record(rec) => rec.get_obj(field_idx as usize).clone(),
+                    Obj::Record(rec) => rec.get_obj_keep_single_map(field_idx as usize).clone(),
                     _ => return Err(err_msg("Expected Record in GetFieldObj")),
                 };
                 *o_mut!(dst_obj) = val;
@@ -560,6 +668,11 @@ pub(crate) unsafe fn exec_obj_leaf(
             }
             Op::ReturnObj { src } => {
                 return Ok(ExecResult::Obj(std::mem::take(o_mut!(src))));
+            }
+            Op::ReturnScalarIfLtIntImm { a, imm, src } => {
+                if (s_get!(a) as i64) < i64::from(imm) {
+                    return Ok(ExecResult::Scalar(s_get!(src)));
+                }
             }
             Op::ReturnScalar { src } => return Ok(ExecResult::Scalar(s_get!(src))),
             _ => return Err(err_msg("Unexpected op in obj leaf pipeline")),
@@ -592,7 +705,11 @@ pub(crate) fn try_run_record_bump_stage(
             rec_obj: 0,
             field_idx: f_o1,
         },
-        Op::NewRecordMove {
+        Op::NewRecord {
+            dst_obj: rec_dst,
+            desc_idx,
+        }
+        | Op::NewRecordMove {
             dst_obj: rec_dst,
             desc_idx,
         },

@@ -28,8 +28,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                         self.ops.push(Op::AddIntImm { dst, a: dst, imm });
                         return Ok(true);
                     }
-                    let rhs_r = self.lower_scalar(right)?;
-                    self.ops.push(Op::AddInt { dst, a: dst, b: rhs_r });
+                    self.lower_add_int(dst, right, Some(dst))?;
                     return Ok(true);
                 }
                 BinaryOp::Sub => {
@@ -42,6 +41,10 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                     return Ok(true);
                 }
                 BinaryOp::Mul => {
+                    if let Some(imm) = as_i16_lit(right) {
+                        self.ops.push(Op::MulIntImm { dst, a: dst, imm });
+                        return Ok(true);
+                    }
                     let rhs_r = self.lower_scalar(right)?;
                     self.ops.push(Op::MulInt { dst, a: dst, b: rhs_r });
                     return Ok(true);
@@ -52,12 +55,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                     return Ok(true);
                 }
                 BinaryOp::Mod => {
-                    if let Some(imm) = as_i16_lit(right) {
-                        self.ops.push(Op::ModIntImm { dst, a: dst, imm });
-                        return Ok(true);
-                    }
-                    let rhs_r = self.lower_scalar(right)?;
-                    self.ops.push(Op::ModInt { dst, a: dst, b: rhs_r });
+                    self.lower_remainder(dst, right, Some(dst))?;
                     return Ok(true);
                 }
                 _ => return Ok(false),
@@ -90,7 +88,9 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
         body: &Block,
     ) -> Result<(), String> {
         let lp = self.loop_slots[&skey];
-        if let ExprKind::Binary { op: BinaryOp::Range, left, right } = &iterable.kind {
+        if matches!(&iterable.kind, ExprKind::Binary { op: BinaryOp::Range, .. })
+            || iterable.ty == Type::Int
+        {
             let idx_s = match &pattern.kind {
                 PatternKind::Ident(name) => {
                     let pkey = pattern as *const Pattern as usize;
@@ -98,18 +98,24 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 }
                 _ => lp.idx_s,
             };
-            let start_r = self.lower_scalar(left)?;
-            if start_r != idx_s {
-                self.ops.push(Op::MoveScalar { dst: idx_s, src: start_r });
+            if let ExprKind::Binary { op: BinaryOp::Range, left, right } = &iterable.kind {
+                let start_r = self.lower_scalar(left)?;
+                let end_r = self.lower_scalar(right)?;
+                if start_r != idx_s {
+                    self.ops.push(Op::MoveScalar { dst: idx_s, src: start_r });
+                }
+                if end_r != lp.aux_s {
+                    self.ops.push(Op::MoveScalar { dst: lp.aux_s, src: end_r });
+                }
+            } else {
+                let end_r = self.lower_scalar(iterable)?;
+                if end_r != lp.aux_s {
+                    self.ops.push(Op::MoveScalar { dst: lp.aux_s, src: end_r });
+                }
+                self.ops.push(Op::LoadImmInt { dst: idx_s, imm: 0 });
             }
-            let end_r = self.lower_scalar(right)?;
-            if end_r != lp.aux_s {
-                self.ops.push(Op::MoveScalar { dst: lp.aux_s, src: end_r });
-            }
-            let cond_t = self.alloc_temp_s();
-            self.ops.push(Op::LtInt { dst: cond_t, a: idx_s, b: lp.aux_s });
             let jf_pc = self.ops.len();
-            self.ops.push(Op::JumpIfFalse { cond: cond_t, target: 0 });
+            self.ops.push(Op::JumpIfLtInt { a: idx_s, b: lp.aux_s, target: 0, when_true: false });
             let top_pc = self.ops.len() as u32;
 
             self.scopes.push(HashMap::new());
@@ -126,7 +132,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             self.scopes.pop();
 
             let step_pc = self.ops.len() as u32;
-            self.ops.push(Op::ForRangeStep { idx_reg: idx_s, limit_reg: lp.aux_s, target: top_pc });
+            self.emit_range_step(idx_s, lp.aux_s, top_pc);
             let done_pc = self.ops.len() as u32;
             patch_jump(&mut self.ops[jf_pc], done_pc);
             for pc in patch.breaks {
@@ -134,6 +140,55 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             }
             for pc in patch.continues {
                 patch_jump(&mut self.ops[pc], step_pc);
+            }
+            return Ok(());
+        }
+
+        if let Type::Generic { type_id, type_args } = &iterable.ty
+            && type_id.module == crate::frontend::types::ModuleId::Native("cdt.chan".to_string())
+            && type_id.name == "Chan"
+        {
+            let elem_ty = type_args.first().cloned().unwrap_or(Type::Any);
+            let chan_r = self.lower_obj(iterable)?;
+            if chan_r != lp.list_o {
+                self.ops.push(Op::MoveObj { dst_obj: lp.list_o, src: chan_r });
+            }
+            let recv_o = self.alloc_temp_o();
+            let head_pc = self.ops.len();
+            self.ops.push(Op::ExtOp {
+                kind: crate::vm::opcode::EXT_CHAN_OP,
+                aux: crate::native::chan::CHAN_RECV,
+                a: recv_o,
+                b: lp.list_o,
+                c: 0,
+            });
+            self.ops.push(Op::IsTypeObj {
+                dst_s: lp.idx_s,
+                src_obj: recv_o,
+                expected_tag: crate::vm::value::SCHEMA_EMPTY_TAG,
+            });
+            let exit_pc = self.ops.len();
+            self.ops.push(Op::JumpIfTrue { cond: lp.idx_s, target: 0 });
+
+            self.scopes.push(HashMap::new());
+            self.lower_pattern_bind(pattern, &elem_ty, recv_o, false)?;
+            self.loops.push(LoopPatch { breaks: Vec::new(), continues: Vec::new() });
+            self.loop_depth += 1;
+            for s in &body.stmts {
+                self.lower_stmt(s)?;
+            }
+            self.loop_depth -= 1;
+            let patch = self.loops.pop().unwrap();
+            self.scopes.pop();
+
+            self.ops.push(Op::Jump { target: head_pc as u32 });
+            let done_pc = self.ops.len() as u32;
+            patch_jump(&mut self.ops[exit_pc], done_pc);
+            for pc in patch.breaks {
+                patch_jump(&mut self.ops[pc], done_pc);
+            }
+            for pc in patch.continues {
+                patch_jump(&mut self.ops[pc], head_pc as u32);
             }
             return Ok(());
         }
@@ -199,7 +254,15 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
 
         let step_pc = self.ops.len() as u32;
         if is_scalar {
-            self.ops.push(Op::ForListIntStep { list_obj, idx_s: lp.idx_s, elem_s: elem_reg, target: top_pc });
+            let step = match &self.ops[top_pc as usize..] {
+                [Op::AddInt { dst, a, b }] if elem_ty == Type::Int && dst == a && *b == elem_reg
+                    && *dst != lp.idx_s && *dst != elem_reg =>
+                {
+                    Op::SumListIntTail { list_obj, idx_s: lp.idx_s, elem_s: elem_reg, acc_s: *dst }
+                }
+                _ => Op::ForListIntStep { list_obj, idx_s: lp.idx_s, elem_s: elem_reg, target: top_pc },
+            };
+            self.ops.push(step);
         } else {
             // ForListObj already increments idx_s on entry, so jump directly back to head_pc.
             self.ops.push(Op::Jump { target: head_pc as u32 });
@@ -261,10 +324,8 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             lp.aux_s
         };
 
-        let cond_t = self.alloc_temp_s();
-        self.ops.push(Op::LtInt { dst: cond_t, a: idx_slot.reg, b: limit_s });
         let jf_pc = self.ops.len();
-        self.ops.push(Op::JumpIfFalse { cond: cond_t, target: 0 });
+        self.ops.push(Op::JumpIfLtInt { a: idx_slot.reg, b: limit_s, target: 0, when_true: false });
         let top_pc = self.ops.len() as u32;
 
         self.loops.push(LoopPatch { breaks: Vec::new(), continues: Vec::new() });
@@ -278,7 +339,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
         let patch = self.loops.pop().unwrap();
 
         let step_pc = self.ops.len() as u32;
-        self.ops.push(Op::ForRangeStep { idx_reg: idx_slot.reg, limit_reg: limit_s, target: top_pc });
+        self.emit_range_step(idx_slot.reg, limit_s, top_pc);
         let done_pc = self.ops.len() as u32;
         patch_jump(&mut self.ops[jf_pc], done_pc);
         for pc in patch.breaks {
@@ -290,12 +351,27 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
         Ok(true)
     }
 
+    fn emit_range_step(&mut self, idx_s: u16, limit_s: u16, top: u32) {
+        let step = match &self.ops[top as usize..] {
+            [Op::ListAppendInt { list_obj, val_s }] if *val_s == idx_s => {
+                Op::AppendIntRangeTail { list_obj: *list_obj, idx_s, limit_s }
+            }
+            [Op::AddIntMapGetOrImm { dst_s, a, map_obj, key_s, default }]
+                if dst_s == a && *key_s == idx_s && *dst_s != idx_s && *dst_s != limit_s =>
+            {
+                Op::SumIntMapRangeTail {
+                    acc_s: *dst_s, map_obj: *map_obj, idx_s, limit_s, default: *default,
+                }
+            }
+            _ => Op::ForRangeStep { idx_reg: idx_s, limit_reg: limit_s, target: top },
+        };
+        self.ops.push(step);
+    }
+
     pub(crate) fn lower_while_generic(&mut self, condition: &Expr, body: &Block) -> Result<(), String> {
         let top_pc = self.ops.len() as u32;
         self.reset_temps();
-        let cond_r = self.lower_scalar(condition)?;
-        let jf_pc = self.ops.len();
-        self.ops.push(Op::JumpIfFalse { cond: cond_r, target: 0 });
+        let jf_pc = self.lower_conditional_jump(condition, false)?;
 
         self.loops.push(LoopPatch { breaks: Vec::new(), continues: Vec::new() });
         self.loop_depth += 1;
@@ -315,13 +391,204 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
         Ok(())
     }
 
-    pub(crate) fn lower_switch(&mut self, expr: &Expr, cases: &[SwitchCase]) -> Result<(), String> {
-        let scr_is_scalar = expr.ty.is_scalar();
-        let scr_reg = if scr_is_scalar {
-            self.lower_scalar(expr)?
-        } else {
-            self.lower_obj(expr)?
+    pub(crate) fn try_lower_int_if_chain(
+        &mut self,
+        condition: &Expr,
+        then_block: &Block,
+        else_block: Option<&Block>,
+    ) -> Result<bool, String> {
+        if else_block.is_none() {
+            return Ok(false);
+        }
+        let Some((name, key)) = int_equality_test(condition) else {
+            return Ok(false);
         };
+        let Some((slot, _)) = self.lookup_local(name) else {
+            return Ok(false);
+        };
+        let mut keys = HashSet::from([key]);
+        let mut cases = vec![(key, then_block)];
+        let mut fallback = else_block;
+        while let Some([Stmt { kind: StmtKind::If { condition, then_block, else_block }, .. }]) =
+            fallback.map(|block| block.stmts.as_slice())
+        {
+            let Some((next_name, key)) = int_equality_test(condition) else { break };
+            if name != next_name {
+                break;
+            }
+            if !keys.insert(key) {
+                return Ok(false);
+            }
+            cases.push((key, then_block));
+            fallback = else_block.as_ref();
+        }
+        if cases.len() < 3 {
+            return Ok(false);
+        }
+        let first = *keys.iter().min().unwrap();
+        let last = *keys.iter().max().unwrap();
+        let Ok(count) = u16::try_from(i32::from(last) - i32::from(first) + 1) else {
+            return Ok(false);
+        };
+        if usize::from(count) > cases.len() * 2 {
+            return Ok(false);
+        }
+
+        self.ops.push(Op::SwitchIntImm { src: slot.reg, first, count });
+        let table = self.ops.len();
+        self.ops.resize(table + 1 + usize::from(count), Op::Jump { target: 0 });
+
+        let mut targets = vec![None; usize::from(count)];
+        let mut end_jumps = Vec::with_capacity(cases.len());
+        for (key, block) in cases {
+            targets[(i32::from(key) - i32::from(first)) as usize] = Some(self.ops.len() as u32);
+            self.lower_block_stmts(&block.stmts)?;
+            end_jumps.push(self.ops.len());
+            self.ops.push(Op::Jump { target: 0 });
+        }
+        let default = self.ops.len() as u32;
+        if let Some(block) = fallback {
+            self.lower_block_stmts(&block.stmts)?;
+        }
+        patch_jump(&mut self.ops[table], default);
+        for (i, target) in targets.into_iter().enumerate() {
+            patch_jump(&mut self.ops[table + i + 1], target.unwrap_or(default));
+        }
+        for jump in end_jumps {
+            self.patch_here(jump);
+        }
+        Ok(true)
+    }
+
+    fn lower_tag_switch(
+        &mut self,
+        ename: &str,
+        scr_reg: u16,
+        layout: Option<super::lower::CompactEnum>,
+        cases: &[SwitchCase],
+    ) -> Result<(), String> {
+        let variants = &self.mc.checked.data_enums[ename];
+        let first_tag = variants[0].schema_id;
+        let tag_count = u16::try_from(variants.len()).map_err(|_| "Too many variants in switch")?;
+        self.ops.push(if let Some(layout) = layout {
+            Op::SwitchScalarTag { tag_s: layout.tag_s, src_obj: scr_reg, first_tag, tag_count }
+        } else {
+            Op::SwitchTag { src_obj: scr_reg, first_tag, tag_count }
+        });
+        let table = self.ops.len();
+        self.ops.resize(table + 1 + usize::from(tag_count), Op::Jump { target: 0 });
+
+        let mut targets = vec![None; usize::from(tag_count)];
+        let mut default = None;
+        let mut end_jumps = Vec::new();
+        for case in cases {
+            let (variant, bindings): (_, &[(Option<String>, String)]) = match &case.pattern.kind {
+                PatternKind::Ident(name) => (name.split_once('.').map(|(_, v)| v), &[]),
+                PatternKind::EnumVariant { variant_name, bindings, .. } => {
+                    (Some(variant_name.as_str()), bindings)
+                }
+                PatternKind::Type { name, binding } => (
+                    name.rsplit_once('.').map(|(_, v)| v),
+                    &[(None, binding.clone())],
+                ),
+                _ => (None, &[]),
+            };
+
+            let pc = self.ops.len() as u32;
+            let pkey = &case.pattern as *const Pattern as usize;
+            self.scopes.push(HashMap::new());
+            if let Some(variant) = variant {
+                let (var, fields) = crate::frontend::check::resolve_data_enum_bindings(
+                    self.mc.checked, ename, variant, bindings,
+                )?;
+                let entry = &mut targets[(var.schema_id - first_tag) as usize];
+                if entry.is_some() {
+                    self.scopes.pop();
+                    continue;
+                }
+                *entry = Some(pc);
+                if let Some(layout) = layout
+                    && let [(name_a, field_a), (name_b, field_b)] = fields.as_slice()
+                {
+                    let slot_a = self.pat_slots[&(pkey, name_a.clone())];
+                    let slot_b = self.pat_slots[&(pkey, name_b.clone())];
+                    self.ops.push(Op::ReadScalarEnumPair {
+                        dst_a: slot_a.reg, dst_b: slot_b.reg, tag_s: layout.tag_s, src_obj: scr_reg,
+                        field_a: field_a.slot_idx as u8, field_b: field_b.slot_idx as u8,
+                    });
+                    self.bind_var(name_a.clone(), slot_a, field_a.ty.clone());
+                    self.bind_var(name_b.clone(), slot_b, field_b.ty.clone());
+                } else {
+                    for (local, field) in fields {
+                        let slot = self.pat_slots[&(pkey, local.clone())];
+                        self.ops.push(if let Some(layout) = layout {
+                            Op::ReadScalarEnumField {
+                                dst_s: slot.reg, tag_s: layout.tag_s,
+                                src_obj: scr_reg, field_idx: field.slot_idx as u8,
+                            }
+                        } else if field.is_scalar {
+                            Op::GetFieldScalar { dst_s: slot.reg, rec_obj: scr_reg, field_idx: field.slot_idx }
+                        } else {
+                            Op::GetFieldObj { dst_obj: slot.reg, rec_obj: scr_reg, field_idx: field.slot_idx }
+                        });
+                        self.bind_var(local, slot, field.ty.clone());
+                    }
+                }
+            } else {
+                default = Some(pc);
+                if let PatternKind::Ident(name) = &case.pattern.kind {
+                    let slot = self.pat_slots[&(pkey, name.clone())];
+                    let src = self.materialize_local_obj(scr_reg, Some(slot.reg));
+                    if src != slot.reg {
+                        self.ops.push(Op::MoveObj { dst_obj: slot.reg, src });
+                    }
+                    self.bind_var(name.clone(), slot, Type::DataEnum(ename.to_owned()));
+                }
+            }
+            for stmt in &case.body.stmts {
+                self.lower_stmt(stmt)?;
+            }
+            self.scopes.pop();
+
+            if default.is_some() {
+                break;
+            }
+            end_jumps.push(self.ops.len());
+            self.ops.push(Op::Jump { target: 0 });
+        }
+
+        let end = self.ops.len() as u32;
+        let default = default.unwrap_or(end);
+        patch_jump(&mut self.ops[table], default);
+        for (i, target) in targets.into_iter().enumerate() {
+            patch_jump(&mut self.ops[table + 1 + i], target.unwrap_or(default));
+        }
+        for jump in end_jumps {
+            patch_jump(&mut self.ops[jump], end);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn lower_switch(&mut self, expr: &Expr, cases: &[SwitchCase]) -> Result<(), String> {
+        if let Type::DataEnum(ename) = &expr.ty
+            && cases.iter().all(|case| match &case.pattern.kind {
+                PatternKind::Nil | PatternKind::Tuple(_) => false,
+                PatternKind::Type { name, .. } => name.contains('.'),
+                _ => true,
+            })
+            && u16::try_from(self.mc.checked.data_enums[ename].len()).is_ok()
+        {
+            if let ExprKind::Ident(name) = &expr.kind
+                && let Some((slot, _)) = self.lookup_local(name)
+                && let Some(layout) = self.compact_enums.get(&slot.reg).copied()
+            {
+                return self.lower_tag_switch(ename, slot.reg, Some(layout), cases);
+            }
+            let scr_reg = self.lower_obj(expr)?;
+            return self.lower_tag_switch(ename, scr_reg, None, cases);
+        }
+        let scr_is_scalar = expr.ty.is_scalar();
+        let scr_reg = if scr_is_scalar { self.lower_scalar(expr)? } else { self.lower_obj(expr)? };
         let mut end_jumps = Vec::new();
         for case in cases {
             match &case.pattern.kind {
@@ -454,10 +721,9 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                     self.patch_here(jf);
                 }
                 PatternKind::Type { name, binding } => {
-                    if let Type::DataEnum(ename) = &expr.ty {
-                        let (_, vname) = name.rsplit_once('.').ok_or_else(|| {
-                            format!("Invalid enum variant pattern '{}'", name)
-                        })?;
+                    if let Type::DataEnum(ename) = &expr.ty
+                        && let Some((_, vname)) = name.rsplit_once('.')
+                    {
                         let (var, resolved) = crate::frontend::check::resolve_data_enum_bindings(
                             self.mc.checked,
                             ename,
@@ -598,6 +864,9 @@ pub(crate) fn patch_jump(op: &mut Op, new_target: u32) {
         Op::Jump { target }
         | Op::JumpIfFalse { target, .. }
         | Op::JumpIfTrue { target, .. }
+        | Op::JumpIfLtInt { target, .. }
+        | Op::JumpIfLtIntImm { target, .. }
+        | Op::JumpIfEqIntImm { target, .. }
         | Op::ForRangeStep { target, .. }
         | Op::ForListIntStep { target, .. } => *target = new_target,
         Op::ForListInt { exit_target, .. } | Op::ForListObj { exit_target, .. } => {
@@ -608,10 +877,14 @@ pub(crate) fn patch_jump(op: &mut Op, new_target: u32) {
 }
 
 pub(crate) fn as_i16_lit(expr: &Expr) -> Option<i16> {
+    i16::try_from(int_literal(expr)?).ok()
+}
+
+pub(super) fn int_literal(expr: &Expr) -> Option<i64> {
     match &expr.kind {
-        ExprKind::Int(n) => i16::try_from(*n).ok(),
+        ExprKind::Int(n) => Some(*n),
         ExprKind::Unary { op: UnaryOp::Neg, expr: inner } => match inner.kind {
-            ExprKind::Int(n) => n.checked_neg().and_then(|v| i16::try_from(v).ok()),
+            ExprKind::Int(n) => n.checked_neg(),
             _ => None,
         },
         _ => None,
@@ -627,6 +900,19 @@ pub(crate) fn as_neg_i16_lit(expr: &Expr) -> Option<i16> {
         },
         _ => None,
     }
+}
+
+fn int_equality_test(condition: &Expr) -> Option<(&str, i16)> {
+    let ExprKind::Binary { op: BinaryOp::Eq, left, right } = &condition.kind else {
+        return None;
+    };
+    if left.ty.is_int() && let ExprKind::Ident(name) = &left.kind {
+        return Some((name, as_i16_lit(right)?));
+    }
+    if right.ty.is_int() && let ExprKind::Ident(name) = &right.kind {
+        return Some((name, as_i16_lit(left)?));
+    }
+    None
 }
 
 fn is_plus_one_assign(stmt: &Stmt, var_name: &str) -> bool {
@@ -803,7 +1089,7 @@ fn collect_free_stmt(stmt: &Stmt, bound: &mut Vec<HashSet<String>>, out: &mut Ha
                 bound.pop();
             }
         }
-        StmtKind::Defer(block) => {
+        StmtKind::Defer(block) | StmtKind::Spawn(block) => {
             collect_free_block(block, bound, out);
         }
     }

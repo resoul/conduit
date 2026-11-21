@@ -754,7 +754,7 @@ func main() -> Void {
     stats := c.pool_stats()
     idle_before := stats.get("idle") ?? -1
     res := c.get("/health")
-    err_kind := ""
+    var err_kind = ""
     switch res {
         case http.HttpError(e): err_kind = e.kind
         case http.Response(_): err_kind = "ok"
@@ -776,5 +776,116 @@ func main() -> Void {
         String::from_utf8_lossy(&run_out.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&run_out.stdout).trim(), "0:invalid_url");
+    let _ = fs::remove_dir_all(&dir_path);
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_http_signal_graceful_shutdown_and_lifecycle_e2e() {
+    use std::net::{TcpListener, TcpStream};
+    use std::io::{Read, Write};
+    use std::process::Stdio;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir_path = std::env::temp_dir().join(format!("conduit_sig_srv_{}_{}", std::process::id(), n));
+    fs::create_dir_all(&dir_path).unwrap();
+    let main_cdt = dir_path.join("srv.cdt");
+    fs::write(
+        &main_cdt,
+        format!(
+            r#"
+import * as http from "cdt.http"
+import * as time from "cdt.time"
+
+on start {{
+    print("top_start")
+}}
+
+on stop {{
+    print("top_stop")
+}}
+
+func r_start() -> Void {{
+    print("router_start")
+}}
+
+func r_stop() -> Void {{
+    print("router_stop")
+}}
+
+func ping(_req: http.Request) -> http.Response {{
+    spawn {{
+        _s := time.sleep(30)
+        print("spawn_done")
+    }}
+    return http.text("pong")
+}}
+
+router Api {{
+    on start => r_start
+    on stop => r_stop
+    get "/ping" => ping
+}}
+
+func main() -> Void {{
+    _srv := http.serve<Api>("127.0.0.1:{port}")
+}}
+"#
+        ),
+    )
+    .unwrap();
+
+    let child = Command::new(conduit_bin())
+        .args(["run", main_cdt.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let addr = format!("127.0.0.1:{port}");
+    let mut got_pong = false;
+    for _ in 0..50 {
+        if let Ok(mut stream) = TcpStream::connect(&addr) {
+            let _ = stream.write_all(b"GET /ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut resp = String::new();
+            let _ = stream.read_to_string(&mut resp);
+            if resp.contains("pong") {
+                got_pong = true;
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(got_pong, "server did not respond with pong on {addr}");
+
+    let kill_status = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(kill_status.success());
+
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines,
+        vec![
+            "top_start",
+            "router_start",
+            "spawn_done",
+            "router_stop",
+            "top_stop",
+        ],
+        "stdout was:\n{stdout}"
+    );
     let _ = fs::remove_dir_all(&dir_path);
 }

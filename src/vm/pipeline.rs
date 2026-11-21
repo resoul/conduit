@@ -34,6 +34,9 @@ fn match_mod_eq_filter(ops: &[Op], int_consts: &[i64]) -> Option<(i64, i64)> {
             Op::NegInt { dst, src } if (dst as usize) < 16 && (src as usize) < 16 => {
                 imm[dst as usize] = imm[src as usize].and_then(i64::checked_neg);
             }
+            Op::ModIntConst { dst, a: 0, divisor, .. } if (dst as usize) < 16 => {
+                mod_of_x[dst as usize] = Some(i64::from(divisor));
+            }
             Op::ModIntImm { dst, a, imm: m } if a == 0 && (dst as usize) < 16 => {
                 mod_of_x[dst as usize] = Some(i64::from(m));
             }
@@ -98,6 +101,31 @@ fn match_affine_map(ops: &[Op], int_consts: &[i64]) -> Option<(i64, i64)> {
             {
                 imm[dst as usize] = imm[src as usize];
                 aff[dst as usize] = aff[src as usize];
+            }
+            Op::MulAddInt { dst, a, b, c } if stage == 0 && [dst, a, b, c].into_iter().all(|r| r < 16) => {
+                let (a, b, c) = (usize::from(a), usize::from(b), usize::from(c));
+                let ((k, offset), mul) = aff[a].zip(imm[b]).or_else(|| aff[b].zip(imm[a]))?;
+                aff[usize::from(dst)] = Some((k.checked_mul(mul)?, offset.checked_mul(mul)?.checked_add(imm[c]?)?));
+                imm[usize::from(dst)] = None;
+                stage = 2;
+            }
+            Op::MulAddIntImm { dst, src, mul, add }
+                if stage == 0 && (dst as usize) < 16 && (src as usize) < 16 =>
+            {
+                let (k, c) = aff[src as usize]?;
+                let m = i64::from(mul);
+                aff[dst as usize] = Some((k.checked_mul(m)?, c.checked_mul(m)?.checked_add(i64::from(add))?));
+                imm[dst as usize] = None;
+                stage = 2;
+            }
+            Op::MulIntImm { dst, a, imm: m }
+                if stage == 0 && (dst as usize) < 16 && (a as usize) < 16 =>
+            {
+                let (k, c) = aff[a as usize]?;
+                let m = i64::from(m);
+                aff[dst as usize] = Some((k.checked_mul(m)?, c.checked_mul(m)?));
+                imm[dst as usize] = None;
+                stage = 1;
             }
             Op::MulInt { dst, a, b }
                 if stage == 0 && (dst as usize) < 16 && (a as usize) < 16 && (b as usize) < 16 =>
@@ -277,17 +305,15 @@ fn match_int_filter(ops: &[Op], int_consts: &[i64]) -> Option<IntFilter> {
 }
 
 #[inline]
-fn extract_if_else_returns(ops: &[Op], cond_reg: u16, target: u32) -> Option<(u16, u16)> {
-    // ops[0] is comparison, ops[1] is JumpIfFalse { cond, target }
+fn extract_if_else_returns(ops: &[Op], then_start: usize, target: u32) -> Option<(u16, u16)> {
     let t = target as usize;
-    if t >= ops.len() || t < 3 {
+    if t >= ops.len() || t <= then_start {
         return None;
     }
-    match (&ops[2..t], &ops[t..]) {
+    match (&ops[then_start..t], &ops[t..]) {
         ([Op::ReturnScalar { src: ts }], [Op::ReturnScalar { src: es }])
             if (*ts == 0 || *ts == 1) && (*es == 0 || *es == 1) && ts != es =>
         {
-            let _ = cond_reg;
             Some((*ts, *es))
         }
         (
@@ -317,26 +343,27 @@ fn match_int_reduce(ops: &[Op]) -> Option<IntReduceOp> {
     if match_sum_reduce(ops) {
         return Some(IntReduceOp::Sum);
     }
-    if ops.len() < 4 || ops.len() > 6 {
-        return None;
-    }
-    let (cmp, a, b, cond_reg) = match ops[0] {
-        Op::LtInt { dst, a, b } => (IntCmp::Lt, a, b, dst),
-        Op::LeInt { dst, a, b } => (IntCmp::Le, a, b, dst),
-        Op::GtInt { dst, a, b } => (IntCmp::Gt, a, b, dst),
-        Op::GeInt { dst, a, b } => (IntCmp::Ge, a, b, dst),
-        _ => return None,
+    let (cmp, a, b, then_start, target) = match *ops.first()? {
+        Op::JumpIfLtInt { a, b, target, when_true: false } => (IntCmp::Lt, a, b, 1, target),
+        op => {
+            let (cmp, a, b, result) = match op {
+                Op::LtInt { dst, a, b } => (IntCmp::Lt, a, b, dst),
+                Op::LeInt { dst, a, b } => (IntCmp::Le, a, b, dst),
+                Op::GtInt { dst, a, b } => (IntCmp::Gt, a, b, dst),
+                Op::GeInt { dst, a, b } => (IntCmp::Ge, a, b, dst),
+                _ => return None,
+            };
+            let Op::JumpIfFalse { cond, target } = *ops.get(1)? else { return None };
+            if cond != result {
+                return None;
+            }
+            (cmp, a, b, 2, target)
+        }
     };
     if !((a == 0 && b == 1) || (a == 1 && b == 0)) {
         return None;
     }
-    let Op::JumpIfFalse { cond, target } = ops[1] else {
-        return None;
-    };
-    if cond != cond_reg {
-        return None;
-    }
-    let (then_s, _else_s) = extract_if_else_returns(ops, cond_reg, target)?;
+    let (then_s, _) = extract_if_else_returns(ops, then_start, target)?;
     // Normalize so we ask: when `acc <cmp_norm> x` is true, does it return `acc` (0)?
     let cmp_norm = if a == 0 { cmp } else { flip_int_cmp(cmp) };
     let returns_acc_when_true = then_s == 0;
@@ -710,7 +737,7 @@ fn match_float_reduce(ops: &[Op]) -> Option<FloatReduceOp> {
     if cond != cond_reg {
         return None;
     }
-    let (then_s, _else_s) = extract_if_else_returns(ops, cond_reg, target)?;
+    let (then_s, _else_s) = extract_if_else_returns(ops, 2, target)?;
     let cmp_norm = if a == 0 { cmp } else { flip_float_cmp(cmp) };
     let returns_acc_when_true = then_s == 0;
     match (cmp_norm, returns_acc_when_true) {
@@ -996,6 +1023,8 @@ impl Vm {
             let int_consts = module.int_consts.as_ptr();
             let float_consts = module.float_consts.as_ptr();
 
+            // SAFETY: `is_scalar_leaf_ops` and `ensure_capacity` ensure `s_win` covers every
+            // scalar register accessed by `ops`, and constant indices are validated by `Module::validate`.
             match leaf_stages.as_slice() {
                 [LeafStage {
                     kind: StageKind::MapScalar,
@@ -1275,6 +1304,8 @@ impl Vm {
                                 let o_ptr = o_win.as_mut_ptr();
                                 let mut res = Ok(());
                                 for item in src_arc.iter() {
+                                    // SAFETY: `o0_read_only` guarantees `exec_obj_leaf` never mutates or drops
+                                    // `o_win[0]`, and we restore `Obj::Empty` via `ptr::write` after the loop so no double-drop occurs.
                                     unsafe {
                                         std::ptr::copy_nonoverlapping(
                                             item as *const Obj,
@@ -1319,9 +1350,11 @@ impl Vm {
                             let o_ptr = o_win.as_mut_ptr();
                             let mut res = Ok(());
                             for item in src_arc.iter() {
+                                // SAFETY: `o0_read_only` guarantees `exec_obj_leaf` borrows `o_win[0]` without moving/dropping it; `ptr::write(o_ptr, Obj::Empty)` clears the temporary alias after the loop.
                                 unsafe {
                                     std::ptr::copy_nonoverlapping(item as *const Obj, o_ptr, 1);
                                 }
+                                // SAFETY: Leaf register bounds and constants are verified by `is_obj_leaf_ops` + `ensure_capacity`.
                                 match unsafe { exec_obj_leaf(s_ptr, o_ptr, ops, module, *closure) }
                                 {
                                     Ok(ExecResult::Scalar(pass)) => {
@@ -1383,6 +1416,7 @@ impl Vm {
                                             let borrowed_item =
                                                 st.o0_read_only && owned_cur.is_none();
                                             if borrowed_item {
+                                                // SAFETY: `o0_read_only` guarantees `exec_obj_leaf` only reads `o_win[0]`, and we clear the alias right below.
                                                 unsafe {
                                                     std::ptr::copy_nonoverlapping(
                                                         item as *const Obj,
@@ -1521,10 +1555,12 @@ impl Vm {
             let max_s = stages.iter().map(|s| s.num_scalars as usize).max().unwrap_or(2).max(2);
             self.ensure_capacity(stage_s_base + max_s, stage_o_base);
             let leaf_stages = resolve_leaf_stages(stages, &self.objs);
+            // SAFETY: `ensure_capacity` above allocated `stage_s_base + max_s` (`>= 2`) scalar slots.
             let s_ptr = unsafe { self.scalars.as_mut_ptr().add(stage_s_base) };
             let int_consts = module.int_consts.as_ptr();
             let float_consts = module.float_consts.as_ptr();
 
+            // SAFETY: Every leaf stage has `num_scalars <= max_s` and valid constant indices per `Module::validate`.
             match leaf_stages.as_slice() {
                 [LeafStage { kind: StageKind::ReduceScalar, ops, closure, .. }] => {
                     for &item in src {

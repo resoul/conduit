@@ -63,7 +63,7 @@ pub const NATIVE_MODULES: &[NativeModuleSpec] = &[
     },
     NativeModuleSpec {
         name: "cdt.process",
-        fns: &["run", "status", "cwd", "set_cwd", "pid", "exit"],
+        fns: &["run", "status", "pipe", "cwd", "set_cwd", "pid", "exit"],
         types: &["ProcessError", "Output"],
     },
     NativeModuleSpec {
@@ -149,6 +149,11 @@ pub const NATIVE_MODULES: &[NativeModuleSpec] = &[
         fns: &["connect"],
         types: &["Client", "Lock", "RedisError"],
     },
+    NativeModuleSpec {
+        name: "cdt.chan",
+        fns: &["open"],
+        types: &["Chan"],
+    },
 ];
 
 pub fn find_native_module(path: &str) -> Option<&'static NativeModuleSpec> {
@@ -161,6 +166,19 @@ pub fn is_native_module(path: &str) -> bool {
 
 pub(crate) fn is_valid_native_type(mod_name: &str, ty_name: &str) -> bool {
     find_native_module(mod_name).is_some_and(|m| m.types.contains(&ty_name))
+}
+
+pub(crate) fn is_chan_type_name(name: &str, checked: &CheckedProgram) -> bool {
+    if name == "Chan" {
+        return true;
+    }
+    if let Some((mod_name, ty_name)) = checked.native_direct_types.get(name) {
+        return *mod_name == "cdt.chan" && ty_name == "Chan";
+    }
+    if let Some((alias, sub)) = name.split_once('.') {
+        return sub == "Chan" && checked.native_aliases.get(alias) == Some(&"cdt.chan");
+    }
+    false
 }
 
 pub(crate) fn register_native_imports(
@@ -221,6 +239,7 @@ pub fn resolve_type_expr(te: &TypeExpr, checked: &CheckedProgram) -> Result<Type
             "Int" => Ok(Type::Int),
             "Float" => Ok(Type::Float),
             "String" => Ok(Type::String),
+            "Bytes" => Ok(Type::Bytes),
             "Bool" => Ok(Type::Bool),
             "Nil" => Ok(Type::Nil),
             "Void" => Ok(Type::Void),
@@ -229,6 +248,9 @@ pub fn resolve_type_expr(te: &TypeExpr, checked: &CheckedProgram) -> Result<Type
                 module: ModuleId::Builtin,
                 name: name.to_string(),
             })),
+            _ if is_chan_type_name(name, checked) => {
+                Err("Generic type 'Chan' requires 1 type argument(s)".to_string())
+            }
             _ if checked.generic_structs.contains_key(name) => Err(format!(
                 "Generic type '{}' requires {} type argument(s)",
                 name,
@@ -263,6 +285,21 @@ pub fn resolve_type_expr(te: &TypeExpr, checked: &CheckedProgram) -> Result<Type
                 validate_map_key_type(&k)?;
                 let v = resolve_type_expr(&type_args[1], checked)?;
                 Ok(Type::Map(Box::new(k), Box::new(v)))
+            } else if is_chan_type_name(name, checked) {
+                if type_args.len() != 1 {
+                    return Err(format!(
+                        "Generic type 'Chan' expects 1 type argument(s), got {}",
+                        type_args.len()
+                    ));
+                }
+                let elem = resolve_type_expr(&type_args[0], checked)?;
+                if elem == Type::Void {
+                    return Err("Chan element type cannot be Void".to_string());
+                }
+                Ok(Type::Generic {
+                    type_id: TypeId::native("cdt.chan", "Chan"),
+                    type_args: vec![elem],
+                })
             } else if checked.generic_structs.contains_key(name) {
                 let mut resolved = Vec::with_capacity(type_args.len());
                 for ta in type_args {
@@ -468,6 +505,10 @@ pub(crate) fn native_member_field(tid: &TypeId, field: &str) -> Result<(Type, u1
         ("cdt.http", "Request", "method") => Ok((Type::String, 0)),
         ("cdt.http", "Request", "path") => Ok((Type::String, 1)),
         ("cdt.http", "Request", "body") => Ok((Type::String, 2)),
+        ("cdt.http", "Request", "body_bytes") => Ok((Type::Bytes, 6)),
+        ("cdt.http", "Request", "headers_bytes") => Ok((
+            Type::Map(Box::new(Type::String), Box::new(Type::Bytes)), 7,
+        )),
         ("cdt.http", "Request", "headers") => Ok((
             Type::Map(Box::new(Type::String), Box::new(Type::String)),
             3,
@@ -487,7 +528,7 @@ pub(crate) fn native_member_field(tid: &TypeId, field: &str) -> Result<(Type, u1
             1,
         )),
         ("cdt.http", "BinaryResponse", "status") => Ok((Type::Int, 0)),
-        ("cdt.http", "BinaryResponse", "body") => Ok((Type::List(Box::new(Type::Int)), 0)),
+        ("cdt.http", "BinaryResponse", "body") => Ok((Type::Bytes, 0)),
         ("cdt.http", "BinaryResponse", "headers") => Ok((
             Type::Map(Box::new(Type::String), Box::new(Type::String)),
             1,

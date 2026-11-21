@@ -21,7 +21,7 @@ use crate::native::path::{
     PATH_STEM, PATH_WITH_EXT,
 };
 use crate::native::process::{
-    PROC_CWD, PROC_EXIT, PROC_PID, PROC_RUN, PROC_SET_CWD, PROC_STATUS,
+    PROC_CWD, PROC_EXIT, PROC_PID, PROC_PIPE, PROC_RUN, PROC_SET_CWD, PROC_STATUS,
 };
 use crate::native::time::{TIME_ADD, TIME_DIFF, TIME_SUB, TimeOpKind};
 use crate::native::url::{URL_DECODE, URL_DECODE_QUERY, URL_ENCODE, URL_ENCODE_QUERY, URL_PARSE};
@@ -66,6 +66,7 @@ pub(crate) fn type_tag_for_switch(ty: &Type, checked: &CheckedProgram) -> Result
         Type::Float => Ok(SCHEMA_BOXED_FLOAT),
         Type::Bool => Ok(SCHEMA_BOXED_BOOL),
         Type::String => Ok(SCHEMA_STR_TAG),
+        Type::Bytes => Ok(crate::vm::value::SCHEMA_BYTES_TAG),
         Type::List(_) => Ok(SCHEMA_LIST_TAG),
         Type::Map(_, _) => Ok(SCHEMA_MAP_TAG),
         Type::Custom(tid) => match &tid.module {
@@ -121,6 +122,11 @@ pub(crate) fn type_tag_for_switch(ty: &Type, checked: &CheckedProgram) -> Result
             },
             _ => Err(format!("Unsupported type '{}' in switch pattern", tid)),
         },
+        Type::Generic { type_id: tid, .. }
+            if tid.module == ModuleId::Native("cdt.chan".to_string()) && tid.name == "Chan" =>
+        {
+            Ok(crate::vm::value::SCHEMA_CHAN_HANDLE)
+        }
         other => Err(format!("Unsupported type '{}' in switch pattern", other)),
     }
 }
@@ -859,6 +865,12 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 self.ops.push(Op::ExtOp { kind: EXT_PROCESS_OP, aux, a, b, c });
                 Ok(a)
             }
+            "pipe" => {
+                let b = self.lower_obj(&args[0])?;
+                let a = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp { kind: EXT_PROCESS_OP, aux: PROC_PIPE, a, b, c: 0 });
+                Ok(a)
+            }
             "cwd" => {
                 let a = self.alloc_temp_o();
                 self.ops.push(Op::ExtOp { kind: EXT_PROCESS_OP, aux: PROC_CWD, a, b: 0, c: 0 });
@@ -1168,15 +1180,28 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             "HttpError" => {
                 self.lower_native_record(SCHEMA_HTTP_ERROR, &["kind", "message"], args, named_args)
             }
-            "Request" => self.lower_native_record(
-                SCHEMA_HTTP_REQUEST,
-                &["method", "path", "body", "headers", "query", "params"],
-                args,
-                named_args,
-            ),
+            "Request" => {
+                let mut regs = [0; 6];
+                for (idx, field) in ["method", "path", "body", "headers", "query", "params"].into_iter().enumerate() {
+                    regs[idx] = self.lower_obj(get_expr(idx, field))?;
+                }
+                let dst_obj = self.alloc_temp_o();
+                let desc_idx = self.mc.intern_record_desc(RecordDesc {
+                    schema_id: SCHEMA_HTTP_REQUEST,
+                    scalar_regs: Box::new([]),
+                    obj_regs: Box::new(regs),
+                })?;
+                self.ops.push(Op::NewHttpRequest { dst_obj, desc_idx });
+                Ok(dst_obj)
+            }
             "Response" | "BinaryResponse" => {
                 let status_s = self.lower_scalar(get_expr(0, "status"))?;
-                let body_o = self.lower_obj(get_expr(1, "body"))?;
+                let mut body_o = self.lower_obj(get_expr(1, "body"))?;
+                if sym == "BinaryResponse" && get_expr(1, "body").ty != Type::Bytes {
+                    let dst_obj = self.alloc_temp_o();
+                    self.ops.push(Op::ToBytes { dst_obj, src_obj: body_o });
+                    body_o = dst_obj;
+                }
                 let headers_o = self.lower_obj(get_expr(2, "headers"))?;
                 let schema_id = if sym == "BinaryResponse" {
                     SCHEMA_HTTP_BINARY_RESPONSE
@@ -1369,6 +1394,24 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                             self.ops.push(Op::ExtOp {
                                 kind: EXT_HTTP_OP,
                                 aux: HTTP_ROUTE_AFTER,
+                                a: router_o,
+                                b: handler_o,
+                                c: 0,
+                            });
+                        }
+                        HttpRouterDeclKind::OnStart => {
+                            self.ops.push(Op::ExtOp {
+                                kind: EXT_HTTP_OP,
+                                aux: HTTP_ROUTE_ON_START,
+                                a: router_o,
+                                b: handler_o,
+                                c: 0,
+                            });
+                        }
+                        HttpRouterDeclKind::OnStop => {
+                            self.ops.push(Op::ExtOp {
+                                kind: EXT_HTTP_OP,
+                                aux: HTTP_ROUTE_ON_STOP,
                                 a: router_o,
                                 b: handler_o,
                                 c: 0,
@@ -1856,11 +1899,12 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 });
                 Ok(router_o)
             }
-            ("Router", "before" | "after") => {
-                let aux = if method == "before" {
-                    HTTP_ROUTE_BEFORE
-                } else {
-                    HTTP_ROUTE_AFTER
+            ("Router", "before" | "after" | "on_start" | "on_stop") => {
+                let aux = match method {
+                    "before" => HTTP_ROUTE_BEFORE,
+                    "after" => HTTP_ROUTE_AFTER,
+                    "on_start" => HTTP_ROUTE_ON_START,
+                    _ => HTTP_ROUTE_ON_STOP,
                 };
                 let handler_o = self.lower_obj(&args[0])?;
                 self.ops.push(Op::ExtOp {
@@ -1942,6 +1986,11 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             && m == "cdt.redis"
         {
             return self.lower_redis_method(&tid.name, target, method, type_args, args);
+        }
+        if let ModuleId::Native(m) = &tid.module
+            && m == "cdt.chan"
+        {
+            return self.lower_chan_method(&tid.name, target, method, args);
         }
         if let ModuleId::Native(m) = &tid.module
             && m == "cdt.time"
@@ -2078,6 +2127,12 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
         method: &str,
         args: &[Expr],
     ) -> Result<Option<u16>, String> {
+        if target.ty == Type::Bytes && method == "to_list" {
+            let src_obj = self.lower_obj(target)?;
+            let dst_obj = self.alloc_temp_o();
+            self.ops.push(Op::BytesToList { dst_obj, src_obj });
+            return Ok(Some(dst_obj));
+        }
         if method == "to_string" {
             if target.ty.is_scalar() {
                 let src_s = self.lower_scalar(target)?;
@@ -2135,7 +2190,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 });
                 Ok(Some(dst_obj))
             }
-            (Type::List(elem), "get") => {
+            (ty @ (Type::List(_) | Type::Bytes), "get") => {
                 let list_obj = self.lower_obj(target)?;
                 let idx_s = self.lower_scalar(&args[0])?;
                 let dst_obj = self.alloc_temp_o();
@@ -2143,7 +2198,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                     dst_obj,
                     list_obj,
                     idx_s,
-                    elem_tag: elem_tag_for(elem),
+                    elem_tag: if let Type::List(elem) = ty { elem_tag_for(elem) } else { 1 },
                 });
                 Ok(Some(dst_obj))
             }
@@ -2191,7 +2246,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 Ok(Some(dst_obj))
             }
             (Type::List(_), "find") => Ok(Some(self.lower_list_pred_loop(target, &args[0], 2)?)),
-            (Type::List(_), "slice") => {
+            (Type::List(_) | Type::Bytes, "slice") => {
                 let list_obj = self.lower_obj(target)?;
                 let start_s = self.lower_scalar(&args[0])?;
                 let end_s = self.lower_scalar(&args[1])?;

@@ -1,4 +1,9 @@
+import * as cache from "cdt.cache"
+import * as chan from "cdt.chan"
 import * as http from "cdt.http"
+import * as lock from "cdt.lock"
+import * as process from "cdt.process"
+import * as time from "cdt.time"
 import { load_config } from "./config"
 import { process_events } from "./pipeline"
 import { build_demo_router } from "./server"
@@ -71,8 +76,79 @@ test "cli_http router cors group middleware and routes" {
     ))
     assert_eq(r_bad_limit.status, 422)
 
+    // Verify background spawn task in PATCH /items/9 updated shared cache
+    state := cache.open("demo_server_state")
+    var patch_wait = 0
+    while patch_wait < 30 && (state.get("last_patched_id") ?? "") != "9" {
+        _s := time.sleep(10)
+        patch_wait = patch_wait + 1
+    }
+    assert_eq(state.get("last_patched_id") ?? "", "9")
+
     // Pooled http.Client builder & stats
     client := http.client("http://127.0.0.1:1").bearer("secret").timeout_ms(500)
     assert_eq(client.pool_stats().get("idle") ?? -1, 0)
     client.close()
+}
+
+struct WorkerResult {
+    worker: String
+    total: Int
+}
+
+test "cli_http process.pipe and spawn cross-thread data transfer" {
+    pipe_out := process.pipe([
+        ["printf", "alpha\nbeta\ngamma\n"],
+        ["grep", "beta"],
+    ])?
+    assert_eq(pipe_out.code, 0)
+    assert_eq(pipe_out.stdout, "beta\n")
+
+    // Go-style typed channel (`cdt.chan`) + integer range (`for i in 3`) + `for res in ch`
+    ch := chan.open<WorkerResult>(4)
+    spawn {
+        for i in 3 {
+            ch.send(WorkerResult(worker: "w{i}", total: (i + 1) * 10))
+        }
+        ch.close()
+    }
+    var chan_sum = 0
+    for res in ch {
+        chan_sum = chan_sum + res.total
+    }
+    assert_eq(chan_sum, 60)
+
+    mailbox := cache.open("demo_worker_mailbox")
+    mailbox.clear()?
+    items := [10, 20, 12]
+    prefix := "sum"
+    done := chan.open<WorkerResult>(1)
+    spawn {
+        var total = 0
+        for n in items {
+            total = total + n
+        }
+        _locked := lock.with("demo_mailbox_lock", () => {
+            box := cache.open("demo_worker_mailbox")
+            _s := box.set_json("result", WorkerResult(worker: prefix, total: total))
+        })
+        done.send(WorkerResult(worker: prefix, total: total))
+        done.close()
+    }
+
+    switch done.recv() {
+        case WorkerResult(res):
+            assert_eq(res.worker, "sum")
+            assert_eq(res.total, 42)
+        case nil:
+            assert(false)
+    }
+    got := mailbox.get_json<WorkerResult>("result")?
+    switch got {
+        case WorkerResult(res):
+            assert_eq(res.worker, "sum")
+            assert_eq(res.total, 42)
+        case nil:
+            assert(false)
+    }
 }

@@ -609,6 +609,7 @@ mod oid {
     pub const OID: u32 = 26;
     pub const FLOAT4: u32 = 700;
     pub const FLOAT8: u32 = 701;
+    pub const UUID: u32 = 2950;
 }
 
 fn decode_cell(type_oid: u32, bytes: Option<&[u8]>) -> Cell {
@@ -632,6 +633,39 @@ fn decode_cell(type_oid: u32, bytes: Option<&[u8]>) -> Cell {
                 .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()),
         ),
     }
+}
+
+fn supports_binary_result(type_oid: u32) -> bool {
+    matches!(type_oid, oid::BOOL | oid::INT2 | oid::INT4 | oid::INT8 | oid::OID | oid::FLOAT8 | oid::UUID)
+}
+
+fn decode_binary_cell(type_oid: u32, bytes: &[u8]) -> Result<Cell, Failure> {
+    let wrong_length = |_| Failure::Broken(format!("Invalid PostgreSQL binary value for OID {type_oid}"));
+    Ok(match type_oid {
+        oid::BOOL => match bytes {
+            [0] => Cell::Bool(false),
+            [1] => Cell::Bool(true),
+            _ => return Err(Failure::Broken("Invalid PostgreSQL binary Bool".to_owned())),
+        },
+        oid::INT2 => Cell::Int(i64::from(i16::from_be_bytes(bytes.try_into().map_err(wrong_length)?))),
+        oid::INT4 => Cell::Int(i64::from(i32::from_be_bytes(bytes.try_into().map_err(wrong_length)?))),
+        oid::INT8 => Cell::Int(i64::from_be_bytes(bytes.try_into().map_err(wrong_length)?)),
+        oid::OID => Cell::Int(i64::from(u32::from_be_bytes(bytes.try_into().map_err(wrong_length)?))),
+        oid::FLOAT8 => Cell::Float(f64::from_be_bytes(bytes.try_into().map_err(wrong_length)?)),
+        oid::UUID if bytes.len() == 16 => {
+            let mut uuid = String::with_capacity(36);
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            for (i, &byte) in bytes.iter().enumerate() {
+                if matches!(i, 4 | 6 | 8 | 10) {
+                    uuid.push('-');
+                }
+                uuid.push(char::from(HEX[usize::from(byte >> 4)]));
+                uuid.push(char::from(HEX[usize::from(byte & 0xf)]));
+            }
+            Cell::Text(uuid)
+        }
+        _ => return Err(Failure::Broken(format!("Unsupported PostgreSQL binary value for OID {type_oid}"))),
+    })
 }
 
 fn encode_param(cell: &Cell) -> Result<Option<Vec<u8>>, String> {
@@ -899,7 +933,7 @@ fn run_statement(
         let mut message = Out::message(b'Q');
         message.cstr(&translated);
         conn.send(&message.finish(true))?;
-        return read_response(conn, None).map(|(ex, _)| ex);
+        return read_response(conn, None, false).map(|(ex, _)| ex);
     }
 
     if params.len() > 65_535 {
@@ -935,7 +969,15 @@ fn run_statement(
                 }
             }
         }
-        bind.i16(0);
+        let binary = cached.columns.iter().any(|(_, oid)| supports_binary_result(*oid));
+        if binary {
+            bind.i16(cached.columns.len() as i16);
+            for &(_, oid) in &cached.columns {
+                bind.i16(i16::from(supports_binary_result(oid)));
+            }
+        } else {
+            bind.i16(0);
+        }
         request.extend(bind.finish(true));
 
         let mut execute = Out::message(b'E');
@@ -944,7 +986,7 @@ fn run_statement(
         request.extend(Out::message(b'S').finish(true));
 
         conn.send(&request)?;
-        return match read_response(conn, Some(&cached.columns)) {
+        return match read_response(conn, Some((&cached.columns, binary)), want_rows) {
             Ok((ex, _)) => Ok(ex),
             Err(Failure::Server(err)) if err.code == "26000" || err.code == "0A000" => {
                 conn.stmt_cache.remove(sql);
@@ -1008,7 +1050,7 @@ fn run_statement(
     request.extend(Out::message(b'S').finish(true));
 
     conn.send(&request)?;
-    let (ex, cols) = read_response(conn, None)?;
+    let (ex, cols) = read_response(conn, None, want_rows)?;
     if prepare
         && let Some(evicted) = conn.stmt_cache.insert(
             sql.to_string(),
@@ -1024,7 +1066,7 @@ fn run_statement(
         let mut flush = close.finish(true);
         flush.extend(Out::message(b'S').finish(true));
         if conn.send(&flush).is_ok() {
-            let _ = read_response(conn, None);
+            let _ = read_response(conn, None, false);
         }
     }
     Ok(ex)
@@ -1032,9 +1074,11 @@ fn run_statement(
 
 fn read_response(
     conn: &mut Conn,
-    preset_cols: Option<&[(String, u32)]>,
+    preset_cols: Option<(&[(String, u32)], bool)>,
+    want_rows: bool,
 ) -> Result<(Exchange, Vec<(String, u32)>), Failure> {
-    let mut columns: Vec<(String, u32)> = preset_cols.map(|c| c.to_vec()).unwrap_or_default();
+    let (preset, mut binary) = preset_cols.unwrap_or_default();
+    let mut columns = preset.to_vec();
     let mut result = QueryResult::default();
     if !columns.is_empty() {
         result.columns = columns
@@ -1055,6 +1099,8 @@ fn read_response(
             b'T' => {
                 let mut reader = Reader::new(body);
                 let count = reader.i16()? as usize;
+                // Only the cached Bind path requests binary formats and omits Describe.
+                binary = false;
                 columns.clear();
                 for _ in 0..count {
                     let name = reader.cstr()?;
@@ -1071,7 +1117,7 @@ fn read_response(
                     })
                     .collect();
             }
-            b'D' => {
+            b'D' if want_rows => {
                 let mut reader = Reader::new(body);
                 let count = reader.i16()? as usize;
                 if count != columns.len() {
@@ -1087,7 +1133,12 @@ fn read_response(
                     row.push(if length < 0 {
                         decode_cell(*type_oid, None)
                     } else {
-                        decode_cell(*type_oid, Some(reader.take(length as usize)?))
+                        let bytes = reader.take(length as usize)?;
+                        if binary && supports_binary_result(*type_oid) {
+                            decode_binary_cell(*type_oid, bytes)?
+                        } else {
+                            decode_cell(*type_oid, Some(bytes))
+                        }
                     });
                 }
                 result.rows.push(row);
@@ -1112,7 +1163,7 @@ fn run_simple(conn: &mut Conn, sql: &str) -> Result<(), String> {
     let mut message = Out::message(b'Q');
     message.cstr(sql);
     conn.send(&message.finish(true))?;
-    read_response(conn, None).map(|_| ()).map_err(|f| match f {
+    read_response(conn, None, false).map(|_| ()).map_err(|f| match f {
         Failure::Server(e) => e.text(),
         Failure::Msg(m) | Failure::Broken(m) => m,
     })
@@ -1345,6 +1396,23 @@ fn open_connection(config: &PgConfig) -> Result<Conn, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binary_result_formats_preserve_database_cell_types() {
+        for (oid, bytes, expected) in [
+            (oid::INT2, (-23i16).to_be_bytes().to_vec(), Cell::Int(-23)),
+            (oid::INT4, (-42i32).to_be_bytes().to_vec(), Cell::Int(-42)),
+            (oid::INT8, i64::MIN.to_be_bytes().to_vec(), Cell::Int(i64::MIN)),
+            (oid::OID, u32::MAX.to_be_bytes().to_vec(), Cell::Int(i64::from(u32::MAX))),
+            (oid::BOOL, vec![1], Cell::Bool(true)),
+            (oid::FLOAT8, (-1.25f64).to_be_bytes().to_vec(), Cell::Float(-1.25)),
+            (oid::UUID, vec![0xff; 16], Cell::Text("ffffffff-ffff-ffff-ffff-ffffffffffff".to_owned())),
+        ] {
+            assert!(supports_binary_result(oid));
+            assert_eq!(decode_binary_cell(oid, &bytes).ok(), Some(expected));
+            assert!(decode_binary_cell(oid, &bytes[..bytes.len() - 1]).is_err());
+        }
+    }
 
     #[test]
     fn pg_url_parsing() {

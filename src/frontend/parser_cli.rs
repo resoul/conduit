@@ -395,6 +395,43 @@ impl Parser {
                         }
                     }
                 }
+                "on_start" | "on_stop" | "on" => {
+                    let hook_kw = if kw == "on" {
+                        let (sub, sub_span) = self.expect_ident()?;
+                        match sub.as_str() {
+                            "start" => "on_start",
+                            "stop" => "on_stop",
+                            other => {
+                                return Err(ParserError {
+                                    message: format!(
+                                        "Expected 'start' or 'stop' after 'on' in router block, got '{}'",
+                                        other
+                                    ),
+                                    span: sub_span,
+                                });
+                            }
+                        }
+                    } else {
+                        kw.as_str()
+                    };
+                    if !prefix.is_empty() || guard_fn.is_some() {
+                        return Err(ParserError {
+                            message: "on_start/on_stop must be declared at the root of a router block".to_string(),
+                            span,
+                        });
+                    }
+                    let _ = self.match_token(&TokenKind::FatArrow);
+                    let (handler_name, hspan) = self.expect_ident()?;
+                    FieldAnnotation {
+                        target: format!("router.{}", hook_kw),
+                        args: vec![Expr {
+                            kind: ExprKind::Ident(handler_name),
+                            ty: crate::frontend::types::Type::Void,
+                            span: hspan,
+                        }],
+                        span,
+                    }
+                }
                 "static" => {
                     let pspan = self.peek().span;
                     let Some(url_pat) = self.try_take_string() else {
@@ -967,6 +1004,67 @@ impl Parser {
             })),
             start_span,
             is_exported,
+        ))
+    }
+
+    pub(super) fn parse_lifecycle_item(
+        &mut self,
+        is_exported: bool,
+        export_span: Option<Span>,
+    ) -> Result<Item, ParserError> {
+        let start_tok = self.bump();
+        let start_span = start_tok.span;
+        if is_exported {
+            return Err(ParserError {
+                message: "'export' cannot be applied to lifecycle hooks".to_string(),
+                span: export_span.unwrap_or(start_span),
+            });
+        }
+        let is_start = match &start_tok.kind {
+            TokenKind::Ident(kw) if kw == "on_start" => true,
+            TokenKind::Ident(kw) if kw == "on_stop" => false,
+            TokenKind::Ident(kw) if kw == "on" => {
+                let (sub, sub_span) = self.expect_ident()?;
+                match sub.as_str() {
+                    "start" => true,
+                    "stop" => false,
+                    other => {
+                        return Err(ParserError {
+                            message: format!(
+                                "Expected 'start' or 'stop' after 'on', got '{}'",
+                                other
+                            ),
+                            span: sub_span,
+                        });
+                    }
+                }
+            }
+            _ => unreachable!(),
+        };
+        let return_type = if self.match_token(&TokenKind::Arrow) {
+            Some(self.parse_type_expr()?)
+        } else {
+            None
+        };
+        let body = self.parse_block()?;
+        let idx = self.lifecycle_counter;
+        self.lifecycle_counter += 1;
+        let name = if is_start {
+            format!("__cdt_on_start_{}", idx)
+        } else {
+            format!("__cdt_on_stop_{}", idx)
+        };
+        Ok(Item::new_exported(
+            ItemKind::Func {
+                name,
+                type_params: Vec::new(),
+                params: Vec::new(),
+                return_type,
+                body,
+                is_validator: false,
+            },
+            start_span,
+            false,
         ))
     }
 }

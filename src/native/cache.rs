@@ -1,5 +1,7 @@
+use std::borrow::Borrow;
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
+use std::hash::BuildHasher;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -8,7 +10,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::native::json_encode::write_escaped_bytes;
 use crate::native::lock::{file_lock_exclusive, file_lock_shared};
-use crate::vm::value::{Obj, SCHEMA_CACHE_ERROR, SCHEMA_CACHE_HANDLE, StructData};
+use crate::vm::string::VmString;
+use crate::vm::value::{FxBuildHasher, Obj, SCHEMA_CACHE_ERROR, SCHEMA_CACHE_HANDLE, StructData};
 
 pub const CACHE_OPEN: u8 = 0;
 pub const CACHE_OPEN_FILE: u8 = 1;
@@ -29,6 +32,7 @@ pub const CACHE_PRUNE: u8 = 15;
 pub const CACHE_SAVE: u8 = 16;
 pub const CACHE_LOAD: u8 = 17;
 pub const CACHE_COMPACT: u8 = 18;
+pub const CACHE_SET_NO_TTL: u8 = 19;
 
 const AUTO_COMPACT_MIN_OPS: usize = 4096;
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -369,9 +373,18 @@ fn append_wal_del(buf: &mut Vec<u8>, key: &str) {
 
 const LRU_NONE: u32 = u32::MAX;
 
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct CacheKey(Arc<VmString>);
+
+impl Borrow<str> for CacheKey {
+    fn borrow(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
 struct CacheSlot {
-    key: Arc<str>,
-    value: String,
+    key: CacheKey,
+    value: Option<Arc<VmString>>,
     expires_at_ms: Option<i64>,
     prev: u32,
     next: u32,
@@ -395,7 +408,7 @@ struct CacheInner {
     max_entries: usize,
     slots: Vec<CacheSlot>,
     free_slots: Vec<u32>,
-    index: HashMap<Arc<str>, u32, crate::vm::value::FxBuildHasher>,
+    index: HashMap<CacheKey, u32, FxBuildHasher>,
     head: u32,
     tail: u32,
     live_count: usize,
@@ -409,7 +422,7 @@ impl CacheInner {
             max_entries,
             slots: Vec::new(),
             free_slots: Vec::new(),
-            index: HashMap::with_hasher(crate::vm::value::FxBuildHasher),
+            index: HashMap::with_hasher(FxBuildHasher),
             head: LRU_NONE,
             tail: LRU_NONE,
             live_count: 0,
@@ -458,16 +471,16 @@ impl CacheInner {
         self.push_front(idx);
     }
 
-    fn remove_slot(&mut self, idx: u32) -> Arc<str> {
+    fn remove_slot(&mut self, idx: u32) -> CacheKey {
         self.unlink_slot(idx);
         let slot = &mut self.slots[idx as usize];
         slot.alive = false;
-        let key = Arc::clone(&slot.key);
-        slot.value.clear();
+        let key = slot.key.clone();
+        slot.value = None;
         if let Some(exp) = slot.expires_at_ms.take() {
             self.ttl_index.remove(&(exp, idx));
         }
-        self.index.remove(key.as_ref());
+        self.index.remove(key.0.as_str());
         self.live_count -= 1;
         self.free_slots.push(idx);
         key
@@ -492,52 +505,70 @@ impl CacheInner {
         }
     }
 
-    fn insert_in_memory(&mut self, key: &str, value: &str, expires_at_ms: Option<i64>) {
-        if let Some(&idx) = self.index.get(key) {
-            let old_exp = self.slots[idx as usize].expires_at_ms;
-            if old_exp != expires_at_ms {
-                if let Some(old) = old_exp {
-                    self.ttl_index.remove(&(old, idx));
+    fn insert_in_memory(&mut self, key: Arc<VmString>, value: Arc<VmString>, expires_at_ms: Option<i64>) {
+        match self.index.entry(CacheKey(key)) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                let idx = *entry.get();
+                let old_exp = self.slots[idx as usize].expires_at_ms;
+                if old_exp != expires_at_ms {
+                    if let Some(old) = old_exp {
+                        self.ttl_index.remove(&(old, idx));
+                    }
+                    if let Some(new_exp) = expires_at_ms {
+                        self.ttl_index.insert((new_exp, idx));
+                    }
+                    self.slots[idx as usize].expires_at_ms = expires_at_ms;
                 }
-                if let Some(new_exp) = expires_at_ms {
-                    self.ttl_index.insert((new_exp, idx));
-                }
-                self.slots[idx as usize].expires_at_ms = expires_at_ms;
+                self.slots[idx as usize].value = Some(value);
+                self.move_to_front(idx);
             }
-            self.slots[idx as usize].value.clear();
-            self.slots[idx as usize].value.push_str(value);
-            self.move_to_front(idx);
-            return;
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                if self.wal.is_none()
+                    && expires_at_ms.is_none()
+                    && self.ttl_index.is_empty()
+                    && self.max_entries > 0
+                    && self.live_count == self.max_entries
+                    && self.tail != LRU_NONE
+                {
+                    let reuse_idx = self.tail;
+                    let new_key = vacant.key().clone();
+                    vacant.insert(reuse_idx);
+                    self.move_to_front(reuse_idx);
+                    let old_key = std::mem::replace(&mut self.slots[reuse_idx as usize].key, new_key);
+                    self.slots[reuse_idx as usize].value = Some(value);
+                    self.index.remove(old_key.0.as_str());
+                    return;
+                }
+                let arc_key = vacant.key().clone();
+                let idx = if let Some(free_idx) = self.free_slots.pop() {
+                    let slot = &mut self.slots[free_idx as usize];
+                    slot.key = arc_key;
+                    slot.value = Some(value);
+                    slot.expires_at_ms = expires_at_ms;
+                    slot.prev = LRU_NONE;
+                    slot.next = LRU_NONE;
+                    slot.alive = true;
+                    free_idx
+                } else {
+                    let new_idx = self.slots.len() as u32;
+                    self.slots.push(CacheSlot {
+                        key: arc_key,
+                        value: Some(value),
+                        expires_at_ms,
+                        prev: LRU_NONE,
+                        next: LRU_NONE,
+                        alive: true,
+                    });
+                    new_idx
+                };
+                vacant.insert(idx);
+                if let Some(exp) = expires_at_ms {
+                    self.ttl_index.insert((exp, idx));
+                }
+                self.live_count += 1;
+                self.push_front(idx);
+            }
         }
-        let arc_key: Arc<str> = Arc::from(key);
-        let idx = if let Some(free_idx) = self.free_slots.pop() {
-            let slot = &mut self.slots[free_idx as usize];
-            slot.key = Arc::clone(&arc_key);
-            slot.value.clear();
-            slot.value.push_str(value);
-            slot.expires_at_ms = expires_at_ms;
-            slot.prev = LRU_NONE;
-            slot.next = LRU_NONE;
-            slot.alive = true;
-            free_idx
-        } else {
-            let new_idx = self.slots.len() as u32;
-            self.slots.push(CacheSlot {
-                key: Arc::clone(&arc_key),
-                value: value.to_string(),
-                expires_at_ms,
-                prev: LRU_NONE,
-                next: LRU_NONE,
-                alive: true,
-            });
-            new_idx
-        };
-        if let Some(exp) = expires_at_ms {
-            self.ttl_index.insert((exp, idx));
-        }
-        self.index.insert(arc_key, idx);
-        self.live_count += 1;
-        self.push_front(idx);
     }
 
     fn prune_expired(&mut self, now_ms: i64) -> usize {
@@ -557,7 +588,7 @@ impl CacheInner {
         count
     }
 
-    fn enforce_cap(&mut self, now_ms: i64) -> Vec<String> {
+    fn enforce_cap(&mut self, now_ms: i64) -> Vec<CacheKey> {
         let mut evicted = Vec::new();
         if self.max_entries == 0 || self.live_count <= self.max_entries {
             return evicted;
@@ -573,7 +604,7 @@ impl CacheInner {
             }
             let key = self.remove_slot(lru_idx);
             if record_evicted {
-                evicted.push(key.as_ref().to_string());
+                evicted.push(key);
             }
         }
         evicted
@@ -620,7 +651,8 @@ impl CacheInner {
         let mut live = 0usize;
         for slot in &self.slots {
             if slot.alive {
-                append_wal_set(&mut buf, &slot.key, &slot.value, slot.expires_at_ms);
+                let Some(value) = &slot.value else { continue };
+                append_wal_set(&mut buf, &slot.key.0, value, slot.expires_at_ms);
                 live += 1;
             }
         }
@@ -655,16 +687,19 @@ impl CacheInner {
     }
 }
 
+const KEY_LOCK_SHARDS: usize = 16;
+type KeyLockShard = Mutex<HashMap<CacheKey, Arc<Mutex<()>>, FxBuildHasher>>;
+
 pub(crate) struct CacheStore {
     state: Mutex<CacheInner>,
-    key_locks: Mutex<HashMap<String, Arc<Mutex<()>>, crate::vm::value::FxBuildHasher>>,
+    key_locks: [KeyLockShard; KEY_LOCK_SHARDS],
 }
 
 impl CacheStore {
     fn new_in_mem(max_entries: usize) -> Self {
         Self {
             state: Mutex::new(CacheInner::new(max_entries)),
-            key_locks: Mutex::new(HashMap::with_hasher(crate::vm::value::FxBuildHasher)),
+            key_locks: std::array::from_fn(|_| KeyLockShard::default()),
         }
     }
 
@@ -727,7 +762,7 @@ impl CacheStore {
                         if exp.is_some_and(|e| now >= e) {
                             inner.remove_key_only(&k);
                         } else {
-                            inner.insert_in_memory(&k, &v, exp);
+                            inner.insert_in_memory(Arc::new(k.into()), Arc::new(v.into()), exp);
                             let _ = inner.enforce_cap(now);
                         }
                     }
@@ -768,22 +803,29 @@ impl CacheStore {
 
         Ok(Self {
             state: Mutex::new(inner),
-            key_locks: Mutex::new(HashMap::with_hasher(crate::vm::value::FxBuildHasher)),
+            key_locks: std::array::from_fn(|_| KeyLockShard::default()),
         })
     }
 
-    pub(crate) fn key_lock(&self, key: &str) -> Arc<Mutex<()>> {
-        let mut map = self.key_locks.lock().unwrap_or_else(|e| e.into_inner());
-        if map.len() > 256 && map.len().is_multiple_of(64) {
+    pub(crate) fn key_lock(&self, key: &Arc<VmString>) -> Arc<Mutex<()>> {
+        let hash = FxBuildHasher.hash_one(key.as_str());
+        let shard = &self.key_locks[hash as usize % KEY_LOCK_SHARDS];
+        let mut map = shard.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(lock) = map.get(key.as_str()) {
+            return Arc::clone(lock);
+        }
+        if map.len() > 256 / KEY_LOCK_SHARDS
+            && map.len().is_multiple_of(64 / KEY_LOCK_SHARDS)
+        {
             map.retain(|_, v| Arc::strong_count(v) > 1);
         }
         Arc::clone(
-            map.entry(key.to_string())
+            map.entry(CacheKey(Arc::clone(key)))
                 .or_insert_with(|| Arc::new(Mutex::new(()))),
         )
     }
 
-    pub(crate) fn get_str(&self, key: &str) -> Option<String> {
+    pub(crate) fn get_str(&self, key: &str) -> Option<Arc<VmString>> {
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let inner = &mut *guard;
         let idx = *inner.index.get(key)?;
@@ -795,13 +837,13 @@ impl CacheStore {
         }
         let val = inner.slots[idx as usize].value.clone();
         inner.move_to_front(idx);
-        Some(val)
+        val
     }
 
     pub(crate) fn set_str(
         &self,
-        key: &str,
-        val: &str,
+        key: &Arc<VmString>,
+        val: Arc<VmString>,
         ttl_ms: Option<i64>,
     ) -> Result<(), (&'static str, String)> {
         let mut now_cached: Option<i64> = None;
@@ -818,18 +860,19 @@ impl CacheStore {
             }
         };
         let mut inner = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        inner.insert_in_memory(key, val, exp);
+        let wal_value = inner.wal.as_ref().map(|_| Arc::clone(&val));
+        inner.insert_in_memory(Arc::clone(key), val, exp);
         let now = if !inner.ttl_index.is_empty() {
             now_cached.unwrap_or_else(now_unix_ms)
         } else {
             0
         };
         let evicted = inner.enforce_cap(now);
-        if inner.wal.is_some() {
+        if let Some(val) = wal_value {
             let mut buf = Vec::with_capacity(key.len() + val.len() + 48);
-            append_wal_set(&mut buf, key, val, exp);
+            append_wal_set(&mut buf, key, &val, exp);
             for ek in &evicted {
-                append_wal_del(&mut buf, ek);
+                append_wal_del(&mut buf, &ek.0);
             }
             inner.write_wal_bytes(&buf, 1 + evicted.len())?;
         }
@@ -838,7 +881,7 @@ impl CacheStore {
 
     pub(crate) fn incr(
         &self,
-        key: &str,
+        key: &Arc<VmString>,
         delta: i64,
         ttl_ms: Option<i64>,
     ) -> Result<i64, (&'static str, String)> {
@@ -849,18 +892,19 @@ impl CacheStore {
         }
         let now = now_unix_ms();
         let mut inner = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(&idx) = inner.index.get(key)
+        if let Some(&idx) = inner.index.get(key.as_str())
             && inner.slots[idx as usize].is_expired(now)
         {
             inner.remove_slot(idx);
         }
 
-        let (next_val, exp) = if let Some(&idx) = inner.index.get(key) {
+        let (next_val, exp) = if let Some(&idx) = inner.index.get(key.as_str()) {
             let entry = &inner.slots[idx as usize];
-            let cur = entry.value.parse::<i64>().map_err(|_| {
+            let value = entry.value.as_deref().expect("live cache entry has a value");
+            let cur = value.parse::<i64>().map_err(|_| {
                 (
                     "invalid_value",
-                    format!("Cache key '{}' value '{}' is not an integer", key, entry.value),
+                    format!("Cache key '{}' value '{}' is not an integer", key, value),
                 )
             })?;
             let sum = cur.checked_add(delta).ok_or_else(|| {
@@ -875,14 +919,14 @@ impl CacheStore {
             (delta, exp)
         };
 
-        let val_str = next_val.to_string();
-        inner.insert_in_memory(key, &val_str, exp);
+        let val_str = Arc::new(VmString::from(next_val.to_string()));
+        inner.insert_in_memory(Arc::clone(key), Arc::clone(&val_str), exp);
         let evicted = inner.enforce_cap(now);
         if inner.wal.is_some() {
             let mut buf = Vec::with_capacity(key.len() + val_str.len() + 48);
             append_wal_set(&mut buf, key, &val_str, exp);
             for ek in &evicted {
-                append_wal_del(&mut buf, ek);
+                append_wal_del(&mut buf, &ek.0);
             }
             inner.write_wal_bytes(&buf, 1 + evicted.len())?;
         }
@@ -941,8 +985,8 @@ impl CacheStore {
         let mut out: Vec<String> = inner
             .slots
             .iter()
-            .filter(|s| s.alive && prefix.is_none_or(|p| s.key.starts_with(p)))
-            .map(|s| s.key.as_ref().to_string())
+            .filter(|s| s.alive && prefix.is_none_or(|p| s.key.0.starts_with(p)))
+            .map(|s| s.key.0.as_str().to_string())
             .collect();
         out.sort();
         out
@@ -965,14 +1009,13 @@ impl CacheStore {
 
     pub(crate) fn save_snapshot(&self, path: &Path) -> Result<usize, (&'static str, String)> {
         let now = now_unix_ms();
-        let snapshot_items: Vec<(String, String, Option<i64>)> = {
+        let snapshot_items: Vec<_> = {
             let mut inner = self.state.lock().unwrap_or_else(|e| e.into_inner());
             inner.prune_expired(now);
             inner
                 .slots
                 .iter()
-                .filter(|s| s.alive)
-                .map(|s| (s.key.as_ref().to_string(), s.value.clone(), s.expires_at_ms))
+                .filter_map(|s| s.value.clone().map(|v| (Arc::clone(&s.key.0), v, s.expires_at_ms)))
                 .collect()
         };
 
@@ -1074,12 +1117,12 @@ impl CacheStore {
             if has_wal {
                 append_wal_set(&mut wal_buf, &k, &v, exp);
             }
-            inner.insert_in_memory(&k, &v, exp);
+            inner.insert_in_memory(Arc::new(k.into()), Arc::new(v.into()), exp);
         }
         let evicted = inner.enforce_cap(now);
         if has_wal {
             for ek in &evicted {
-                append_wal_del(&mut wal_buf, ek);
+                append_wal_del(&mut wal_buf, &ek.0);
             }
             if !wal_buf.is_empty() {
                 inner.write_wal_bytes(&wal_buf, loaded_count + evicted.len())?;

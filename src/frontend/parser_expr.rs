@@ -87,11 +87,23 @@ impl Parser {
     }
 
     fn parse_and(&mut self) -> Result<Expr, ParserError> {
-        self.parse_binary_op(Self::parse_equality, &[(TokenKind::And, BinaryOp::And)])
+        self.parse_binary_op(Self::parse_bit_or, &[(TokenKind::And, BinaryOp::And)])
+    }
+
+    fn parse_bit_or(&mut self) -> Result<Expr, ParserError> {
+        self.parse_binary_op(Self::parse_bit_xor, &[(TokenKind::Bar, BinaryOp::BitOr)])
+    }
+
+    fn parse_bit_xor(&mut self) -> Result<Expr, ParserError> {
+        self.parse_binary_op(Self::parse_bit_and, &[(TokenKind::Caret, BinaryOp::BitXor)])
+    }
+
+    fn parse_bit_and(&mut self) -> Result<Expr, ParserError> {
+        self.parse_binary_op(Self::parse_equality, &[(TokenKind::Ampersand, BinaryOp::BitAnd)])
     }
 
     pub(super) fn parse_query_value_expr(&mut self) -> Result<Expr, ParserError> {
-        self.parse_equality()
+        self.parse_bit_or()
     }
 
     fn parse_equality(&mut self) -> Result<Expr, ParserError> {
@@ -106,7 +118,7 @@ impl Parser {
 
     fn parse_comparison(&mut self) -> Result<Expr, ParserError> {
         self.parse_binary_op(
-            Self::parse_coalesce,
+            Self::parse_shift,
             &[
                 (TokenKind::Lt, BinaryOp::Lt),
                 (TokenKind::LtEq, BinaryOp::LtEq),
@@ -114,6 +126,31 @@ impl Parser {
                 (TokenKind::GtEq, BinaryOp::GtEq),
             ],
         )
+    }
+
+    fn parse_shift(&mut self) -> Result<Expr, ParserError> {
+        let mut left = self.parse_coalesce()?;
+        loop {
+            // Keep the angle brackets separate in the lexer for nested generic types.
+            let first = self.peek();
+            let second = self.peek_ahead(1);
+            let op = match (&first.kind, &second.kind) {
+                (TokenKind::Lt, TokenKind::Lt) => BinaryOp::ShiftLeft,
+                (TokenKind::Gt, TokenKind::Gt) => BinaryOp::ShiftRight,
+                _ => return Ok(left),
+            };
+            if first.span.line != second.span.line || first.span.col + 1 != second.span.col {
+                return Ok(left);
+            }
+            self.bump();
+            self.bump();
+            let span = left.span;
+            let right = self.parse_coalesce()?;
+            left = Expr::new(
+                ExprKind::Binary { op, left: Box::new(left), right: Box::new(right) },
+                span,
+            );
+        }
     }
 
     fn parse_coalesce(&mut self) -> Result<Expr, ParserError> {
@@ -396,22 +433,42 @@ impl Parser {
             TokenKind::LBracket => {
                 let saved_cursor = self.cursor;
                 let span = self.bump().span;
-                if let Ok(k_ty) = self.parse_type_expr()
-                    && self.match_token(&TokenKind::Colon)
-                    && let Ok(v_ty) = self.parse_type_expr()
-                    && self.match_token(&TokenKind::RBracket)
-                    && self.match_token(&TokenKind::LParen)
-                    && self.match_token(&TokenKind::RParen)
-                {
-                    return Ok(Expr::new(
-                        ExprKind::Call {
-                            callee: Box::new(Expr::new(ExprKind::Ident("Map".to_string()), span)),
-                            type_args: vec![k_ty, v_ty],
-                            args: Vec::new(),
-                            named_args: Vec::new(),
-                        },
-                        span,
-                    ));
+                if let Ok(first_ty) = self.parse_type_expr() {
+                    if self.match_token(&TokenKind::Colon)
+                        && let Ok(v_ty) = self.parse_type_expr()
+                        && self.match_token(&TokenKind::RBracket)
+                        && self.match_token(&TokenKind::LParen)
+                        && self.match_token(&TokenKind::RParen)
+                    {
+                        return Ok(Expr::new(
+                            ExprKind::Call {
+                                callee: Box::new(Expr::new(ExprKind::Ident("Map".to_string()), span)),
+                                type_args: vec![first_ty, v_ty],
+                                args: Vec::new(),
+                                named_args: Vec::new(),
+                            },
+                            span,
+                        ));
+                    }
+                    if self.check(&TokenKind::RBracket) {
+                        self.bump();
+                        if self.match_token(&TokenKind::LParen)
+                            && self.match_token(&TokenKind::RParen)
+                        {
+                            return Ok(Expr::new(
+                                ExprKind::Call {
+                                    callee: Box::new(Expr::new(
+                                        ExprKind::Ident("List".to_string()),
+                                        span,
+                                    )),
+                                    type_args: vec![first_ty],
+                                    args: Vec::new(),
+                                    named_args: Vec::new(),
+                                },
+                                span,
+                            ));
+                        }
+                    }
                 }
                 self.cursor = saved_cursor + 1;
                 let mut elements = Vec::new();

@@ -37,7 +37,8 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 if slot.is_scalar {
                     cap_s.push((name, ty, slot.reg));
                 } else {
-                    cap_o.push((name, ty, slot.reg));
+                    let src = self.materialize_local_obj(slot.reg, None);
+                    cap_o.push((name, ty, src));
                 }
             }
         }
@@ -243,6 +244,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             "cdt.lock" => self.lower_lock_call(sym, args, named_args),
             "cdt.cache" => self.lower_cache_call(sym, args, named_args),
             "cdt.redis" => self.lower_redis_call(sym, args, named_args),
+            "cdt.chan" => self.lower_chan_call(sym, args),
             other => Err(format!("Unsupported native call '{}.{}'", other, sym)),
         }
     }
@@ -279,7 +281,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
         self.lower_func_call(callee, args, true, false)
     }
 
-    pub(crate) fn lower_call_obj(&mut self, expr: &Expr) -> Result<u16, String> {
+    pub(crate) fn lower_call_obj(&mut self, expr: &Expr, dest: Option<u16>) -> Result<u16, String> {
         let ExprKind::Call { callee, type_args, args, named_args } = &expr.kind else {
             return Err("Expected call".to_string());
         };
@@ -324,7 +326,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                     let var = dvars.iter().find(|v| &v.name == field).ok_or_else(|| {
                         format!("Enum '{}' has no variant '{}'", alias, field)
                     })?;
-                    return self.lower_struct_ctor(&var.struct_name, args, named_args);
+                    return self.lower_struct_ctor(&var.struct_name, args, named_args, dest);
                 }
                 if let Some(&mod_name) = self.mc.checked.native_aliases.get(alias) {
                     return self.lower_native_obj_call(mod_name, field, type_args, args, named_args);
@@ -358,16 +360,28 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 let sym = sym.clone();
                 return self.lower_native_obj_call(mod_name, &sym, type_args, args, named_args);
             }
+            if name == "Bytes" {
+                let src_obj = self.lower_obj(&args[0])?;
+                let dst_obj = dest.unwrap_or_else(|| self.alloc_temp_o());
+                self.ops.push(Op::ToBytes { dst_obj, src_obj });
+                return Ok(dst_obj);
+            }
             if name == "Map" {
                 let dst_obj = self.alloc_temp_o();
                 self.ops.push(Op::NewMap { dst_obj });
                 return Ok(dst_obj);
             }
+            if name == "List" {
+                return self.lower_list_lit(&[], &expr.ty);
+            }
+            if name == "Chan" {
+                return self.lower_chan_call("open", args);
+            }
             if matches!(name.as_str(), "IndexError" | "KeyError" | "ParseError") {
                 return self.lower_prelude_error_ctor(name, args, named_args);
             }
             if self.mc.checked.struct_by_name.contains_key(name) {
-                return self.lower_struct_ctor(name, args, named_args);
+                return self.lower_struct_ctor(name, args, named_args, dest);
             }
         }
 
@@ -437,6 +451,12 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 self.lower_native_method_obj(tid, target, method, &[], args)?;
                 Ok(())
             }
+            (Type::Generic { type_id: tid, .. }, _)
+                if matches!(&tid.module, ModuleId::Native(m) if m == "cdt.chan") =>
+            {
+                self.lower_native_method_obj(tid, target, method, &[], args)?;
+                Ok(())
+            }
             _ => Err(format!("Unsupported void method '.{}()'", method)),
         }
     }
@@ -448,7 +468,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
         args: &[Expr],
     ) -> Result<u16, String> {
         match (&target.ty, method) {
-            (Type::List(_), "len") => {
+            (Type::List(_) | Type::Bytes, "len") => {
                 let list_obj = self.lower_obj(target)?;
                 let dst_s = self.alloc_temp_s();
                 self.ops.push(Op::ListLen { dst_s, list_obj });
@@ -627,6 +647,13 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 self.lower_cache_scalar_method(target, method, args)
             }
             (
+                Type::Generic { type_id: tid, .. },
+                "send" | "try_send" | "len" | "cap" | "is_empty" | "is_closed",
+            ) if matches!(&tid.module, ModuleId::Native(m) if m == "cdt.chan") =>
+            {
+                self.lower_chan_scalar_method(target, method, args)
+            }
+            (
                 Type::Custom(tid),
                 "year" | "month" | "day" | "hour" | "minute" | "second" | "weekday",
             ) if matches!(&tid.module, ModuleId::Native(m) if m == "cdt.time")
@@ -661,9 +688,33 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
         name: &str,
         args: &[Expr],
         named_args: &[NamedArg],
+        dest: Option<u16>,
     ) -> Result<u16, String> {
         let sid = self.mc.checked.struct_by_name[name];
         let st = self.mc.checked.structs[sid].clone();
+        if st.fields.is_empty() && named_args.is_empty() {
+            let idx = self.mc.intern_unit_record(st.schema_id)?;
+            let dst_obj = dest.unwrap_or_else(|| self.alloc_temp_o());
+            self.ops.push(Op::LoadConstObj { dst_obj, idx });
+            return Ok(dst_obj);
+        }
+        let (s_regs, o_regs) = self.lower_struct_fields(&st, args, named_args)?;
+        let desc_idx = self.mc.intern_record_desc(RecordDesc {
+            schema_id: st.schema_id,
+            scalar_regs: s_regs.into_boxed_slice(),
+            obj_regs: o_regs.into_boxed_slice(),
+        })?;
+        let dst_obj = dest.unwrap_or_else(|| self.alloc_temp_o());
+        self.ops.push(Op::NewRecord { dst_obj, desc_idx });
+        Ok(dst_obj)
+    }
+
+    pub(crate) fn lower_struct_fields(
+        &mut self,
+        st: &crate::frontend::types::ResolvedStruct,
+        args: &[Expr],
+        named_args: &[NamedArg],
+    ) -> Result<(Vec<u16>, Vec<u16>), String> {
         let mut s_regs = vec![0u16; st.scalar_len as usize];
         let mut o_regs = vec![0u16; st.obj_len as usize];
 
@@ -710,14 +761,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             }
         }
 
-        let desc_idx = self.mc.intern_record_desc(RecordDesc {
-            schema_id: st.schema_id,
-            scalar_regs: s_regs.into_boxed_slice(),
-            obj_regs: o_regs.into_boxed_slice(),
-        })?;
-        let dst_obj = self.alloc_temp_o();
-        self.ops.push(Op::NewRecord { dst_obj, desc_idx });
-        Ok(dst_obj)
+        Ok((s_regs, o_regs))
     }
 
     fn lower_json_call(
@@ -765,7 +809,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             {
                 let fn_name = format!("__pipe_fn_{}", self.mc.module.functions.len());
                 let proto = self.mc.lower_function(
-                    &fn_name, params, param_tys, ret_ty, body, &[], &[],
+                    &fn_name, None, params, param_tys, ret_ty, body, &[], &[],
                 )?;
                 let fid = self.mc.module.functions.len() as u32;
                 self.mc.module.functions.push(proto);
@@ -817,7 +861,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 {
                     let fn_name = format!("__pipe_fn_{}", self.mc.module.functions.len());
                     let proto = self.mc.lower_function(
-                        &fn_name, params, param_tys, ret_ty, body, &[], &[],
+                        &fn_name, None, params, param_tys, ret_ty, body, &[], &[],
                     )?;
                     let fid = self.mc.module.functions.len() as u32;
                     self.mc.module.functions.push(proto);
@@ -894,6 +938,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             Type::Function { params, .. } => Some(params.as_slice()),
             _ => None,
         };
+        let arg_start = self.ops.len();
         for (i, arg) in args.iter().enumerate() {
             let expected_ty = param_tys.and_then(|ps| ps.get(i)).unwrap_or(&arg.ty);
             if expected_ty.is_scalar() {
@@ -939,7 +984,20 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             0
         };
 
-        if let Some(fid) = direct_fid {
+        if let Some(fid) = direct_fid
+            && Some(fid) == self.function_id
+            && ret_scalar
+            && s_vals.len() == 1
+            && o_vals.is_empty()
+            && ret_reg == arg_base_s
+            && self.ops.len() > arg_start
+            && matches!(&args[0].kind, ExprKind::Binary { op: BinaryOp::Add | BinaryOp::Sub, .. })
+            && let Some(Op::AddIntImm { dst, a, imm }) = self.ops.last().copied()
+            && dst == arg_base_s
+        {
+            self.ops.pop();
+            self.ops.push(Op::CallSelfIntImm { arg_s: arg_base_s, arg_o: arg_base_o, src: a, imm });
+        } else if let Some(fid) = direct_fid {
             self.ops.push(Op::CallDirect {
                 func_id: fid as u16,
                 arg_base_s,

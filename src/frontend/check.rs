@@ -40,6 +40,8 @@ pub enum HttpRouterDeclKind {
     GroupAfter(String),
     Static(String, String),
     Cors(String),
+    OnStart,
+    OnStop,
     Route(String, String),
 }
 
@@ -197,6 +199,7 @@ pub fn check_program_with_roots(
         );
         if is_concrete_fn {
             let source_file = program.items[idx].source_file.clone();
+            let item_span = program.items[idx].span;
             let ItemKind::Func {
                 name,
                 params,
@@ -208,6 +211,18 @@ pub fn check_program_with_roots(
             };
             let fid = checked.func_by_name[name];
             let sig = checked.funcs[fid as usize].clone();
+            if crate::ir::is_lifecycle_hook_name(name)
+                && !crate::frontend::check_sys::is_cron_handler_return(&sig.return_type, &checked)
+            {
+                all_errors.push(format_check_err(
+                    item_span,
+                    source_file.as_deref(),
+                    format!(
+                        "on start / on stop hook must return Void or Void | Error, got {}",
+                        sig.return_type
+                    ),
+                ));
+            }
             let mut tc = Checker {
                 checked: &mut checked,
                 scopes: vec![HashMap::new()],
@@ -667,7 +682,7 @@ pub(crate) fn resolve_data_enum_bindings<'a>(
 
 pub(crate) struct Checker<'a> {
     pub(crate) checked: &'a mut CheckedProgram,
-    pub(crate) scopes: Vec<HashMap<String, Type>>,
+    pub(crate) scopes: Vec<HashMap<String, (Type, bool)>>,
     pub(crate) current_return: Type,
     pub(crate) loop_depth: usize,
     pub(crate) in_defer: bool,
@@ -686,7 +701,13 @@ impl<'a> Checker<'a> {
 
     pub(crate) fn bind(&mut self, name: String, ty: Type) {
         if let Some(top) = self.scopes.last_mut() {
-            top.insert(name, ty);
+            top.insert(name, (ty, false));
+        }
+    }
+
+    pub(crate) fn bind_mut(&mut self, name: String, ty: Type) {
+        if let Some(top) = self.scopes.last_mut() {
+            top.insert(name, (ty, true));
         }
     }
 
@@ -694,9 +715,18 @@ impl<'a> Checker<'a> {
         self.scopes.iter().any(|scope| scope.contains_key(name))
     }
 
+    pub(crate) fn lookup_mutability(&self, name: &str) -> Option<bool> {
+        for scope in self.scopes.iter().rev() {
+            if let Some((_, is_mut)) = scope.get(name) {
+                return Some(*is_mut);
+            }
+        }
+        None
+    }
+
     pub(crate) fn lookup(&self, name: &str) -> Option<Type> {
         for scope in self.scopes.iter().rev() {
-            if let Some(ty) = scope.get(name) {
+            if let Some((ty, _)) = scope.get(name) {
                 return Some(ty.clone());
             }
         }
@@ -751,7 +781,7 @@ impl<'a> Checker<'a> {
                     .as_ref()
                     .and_then(|te| self.checked.resolve_type(te).ok())
                     .unwrap_or(Type::Any);
-                self.bind(name.clone(), fallback);
+                self.bind_mut(name.clone(), fallback);
             }
             _ => {}
         }
@@ -800,12 +830,12 @@ impl<'a> Checker<'a> {
                                 name, expected, init_expr.ty
                             ));
                         }
-                        self.bind(name.clone(), expected.clone());
+                        self.bind_mut(name.clone(), expected.clone());
                     } else {
-                        self.bind(name.clone(), init_expr.ty.clone());
+                        self.bind_mut(name.clone(), init_expr.ty.clone());
                     }
                 } else if let Some(expected) = decl_ty {
-                    self.bind(name.clone(), expected);
+                    self.bind_mut(name.clone(), expected);
                 } else {
                     return Err(format!(
                         "Variable '{}' requires a type annotation or initializer",
@@ -817,11 +847,18 @@ impl<'a> Checker<'a> {
                 if matches!(target.kind, ExprKind::Index { .. }) {
                     return Err("Index assignment is not supported".to_string());
                 }
-                if let ExprKind::Ident(name) = &target.kind
-                    && self.lookup(name).is_none()
-                    && self.checked.consts.contains_key(name)
-                {
-                    return Err(format!("Cannot assign to constant '{}'", name));
+                if let ExprKind::Ident(name) = &target.kind {
+                    if self.lookup(name).is_none()
+                        && self.checked.consts.contains_key(name)
+                    {
+                        return Err(format!("Cannot assign to constant '{}'", name));
+                    }
+                    if self.lookup_mutability(name) == Some(false) {
+                        return Err(format!(
+                            "Cannot assign to immutable variable '{}' (declare with 'var' to allow reassignment)",
+                            name
+                        ));
+                    }
                 }
                 self.check_expr(target, None)?;
                 self.check_expr(value, Some(&target.ty))?;
@@ -888,6 +925,13 @@ impl<'a> Checker<'a> {
                 let elem_ty = match &iterable.ty {
                     Type::List(inner) => (**inner).clone(),
                     Type::Map(k, v) => Type::Tuple(vec![(**k).clone(), (**v).clone()]),
+                    Type::Int => Type::Int,
+                    Type::Generic { type_id, type_args }
+                        if type_id.module == ModuleId::Native("cdt.chan".to_string())
+                            && type_id.name == "Chan" =>
+                    {
+                        type_args.first().cloned().unwrap_or(Type::Any)
+                    }
                     other => return Err(format!("Cannot iterate over {}", other)),
                 };
                 self.loop_depth += 1;
@@ -976,6 +1020,17 @@ impl<'a> Checker<'a> {
                 self.in_defer = true;
                 let _ = self.check_block(block);
                 self.in_defer = false;
+                self.loop_depth = prev_loop;
+            }
+            StmtKind::Spawn(block) => {
+                let prev_loop = self.loop_depth;
+                let prev_defer = self.in_defer;
+                let prev_ret = std::mem::replace(&mut self.current_return, Type::Void);
+                self.loop_depth = 0;
+                self.in_defer = false;
+                let _ = self.check_block(block);
+                self.current_return = prev_ret;
+                self.in_defer = prev_defer;
                 self.loop_depth = prev_loop;
             }
             StmtKind::Break | StmtKind::Continue => {
@@ -1309,13 +1364,17 @@ impl<'a> Checker<'a> {
             ExprKind::Index { target, index } => {
                 self.check_expr(target, None)?;
                 match &target.ty.clone() {
-                    Type::List(inner) => {
+                    ty @ (Type::List(_) | Type::Bytes) => {
+                        let elem = match ty {
+                            Type::List(inner) => (**inner).clone(),
+                            _ => Type::Int,
+                        };
                         self.check_expr(index, Some(&Type::Int))?;
                         if index.ty != Type::Int {
                             return Err(format!("List index must be Int, got {}", index.ty));
                         }
                         Type::union(vec![
-                            (**inner).clone(),
+                            elem,
                             Type::Custom(TypeId {
                                 module: ModuleId::Builtin,
                                 name: "IndexError".to_string(),
@@ -1496,6 +1555,21 @@ fn eval_const_expr(
                             .map(|v| (Type::Int, ConstVal::Int(v)))
                             .ok_or_else(|| "Integer overflow in const '%'".to_string())
                     }
+                }
+                (BinaryOp::BitAnd, ConstVal::Int(a), ConstVal::Int(b)) => {
+                    Ok((Type::Int, ConstVal::Int(a & b)))
+                }
+                (BinaryOp::BitOr, ConstVal::Int(a), ConstVal::Int(b)) => {
+                    Ok((Type::Int, ConstVal::Int(a | b)))
+                }
+                (BinaryOp::BitXor, ConstVal::Int(a), ConstVal::Int(b)) => {
+                    Ok((Type::Int, ConstVal::Int(a ^ b)))
+                }
+                (BinaryOp::ShiftLeft | BinaryOp::ShiftRight, ConstVal::Int(a), ConstVal::Int(b)) => {
+                    let shift = u32::try_from(b).ok().filter(|&b| b < i64::BITS)
+                        .ok_or_else(|| "Shift count must be in 0..64".to_owned())?;
+                    let value = if *op == BinaryOp::ShiftLeft { a << shift } else { a >> shift };
+                    Ok((Type::Int, ConstVal::Int(value)))
                 }
                 (BinaryOp::Add, ConstVal::Float(a), ConstVal::Float(b)) => {
                     Ok((Type::Float, ConstVal::Float(a + b)))

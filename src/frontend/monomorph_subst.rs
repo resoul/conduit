@@ -37,6 +37,9 @@ pub(crate) fn resolve_type_expr_with_scope(
             if type_params.contains(name) {
                 return Ok(Type::TypeParam(name.clone()));
             }
+            if crate::frontend::check_native::is_chan_type_name(name, checked) {
+                return Err("Generic type 'Chan' requires 1 type argument(s)".to_string());
+            }
             if let Some(tmpl) = checked.generic_structs.get(name) {
                 return Err(format!(
                     "Generic type '{}' requires {} type argument(s)",
@@ -58,6 +61,22 @@ pub(crate) fn resolve_type_expr_with_scope(
                 crate::frontend::check_native::validate_map_key_type(&k)?;
                 let v = resolve_type_expr_with_scope(&type_args[1], checked, type_params)?;
                 return Ok(Type::Map(Box::new(k), Box::new(v)));
+            }
+            if crate::frontend::check_native::is_chan_type_name(name, checked) {
+                if type_args.len() != 1 {
+                    return Err(format!(
+                        "Generic type 'Chan' expects 1 type argument(s), got {}",
+                        type_args.len()
+                    ));
+                }
+                let elem = resolve_type_expr_with_scope(&type_args[0], checked, type_params)?;
+                if elem == Type::Void {
+                    return Err("Chan element type cannot be Void".to_string());
+                }
+                return Ok(Type::Generic {
+                    type_id: TypeId::native("cdt.chan", "Chan"),
+                    type_args: vec![elem],
+                });
             }
             let expected_arity = checked
                 .generic_structs
@@ -128,6 +147,7 @@ pub(crate) fn type_to_type_expr(ty: &Type) -> TypeExpr {
     match ty {
         Type::Int => TypeExpr::Named("Int".into()),
         Type::Float => TypeExpr::Named("Float".into()),
+        Type::Bytes => TypeExpr::Named("Bytes".into()),
         Type::String => TypeExpr::Named("String".into()),
         Type::Bool => TypeExpr::Named("Bool".into()),
         Type::Nil => TypeExpr::Named("Nil".into()),
@@ -147,7 +167,11 @@ pub(crate) fn type_to_type_expr(ty: &Type) -> TypeExpr {
             return_type: Box::new(type_to_type_expr(return_type)),
         },
         Type::Generic { type_id, type_args } => TypeExpr::Generic {
-            name: type_id.name.clone(),
+            name: if type_id.module == ModuleId::Native("cdt.chan".to_string()) {
+                "Chan".to_string()
+            } else {
+                type_id.name.clone()
+            },
             type_args: type_args.iter().map(type_to_type_expr).collect(),
         },
         Type::Custom(tid) => match &tid.module {
@@ -204,7 +228,7 @@ pub(crate) fn substitute_type(
             for a in type_args {
                 new_args.push(substitute_type(a, subst, checked)?);
             }
-            if !new_args.iter().any(has_type_param) {
+            if type_id.module == ModuleId::Program && !new_args.iter().any(has_type_param) {
                 let mono = ensure_monomorphized_struct(checked, &type_id.name, &new_args)?;
                 Type::Custom(TypeId::program(mono))
             } else {
@@ -244,7 +268,8 @@ pub(crate) fn substitute_type_partial(
                 .iter()
                 .map(|a| substitute_type_partial(a, subst, checked))
                 .collect();
-            if resolved.iter().all(|a| *a != Type::Any && !has_type_param(a))
+            if type_id.module == ModuleId::Program
+                && resolved.iter().all(|a| *a != Type::Any && !has_type_param(a))
                 && let Ok(mono) = ensure_monomorphized_struct(checked, &type_id.name, &resolved)
             {
                 return Type::Custom(TypeId::program(mono));
@@ -408,7 +433,7 @@ pub(crate) fn subst_block(block: &mut Block, subst: &HashMap<String, TypeExpr>) 
             }
             StmtKind::Return(Some(e)) => subst_expr(e, subst),
             StmtKind::Return(None) | StmtKind::Break | StmtKind::Continue => {}
-            StmtKind::Defer(block) => subst_block(block, subst),
+            StmtKind::Defer(block) | StmtKind::Spawn(block) => subst_block(block, subst),
             StmtKind::If { condition, then_block, else_block } => {
                 subst_expr(condition, subst);
                 subst_block(then_block, subst);

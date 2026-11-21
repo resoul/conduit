@@ -12,7 +12,7 @@ import * as http from "cdt.http"
 
 - `Request { method: String, path: String, body: String, headers: Map<String, String>, query: Map<String, String>, params: Map<String, String> }`
 - `Response { status: Int, body: String, headers: Map<String, String> }`
-- `BinaryResponse { status: Int, body: [Int], headers: Map<String, String> }`
+- `BinaryResponse { status: Int, body: Bytes, headers: Map<String, String> }`
 - `HttpError { kind: String, message: String }`
 - `Router`
 - `Client` — Reusable HTTP/1.1 client with base URL, default headers, configurable timeout, and a thread-safe Keep-Alive TCP/TLS connection pool.
@@ -40,12 +40,29 @@ import * as http from "cdt.http"
 | `post_json` | `http.post_json(url: String, body: T) -> Response \| HttpError` | Encodes `body` as JSON and sends `POST` with `Content-Type: application/json`. |
 | `request` | `http.request(method: String, url: String, body: String, headers: Map<String, String>) -> Response \| HttpError` | Sends a custom HTTP request with method, body, and headers. |
 | `request_timeout` | `http.request_timeout(method: String, url: String, body: String, headers: Map<String, String>, timeout_ms: Int) -> Response \| HttpError` | Sends a custom HTTP request with an explicit timeout in milliseconds. |
-| `get_bytes` | `http.get_bytes(url: String) -> BinaryResponse \| HttpError` | Sends an HTTP `GET` request and returns raw byte list `[Int]` (`0..=255`). |
-| `request_bytes` | `http.request_bytes(method: String, url: String, body: [Int], headers: Map<String, String>) -> BinaryResponse \| HttpError` | Sends a binary HTTP request and returns `BinaryResponse`. |
+| `get_bytes` | `http.get_bytes(url: String) -> BinaryResponse \| HttpError` | Sends an HTTP `GET` request and returns a `BinaryResponse` with a `Bytes` body. |
+| `request_bytes` | `http.request_bytes(method: String, url: String, body: Bytes \| [Int], headers: Map<String, String>) -> BinaryResponse \| HttpError` | Sends a binary HTTP request and returns `BinaryResponse`. |
+
+The `http.Request` constructor accepts `String` or `Bytes` for its `body` argument.
+Incoming requests expose the raw payload in `req.body_bytes` and the original header value
+bytes in `req.headers_bytes` (with lowercase names for network requests). The text fields
+`req.body` and `req.headers` decode UTF-8 with replacement characters for invalid
+sequences. Routes with typed JSON bodies continue to require valid UTF-8.
+
+`BinaryResponse.body` is a `Bytes` value. Use `.to_list()` when passing it to code
+that expects `[Int]`.
+
+## Outbound Redirects
+
+The HTTP client follows up to ten redirects and rejects redirects from HTTPS to HTTP. A change in scheme, host, or port removes all caller-supplied headers for the rest of the redirect chain, including default headers set on `http.Client`.
+
+For `301`, `302`, and `303`, the client sends non-`HEAD` requests as `GET` and removes the body along with `Content-Length`, `Transfer-Encoding`, `Content-Type`, `Content-Encoding`, and `Expect`. For `307` and `308`, it sends the original method and body to the redirect destination.
 
 ## `Client` Methods (Keep-Alive Pool)
 
-`http.Client` reuses idle HTTP/1.1 TCP and TLS connections per `(host, port, tls)` across requests (up to 8 idle connections per host, 60s idle TTL) and transparently retries once on a fresh socket if a pooled connection was closed by the server.
+`http.Client` reuses idle HTTP/1.1 TCP and TLS connections per `(host, port, tls)` across requests, with up to 8 idle connections per host and a 60-second idle TTL.
+
+If a pooled request fails while sending the request or parsing the response, the client can retry once on a fresh connection for `GET`, `HEAD`, `OPTIONS`, `TRACE`, `PUT`, and `DELETE`. For other methods such as `POST` and `PATCH`, the client returns the error. The server may already have processed the request by then.
 
 | Method | Signature | Description |
 | :--- | :--- | :--- |
@@ -80,8 +97,10 @@ api.close()
 | `get`, `post`, `put`, `delete`, `patch`, `options`, `head`, `any` | `r.<method>(pattern: String, handler: (Request) -> Response) -> Void` | Registers a route (`/users/:id`, `/files/*rest`; `any` matches all methods). |
 | `before` | `r.before(handler: (Request) -> Response?) -> Void` | Registers a pre-handler hook; returning a `Response` short-circuits routing. |
 | `after` | `r.after(handler: (Request, Response) -> Response) -> Void` | Registers a post-handler hook to transform responses (e.g. CORS headers, logging). |
+| `on_start` | `r.on_start(handler: () -> Void \| Error) -> Void` | Registers a startup hook executed before binding the listener in `r.serve(...)`. |
+| `on_stop` | `r.on_stop(handler: () -> Void \| Error) -> Void` | Registers a shutdown hook executed after draining in-flight requests and `spawn` tasks. |
 | `dispatch` | `r.dispatch(req: Request) -> Response` | Dispatches a `Request` in-memory (returns `404`/`405` automatically). |
-| `serve` | `r.serve(addr: String) -> Void \| HttpError` | Starts a blocking HTTP/1.1 server on `addr` (e.g. `"127.0.0.1:8080"`). |
+| `serve` | `r.serve(addr: String) -> Void \| HttpError` | Starts a blocking HTTP/1.1 server on `addr` (e.g. `"127.0.0.1:8080"`) with `SIGINT`/`SIGTERM` graceful shutdown. |
 | `stop` | `r.stop() -> Void` | Signals `r.serve(...)` to stop accepting new connections and shut down gracefully after in-flight requests finish. |
 
 ## `Request` Helper Methods
@@ -101,6 +120,50 @@ Inside `router Name { ... }`:
 - `@http.status(code)` & typed return/error unions — Handlers can return any JSON-serializable type `T`, `Void` (`204`), `T?` (`200`/`404`), `http.Response`, or a union `T | AppError` directly; annotate `error` or `struct` types with `@http.status(404)` (unannotated `error` defaults to `500`, `struct` defaults to `200`). Both `@http.query` parameters and typed return/error responses are reflected in `conduit openapi`.
 - `static "/assets" => "./public"` — Serves static files with `Content-Type` detection and path-traversal protection.
 - `cors "*"` — Automatically handles `OPTIONS` preflight (`204`) and injects `access-control-allow-origin` on responses.
+- `on_start => init_fn` / `on_stop => cleanup_fn` (or `on start => ...` / `on stop => ...`) — Router-scoped lifecycle hooks (`() -> Void` or `() -> Void | Error`).
+
+## Server Lifecycle Hooks & Graceful Shutdown
+
+Conduit supports both **top-level application hooks** (`on start { ... }` / `on stop { ... }`) and **router-level hooks** (`on_start => fn` / `on_stop => fn` in `router` blocks, or `r.on_start(fn)` / `r.on_stop(fn)` on `Router`):
+
+```conduit
+import * as http from "cdt.http"
+import * as cache from "cdt.cache"
+
+on start {
+    print("app starting")
+}
+
+on stop {
+    print("app stopped cleanly")
+}
+
+func init_router() -> Void {
+    print("router starting")
+}
+
+func close_router() -> Void {
+    print("router stopping")
+}
+
+func hello(_req: http.Request) -> http.Response {
+    spawn print("background audit log")
+    return http.text("ok")
+}
+
+router Api {
+    on_start => init_router
+    on_stop => close_router
+    get "/hello" => hello
+}
+```
+
+Shutdown sequence when `r.stop()` is called or `SIGINT` (`Ctrl+C`) / `SIGTERM` is received:
+1. New connections are rejected and `listener.accept()` wakes up immediately.
+2. In-flight HTTP requests finish normally.
+3. Active `spawn` background tasks are drained (up to 5 seconds).
+4. Router `on_stop` hooks run, followed by top-level `on stop` hooks.
+5. If an `on_start` hook fails, `serve` returns `HttpError { kind: "startup_error", ... }` without binding the port; if an `on_stop` hook fails, `serve` returns `HttpError { kind: "shutdown_error", ... }`.
 
 ## Declarative `router` DSL Example
 

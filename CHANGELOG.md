@@ -5,6 +5,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
+## [Unreleased]
+
+### Security
+
+* Discard caller-supplied HTTP headers for the rest of a redirect chain when the scheme, host, or port changes. This includes `http.Client` defaults, authentication headers, cookies, and custom headers.
+* Reject bytecode before execution when an explicit value return or an early return through `?` uses a different register bank from the function's declared result.
+
+### Fixed
+
+* Limit retries after sending or parsing errors on pooled HTTP requests to known idempotent methods. `POST`, `PATCH`, and custom methods return the original error to the caller.
+
+### Changed
+
+* Use the VM's record-map fast path for eligible `NewRecord` instructions emitted by the compiler. On macOS arm64, the median of three release runs of `collections.map_records` on 4,096 records fell from 161.1 µs to 97.7 µs.
+
 ## [0.3.4] - 2026-11-21
 
 ### Added

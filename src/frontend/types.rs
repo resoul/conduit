@@ -51,6 +51,7 @@ pub enum Type {
     Int,
     Float,
     String,
+    Bytes,
     Bool,
     Nil,
     Void,
@@ -196,7 +197,12 @@ impl Type {
             },
         ) = (self, target)
         {
-            return src_id == dst_id && src_args == dst_args;
+            return src_id == dst_id
+                && src_args.len() == dst_args.len()
+                && src_args
+                    .iter()
+                    .zip(dst_args.iter())
+                    .all(|(s, d)| s.is_assignable_to(d));
         }
         if let (
             Type::Function {
@@ -229,6 +235,7 @@ impl std::fmt::Display for Type {
             Type::Int => write!(f, "Int"),
             Type::Float => write!(f, "Float"),
             Type::String => write!(f, "String"),
+            Type::Bytes => write!(f, "Bytes"),
             Type::Bool => write!(f, "Bool"),
             Type::Nil => write!(f, "Nil"),
             Type::Void => write!(f, "Void"),

@@ -1,6 +1,6 @@
 # Conduit Unified HTTP Client & Server Demo (`cdt-curl`)
 
-A full-featured, zero-dependency HTTP/1.1 CLI client, router server, and Conduit stdlib showcase (`cdt.http`, `cdt.cli`, `cdt.env`, `cdt.fs`, `cdt.json`, `cdt.url`, `cdt.validation` extended rules, `cdt.time`, `cdt.log`, `|>` pipelines, `cors`, `group`, `conduit test`, and Docker `FROM scratch`).
+A full-featured, zero-dependency HTTP/1.1 CLI client, router server, and Conduit stdlib showcase (`cdt.http`, `cdt.cli`, `cdt.env`, `cdt.fs`, `cdt.json`, `cdt.url`, `cdt.validation` extended rules, `cdt.time`, `cdt.log`, `cdt.process` `pipe`, `spawn` background tasks + `cdt.cache`/`cdt.lock` cross-thread sharing, `on_start`/`on_stop` lifecycle hooks, `|>` pipelines, `cors`, `group`, `conduit test`, and Docker `FROM scratch`).
 
 ## Local Usage
 

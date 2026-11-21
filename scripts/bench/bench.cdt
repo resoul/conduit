@@ -60,7 +60,9 @@ func vm_fib(n: Int) -> Int {
     return vm_fib(n - 1) + vm_fib(n - 2)
 }
 
-export func main() -> Void | KeyError | fs.FsError | process.ProcessError | crypto.CryptoError | json.DecodeError | json.EncodeError | time.TimeError | csv.CsvError | url.UrlError | jwt.JwtError | cache.CacheError {
+type BenchError = KeyError | fs.FsError | process.ProcessError | crypto.CryptoError | json.DecodeError | json.EncodeError | time.TimeError | csv.CsvError | url.UrlError | jwt.JwtError | cache.CacheError
+
+export func main() -> Void | BenchError {
     // ── 0. Pure-VM Computation ───────────────────────────────────────────────
     t_fib := time.monotonic()
     fib_res := vm_fib(35)
@@ -127,7 +129,7 @@ export func main() -> Void | KeyError | fs.FsError | process.ProcessError | cryp
 
     t_ws := time.monotonic()
     w := fs.open_write(p)?
-    i := 0
+    var i = 0
     while i < 100000 {
         w.write_line("line payload number 0123456789 abcdefghijklmnopqrstuvwxyz")?
         i = i + 1
@@ -181,7 +183,7 @@ export func main() -> Void | KeyError | fs.FsError | process.ProcessError | cryp
 
     // ── 2. Crypto, Path, Process ─────────────────────────────────────────────
     chunk := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-    big := chunk
+    var big = chunk
     i = 0
     while i < 14 {
         big = big + big
@@ -199,7 +201,7 @@ export func main() -> Void | KeyError | fs.FsError | process.ProcessError | cryp
     ms_sha := ms_since(t_sha)?
 
     t_be := time.monotonic()
-    b64_s := ""
+    var b64_s = ""
     i = 0
     while i < 50 {
         b64_s = crypto.base64_encode(big)
@@ -231,16 +233,15 @@ export func main() -> Void | KeyError | fs.FsError | process.ProcessError | cryp
     }
     ms_path := ms_since(t_pa)?
 
-    is_win := false
+    var is_win = false
     switch env.get("OS") {
         case String(os_val):
             if os_val == "Windows_NT" { is_win = true }
         case nil:
             is_win = false
     }
-    proc_cmd := "true"
-    proc_args := [""]
-    proc_args = []
+    var proc_cmd = "true"
+    var proc_args = [String]()
     if is_win {
         proc_cmd = "cmd"
         proc_args = ["/c", "exit", "0"]
@@ -254,8 +255,7 @@ export func main() -> Void | KeyError | fs.FsError | process.ProcessError | cryp
     ms_proc := ms_since(t_pr)?
 
     // ── 3. JSON + Pipeline (map / filter / reduce) ───────────────────────────
-    items := [Item(id: 0, user: "u0", score: 0)]
-    items = []
+    items := [Item]()
     i = 0
     while i < 10000 {
         items.append(Item(id: i, user: "alice_" + (i % 10).to_string(), score: i % 100))
@@ -271,8 +271,7 @@ export func main() -> Void | KeyError | fs.FsError | process.ProcessError | cryp
     if decoded.len() < 0 { return }
     ms_json_dec := ms_since(t_jd)?
 
-    nums := [0]
-    nums = []
+    nums := [Int]()
     i = 0
     while i < 1000000 {
         nums.append(i)
@@ -287,8 +286,7 @@ export func main() -> Void | KeyError | fs.FsError | process.ProcessError | cryp
     if sum < 0 { return }
     print("CHECK|" + sum.to_string())
 
-    fnums := [0.0]
-    fnums = []
+    fnums := [Float]()
     i = 0
     while i < 1000000 {
         fnums.append(i.to_float())
@@ -317,7 +315,7 @@ export func main() -> Void | KeyError | fs.FsError | process.ProcessError | cryp
     sample_url := "https://api.example.com:8443/v1/items?tag=prod&limit=50&offset=100#top"
     t_url := time.monotonic()
     i = 0
-    url_acc := 0
+    var url_acc = 0
     while i < 50000 {
         u := url.parse(sample_url)?
         q := url.decode_query(u.query)?
@@ -335,7 +333,7 @@ export func main() -> Void | KeyError | fs.FsError | process.ProcessError | cryp
     req3 := http.Request(method: "GET", path: "/files/docs/readme.md", body: "", headers: empty_hdrs, query: empty_hdrs, params: empty_hdrs)
     t_http := time.monotonic()
     i = 0
-    http_acc := 0
+    var http_acc = 0
     while i < 12500 {
         r0 := router_obj.dispatch(req0)
         r1 := router_obj.dispatch(req1)

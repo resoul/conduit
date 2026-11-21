@@ -97,6 +97,37 @@ mod tests {
     use crate::native::crypto::encode_hex;
 
     #[test]
+    fn wycheproof_aes_gcm_known_answers() {
+        // C2SP Wycheproof aes_gcm_test.json v1, test cases 1 and 2.
+        // https://github.com/C2SP/wycheproof/blob/main/testvectors_v1/aes_gcm_test.json
+        let hex_to_bytes = |value: &str| {
+            (0..value.len()).step_by(2)
+                .map(|i| u8::from_str_radix(&value[i..i + 2], 16).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let key = hex_to_bytes("5b9604fe14eadba931b0ccf34843dab9");
+        let plaintext = hex_to_bytes("001d0c231287c1182784554ca3a21908");
+        for (iv, aad, ciphertext, tag) in [
+            ("028318abc1824029138141a2", "", "26073cc1d851beff176384dc9896d5ff",
+                "0a3ea7a5487cb5f7d70fb6c58d038554"),
+            ("921d2507fa8007b7bd067d34", "00112233445566778899aabbccddeeff",
+                "49d8b9783e911913d87094d1f63cc765", "1e348ba07cca2cf04c618cb4d43a5b92"),
+        ] {
+            let iv = hex_to_bytes(iv).try_into().unwrap();
+            let aad = hex_to_bytes(aad);
+            let expected = hex_to_bytes(ciphertext);
+            let tag: [u8; 16] = hex_to_bytes(tag).try_into().unwrap();
+            for cipher in [AesGcm::new(&key).unwrap(), AesGcm::new_portable(&key).unwrap()] {
+                let mut sealed = plaintext.clone();
+                assert_eq!(cipher.seal_in_place(&iv, &aad, &mut sealed), tag);
+                assert_eq!(sealed, expected);
+                assert!(cipher.open_in_place(&iv, &aad, &mut sealed, &tag));
+                assert_eq!(sealed, plaintext);
+            }
+        }
+    }
+
+    #[test]
     fn aes128_gcm_nist_test_case_2_and_4() {
         // Test Case 2: 16-byte plaintext, empty AAD
         let key = [0u8; 16];

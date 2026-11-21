@@ -1,3 +1,4 @@
+import * as chan from "cdt.chan"
 import * as crypto from "cdt.crypto"
 import * as env from "cdt.env"
 import * as lock from "cdt.lock"
@@ -26,6 +27,29 @@ export func describe_payload(p: JobPayload) -> String {
         case JobPayload.Heartbeat:
             return "heartbeat"
     }
+}
+
+export func run_payload_workers(payloads: [JobPayload]) -> [String] {
+    jobs := chan.open<JobPayload>(8)
+    results := chan.open<String>(8)
+
+    spawn {
+        for p in jobs {
+            results.send(describe_payload(p))
+        }
+        results.close()
+    }
+
+    for p in payloads {
+        jobs.send(p)
+    }
+    jobs.close()
+
+    var out: [String] = []
+    for item in results {
+        out.append(item)
+    }
+    return out
 }
 
 export func make_job(kind: String) -> Job | time.TimeError | validation.ValidationError {

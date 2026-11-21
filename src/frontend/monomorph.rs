@@ -430,17 +430,32 @@ pub(crate) fn resolve_switch_pattern_type(
     if let Ok(resolved) = resolve_type_expr(&TypeExpr::Named(name.to_string()), checked) {
         return Ok(resolved);
     }
+    let variants: &[Type] = match scrutinee_ty {
+        Type::Union(vs) => vs.as_slice(),
+        Type::Optional(inner) => std::slice::from_ref(inner.as_ref()),
+        other => std::slice::from_ref(other),
+    };
+    for v in variants {
+        if let Type::Generic { type_id, .. } = v
+            && (v.to_string() == name
+                || (type_id.name == "Chan"
+                    && crate::frontend::check_native::is_chan_type_name(name, checked)))
+        {
+            return Ok(v.clone());
+        }
+    }
     if !name.contains('<') {
         let prefix = format!("{}<", name);
-        let variants: &[Type] = match scrutinee_ty {
-            Type::Union(vs) => vs.as_slice(),
-            other => std::slice::from_ref(other),
-        };
         let mut matches: Vec<Type> = Vec::new();
         for v in variants {
             if let Type::Custom(tid) = v
                 && tid.module == ModuleId::Program
                 && tid.name.starts_with(&prefix)
+                && !matches.contains(v)
+            {
+                matches.push(v.clone());
+            } else if let Type::Generic { type_id, .. } = v
+                && type_id.name == name
                 && !matches.contains(v)
             {
                 matches.push(v.clone());

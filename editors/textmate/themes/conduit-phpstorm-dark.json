@@ -103,6 +103,16 @@
       }
     },
     {
+      "name": "Conduit concurrency (spawn)",
+      "scope": [
+        "keyword.control.concurrency.conduit"
+      ],
+      "settings": {
+        "foreground": "#E06C75",
+        "fontStyle": "bold"
+      }
+    },
+    {
       "name": "Conduit declarative DSL blocks",
       "scope": [
         "keyword.other.dsl.block.conduit"

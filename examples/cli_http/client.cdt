@@ -35,8 +35,8 @@ func build_headers(header_raw: String) -> Map<String, String> {
         }
         kv := trimmed.split(":")
         if kv.len() >= 2 {
-            k := ""
-            v := ""
+            var k = ""
+            var v = ""
             switch kv[0] {
                 case String(s):
                     k = s.trim()
@@ -131,12 +131,12 @@ export func execute_bytes(
     elapsed_ms := elapsed_ms_since(started)
     ct := resp.headers.get("content-type") ?? "application/octet-stream"
     print("HTTP {resp.status} ({elapsed_ms} ms) [{ct}] - {resp.body.len()} bytes")
-    preview_len := 16
+    var preview_len = 16
     if resp.body.len() < 16 {
         preview_len = resp.body.len()
     }
     if preview_len > 0 {
-        preview := resp.body.slice(0, preview_len)
+        preview := resp.body.slice(0, preview_len).to_list()
         print("First bytes: {preview}")
     }
     return

@@ -21,11 +21,12 @@ pub struct Parser {
     pub(super) tokens: Vec<Token>,
     pub(super) cursor: usize,
     pub(super) pending_items: Vec<Item>,
+    pub(super) lifecycle_counter: usize,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, cursor: 0, pending_items: Vec::new() }
+        Self { tokens, cursor: 0, pending_items: Vec::new(), lifecycle_counter: 0 }
     }
 
     pub(super) fn peek(&self) -> &Token {
@@ -192,6 +193,9 @@ impl Parser {
             TokenKind::Ident(kw) if kw == "job" => self.parse_job_item(is_exported),
             TokenKind::Ident(kw) if kw == "migration" => self.parse_migration_item(),
             TokenKind::Ident(kw) if kw == "query" => self.parse_query_item(is_exported),
+            TokenKind::Ident(kw) if matches!(kw.as_str(), "on" | "on_start" | "on_stop") => {
+                self.parse_lifecycle_item(is_exported, export_span)
+            }
             TokenKind::Ident(kw) if kw == "test" => self.parse_test_item(is_exported, export_span),
             TokenKind::KwImport => {
                 if is_exported {

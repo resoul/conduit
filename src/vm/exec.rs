@@ -3,13 +3,13 @@ use std::sync::Arc;
 use crate::ir::Module;
 use crate::native::validation::{box_scalar_val, is_err_or_nil_obj, is_type_tag_match};
 use crate::vm::exec_cold::{
-    build_record_into_reg, err_call_depth, err_div_zero, err_msg, err_overflow,
-    exec_for_range_fast,
+    build_record_into_reg, err_div_zero, err_msg, err_overflow, finish_range_kernel,
+    map_get_int_or_slot, map_set_int_slot, sum_int_map_range,
 };
 use crate::vm::exec_union::{format_try_error, is_try_fail_obj, unbox_scalar_val};
 use crate::vm::opcode::Op;
 use crate::vm::value::{ListStorage, Obj, OrderedMap, append_int_cow, append_obj_cow};
-use crate::vm::{CallFrame, ExecResult, MAX_CALL_DEPTH, RuntimeError, Vm};
+use crate::vm::{CallFrame, ExecResult, RuntimeError, Vm};
 
 impl Vm {
     pub(crate) fn exec_from(
@@ -20,7 +20,7 @@ impl Vm {
         entry_o_base: usize,
         entry_closure_slot: usize,
     ) -> Result<ExecResult, RuntimeError> {
-        let base_frame_depth = self.frames.len();
+        let base_frame_depth = self.frame_depth;
         let mut func_id = entry_func_id;
         let mut func = &module.functions[func_id as usize];
         let mut ops_ptr = func.ops.as_ptr();
@@ -33,6 +33,9 @@ impl Vm {
             s_base + func.num_scalars as usize,
             o_base + func.num_objs as usize,
         );
+        // SAFETY: `ensure_capacity` sized `scalars` and `objs` to cover `[s_base .. s_base + num_scalars]`
+        // and `[o_base .. o_base + num_objs]`; `Module::validate` guarantees all register operands stay
+        // within each function's declared frame window.
         let mut s_ptr = unsafe { self.scalars.as_mut_ptr().add(s_base) };
         let mut o_ptr = unsafe { self.objs.as_mut_ptr().add(o_base) };
 
@@ -44,6 +47,7 @@ impl Vm {
             ($r:expr) => {{
                 let idx = $r as usize;
                 debug_assert!(idx < func.num_scalars as usize);
+                // SAFETY: `idx < func.num_scalars` is verified by `Module::validate` and capacity by `ensure_capacity`.
                 unsafe { *s_ptr.add(idx) }
             }};
         }
@@ -52,6 +56,7 @@ impl Vm {
                 let idx = $r as usize;
                 debug_assert!(idx < func.num_scalars as usize);
                 let val = $val;
+                // SAFETY: `idx < func.num_scalars` is verified by `Module::validate` and capacity by `ensure_capacity`.
                 unsafe { *s_ptr.add(idx) = val };
             }};
         }
@@ -59,6 +64,7 @@ impl Vm {
             ($r:expr) => {{
                 let idx = $r as usize;
                 debug_assert!(idx < func.num_objs as usize);
+                // SAFETY: `idx < func.num_objs` is verified by `Module::validate` and capacity by `ensure_capacity`.
                 unsafe { &*o_ptr.add(idx) }
             }};
         }
@@ -66,14 +72,54 @@ impl Vm {
             ($r:expr) => {{
                 let idx = $r as usize;
                 debug_assert!(idx < func.num_objs as usize);
+                // SAFETY: `idx < func.num_objs` is verified by `Module::validate` and capacity by `ensure_capacity`.
                 unsafe { &mut *o_ptr.add(idx) }
+            }};
+        }
+        macro_rules! switch_jump {
+            ($slot:expr, $count:expr) => {{
+                let slot = $slot;
+                let offset = if slot < u64::from($count) { slot as usize + 1 } else { 0 };
+                // SAFETY: `Module::validate` verifies every switch entry is an in-bounds `Op::Jump`.
+                if let Op::Jump { target } = unsafe { *ops_ptr.add(ip + offset) } {
+                    ip = target as usize;
+                }
             }};
         }
         macro_rules! sync_frame_ptrs {
             () => {
+                // SAFETY: Frame pointers are recomputed from live `Vec` allocations after any growth.
                 s_ptr = unsafe { self.scalars.as_mut_ptr().add(s_base) };
                 o_ptr = unsafe { self.objs.as_mut_ptr().add(o_base) };
             };
+        }
+        macro_rules! return_scalar_val {
+            ($val:expr) => {{
+                let val = $val;
+                if func.num_objs > 0 {
+                    self.clear_obj_range(o_base, func.num_objs as usize);
+                }
+                let Some(frame) = self.pop_frame(base_frame_depth) else {
+                    return Ok(ExecResult::Scalar(val));
+                };
+                ip = frame.return_ip as usize;
+                cur_closure_slot = frame.unpack_closure_slot();
+                let caller_s_base = frame.s_base as usize;
+                if frame.func_id == func_id && func.num_objs == 0 {
+                    // SAFETY: `s_base >= caller_s_base` and both frames lie within `self.scalars`.
+                    s_ptr = unsafe { s_ptr.sub(s_base - caller_s_base) };
+                    s_base = caller_s_base;
+                } else {
+                    func_id = frame.func_id;
+                    // SAFETY: `frame.func_id` came from a validated `module.functions` entry.
+                    func = unsafe { module.functions.get_unchecked(func_id as usize) };
+                    ops_ptr = func.ops.as_ptr();
+                    s_base = caller_s_base;
+                    o_base = frame.o_base as usize;
+                    sync_frame_ptrs!();
+                }
+                s_set!(frame.ret_reg, val);
+            }};
         }
         macro_rules! return_obj_val {
             ($val:expr) => {{
@@ -82,6 +128,7 @@ impl Vm {
                     return Ok(ExecResult::Obj(val));
                 };
                 func_id = frame.func_id;
+                // SAFETY: `frame.func_id` came from a validated `module.functions` entry.
                 func = unsafe { module.functions.get_unchecked(func_id as usize) };
                 ops_ptr = func.ops.as_ptr();
                 ip = frame.return_ip as usize;
@@ -95,15 +142,18 @@ impl Vm {
 
         loop {
             debug_assert!(ip < func.ops.len());
+            // SAFETY: `Module::validate` guarantees `ip` and jump targets remain inside `func.ops`.
             let op = unsafe { *ops_ptr.add(ip) };
             ip += 1;
 
             match op {
                 Op::LoadImmInt { dst, imm } => s_set!(dst, (imm as i64) as u64),
                 Op::LoadConstInt { dst, idx } => {
+                    // SAFETY: `idx` is bounds-checked against `module.int_consts` by `Module::validate`.
                     s_set!(dst, unsafe { *int_consts.add(idx as usize) } as u64);
                 }
                 Op::LoadConstFloat { dst, idx } => {
+                    // SAFETY: `idx` is bounds-checked against `module.float_consts` by `Module::validate`.
                     s_set!(dst, unsafe { *float_consts.add(idx as usize) }.to_bits());
                 }
                 Op::LoadBool { dst, val } => s_set!(dst, val as u64),
@@ -132,6 +182,20 @@ impl Vm {
                     };
                     s_set!(dst, res as u64);
                 }
+                Op::MulAddInt { dst, a, b, c } => {
+                    let product = (s_get!(a) as i64).checked_mul(s_get!(b) as i64).ok_or_else(err_overflow)?;
+                    let result = product.checked_add(s_get!(c) as i64).ok_or_else(err_overflow)?;
+                    s_set!(dst, result as u64);
+                }
+                Op::MulAddIntImm { dst, src, mul, add } => {
+                    let product = (s_get!(src) as i64).checked_mul(i64::from(mul)).ok_or_else(err_overflow)?;
+                    let value = product.checked_add(i64::from(add)).ok_or_else(err_overflow)?;
+                    s_set!(dst, value as u64);
+                }
+                Op::MulIntImm { dst, a, imm } => {
+                    let value = (s_get!(a) as i64).checked_mul(i64::from(imm)).ok_or_else(err_overflow)?;
+                    s_set!(dst, value as u64);
+                }
                 Op::DivInt { dst, a, b } => {
                     let rhs = s_get!(b) as i64;
                     if rhs == 0 {
@@ -152,15 +216,47 @@ impl Vm {
                     };
                     s_set!(dst, res as u64);
                 }
+                Op::ModIntConst { dst, a, divisor, magic_idx, shift } => {
+                    // SAFETY: Module validation checks the reciprocal and its constant index.
+                    let magic = unsafe { *int_consts.add(usize::from(magic_idx)) };
+                    let rem = crate::vm::opcode::remainder_by_constant(s_get!(a) as i64, divisor, magic, shift);
+                    s_set!(dst, rem as u64);
+                }
                 Op::ModIntImm { dst, a, imm } => {
                     let rhs = imm as i64;
                     if rhs == 0 {
                         return Err(err_div_zero());
                     }
-                    let Some(res) = (s_get!(a) as i64).checked_rem(rhs) else {
-                        return Err(err_overflow());
+                    let lhs = s_get!(a) as i64;
+                    let res = if rhs > 0 && (rhs & (rhs - 1)) == 0 {
+                        let mask = rhs - 1;
+                        if lhs >= 0 {
+                            lhs & mask
+                        } else {
+                            -(lhs.wrapping_neg() & mask)
+                        }
+                    } else {
+                        let Some(r) = lhs.checked_rem(rhs) else {
+                            return Err(err_overflow());
+                        };
+                        r
                     };
                     s_set!(dst, res as u64);
+                }
+                Op::BitAndInt { dst, a, b } => s_set!(dst, s_get!(a) & s_get!(b)),
+                Op::BitOrInt { dst, a, b } => s_set!(dst, s_get!(a) | s_get!(b)),
+                Op::BitXorInt { dst, a, b } => s_set!(dst, s_get!(a) ^ s_get!(b)),
+                Op::ShiftLeftInt { dst, a, b } | Op::ShiftRightInt { dst, a, b } => {
+                    let shift = s_get!(b);
+                    if shift >= u64::from(i64::BITS) {
+                        return Err(err_msg("Shift count must be in 0..64"));
+                    }
+                    let value = s_get!(a) as i64;
+                    let result = match op {
+                        Op::ShiftLeftInt { .. } => value << shift,
+                        _ => value >> shift,
+                    };
+                    s_set!(dst, result as u64);
                 }
                 Op::NegInt { dst, src } => {
                     let Some(res) = (s_get!(src) as i64).checked_neg() else {
@@ -223,14 +319,7 @@ impl Vm {
                     s_set!(dst, ((s_get!(a) as i64) == imm as i64) as u64);
                 }
                 Op::LtIntImm { dst, a, imm } => {
-                    let lt = (s_get!(a) as i64) < imm as i64;
-                    s_set!(dst, lt as u64);
-                    debug_assert!(ip < func.ops.len());
-                    if let Op::JumpIfFalse { cond, target } = unsafe { *ops_ptr.add(ip) }
-                        && cond == dst
-                    {
-                        ip = if lt { ip + 1 } else { target as usize };
-                    }
+                    s_set!(dst, ((s_get!(a) as i64) < imm as i64) as u64);
                 }
                 Op::EqFloat { dst, a, b } => {
                     let eq = f64::from_bits(s_get!(a)) == f64::from_bits(s_get!(b));
@@ -260,60 +349,191 @@ impl Vm {
                         ip = target as usize;
                     }
                 }
+                Op::JumpIfLtInt { a, b, target, when_true } => {
+                    if ((s_get!(a) as i64) < (s_get!(b) as i64)) == when_true {
+                        ip = target as usize;
+                    }
+                }
+                Op::JumpIfLtIntImm { a, imm, target, when_true } => {
+                    if ((s_get!(a) as i64) < imm as i64) == when_true {
+                        ip = target as usize;
+                    }
+                }
+                Op::JumpIfEqIntImm { a, imm, target, when_true } => {
+                    if ((s_get!(a) as i64) == i64::from(imm)) == when_true {
+                        ip = target as usize;
+                    }
+                }
+                Op::MakeScalarEnum { dst_s, schema_id, a, b, len } => {
+                    // The low half holds the schema ID. The high half holds the payload length.
+                    let first = if len >= 1 { s_get!(a) } else { 0 };
+                    let second = if len == 2 { s_get!(b) } else { 0 };
+                    if len >= 1 { s_set!(dst_s + 1, first); }
+                    if len == 2 { s_set!(dst_s + 2, second); }
+                    s_set!(dst_s, u64::from(schema_id) | (u64::from(len) << 32));
+                }
+                Op::BoxScalarEnum { dst_obj, src_obj, tag_s, width } => {
+                    let tag = s_get!(tag_s);
+                    let value = if tag == u64::MAX {
+                        o_ref!(src_obj).clone()
+                    } else {
+                        let len = tag >> 32;
+                        if len > u64::from(width) {
+                            return Err(err_msg("Invalid scalar enum length"));
+                        }
+                        let mut record = crate::vm::value::StructData::new(tag as u32, len as u16, 0);
+                        for field in 0..len as u16 {
+                            record.set_scalar(usize::from(field), s_get!(tag_s + 1 + field));
+                        }
+                        Obj::Record(Arc::new(record))
+                    };
+                    *o_mut!(dst_obj) = value;
+                }
+                Op::ReadScalarEnumField { dst_s, tag_s, src_obj, field_idx } => {
+                    let tag = s_get!(tag_s);
+                    let value = if tag == u64::MAX {
+                        match o_ref!(src_obj) {
+                            Obj::Record(rec) => rec.get_scalar(usize::from(field_idx)),
+                            _ => return Err(err_msg("Expected enum record")),
+                        }
+                    } else {
+                        if u64::from(field_idx) >= tag >> 32 {
+                            return Err(err_msg("Scalar enum field out of bounds"));
+                        }
+                        s_get!(tag_s + 1 + u16::from(field_idx))
+                    };
+                    s_set!(dst_s, value);
+                }
+                Op::ReadScalarEnumPair { dst_a, dst_b, tag_s, src_obj, field_a, field_b } => {
+                    let tag = s_get!(tag_s);
+                    let (a, b) = if tag == u64::MAX {
+                        match o_ref!(src_obj) {
+                            Obj::Record(rec) => (
+                                rec.get_scalar(usize::from(field_a)),
+                                rec.get_scalar(usize::from(field_b)),
+                            ),
+                            _ => return Err(err_msg("Expected enum record")),
+                        }
+                    } else {
+                        if u64::from(field_a.max(field_b)) >= tag >> 32 {
+                            return Err(err_msg("Scalar enum field out of bounds"));
+                        }
+                        (
+                            s_get!(tag_s + 1 + u16::from(field_a)),
+                            s_get!(tag_s + 1 + u16::from(field_b)),
+                        )
+                    };
+                    s_set!(dst_a, a);
+                    s_set!(dst_b, b);
+                }
+                Op::SwitchIntImm { src, first, count } => {
+                    switch_jump!(s_get!(src).wrapping_sub(i64::from(first) as u64), count);
+                }
+                Op::SwitchTag { src_obj, first_tag, tag_count }
+                | Op::SwitchScalarTag { src_obj, first_tag, tag_count, .. } => {
+                    let tag = match op {
+                        Op::SwitchScalarTag { tag_s, .. } => s_get!(tag_s),
+                        _ => u64::MAX,
+                    };
+                    let slot = if tag != u64::MAX {
+                        (tag as u32).wrapping_sub(first_tag)
+                    } else {
+                        match o_ref!(src_obj) {
+                            Obj::Record(rec) => rec.schema_id.wrapping_sub(first_tag),
+                            _ => u32::MAX,
+                        }
+                    };
+                    switch_jump!(u64::from(slot), tag_count);
+                }
+                Op::AppendIntRangeTail { list_obj, idx_s, limit_s } => {
+                    let start = (s_get!(idx_s) as i64).checked_add(1).ok_or_else(err_overflow)?;
+                    let end = s_get!(limit_s) as i64;
+                    if start < end {
+                        let Obj::List(ListStorage::Int(items)) = o_mut!(list_obj) else {
+                            return Err(err_msg("Expected [Int] list in AppendIntRangeTail"));
+                        };
+                        let items = Arc::make_mut(items);
+                        let count = usize::try_from(start.abs_diff(end)).map_err(|_| err_overflow())?;
+                        items.try_reserve(count).map_err(|_| err_msg("Cannot reserve list capacity"))?;
+                        items.extend(start..end);
+                    }
+                    s_set!(idx_s, start.max(end) as u64);
+                }
                 Op::ForRangeStep {
                     idx_reg,
                     limit_reg,
                     target,
                 } => {
                     let cur = s_get!(idx_reg) as i64;
+                    let Some(next) = cur.checked_add(1) else {
+                        return Err(err_overflow());
+                    };
                     let limit = s_get!(limit_reg) as i64;
-                    if cur < limit {
-                        let next = cur + 1;
-                        if next < limit {
-                            let step_ip = ip - 1;
-                            let t = target as usize;
-                            if t < step_ip
-                                && step_ip - t <= 12
-                                && !matches!(
-                                    unsafe { *ops_ptr.add(t) },
-                                    Op::CallDirect { .. }
-                                        | Op::CallCallable { .. }
-                                        | Op::MakeClosure { .. }
-                                        | Op::LoadConstObj { .. }
-                                        | Op::MoveObj { .. }
-                                        | Op::RunPipeline { .. }
-                                        | Op::JsonDecode { .. }
-                                        | Op::JsonEncode { .. }
-                                )
-                            {
-                                let body =
-                                    unsafe { std::slice::from_raw_parts(ops_ptr.add(t), step_ip - t) };
-                                if unsafe {
-                                    exec_for_range_fast(
-                                        body,
-                                        s_ptr,
-                                        o_ptr,
-                                        int_consts,
-                                        float_consts,
-                                        idx_reg,
-                                        limit_reg,
-                                        cur,
-                                        limit,
-                                    )?
-                                } {
-                                    continue;
-                                }
-                            }
-                            s_set!(idx_reg, next as u64);
-                            ip = t;
-                        } else {
-                            s_set!(idx_reg, next as u64);
-                        }
-                    } else {
-                        let Some(next) = cur.checked_add(1) else {
-                            return Err(err_overflow());
+                    if next < limit {
+                        let target = target as usize;
+                        let step = ip - 1;
+                        let may_use_arithmetic_kernel = match step.checked_sub(target) {
+                            Some(1) => matches!(func.ops[target], Op::AddInt { .. }),
+                            Some(3) => matches!(
+                                func.ops[target],
+                                Op::IntToFloat { .. } | Op::MulAddInt { .. }
+                            ),
+                            _ => false,
                         };
-                        s_set!(idx_reg, next as u64);
+                        if may_use_arithmetic_kernel {
+                            let finished = finish_range_kernel(
+                                &func.ops[target..step],
+                                &mut self.scalars[s_base..s_base + usize::from(func.num_scalars)],
+                                &module.int_consts,
+                                idx_reg, limit_reg, next, limit,
+                            )?;
+                            sync_frame_ptrs!();
+                            if finished {
+                                continue;
+                            }
+                        }
+                        ip = target;
+                    }
+                    s_set!(idx_reg, next as u64);
+                }
+                Op::CallSelfIntImm { arg_s, arg_o, src, imm } => {
+                    let arg = (s_get!(src) as i64).checked_add(i64::from(imm)).ok_or_else(err_overflow)?;
+                    s_set!(arg_s, arg as u64);
+                    let start_ip = if func.num_objs == 0
+                        && let Some(Op::ReturnScalarIfLtIntImm { a: 0, src: 0, imm: limit }) = func.ops.first()
+                    {
+                        if arg < i64::from(*limit) {
+                            // This still counts as a call at the language's depth limit.
+                            if self.frame_depth >= crate::vm::MAX_CALL_DEPTH {
+                                return Err(crate::vm::exec_cold::err_call_depth());
+                            }
+                            continue;
+                        }
+                        1
+                    } else {
+                        0
+                    };
+                    self.push_frame(CallFrame {
+                        func_id,
+                        return_ip: ip as u32,
+                        s_base: s_base as u32,
+                        o_base: o_base as u32,
+                        ret_reg: arg_s,
+                        prev_closure_slot: CallFrame::pack_closure_slot(cur_closure_slot),
+                    })?;
+                    ip = start_ip;
+                    s_base += usize::from(arg_s);
+                    o_base += usize::from(arg_o);
+                    cur_closure_slot = usize::MAX;
+                    let s_needed = s_base + usize::from(func.num_scalars);
+                    let o_needed = o_base + usize::from(func.num_objs);
+                    if s_needed > self.scalars.len() || o_needed > self.objs.len() {
+                        self.ensure_capacity(s_needed, o_needed);
+                        sync_frame_ptrs!();
+                    } else {
+                        // SAFETY: Capacity check above ensures the new self-call frame fits within live buffers.
+                        s_ptr = unsafe { s_ptr.add(usize::from(arg_s)) };
+                        o_ptr = unsafe { o_ptr.add(usize::from(arg_o)) };
                     }
                 }
                 Op::CallDirect {
@@ -322,18 +542,16 @@ impl Vm {
                     arg_base_o,
                     ret_reg,
                 } => {
-                    if self.frames.len() >= MAX_CALL_DEPTH {
-                        return Err(err_call_depth());
-                    }
-                    self.frames.push(CallFrame {
+                    self.push_frame(CallFrame {
                         func_id,
                         return_ip: ip as u32,
                         s_base: s_base as u32,
                         o_base: o_base as u32,
                         ret_reg,
                         prev_closure_slot: CallFrame::pack_closure_slot(cur_closure_slot),
-                    });
+                    })?;
                     func_id = callee_id as u32;
+                    // SAFETY: `callee_id` is bounds-checked against `module.functions` by `Module::validate`.
                     func = unsafe { module.functions.get_unchecked(func_id as usize) };
                     ops_ptr = func.ops.as_ptr();
                     ip = 0;
@@ -344,8 +562,12 @@ impl Vm {
                     let o_needed = o_base + func.num_objs as usize;
                     if s_needed > self.scalars.len() || o_needed > self.objs.len() {
                         self.ensure_capacity(s_needed, o_needed);
+                        sync_frame_ptrs!();
+                    } else {
+                        // SAFETY: Capacity check above ensures the callee frame fits within live buffers.
+                        s_ptr = unsafe { s_ptr.add(arg_base_s as usize) };
+                        o_ptr = unsafe { o_ptr.add(arg_base_o as usize) };
                     }
-                    sync_frame_ptrs!();
                 }
                 Op::CallCallable {
                     callee_obj,
@@ -368,6 +590,7 @@ impl Vm {
                         ret_reg,
                     )?;
                     func_id = nf;
+                    // SAFETY: `exec_call_callable` validates `nf < module.functions.len()`.
                     func = unsafe { module.functions.get_unchecked(func_id as usize) };
                     ops_ptr = func.ops.as_ptr();
                     ip = 0;
@@ -402,22 +625,17 @@ impl Vm {
                 }
                 Op::ReturnScalar { src } => {
                     let val = s_get!(src);
-                    if func.num_objs > 0 {
-                        self.clear_obj_range(o_base, func.num_objs as usize);
+                    return_scalar_val!(val);
+                }
+                Op::ReturnAddInt { a, b } => {
+                    let sum = (s_get!(a) as i64).checked_add(s_get!(b) as i64).ok_or_else(err_overflow)?;
+                    return_scalar_val!(sum as u64);
+                }
+                Op::ReturnScalarIfLtIntImm { a, imm, src } => {
+                    if (s_get!(a) as i64) < imm as i64 {
+                        let val = s_get!(src);
+                        return_scalar_val!(val);
                     }
-                    if self.frames.len() == base_frame_depth {
-                        return Ok(ExecResult::Scalar(val));
-                    }
-                    let frame = unsafe { self.frames.pop().unwrap_unchecked() };
-                    func_id = frame.func_id;
-                    func = unsafe { module.functions.get_unchecked(func_id as usize) };
-                    ops_ptr = func.ops.as_ptr();
-                    ip = frame.return_ip as usize;
-                    s_base = frame.s_base as usize;
-                    o_base = frame.o_base as usize;
-                    cur_closure_slot = frame.unpack_closure_slot();
-                    sync_frame_ptrs!();
-                    s_set!(frame.ret_reg, val);
                 }
                 Op::ReturnObj { src } => {
                     let val = std::mem::take(o_mut!(src));
@@ -427,11 +645,11 @@ impl Vm {
                     if func.num_objs > 0 {
                         self.clear_obj_range(o_base, func.num_objs as usize);
                     }
-                    if self.frames.len() == base_frame_depth {
+                    let Some(frame) = self.pop_frame(base_frame_depth) else {
                         return Ok(ExecResult::Void);
-                    }
-                    let frame = unsafe { self.frames.pop().unwrap_unchecked() };
+                    };
                     func_id = frame.func_id;
+                    // SAFETY: `frame.func_id` came from a validated `module.functions` entry.
                     func = unsafe { module.functions.get_unchecked(func_id as usize) };
                     ops_ptr = func.ops.as_ptr();
                     ip = frame.return_ip as usize;
@@ -439,6 +657,31 @@ impl Vm {
                     o_base = frame.o_base as usize;
                     cur_closure_slot = frame.unpack_closure_slot();
                     sync_frame_ptrs!();
+                }
+                Op::ToBytes { dst_obj, src_obj } => {
+                    let bytes = match o_ref!(src_obj) {
+                        Obj::Bytes(bytes) => Arc::clone(bytes),
+                        Obj::Str(text) => Arc::new(text.as_bytes().to_vec()),
+                        Obj::List(ListStorage::Int(ints)) => Arc::new(
+                            ints.iter().copied().map(u8::try_from).collect::<Result<Vec<_>, _>>()
+                                .map_err(|_| err_msg("Bytes values must be in 0..=255"))?,
+                        ),
+                        _ => return Err(err_msg("Expected String or [Int] in Bytes()")),
+                    };
+                    *o_mut!(dst_obj) = Obj::Bytes(bytes);
+                }
+                Op::BytesToList { dst_obj, src_obj } => {
+                    let ints = match o_ref!(src_obj) {
+                        Obj::Bytes(bytes) => Arc::new(bytes.iter().copied().map(i64::from).collect()),
+                        Obj::List(ListStorage::Int(ints)) => Arc::clone(ints),
+                        _ => return Err(err_msg("Expected Bytes in to_list()")),
+                    };
+                    *o_mut!(dst_obj) = Obj::List(ListStorage::Int(ints));
+                }
+                Op::NewHttpRequest { dst_obj, desc_idx } => {
+                    let desc = &module.records[desc_idx as usize];
+                    let fields = std::array::from_fn(|idx| o_ref!(desc.obj_regs[idx]).clone());
+                    *o_mut!(dst_obj) = crate::native::http::request_from_fields(fields);
                 }
                 Op::LoadConstObj { dst_obj, idx } => {
                     *o_mut!(dst_obj) = obj_consts[idx as usize].clone();
@@ -486,7 +729,8 @@ impl Vm {
                 Op::ListLen { dst_s, list_obj } => {
                     let len = match o_ref!(list_obj) {
                         Obj::List(l) => l.len() as u64,
-                        _ => return Err(err_msg("Expected List in ListLen")),
+                        Obj::Bytes(bytes) => bytes.len() as u64,
+                        _ => return Err(err_msg("Expected List or Bytes in ListLen")),
                     };
                     s_set!(dst_s, len);
                 }
@@ -497,6 +741,13 @@ impl Vm {
                     };
                     s_set!(dst_s, len);
                 }
+                Op::StrConcatInt { dst_obj, prefix_obj, src_s } => {
+                    let Obj::Str(prefix) = o_ref!(prefix_obj) else {
+                        return Err(err_msg("Expected string prefix in StrConcatInt"));
+                    };
+                    let result = crate::vm::string::VmString::concat_int(prefix, s_get!(src_s) as i64);
+                    *o_mut!(dst_obj) = Obj::Str(Arc::new(result));
+                }
                 Op::StrConcat { dst_obj, a_obj, b_obj } => {
                     self.exec_str_concat(o_base, dst_obj, a_obj, b_obj)?;
                     sync_frame_ptrs!();
@@ -506,6 +757,7 @@ impl Vm {
                     match o_ref!(list_obj) {
                         Obj::List(ListStorage::Int(arc)) => {
                             if idx < arc.len() {
+                                // SAFETY: `idx < arc.len()` was just checked.
                                 s_set!(elem_s, unsafe { *arc.get_unchecked(idx) } as u64);
                                 s_set!(idx_s, (idx + 1) as u64);
                             } else {
@@ -519,32 +771,29 @@ impl Vm {
                         }
                     }
                 }
+                Op::SumListIntTail { list_obj, idx_s, elem_s, acc_s } => {
+                    let Obj::List(ListStorage::Int(items)) = o_ref!(list_obj) else {
+                        return Err(err_msg("Expected [Int] in SumListIntTail"));
+                    };
+                    let idx = s_get!(idx_s) as usize;
+                    if let Some(tail) = items.get(idx..)
+                        && let Some(&last) = tail.last()
+                    {
+                        let mut acc = s_get!(acc_s) as i64;
+                        for &value in tail {
+                            acc = acc.checked_add(value).ok_or_else(err_overflow)?;
+                        }
+                        s_set!(acc_s, acc as u64);
+                        s_set!(elem_s, last as u64);
+                        s_set!(idx_s, items.len() as u64);
+                    }
+                }
                 Op::ForListIntStep { list_obj, idx_s, elem_s, target } => {
                     let idx = s_get!(idx_s) as usize;
                     match o_ref!(list_obj) {
                         Obj::List(ListStorage::Int(arc)) => {
                             if idx < arc.len() {
-                                if target as usize + 1 == ip - 1
-                                    && let Op::AddInt { dst, a, b } =
-                                        unsafe { *ops_ptr.add(target as usize) }
-                                    && dst == a
-                                    && b == elem_s
-                                    && dst != idx_s
-                                    && dst != elem_s
-                                {
-                                    let mut acc = s_get!(dst) as i64;
-                                    let slice = &arc[idx..];
-                                    for &v in slice {
-                                        let Some(next_acc) = acc.checked_add(v) else {
-                                            return Err(err_overflow());
-                                        };
-                                        acc = next_acc;
-                                    }
-                                    s_set!(dst, acc as u64);
-                                    s_set!(elem_s, *slice.last().unwrap() as u64);
-                                    s_set!(idx_s, arc.len() as u64);
-                                    continue;
-                                }
+                                // SAFETY: `idx < arc.len()` was just checked.
                                 s_set!(elem_s, unsafe { *arc.get_unchecked(idx) } as u64);
                                 s_set!(idx_s, (idx + 1) as u64);
                                 ip = target as usize;
@@ -565,10 +814,12 @@ impl Vm {
                 }
                 Op::NewRecord { dst_obj, desc_idx } => {
                     let desc = &module.records[desc_idx as usize];
+                    // SAFETY: `Module::validate` verifies `desc` register indices fit within the frame window.
                     unsafe { build_record_into_reg(desc, s_ptr, o_ptr, dst_obj, false) };
                 }
                 Op::NewRecordMove { dst_obj, desc_idx } => {
                     let desc = &module.records[desc_idx as usize];
+                    // SAFETY: `Module::validate` verifies `desc` register indices fit within the frame window.
                     unsafe { build_record_into_reg(desc, s_ptr, o_ptr, dst_obj, true) };
                 }
                 Op::GetFieldScalar { dst_s, rec_obj, field_idx } => {
@@ -580,21 +831,55 @@ impl Vm {
                 }
                 Op::GetFieldObj { dst_obj, rec_obj, field_idx } => {
                     let val = match o_ref!(rec_obj) {
-                        Obj::Record(rec) => rec.get_obj(field_idx as usize).clone(),
+                        Obj::Record(rec) => rec.get_obj_keep_single_map(field_idx as usize).clone(),
                         _ => return Err(err_msg("Expected Record in GetFieldObj")),
                     };
                     *o_mut!(dst_obj) = val;
                 }
                 Op::NewMap { dst_obj } => *o_mut!(dst_obj) = Obj::Map(Arc::new(OrderedMap::new())),
                 Op::MapSetIntInt { map_obj, key_s, val_s } => {
-                    self.exec_map_set_int(s_base, o_base, map_obj, key_s, val_s)?;
+                    map_set_int_slot(o_mut!(map_obj), s_get!(key_s) as i64, s_get!(val_s))?;
                 }
                 Op::MapGetIntIntOr { dst_s, map_obj, key_s, def_s } => {
-                    self.exec_map_get_int_or(s_base, o_base, dst_s, map_obj, key_s, def_s)?;
+                    let value = map_get_int_or_slot(o_ref!(map_obj), s_get!(key_s) as i64, s_get!(def_s))?;
+                    s_set!(dst_s, value);
+                }
+                Op::MapGetIntIntOrImm { dst_s, map_obj, key_s, default } => {
+                    let value = map_get_int_or_slot(o_ref!(map_obj), s_get!(key_s) as i64, i64::from(default) as u64)?;
+                    s_set!(dst_s, value);
+                }
+                Op::AddIntMapGetOrImm { dst_s, a, map_obj, key_s, default } => {
+                    let value = map_get_int_or_slot(
+                        o_ref!(map_obj),
+                        s_get!(key_s) as i64,
+                        i64::from(default) as u64,
+                    )?;
+                    let sum = (s_get!(a) as i64).checked_add(value as i64).ok_or_else(err_overflow)?;
+                    s_set!(dst_s, sum as u64);
+                }
+                Op::SumIntMapRangeTail { acc_s, map_obj, idx_s, limit_s, default } => {
+                    let start = (s_get!(idx_s) as i64).checked_add(1).ok_or_else(err_overflow)?;
+                    let end = s_get!(limit_s) as i64;
+                    if start < end {
+                        let sum = sum_int_map_range(
+                            o_ref!(map_obj), start..end, s_get!(acc_s) as i64, i64::from(default),
+                        )?;
+                        s_set!(acc_s, sum as u64);
+                    }
+                    s_set!(idx_s, start.max(end) as u64);
                 }
                 Op::MapLen { dst_s, map_obj } => {
                     let len = match o_ref!(map_obj) {
                         Obj::Map(arc) => arc.len() as u64,
+                        Obj::DeferredField(df) => {
+                            if df.as_single_map_entry().is_some() {
+                                1
+                            } else if let Obj::Map(arc) = df.value() {
+                                arc.len() as u64
+                            } else {
+                                return Err(err_msg("Expected Map in MapLen"));
+                            }
+                        }
                         _ => return Err(err_msg("Expected Map in MapLen")),
                     };
                     s_set!(dst_s, len);

@@ -13,8 +13,8 @@ use crate::native::path::{
     path_join_all, path_normalize, path_stem, path_with_ext,
 };
 use crate::native::process::{
-    PROC_CWD, PROC_EXIT, PROC_PID, PROC_RUN, PROC_SET_CWD, PROC_STATUS, make_process_error,
-    proc_cwd, proc_run, proc_set_cwd, proc_status,
+    PROC_CWD, PROC_EXIT, PROC_PID, PROC_PIPE, PROC_RUN, PROC_SET_CWD, PROC_STATUS,
+    make_process_error, proc_cwd, proc_pipe, proc_run, proc_set_cwd, proc_status,
 };
 use crate::native::csv::{CsvError, parse_csv_objs, parse_csv_records_objs, stringify_csv};
 use crate::native::log::{
@@ -120,6 +120,14 @@ impl Vm {
                         }
                     }
                     _ => make_process_error("invalid_input", "Expected [String] arguments"),
+                };
+                self.objs[o_base + a as usize] = res;
+            }
+            PROC_PIPE => {
+                crate::vm::exec_map::flush_stdout();
+                let res = match &self.objs[o_base + b as usize] {
+                    Obj::List(ListStorage::Obj(items)) => proc_pipe(items),
+                    _ => make_process_error("invalid_input", "Expected [[String]] commands"),
                 };
                 self.objs[o_base + a as usize] = res;
             }
@@ -235,7 +243,7 @@ impl Vm {
                 };
             }
             URL_ENCODE_QUERY => {
-                let Obj::Map(map) = &self.objs[o_base + b as usize] else {
+                let Obj::Map(map) = self.objs[o_base + b as usize].resolved() else {
                     return Err(err_msg("Expected Map<String, String> in url.encode_query()"));
                 };
                 let map_clone = Arc::clone(map);

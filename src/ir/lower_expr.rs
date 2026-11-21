@@ -107,7 +107,108 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
         Ok(())
     }
 
+    pub(crate) fn lower_into_slot(&mut self, expr: &Expr, slot: super::lower::VarSlot) -> Result<(), String> {
+        let dst = slot.reg;
+        if slot.is_scalar {
+            let src = self.lower_scalar_with_dest(expr, Some(dst))?;
+            if src != dst {
+                self.ops.push(Op::MoveScalar { dst, src });
+            }
+        } else if let Some(layout) = self.compact_enums.get(&dst).copied() {
+            if !self.try_lower_compact_enum_ctor(expr, layout)? {
+                let src = self.lower_obj_with_dest(expr, Some(dst))?;
+                if src != dst {
+                    self.ops.push(Op::MoveObj { dst_obj: dst, src });
+                }
+                self.load_int_into(layout.tag_s, -1)?;
+            }
+        } else {
+            let src = self.lower_obj_with_dest(expr, Some(dst))?;
+            if src != dst {
+                self.ops.push(Op::MoveObj { dst_obj: dst, src });
+            }
+        }
+        Ok(())
+    }
+
+    fn try_lower_compact_enum_ctor(
+        &mut self,
+        expr: &Expr,
+        layout: super::lower::CompactEnum,
+    ) -> Result<bool, String> {
+        let (member, args, named_args): (_, &[_], &[_]) = match &expr.kind {
+            ExprKind::Call { callee, args, named_args, .. } => (callee.as_ref(), args, named_args),
+            _ => (expr, &[], &[]),
+        };
+        let ExprKind::Member { target, field } = &member.kind else { return Ok(false) };
+        let ExprKind::Ident(name) = &target.kind else { return Ok(false) };
+        if !matches!(&expr.ty, Type::DataEnum(ename) if ename == name)
+            || self.lookup_local(name).is_some()
+        {
+            return Ok(false);
+        }
+        let Some(variant) = self.mc.checked.data_enums[name].iter().find(|v| v.name == *field) else {
+            return Ok(false);
+        };
+        let st = self.mc.checked.structs[self.mc.checked.struct_by_name[&variant.struct_name]].clone();
+        let (payload, _) = self.lower_struct_fields(&st, args, named_args)?;
+        if payload.len() > usize::from(layout.width) {
+            return Err("Enum payload exceeds the scalar register allocation".to_owned());
+        }
+        if payload.is_empty() {
+            self.load_int_into(layout.tag_s, i64::from(st.schema_id))?;
+            return Ok(true);
+        }
+        self.ops.push(Op::MakeScalarEnum {
+            dst_s: layout.tag_s,
+            schema_id: st.schema_id,
+            a: payload.first().copied().unwrap_or(0),
+            b: payload.get(1).copied().unwrap_or(0),
+            len: payload.len() as u8,
+        });
+        Ok(true)
+    }
+
+    pub(crate) fn materialize_local_obj(&mut self, src_obj: u16, dest: Option<u16>) -> u16 {
+        let Some(layout) = self.compact_enums.get(&src_obj).copied() else { return src_obj };
+        let dst_obj = dest.unwrap_or_else(|| self.alloc_temp_o());
+        self.ops.push(Op::BoxScalarEnum { dst_obj, src_obj, tag_s: layout.tag_s, width: layout.width });
+        dst_obj
+    }
+
+    pub(crate) fn lower_conditional_jump(&mut self, condition: &Expr, when_true: bool) -> Result<usize, String> {
+        let start = self.ops.len();
+        let cond = self.lower_scalar(condition)?;
+        // A comparison used only by this branch has no need to materialize its boolean.
+        let fused = match self.ops.last().copied().filter(|_| self.ops.len() > start) {
+            Some(Op::LtInt { dst, a, b }) if dst == cond => {
+                Some(Op::JumpIfLtInt { a, b, target: 0, when_true })
+            }
+            Some(Op::EqIntImm { dst, a, imm }) if dst == cond => {
+                Some(Op::JumpIfEqIntImm { a, imm, target: 0, when_true })
+            }
+            Some(Op::LtIntImm { dst, a, imm }) if dst == cond => {
+                Some(Op::JumpIfLtIntImm { a, imm, target: 0, when_true })
+            }
+            _ => None,
+        };
+        if fused.is_some() {
+            self.ops.pop();
+        }
+        let pc = self.ops.len();
+        self.ops.push(fused.unwrap_or(if when_true {
+            Op::JumpIfTrue { cond, target: 0 }
+        } else {
+            Op::JumpIfFalse { cond, target: 0 }
+        }));
+        Ok(pc)
+    }
+
     pub(crate) fn lower_scalar(&mut self, expr: &Expr) -> Result<u16, String> {
+        self.lower_scalar_with_dest(expr, None)
+    }
+
+    fn lower_scalar_with_dest(&mut self, expr: &Expr, dest: Option<u16>) -> Result<u16, String> {
         match &expr.kind {
             ExprKind::Int(n) => {
                 if self.loop_depth > 0
@@ -115,7 +216,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 {
                     return Ok(reg);
                 }
-                let dst = self.alloc_temp_s();
+                let dst = dest.unwrap_or_else(|| self.alloc_temp_s());
                 self.load_int_into(dst, *n)?;
                 Ok(dst)
             }
@@ -124,12 +225,12 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 if let Some(&reg) = self.hoisted_floats.get(&bits) {
                     return Ok(reg);
                 }
-                let dst = self.alloc_temp_s();
+                let dst = dest.unwrap_or_else(|| self.alloc_temp_s());
                 self.load_float_into(dst, *v)?;
                 Ok(dst)
             }
             ExprKind::Bool(b) => {
-                let dst = self.alloc_temp_s();
+                let dst = dest.unwrap_or_else(|| self.alloc_temp_s());
                 self.ops.push(Op::LoadBool { dst, val: *b });
                 Ok(dst)
             }
@@ -151,7 +252,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                         {
                             return Ok(reg);
                         }
-                        let dst = self.alloc_temp_s();
+                        let dst = dest.unwrap_or_else(|| self.alloc_temp_s());
                         self.load_int_into(dst, neg)?;
                         return Ok(dst);
                     }
@@ -160,12 +261,12 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                         if let Some(&reg) = self.hoisted_floats.get(&bits) {
                             return Ok(reg);
                         }
-                        let dst = self.alloc_temp_s();
+                        let dst = dest.unwrap_or_else(|| self.alloc_temp_s());
                         self.load_float_into(dst, -v)?;
                         return Ok(dst);
                     }
                     let src = self.lower_scalar(inner)?;
-                    let dst = self.alloc_temp_s();
+                    let dst = dest.unwrap_or_else(|| self.alloc_temp_s());
                     if expr.ty.is_int() {
                         self.ops.push(Op::NegInt { dst, src });
                     } else {
@@ -177,12 +278,12 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 }
                 UnaryOp::Not => {
                     let src = self.lower_scalar(inner)?;
-                    let dst = self.alloc_temp_s();
+                    let dst = dest.unwrap_or_else(|| self.alloc_temp_s());
                     self.ops.push(Op::NotBool { dst, src });
                     Ok(dst)
                 }
             },
-            ExprKind::Binary { op, left, right } => self.lower_binary_scalar(*op, left, right, &expr.ty),
+            ExprKind::Binary { op, left, right } => self.lower_binary_scalar(*op, left, right, &expr.ty, dest),
             ExprKind::Member { target, field } => {
                 let target_ty = target.ty.clone();
                 let Type::Custom(tid) = &target_ty else {
@@ -197,7 +298,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 let f = st
                     .field(field)
                     .ok_or_else(|| format!("Unknown field '.{}' on {}", field, tid.name))?;
-                let dst_s = self.alloc_temp_s();
+                let dst_s = dest.unwrap_or_else(|| self.alloc_temp_s());
                 self.ops.push(Op::GetFieldScalar { dst_s, rec_obj, field_idx: f.slot_idx });
                 Ok(dst_s)
             }
@@ -206,7 +307,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                     return self.lower_scalar(inner);
                 }
                 let src_obj = self.lower_obj(inner)?;
-                let dst_s = self.alloc_temp_s();
+                let dst_s = dest.unwrap_or_else(|| self.alloc_temp_s());
                 let ret_on_err = can_propagate_try(&inner.ty, &self.return_ty, self.mc.checked);
                 if ret_on_err && self.has_defer {
                     self.emit_defer_try_check(&inner.ty, src_obj, true)?;
@@ -226,6 +327,10 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
     }
 
     pub(crate) fn lower_obj(&mut self, expr: &Expr) -> Result<u16, String> {
+        self.lower_obj_with_dest(expr, None)
+    }
+
+    fn lower_obj_with_dest(&mut self, expr: &Expr, dest: Option<u16>) -> Result<u16, String> {
         if expr.ty.is_scalar() {
             let s = self.lower_scalar(expr)?;
             return Ok(self.emit_box_scalar_from(s, &expr.ty));
@@ -236,13 +341,13 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                     return Ok(reg);
                 }
                 let idx = self.mc.intern_str(s)?;
-                let dst_obj = self.alloc_temp_o();
+                let dst_obj = dest.unwrap_or_else(|| self.alloc_temp_o());
                 self.ops.push(Op::LoadConstObj { dst_obj, idx });
                 Ok(dst_obj)
             }
             ExprKind::Nil => {
                 let idx = self.mc.intern_empty()?;
-                let dst_obj = self.alloc_temp_o();
+                let dst_obj = dest.unwrap_or_else(|| self.alloc_temp_o());
                 self.ops.push(Op::LoadConstObj { dst_obj, idx });
                 Ok(dst_obj)
             }
@@ -251,10 +356,10 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                     if slot.is_scalar {
                         return Err(format!("Expected object '{}' but got scalar", name));
                     }
-                    return Ok(slot.reg);
+                    return Ok(self.materialize_local_obj(slot.reg, dest));
                 }
                 if let Some(&fid) = self.mc.checked.func_by_name.get(name) {
-                    let dst_obj = self.alloc_temp_o();
+                    let dst_obj = dest.unwrap_or_else(|| self.alloc_temp_o());
                     self.ops.push(Op::LoadFuncObj { dst_obj, func_id: fid as u16 });
                     return Ok(dst_obj);
                 }
@@ -265,15 +370,25 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             }
             ExprKind::Binary { op: BinaryOp::Add, left, right } if expr.ty == Type::String => {
                 let a_obj = self.lower_obj(left)?;
+                if let ExprKind::Call { callee, args, named_args, .. } = &right.kind
+                    && args.is_empty() && named_args.is_empty()
+                    && let ExprKind::Member { target, field } = &callee.kind
+                    && target.ty == Type::Int && field == "to_string"
+                {
+                    let src_s = self.lower_scalar(target)?;
+                    let dst_obj = dest.unwrap_or_else(|| self.alloc_temp_o());
+                    self.ops.push(Op::StrConcatInt { dst_obj, prefix_obj: a_obj, src_s });
+                    return Ok(dst_obj);
+                }
                 let b_obj = self.lower_obj(right)?;
-                let dst_obj = self.alloc_temp_o();
+                let dst_obj = dest.unwrap_or_else(|| self.alloc_temp_o());
                 self.ops.push(Op::StrConcat { dst_obj, a_obj, b_obj });
                 Ok(dst_obj)
             }
             ExprKind::Binary { op: BinaryOp::Range, left, right } => {
                 let start_s = self.lower_scalar(left)?;
                 let end_s = self.lower_scalar(right)?;
-                let dst_obj = self.alloc_temp_o();
+                let dst_obj = dest.unwrap_or_else(|| self.alloc_temp_o());
                 self.ops.push(Op::MakeRangeList { dst_obj, start_s, end_s });
                 Ok(dst_obj)
             }
@@ -310,11 +425,11 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 Ok(dst_obj)
             }
             ExprKind::Index { target, index } => match &target.ty {
-                Type::List(inner) => {
+                ty @ (Type::List(_) | Type::Bytes) => {
                     let list_obj = self.lower_obj(target)?;
                     let idx_s = self.lower_scalar(index)?;
-                    let elem_tag = elem_tag_for(inner);
-                    let dst_obj = self.alloc_temp_o();
+                    let elem_tag = if let Type::List(inner) = ty { elem_tag_for(inner) } else { 1 };
+                    let dst_obj = dest.unwrap_or_else(|| self.alloc_temp_o());
                     self.ops.push(Op::ListIndex { dst_obj, list_obj, idx_s, elem_tag });
                     Ok(dst_obj)
                 }
@@ -326,7 +441,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                         self.lower_obj(index)?
                     };
                     let aux = (elem_tag_for(k) << 4) | elem_tag_for(v);
-                    let dst_obj = self.alloc_temp_o();
+                    let dst_obj = dest.unwrap_or_else(|| self.alloc_temp_o());
                     self.ops.push(Op::ExtOp { kind: EXT_MAP_INDEX, aux, a: dst_obj, b: map_obj, c: key_reg });
                     Ok(dst_obj)
                 }
@@ -340,7 +455,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                     let var = dvars.iter().find(|v| &v.name == field).ok_or_else(|| {
                         format!("Enum '{}' has no variant '{}'", ename, field)
                     })?;
-                    return self.lower_struct_ctor(&var.struct_name, &[], &[]);
+                    return self.lower_struct_ctor(&var.struct_name, &[], &[], dest);
                 }
                 if let ExprKind::Ident(alias) = &target.kind
                     && self.lookup_local(alias).is_none()
@@ -361,7 +476,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 let f = st
                     .field(field)
                     .ok_or_else(|| format!("Unknown field '.{}' on {}", field, tid.name))?;
-                let dst_obj = self.alloc_temp_o();
+                let dst_obj = dest.unwrap_or_else(|| self.alloc_temp_o());
                 self.ops.push(Op::GetFieldObj { dst_obj, rec_obj, field_idx: f.slot_idx });
                 Ok(dst_obj)
             }
@@ -430,9 +545,75 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             ExprKind::Closure { params, return_type, body } => {
                 self.lower_closure(params, return_type, body, &expr.ty)
             }
-            ExprKind::Call { .. } => self.lower_call_obj(expr),
+            ExprKind::Call { .. } => self.lower_call_obj(expr, dest),
             _ => Err(format!("Unsupported object expression {:?}", expr.kind)),
         }
+    }
+
+    fn lower_add_int_imm(
+        &mut self,
+        arg: &Expr,
+        imm: i16,
+        dest: Option<u16>,
+    ) -> Result<u16, String> {
+        let a = self.lower_scalar(arg)?;
+        let dst = dest.unwrap_or_else(|| self.alloc_temp_s());
+        if matches!(&arg.kind, ExprKind::Binary { op: BinaryOp::Mul, .. })
+            && let Some(Op::MulIntImm { dst: product, a: src, imm: mul }) = self.ops.last().copied()
+            && product == a
+        {
+            self.ops.pop();
+            self.ops.push(Op::MulAddIntImm { dst, src, mul, add: imm });
+        } else {
+            self.ops.push(Op::AddIntImm { dst, a, imm });
+        }
+        Ok(dst)
+    }
+
+    pub(super) fn lower_remainder(&mut self, a: u16, right: &Expr, dest: Option<u16>) -> Result<u16, String> {
+        let divisor = crate::ir::lower_loops::int_literal(right)
+            .and_then(|n| u32::try_from(n.unsigned_abs()).ok());
+        if let Some(divisor) = divisor
+            && let Some((magic, shift)) = crate::vm::opcode::remainder_magic(divisor)
+            && let Ok(magic_idx) = self.mc.intern_int(magic)
+        {
+            let dst = dest.unwrap_or_else(|| self.alloc_temp_s());
+            self.ops.push(Op::ModIntConst { dst, a, divisor, magic_idx, shift });
+            return Ok(dst);
+        }
+        if let Some(imm) = as_i16_lit(right) {
+            let dst = dest.unwrap_or_else(|| self.alloc_temp_s());
+            self.ops.push(Op::ModIntImm { dst, a, imm });
+            return Ok(dst);
+        }
+        let b = self.lower_scalar(right)?;
+        let dst = dest.unwrap_or_else(|| self.alloc_temp_s());
+        self.ops.push(Op::ModInt { dst, a, b });
+        Ok(dst)
+    }
+
+    pub(crate) fn lower_add_int(
+        &mut self,
+        a: u16,
+        right: &Expr,
+        dest: Option<u16>,
+    ) -> Result<u16, String> {
+        let rhs_start = self.ops.len();
+        let b = self.lower_scalar(right)?;
+        let dst = dest.unwrap_or_else(|| self.alloc_temp_s());
+        if matches!(&right.kind, ExprKind::Binary { op: BinaryOp::Coalesce, .. })
+            && self.ops.len() > rhs_start
+            && let Some(Op::MapGetIntIntOrImm { dst_s, map_obj, key_s, default }) = self.ops.last().copied()
+            && dst_s == b
+            && a != b
+        {
+            // The lookup's result is used only by this addition.
+            self.ops.pop();
+            self.ops.push(Op::AddIntMapGetOrImm { dst_s: dst, a, map_obj, key_s, default });
+        } else {
+            self.ops.push(Op::AddInt { dst, a, b });
+        }
+        Ok(dst)
     }
 
     fn lower_binary_scalar(
@@ -441,6 +622,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
         left: &Expr,
         right: &Expr,
         res_ty: &Type,
+        dest: Option<u16>,
     ) -> Result<u16, String> {
         match op {
             BinaryOp::And => {
@@ -473,8 +655,13 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 {
                     let map_obj = self.lower_obj(target)?;
                     let key_s = self.lower_scalar(&args[0])?;
+                    if let Some(default) = as_i16_lit(right) {
+                        let dst_s = dest.unwrap_or_else(|| self.alloc_temp_s());
+                        self.ops.push(Op::MapGetIntIntOrImm { dst_s, map_obj, key_s, default });
+                        return Ok(dst_s);
+                    }
                     let def_s = self.lower_scalar(right)?;
-                    let dst_s = self.alloc_temp_s();
+                    let dst_s = dest.unwrap_or_else(|| self.alloc_temp_s());
                     self.ops.push(Op::MapGetIntIntOr { dst_s, map_obj, key_s, def_s });
                     return Ok(dst_s);
                 }
@@ -484,7 +671,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 self.ops.push(Op::LoadConstObj { dst_obj: emp, idx: emp_idx });
                 let is_nil = self.alloc_temp_s();
                 self.ops.push(Op::EqObj { dst_s: is_nil, a_obj: lhs_o, b_obj: emp });
-                let dst = self.alloc_temp_s();
+                let dst = dest.unwrap_or_else(|| self.alloc_temp_s());
                 let jf_pc = self.ops.len();
                 self.ops.push(Op::JumpIfFalse { cond: is_nil, target: 0 });
                 let rhs_s = self.lower_scalar(right)?;
@@ -501,7 +688,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                     let ra = self.lower_scalar(ma)?;
                     let rb = self.lower_scalar(mb)?;
                     let rc = self.lower_scalar(right)?;
-                    let dst = self.alloc_temp_s();
+                    let dst = dest.unwrap_or_else(|| self.alloc_temp_s());
                     self.ops.push(Op::FmaFloat { dst, a: ra, b: rb, c: rc });
                     return Ok(dst);
                 }
@@ -509,65 +696,69 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                     let rc = self.lower_scalar(left)?;
                     let ra = self.lower_scalar(ma)?;
                     let rb = self.lower_scalar(mb)?;
-                    let dst = self.alloc_temp_s();
+                    let dst = dest.unwrap_or_else(|| self.alloc_temp_s());
                     self.ops.push(Op::FmaFloat { dst, a: ra, b: rb, c: rc });
                     return Ok(dst);
                 }
                 let a = self.lower_scalar(left)?;
                 let b = self.lower_scalar(right)?;
-                let dst = self.alloc_temp_s();
+                let dst = dest.unwrap_or_else(|| self.alloc_temp_s());
                 self.ops.push(Op::AddFloat { dst, a, b });
                 Ok(dst)
             }
             BinaryOp::Add if res_ty.is_int() => {
                 if let Some(imm) = as_i16_lit(right) {
-                    let a = self.lower_scalar(left)?;
-                    let dst = self.alloc_temp_s();
-                    self.ops.push(Op::AddIntImm { dst, a, imm });
-                    return Ok(dst);
+                    return self.lower_add_int_imm(left, imm, dest);
                 }
                 if let Some(imm) = as_i16_lit(left) {
-                    let a = self.lower_scalar(right)?;
-                    let dst = self.alloc_temp_s();
-                    self.ops.push(Op::AddIntImm { dst, a, imm });
+                    return self.lower_add_int_imm(right, imm, dest);
+                }
+                // A literal or variable has no side effects, so its load can
+                // precede the checked product without changing error order.
+                if let ExprKind::Binary { op: BinaryOp::Mul, left: x, right: y } = &left.kind
+                    && matches!(right.kind, ExprKind::Ident(_) | ExprKind::Int(_))
+                    && as_i16_lit(x).is_none() && as_i16_lit(y).is_none()
+                {
+                    let a = self.lower_scalar(x)?;
+                    let b = self.lower_scalar(y)?;
+                    let c = self.lower_scalar(right)?;
+                    let dst = dest.unwrap_or_else(|| self.alloc_temp_s());
+                    self.ops.push(Op::MulAddInt { dst, a, b, c });
                     return Ok(dst);
                 }
                 let a = self.lower_scalar(left)?;
-                let b = self.lower_scalar(right)?;
-                let dst = self.alloc_temp_s();
-                self.ops.push(Op::AddInt { dst, a, b });
-                Ok(dst)
+                self.lower_add_int(a, right, dest)
             }
             BinaryOp::Sub if res_ty.is_int() => {
                 if let Some(imm) = as_neg_i16_lit(right) {
                     let a = self.lower_scalar(left)?;
-                    let dst = self.alloc_temp_s();
+                    let dst = dest.unwrap_or_else(|| self.alloc_temp_s());
                     self.ops.push(Op::AddIntImm { dst, a, imm });
                     return Ok(dst);
                 }
                 let a = self.lower_scalar(left)?;
                 let b = self.lower_scalar(right)?;
-                let dst = self.alloc_temp_s();
+                let dst = dest.unwrap_or_else(|| self.alloc_temp_s());
                 self.ops.push(Op::SubInt { dst, a, b });
                 Ok(dst)
             }
             BinaryOp::Mod if res_ty.is_int() => {
-                if let Some(imm) = as_i16_lit(right) {
-                    let a = self.lower_scalar(left)?;
-                    let dst = self.alloc_temp_s();
-                    self.ops.push(Op::ModIntImm { dst, a, imm });
-                    return Ok(dst);
-                }
                 let a = self.lower_scalar(left)?;
-                let b = self.lower_scalar(right)?;
-                let dst = self.alloc_temp_s();
-                self.ops.push(Op::ModInt { dst, a, b });
+                self.lower_remainder(a, right, dest)
+            }
+            BinaryOp::Mul if res_ty.is_int()
+                && let Some((arg, imm)) = as_i16_lit(right).map(|n| (left, n))
+                    .or_else(|| as_i16_lit(left).map(|n| (right, n))) =>
+            {
+                let a = self.lower_scalar(arg)?;
+                let dst = dest.unwrap_or_else(|| self.alloc_temp_s());
+                self.ops.push(Op::MulIntImm { dst, a, imm });
                 Ok(dst)
             }
             BinaryOp::Mul | BinaryOp::Div | BinaryOp::Sub => {
                 let a = self.lower_scalar(left)?;
                 let b = self.lower_scalar(right)?;
-                let dst = self.alloc_temp_s();
+                let dst = dest.unwrap_or_else(|| self.alloc_temp_s());
                 let inst = match (op, res_ty.is_float()) {
                     (BinaryOp::Mul, false) => Op::MulInt { dst, a, b },
                     (BinaryOp::Div, false) => Op::DivInt { dst, a, b },
@@ -579,28 +770,43 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 self.ops.push(inst);
                 Ok(dst)
             }
+            BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor
+            | BinaryOp::ShiftLeft | BinaryOp::ShiftRight => {
+                let a = self.lower_scalar(left)?;
+                let b = self.lower_scalar(right)?;
+                let dst = dest.unwrap_or_else(|| self.alloc_temp_s());
+                self.ops.push(match op {
+                    BinaryOp::BitAnd => Op::BitAndInt { dst, a, b },
+                    BinaryOp::BitOr => Op::BitOrInt { dst, a, b },
+                    BinaryOp::BitXor => Op::BitXorInt { dst, a, b },
+                    BinaryOp::ShiftLeft => Op::ShiftLeftInt { dst, a, b },
+                    BinaryOp::ShiftRight => Op::ShiftRightInt { dst, a, b },
+                    _ => unreachable!(),
+                });
+                Ok(dst)
+            }
             BinaryOp::Eq | BinaryOp::NotEq => {
                 let is_neq = op == BinaryOp::NotEq;
                 if (left.ty.is_int() && right.ty.is_int()) || (left.ty.is_bool() && right.ty.is_bool()) {
                     if let Some(imm) = as_i16_lit(right) && !is_neq {
                         let a = self.lower_scalar(left)?;
-                        let dst = self.alloc_temp_s();
+                        let dst = dest.unwrap_or_else(|| self.alloc_temp_s());
                         self.ops.push(Op::EqIntImm { dst, a, imm });
                         return Ok(dst);
                     }
                     let a = self.lower_scalar(left)?;
                     let b = self.lower_scalar(right)?;
-                    let dst = self.alloc_temp_s();
+                    let dst = dest.unwrap_or_else(|| self.alloc_temp_s());
                     self.ops.push(if is_neq { Op::NeInt { dst, a, b } } else { Op::EqInt { dst, a, b } });
                     return Ok(dst);
                 }
                 if left.ty.is_float() && right.ty.is_float() {
                     let a = self.lower_scalar(left)?;
                     let b = self.lower_scalar(right)?;
-                    let dst = self.alloc_temp_s();
+                    let dst = dest.unwrap_or_else(|| self.alloc_temp_s());
                     self.ops.push(Op::EqFloat { dst, a, b });
                     if is_neq {
-                        let nd = self.alloc_temp_s();
+                        let nd = dest.unwrap_or_else(|| self.alloc_temp_s());
                         self.ops.push(Op::NotBool { dst: nd, src: dst });
                         return Ok(nd);
                     }
@@ -608,10 +814,10 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 }
                 let a_obj = self.lower_obj(left)?;
                 let b_obj = self.lower_obj(right)?;
-                let dst_s = self.alloc_temp_s();
+                let dst_s = dest.unwrap_or_else(|| self.alloc_temp_s());
                 self.ops.push(Op::EqObj { dst_s, a_obj, b_obj });
                 if is_neq {
-                    let nd = self.alloc_temp_s();
+                    let nd = dest.unwrap_or_else(|| self.alloc_temp_s());
                     self.ops.push(Op::NotBool { dst: nd, src: dst_s });
                     return Ok(nd);
                 }
@@ -623,13 +829,13 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                         && let Some(imm) = as_i16_lit(right)
                     {
                         let a = self.lower_scalar(left)?;
-                        let dst = self.alloc_temp_s();
+                        let dst = dest.unwrap_or_else(|| self.alloc_temp_s());
                         self.ops.push(Op::LtIntImm { dst, a, imm });
                         return Ok(dst);
                     }
                     let a = self.lower_scalar(left)?;
                     let b = self.lower_scalar(right)?;
-                    let dst = self.alloc_temp_s();
+                    let dst = dest.unwrap_or_else(|| self.alloc_temp_s());
                     let inst = match op {
                         BinaryOp::Lt => Op::LtInt { dst, a, b },
                         BinaryOp::LtEq => Op::LeInt { dst, a, b },
@@ -642,7 +848,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 }
                 let a = self.lower_scalar(left)?;
                 let b = self.lower_scalar(right)?;
-                let dst = self.alloc_temp_s();
+                let dst = dest.unwrap_or_else(|| self.alloc_temp_s());
                 let inst = match op {
                     BinaryOp::Lt => Op::LtFloat { dst, a, b },
                     BinaryOp::LtEq => Op::LeFloat { dst, a, b },
@@ -657,7 +863,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
         }
     }
 
-    fn lower_list_lit(&mut self, elems: &[Expr], list_ty: &Type) -> Result<u16, String> {
+    pub(crate) fn lower_list_lit(&mut self, elems: &[Expr], list_ty: &Type) -> Result<u16, String> {
         let elem_ty = match list_ty {
             Type::List(inner) => inner.as_ref(),
             _ => &Type::Any,

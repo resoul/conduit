@@ -25,6 +25,7 @@ impl Parser {
             TokenKind::KwWhile => self.parse_while_stmt(),
             TokenKind::KwSwitch => self.parse_switch_stmt(),
             TokenKind::KwDefer => self.parse_defer_stmt(),
+            TokenKind::KwSpawn => self.parse_spawn_stmt(),
             TokenKind::KwBreak => Ok(Stmt::new(StmtKind::Break, self.bump().span)),
             TokenKind::KwContinue => Ok(Stmt::new(StmtKind::Continue, self.bump().span)),
             TokenKind::KwVar => self.parse_var_decl_stmt(),
@@ -77,6 +78,21 @@ impl Parser {
             }
         };
         Ok(Stmt::new(StmtKind::Defer(block), span))
+    }
+
+    fn parse_spawn_stmt(&mut self) -> Result<Stmt, ParserError> {
+        let span = self.expect(&TokenKind::KwSpawn)?.span;
+        let block = if self.check(&TokenKind::LBrace) {
+            self.parse_block()?
+        } else {
+            let expr = self.parse_expr()?;
+            let expr_span = expr.span;
+            Block {
+                stmts: vec![Stmt::new(StmtKind::Expr(expr), expr_span)],
+                span,
+            }
+        };
+        Ok(Stmt::new(StmtKind::Spawn(block), span))
     }
 
     fn parse_return_stmt(&mut self) -> Result<Stmt, ParserError> {
@@ -148,6 +164,25 @@ impl Parser {
 
     fn parse_for_stmt(&mut self) -> Result<Stmt, ParserError> {
         let span = self.expect(&TokenKind::KwFor)?.span;
+        if self.match_token(&TokenKind::KwIn)
+            || (matches!(&self.peek().kind, TokenKind::Ident(kw) if kw == "range")
+                && self.peek_ahead(1).kind != TokenKind::KwIn
+                && {
+                    self.bump();
+                    true
+                })
+        {
+            let iterable = self.parse_expr()?;
+            let body = self.parse_block()?;
+            return Ok(Stmt::new(
+                StmtKind::ForIn {
+                    pattern: Pattern::new(PatternKind::Wildcard, span),
+                    iterable,
+                    body,
+                },
+                span,
+            ));
+        }
         let pattern = self.parse_pattern()?;
         Self::validate_for_pattern(&pattern)?;
         self.expect(&TokenKind::KwIn)?;

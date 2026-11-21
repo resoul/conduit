@@ -123,11 +123,7 @@ impl Vm {
         if num_objs > 0 {
             self.clear_obj_range(o_base, num_objs as usize);
         }
-        if self.frames.len() == base_depth {
-            None
-        } else {
-            self.frames.pop()
-        }
+        self.pop_frame(base_depth)
     }
 
     #[cold]
@@ -337,10 +333,11 @@ impl Vm {
 }
 
 pub(crate) fn list_get_or_index(list: &Obj, idx: i64, elem_tag: u8, is_index_err: bool) -> Result<Obj, RuntimeError> {
-    let Obj::List(storage) = list else {
-        return Err(err_msg("Expected List in indexing"));
+    let len = match list {
+        Obj::List(storage) => storage.len(),
+        Obj::Bytes(bytes) => bytes.len(),
+        _ => return Err(err_msg("Expected List or Bytes in indexing")),
     };
-    let len = storage.len();
     if idx < 0 || (idx as usize) >= len {
         if !is_index_err {
             return Ok(Obj::Empty);
@@ -355,16 +352,18 @@ pub(crate) fn list_get_or_index(list: &Obj, idx: i64, elem_tag: u8, is_index_err
         return Ok(Obj::Record(Arc::new(rec)));
     }
     let u = idx as usize;
-    Ok(match storage {
-        ListStorage::Int(v) => {
+    Ok(match list {
+        Obj::Bytes(bytes) => Obj::boxed_int(i64::from(bytes[u])),
+        Obj::List(ListStorage::Int(v)) => {
             if elem_tag == 3 {
                 Obj::boxed_bool(v[u] != 0)
             } else {
                 Obj::boxed_int(v[u])
             }
         }
-        ListStorage::Float(v) => Obj::boxed_float(v[u].to_bits()),
-        ListStorage::Obj(v) => v[u].clone(),
+        Obj::List(ListStorage::Float(v)) => Obj::boxed_float(v[u].to_bits()),
+        Obj::List(ListStorage::Obj(v)) => v[u].clone(),
+        _ => unreachable!("list kind was checked above"),
     })
 }
 
@@ -375,8 +374,12 @@ fn clamp_slice_bounds(start_i: i64, end_i: i64, len: usize) -> (usize, usize) {
 }
 
 fn list_slice_val(list: &Obj, start_i: i64, end_i: i64) -> Result<Obj, RuntimeError> {
+    if let Obj::Bytes(bytes) = list {
+        let (start, end) = clamp_slice_bounds(start_i, end_i, bytes.len());
+        return Ok(Obj::Bytes(Arc::new(bytes[start..end].to_vec())));
+    }
     let Obj::List(storage) = list else {
-        return Err(err_msg("Expected List in ListSlice"));
+        return Err(err_msg("Expected List or Bytes in ListSlice"));
     };
     let (s, e) = clamp_slice_bounds(start_i, end_i, storage.len());
     Ok(Obj::List(match storage {

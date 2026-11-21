@@ -2,7 +2,7 @@ import * as json from "cdt.json"
 import * as redis from "cdt.redis"
 import * as lock from "cdt.lock"
 import * as validation from "cdt.validation"
-import { Job, JobPayload, describe_payload, make_job } from "./main"
+import { Job, JobPayload, describe_payload, make_job, run_payload_workers } from "./main"
 
 test "redis_worker Job validation accepts UUID and allowed kind" {
     job := make_job("webhook")?
@@ -47,4 +47,21 @@ test "redis_worker JobPayload tagged union switch and JSON roundtrip" {
     hb_raw := json.encode(JobPayload.Heartbeat)?
     hb := json.decode<JobPayload>(hb_raw)?
     assert_eq(describe_payload(hb), "heartbeat")
+}
+
+test "redis_worker channel worker pool processes payloads concurrently" {
+    var batch: [JobPayload] = []
+    for i in 3 {
+        if i == 0 {
+            batch.append(JobPayload.Heartbeat)
+        } else {
+            batch.append(JobPayload.Webhook(url: "https://example.com/{i}", retries: i))
+        }
+    }
+
+    processed := run_payload_workers(batch)
+    assert_eq(processed.len(), 3)
+    assert_eq(processed[0]?, "heartbeat")
+    assert_eq(processed[1]?, "webhook->https://example.com/1(retries=1)")
+    assert_eq(processed[2]?, "webhook->https://example.com/2(retries=2)")
 }

@@ -107,6 +107,12 @@ func login_handler(_req: http.Request, body: LoginRequest) -> http.Response {
     role := body.role ?? "member"
     switch jwt.sign(Claims(sub: body.email, role: role), jwt_secret(), 3600) {
         case String(tok):
+            email := body.email
+            spawn {
+                tel := cache.open("auth_api_telemetry")
+                _s := tel.set("last_user", email)
+                _n := tel.incr("logins_total", 1)
+            }
             return http.ok_json(TokenReply(token: tok, expires_in: 3600))
         case jwt.JwtError(e):
             return http.status_json(500, ErrReply(code: e.message))
@@ -182,7 +188,21 @@ func compact_sessions() -> Void | cache.CacheError {
     return
 }
 
+func on_auth_start() -> Void | cache.CacheError {
+    tel := cache.open("auth_api_telemetry")
+    tel.set("boot_status", "started")?
+    return
+}
+
+func on_auth_stop() -> Void | cache.CacheError {
+    tel := cache.open("auth_api_telemetry")
+    tel.set("boot_status", "stopped")?
+    return
+}
+
 export router AuthApi "JWT + Cache + File Lock Auth API" {
+    on_start => on_auth_start
+    on_stop => on_auth_stop
     cors "*"
     post "/auth/login" => login_handler
     group "/api" {

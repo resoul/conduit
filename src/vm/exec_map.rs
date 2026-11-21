@@ -45,15 +45,16 @@ use crate::native::cli::{exec_cli_parse, format_cli_help};
 use crate::native::env::{exec_env_load, make_env_error};
 use crate::vm::exec_union::list_get_or_index;
 use crate::vm::opcode::{
-    EXT_ASSERT, EXT_CACHE_OP, EXT_CLI_HELP, EXT_CLI_PARSE, EXT_CLI_PARSE_ARGS, EXT_CRON_OP,
+    EXT_ASSERT, EXT_CACHE_OP, EXT_CHAN_OP, EXT_CLI_HELP, EXT_CLI_PARSE, EXT_CLI_PARSE_ARGS,
+    EXT_CRON_OP,
     EXT_CRYPTO_OP, EXT_CSV_OP, EXT_DB_OP, EXT_ENV_ARGS, EXT_ENV_GET, EXT_ENV_LOAD,
     EXT_ENV_REQUIRE, EXT_FLOAT_CEIL, EXT_FLOAT_MATH, EXT_FS_BINARY, EXT_FS_UNARY, EXT_HTTP_OP,
     EXT_INT_MATH, EXT_JWT_OP, EXT_LIST_AGG, EXT_LIST_FIRST, EXT_LIST_IS_EMPTY, EXT_LIST_LAST,
     EXT_LIST_SORT, EXT_LOCK_OP, EXT_LOG_OP, EXT_MAP_CONTAINS_KEY, EXT_MAP_ENTRIES, EXT_MAP_FROM,
     EXT_MAP_GET, EXT_MAP_INDEX, EXT_MAP_KEYS, EXT_MAP_REMOVE, EXT_MAP_SET, EXT_MAP_VALUES,
     EXT_MATH_OP, EXT_PATH_OP, EXT_PIPELINE_REDUCE, EXT_PRINT_OBJ, EXT_PRINT_SCALAR, EXT_PROCESS_OP,
-    EXT_REDIS_OP, EXT_STR_IS_EMPTY, EXT_STR_PRED, EXT_STR_SPLIT, EXT_STR_TO_FLOAT, EXT_STR_TO_INT,
-    EXT_TIME_OP, EXT_URL_OP,
+    EXT_REDIS_OP, EXT_SPAWN, EXT_STR_IS_EMPTY, EXT_STR_PRED, EXT_STR_SPLIT, EXT_STR_TO_FLOAT,
+    EXT_STR_TO_INT, EXT_TIME_OP, EXT_URL_OP,
 };
 use crate::vm::value::{
     ListStorage, MapKey, MapVal, Obj, OrderedMap, SCHEMA_BOXED_BOOL, SCHEMA_BOXED_FLOAT,
@@ -376,6 +377,53 @@ impl Vm {
             EXT_REDIS_OP => {
                 self.exec_redis_op(module, s_base, o_base, s_top, o_top, aux, a, b, c)?;
             }
+            EXT_CHAN_OP => {
+                self.exec_chan_op(s_base, o_base, aux, a, b, c)?;
+            }
+            EXT_SPAWN => {
+                struct SpawnGuard(Arc<crate::vm::SpawnTracker>);
+                impl Drop for SpawnGuard {
+                    fn drop(&mut self) {
+                        self.0.on_finish();
+                    }
+                }
+                let callee = self.objs[o_base + a as usize].clone();
+                let mod_arc = self
+                    .host
+                    .shared_module
+                    .get_or_insert_with(|| Arc::new(module.clone()))
+                    .clone();
+                let tracker = Arc::clone(&self.host.spawn_tracker);
+                let script_args = self.script_args.clone();
+                let routers = self.host.routers.clone();
+                let http_clients = self.host.http_clients.clone();
+                let db_pools = self.host.db_pools.clone();
+                let db_pool_free = self.host.db_pool_free.clone();
+                flush_stdout();
+                tracker.on_spawn();
+                std::thread::spawn(move || {
+                    let _guard = SpawnGuard(Arc::clone(&tracker));
+                    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let mut child_vm = Vm::new();
+                        child_vm.script_args = script_args;
+                        child_vm.host.routers = routers;
+                        child_vm.host.http_clients = http_clients;
+                        child_vm.host.db_pools = db_pools;
+                        child_vm.host.db_pool_free = db_pool_free;
+                        child_vm.host.spawn_tracker = tracker;
+                        child_vm.host.shared_module = Some(Arc::clone(&mod_arc));
+                        if let Err(e) = child_vm.invoke_zero_arg_cb(&mod_arc, 0, 0, &callee, 0) {
+                            eprintln!("[spawn] {}", e.message);
+                        }
+                        flush_stdout();
+                    }))
+                    .is_err();
+                    if panicked {
+                        eprintln!("[spawn] background task panicked");
+                        flush_stdout();
+                    }
+                });
+            }
             EXT_STR_TO_INT => {
                 let Obj::Str(s) = &self.objs[o_base + b as usize] else {
                     return Err(err_msg("Expected String in to_int()"));
@@ -410,7 +458,12 @@ impl Vm {
                     3 => MapVal::Bool(self.scalars[s_base + c as usize] != 0),
                     _ => MapVal::Obj(self.objs[o_base + c as usize].clone()),
                 };
-                let Obj::Map(m) = &mut self.objs[o_base + a as usize] else {
+                let slot_idx = o_base + a as usize;
+                if matches!(self.objs[slot_idx], Obj::DeferredField(_)) {
+                    let resolved = self.objs[slot_idx].resolved().clone();
+                    self.objs[slot_idx] = resolved;
+                }
+                let Obj::Map(m) = &mut self.objs[slot_idx] else {
                     return Err(err_msg("Expected Map in map.set()"));
                 };
                 Arc::make_mut(m).set(key, val);
@@ -418,27 +471,61 @@ impl Vm {
             EXT_MAP_GET | EXT_MAP_INDEX => {
                 let v_tag = aux & 0x0F;
                 let key = self.extract_map_key(s_base, o_base, aux >> 4, c)?;
-                let Obj::Map(m) = &self.objs[o_base + b as usize] else {
-                    return Err(err_msg("Expected Map in map lookup"));
-                };
-                let res = match m.get(&key) {
-                    Some(mv) => map_val_to_obj(mv, v_tag),
-                    None if kind == EXT_MAP_INDEX => make_key_error(&key),
-                    None => Obj::Empty,
+                let res = match &self.objs[o_base + b as usize] {
+                    Obj::Map(m) => match m.get(&key) {
+                        Some(mv) => map_val_to_obj(mv, v_tag),
+                        None if kind == EXT_MAP_INDEX => make_key_error(&key),
+                        None => Obj::Empty,
+                    },
+                    Obj::DeferredField(df) => {
+                        if let Some((ek, ev)) = df.as_single_map_entry() {
+                            if matches!(&key, MapKey::Str(k) if k.as_str() == ek.as_str()) {
+                                ev.clone()
+                            } else if kind == EXT_MAP_INDEX {
+                                make_key_error(&key)
+                            } else {
+                                Obj::Empty
+                            }
+                        } else if let Obj::Map(m) = df.value() {
+                            match m.get(&key) {
+                                Some(mv) => map_val_to_obj(mv, v_tag),
+                                None if kind == EXT_MAP_INDEX => make_key_error(&key),
+                                None => Obj::Empty,
+                            }
+                        } else {
+                            return Err(err_msg("Expected Map in map lookup"));
+                        }
+                    }
+                    _ => return Err(err_msg("Expected Map in map lookup")),
                 };
                 self.objs[o_base + a as usize] = res;
             }
             EXT_MAP_CONTAINS_KEY => {
                 let key = self.extract_map_key(s_base, o_base, aux, c)?;
-                let Obj::Map(m) = &self.objs[o_base + b as usize] else {
-                    return Err(err_msg("Expected Map in contains_key()"));
+                let has = match &self.objs[o_base + b as usize] {
+                    Obj::Map(m) => m.get(&key).is_some(),
+                    Obj::DeferredField(df) => {
+                        if let Some((ek, _)) = df.as_single_map_entry() {
+                            matches!(&key, MapKey::Str(k) if k.as_str() == ek.as_str())
+                        } else if let Obj::Map(m) = df.value() {
+                            m.get(&key).is_some()
+                        } else {
+                            return Err(err_msg("Expected Map in contains_key()"));
+                        }
+                    }
+                    _ => return Err(err_msg("Expected Map in contains_key()")),
                 };
-                self.scalars[s_base + a as usize] = u64::from(m.get(&key).is_some());
+                self.scalars[s_base + a as usize] = u64::from(has);
             }
             EXT_MAP_REMOVE => {
                 let v_tag = aux & 0x0F;
                 let key = self.extract_map_key(s_base, o_base, aux >> 4, c)?;
-                let Obj::Map(m) = &mut self.objs[o_base + b as usize] else {
+                let slot_idx = o_base + b as usize;
+                if matches!(self.objs[slot_idx], Obj::DeferredField(_)) {
+                    let resolved = self.objs[slot_idx].resolved().clone();
+                    self.objs[slot_idx] = resolved;
+                }
+                let Obj::Map(m) = &mut self.objs[slot_idx] else {
                     return Err(err_msg("Expected Map in remove()"));
                 };
                 let removed = ordered_map_remove(Arc::make_mut(m), &key);
@@ -446,7 +533,7 @@ impl Vm {
                     removed.map(|mv| map_val_to_obj(&mv, v_tag)).unwrap_or(Obj::Empty);
             }
             EXT_MAP_KEYS => {
-                let Obj::Map(m) = &self.objs[o_base + b as usize] else {
+                let Obj::Map(m) = self.objs[o_base + b as usize].resolved() else {
                     return Err(err_msg("Expected Map in keys()"));
                 };
                 let storage = match aux {
@@ -463,7 +550,7 @@ impl Vm {
                 self.objs[o_base + a as usize] = Obj::List(storage);
             }
             EXT_MAP_VALUES => {
-                let Obj::Map(m) = &self.objs[o_base + b as usize] else {
+                let Obj::Map(m) = self.objs[o_base + b as usize].resolved() else {
                     return Err(err_msg("Expected Map in values()"));
                 };
                 let storage = match aux {
@@ -484,7 +571,7 @@ impl Vm {
             }
             EXT_MAP_ENTRIES => {
                 let v_tag = aux & 0x0F;
-                let Obj::Map(m) = &self.objs[o_base + b as usize] else {
+                let Obj::Map(m) = self.objs[o_base + b as usize].resolved() else {
                     return Err(err_msg("Expected Map in entries()"));
                 };
                 let pairs: Vec<Obj> = m

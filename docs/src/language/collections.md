@@ -10,6 +10,8 @@ A list is an ordered collection of values of uniform type `T`:
 
 ```conduit
 nums := [1, 2, 3, 4, 5]
+empty := [Int]()         // Explicit empty list of Int (equivalent to List<Int>() or var xs: [Int] = [])
+var grow: [String] = []
 ```
 
 The type of `nums` is inferred as `[Int]`. Attempting to construct a list with mismatched element types results in a compile-time type mismatch error.

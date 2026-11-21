@@ -1,5 +1,6 @@
 pub(crate) mod b64_simd;
 pub mod cache;
+pub mod chan;
 pub mod cli;
 pub mod cron;
 pub mod crypto;

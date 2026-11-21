@@ -1,3 +1,4 @@
+import * as cache from "cdt.cache"
 import * as http from "cdt.http"
 import { EncodeError } from "cdt.json"
 import * as validation from "cdt.validation"
@@ -70,8 +71,25 @@ func echo_handler(req: http.Request) -> http.Response {
     return http.json(req.body)
 }
 
+func on_demo_start() -> Void | cache.CacheError {
+    state := cache.open("demo_server_state")
+    state.set("lifecycle", "started")?
+    return
+}
+
+func on_demo_stop() -> Void | cache.CacheError {
+    state := cache.open("demo_server_state")
+    state.set("lifecycle", "stopped")?
+    return
+}
+
 func patch_item_handler(req: http.Request) -> http.Response {
     id := req.param("id") ?? "0"
+    spawn {
+        state := cache.open("demo_server_state")
+        _s := state.set("last_patched_id", id)
+        _n := state.incr("patched_count", 1)
+    }
     return http.ok_json(ItemPatch(id: id, status: "updated"))
 }
 
@@ -88,6 +106,8 @@ func admin_stats_handler(_req: http.Request) -> http.Response {
 }
 
 export router DemoApi "CdtCurl demo HTTP router" {
+    on_start => on_demo_start
+    on_stop => on_demo_stop
     cors "*"
     after add_powered_by
     get "/" => home_handler

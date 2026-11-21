@@ -54,9 +54,10 @@ conduit disasm main.cdt
 
 ```bash
 conduit bench --strict
+conduit bench --strict --filter collections.map_records
 ```
 
-Executes the 34 built-in compute, call, closure, collection, pipeline, and JSON workloads and verifies all target latency gates.
+Use a release build for benchmark timings. The suite reports the median and median absolute deviation in microseconds per operation. `--filter` selects workloads by name substring, and `--strict` exits with status 1 if a selected workload exceeds its target. For `collections.map_records`, one operation maps 4,096 records and the target is 140 µs.
 
 ### Building a Standalone Executable
 

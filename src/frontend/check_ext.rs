@@ -820,4 +820,99 @@ impl Checker<'_> {
             _ => Err(format!("Unknown method '.{}()' on redis.Client", method)),
         }
     }
+
+    // ── cdt.chan ────────────────────────────────────────────────────────────
+
+    pub(crate) fn check_chan_call(
+        &mut self,
+        sym: &str,
+        type_args: &[TypeExpr],
+        args: &mut [Expr],
+        named_args: &[NamedArg],
+    ) -> Result<Type, String> {
+        if !matches!(sym, "open" | "Chan") {
+            return Err(format!("Unknown cdt.chan symbol '{}'", sym));
+        }
+        if !named_args.is_empty() {
+            return Err(format!("chan.{} does not accept named arguments", sym));
+        }
+        if type_args.len() != 1 || args.len() > 1 {
+            return Err(format!(
+                "chan.{}<T>(capacity?) expects 1 type argument and 0 or 1 capacity argument",
+                sym
+            ));
+        }
+        let elem_ty = self.checked.resolve_type_mut(&type_args[0])?;
+        if elem_ty == Type::Void {
+            return Err("Chan element type cannot be Void".to_string());
+        }
+        if args.len() == 1 {
+            self.expect_arg_ty(&mut args[0], &Type::Int, "chan.open capacity")?;
+        }
+        Ok(Type::Generic {
+            type_id: TypeId::native("cdt.chan", "Chan"),
+            type_args: vec![elem_ty],
+        })
+    }
+
+    pub(crate) fn check_chan_method(
+        &mut self,
+        target_type_args: &[Type],
+        method: &str,
+        type_args: &[TypeExpr],
+        args: &mut [Expr],
+    ) -> Result<Type, String> {
+        if !type_args.is_empty() {
+            return Err(format!("Chan.{}() does not accept type arguments", method));
+        }
+        let elem_ty = target_type_args.first().cloned().unwrap_or(Type::Any);
+        let opt_elem_ty = if matches!(elem_ty, Type::Optional(_))
+            || matches!(&elem_ty, Type::Union(vs) if vs.contains(&Type::Nil))
+        {
+            elem_ty.clone()
+        } else {
+            Type::Optional(Box::new(elem_ty.clone()))
+        };
+        match method {
+            "send" | "try_send" => {
+                if args.len() != 1 {
+                    return Err(format!("Chan.{}(value) expects 1 argument", method));
+                }
+                self.expect_arg_ty(&mut args[0], &elem_ty, &format!("Chan.{} value", method))?;
+                Ok(Type::Bool)
+            }
+            "recv" | "try_recv" => {
+                if !args.is_empty() {
+                    return Err(format!("Chan.{}() takes 0 arguments", method));
+                }
+                Ok(opt_elem_ty)
+            }
+            "recv_timeout" => {
+                if args.len() != 1 {
+                    return Err("Chan.recv_timeout(ms) expects 1 Int argument".to_string());
+                }
+                self.expect_arg_ty(&mut args[0], &Type::Int, "Chan.recv_timeout ms")?;
+                Ok(opt_elem_ty)
+            }
+            "close" => {
+                if !args.is_empty() {
+                    return Err("Chan.close() takes 0 arguments".to_string());
+                }
+                Ok(Type::Void)
+            }
+            "len" | "cap" => {
+                if !args.is_empty() {
+                    return Err(format!("Chan.{}() takes 0 arguments", method));
+                }
+                Ok(Type::Int)
+            }
+            "is_empty" | "is_closed" => {
+                if !args.is_empty() {
+                    return Err(format!("Chan.{}() takes 0 arguments", method));
+                }
+                Ok(Type::Bool)
+            }
+            other => Err(format!("Chan has no method '.{}()'", other)),
+        }
+    }
 }

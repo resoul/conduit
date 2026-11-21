@@ -97,7 +97,10 @@ impl<'a> Reader<'a> {
     }
     fn vec<T>(&mut self, mut f: impl FnMut(&mut Self) -> Result<T, String>) -> Result<Vec<T>, String> {
         let len = self.u32()? as usize;
-        let mut out = Vec::with_capacity(len);
+        if len > self.data.len() - self.pos {
+            return Err("Bundle collection exceeds remaining data".to_owned());
+        }
+        let mut out = Vec::new();
         for _ in 0..len { out.push(f(self)?); }
         Ok(out)
     }
@@ -216,6 +219,37 @@ op_codec! {
     94 => ValidationOp { kind: u8, dst_obj: u16, a_reg: u16, b_reg: u16 },
     95 => ValidationCheck { dst_obj: u16, src_obj: u16 },
     96 => ExtOp { kind: u8, aux: u8, a: u16, b: u16, c: u16 },
+    97 => JumpIfLtInt { a: u16, b: u16, target: u32, when_true: bool },
+    98 => JumpIfLtIntImm { a: u16, imm: i16, target: u32, when_true: bool },
+    99 => ReturnScalarIfLtIntImm { a: u16, imm: i16, src: u16 },
+    100 => SwitchTag { src_obj: u16, first_tag: u32, tag_count: u16 },
+    101 => BitAndInt { dst: u16, a: u16, b: u16 },
+    102 => BitOrInt { dst: u16, a: u16, b: u16 },
+    103 => BitXorInt { dst: u16, a: u16, b: u16 },
+    104 => ShiftLeftInt { dst: u16, a: u16, b: u16 },
+    105 => ShiftRightInt { dst: u16, a: u16, b: u16 },
+    106 => SwitchScalarTag { tag_s: u16, src_obj: u16, first_tag: u32, tag_count: u16 },
+    107 => MakeScalarEnum { dst_s: u16, schema_id: u32, a: u16, b: u16, len: u8 },
+    108 => BoxScalarEnum { dst_obj: u16, src_obj: u16, tag_s: u16, width: u8 },
+    109 => ReadScalarEnumField { dst_s: u16, tag_s: u16, src_obj: u16, field_idx: u8 },
+    110 => ToBytes { dst_obj: u16, src_obj: u16 },
+    111 => BytesToList { dst_obj: u16, src_obj: u16 },
+    112 => NewHttpRequest { dst_obj: u16, desc_idx: u16 },
+    113 => SumListIntTail { list_obj: u16, idx_s: u16, elem_s: u16, acc_s: u16 },
+    114 => AppendIntRangeTail { list_obj: u16, idx_s: u16, limit_s: u16 },
+    115 => MulIntImm { dst: u16, a: u16, imm: i16 },
+    116 => MapGetIntIntOrImm { dst_s: u16, map_obj: u16, key_s: u16, default: i16 },
+    117 => AddIntMapGetOrImm { dst_s: u16, a: u16, map_obj: u16, key_s: u16, default: i16 },
+    118 => SumIntMapRangeTail { acc_s: u16, map_obj: u16, idx_s: u16, limit_s: u16, default: i16 },
+    119 => JumpIfEqIntImm { a: u16, imm: i16, target: u32, when_true: bool },
+    120 => ReadScalarEnumPair { dst_a: u16, dst_b: u16, tag_s: u16, src_obj: u16, field_a: u8, field_b: u8 },
+    121 => CallSelfIntImm { arg_s: u16, arg_o: u16, src: u16, imm: i16 },
+    122 => ReturnAddInt { a: u16, b: u16 },
+    123 => SwitchIntImm { src: u16, first: i16, count: u16 },
+    124 => MulAddIntImm { dst: u16, src: u16, mul: i16, add: i16 },
+    125 => StrConcatInt { dst_obj: u16, prefix_obj: u16, src_s: u16 },
+    126 => MulAddInt { dst: u16, a: u16, b: u16, c: u16 },
+    127 => ModIntConst { dst: u16, a: u16, divisor: u32, magic_idx: u16, shift: u8 },
 }
 
 fn encode_obj_const(w: &mut Writer, obj: &Obj) -> Result<(), String> {
@@ -226,6 +260,10 @@ fn encode_obj_const(w: &mut Writer, obj: &Obj) -> Result<(), String> {
         Obj::Record(rec) if rec.schema_id == SCHEMA_BOXED_FLOAT => { w.u8(3); w.u64(rec.inline_scalars[0]); }
         Obj::Record(rec) if rec.schema_id == SCHEMA_BOXED_BOOL => { w.u8(4); w.bool(rec.inline_scalars[0] != 0); }
         Obj::Func(fid) => { w.u8(5); w.u32(*fid); }
+        Obj::Record(rec) if rec.scalar_len == 0 && rec.obj_len == 0 => {
+            w.u8(6);
+            w.u32(rec.schema_id);
+        }
         other => return Err(format!("Unsupported constant object {:?} in bundle", other)),
     }
     Ok(())
@@ -239,6 +277,9 @@ fn decode_obj_const(r: &mut Reader<'_>) -> Result<Obj, String> {
         3 => Ok(Obj::boxed_float(r.u64()?)),
         4 => Ok(Obj::boxed_bool(r.bool()?)),
         5 => Ok(Obj::Func(r.u32()?)),
+        6 => Ok(Obj::Record(std::sync::Arc::new(crate::vm::value::StructData::new(
+            r.u32()?, 0, 0,
+        )))),
         tag => Err(format!("Invalid object constant tag {} in bundle", tag)),
     }
 }
@@ -591,6 +632,7 @@ pub fn decode_bundle(bytes: &[u8]) -> Result<(Module, u32, u8), String> {
             ops: r.vec(decode_op)?.into_boxed_slice(),
         })
     })?;
+    module.populate_lifecycle_hooks();
     module.int_consts = r.vec(Reader::i64)?;
     module.float_consts = r.vec(Reader::f64)?;
     module.obj_consts = r.vec(decode_obj_const)?;

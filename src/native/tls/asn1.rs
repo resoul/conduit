@@ -215,6 +215,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rejects_every_truncated_prefix_of_a_nested_sequence() {
+        let der = [TAG_SEQUENCE, 5, TAG_INTEGER, 1, 42, TAG_NULL, 0];
+        for len in 0..der.len() {
+            assert!(DerReader::new(&der[..len]).read_sequence().is_err());
+            assert!(crate::native::tls::x509::parse_x509(&der[..len]).is_err());
+        }
+        let mut sequence = DerReader::new(&der).read_sequence().unwrap();
+        assert_eq!(sequence.read_positive_integer_be().unwrap(), &[42]);
+        assert!(sequence.read_tag(TAG_NULL).is_ok());
+        assert!(sequence.is_empty());
+    }
+
+    #[test]
     fn asn1_rejects_non_minimal_and_indefinite_lengths() {
         // Indefinite length 0x30 0x80 0x00 0x00
         assert!(DerReader::new(&[0x30, 0x80, 0x00, 0x00]).read_tlv().is_err());

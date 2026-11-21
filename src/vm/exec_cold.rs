@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
 use crate::ir::Module;
-use crate::native::{json_decode::decode_json_with_plan, json_encode::encode_json_obj};
 use crate::vm::opcode::Op;
+use crate::native::{json_decode::decode_json_with_plan, json_encode::encode_json_obj};
 use crate::vm::value::{
     ClosureData, INLINE_CLOSURE_SCALARS, INLINE_STRUCT_OBJS, INLINE_STRUCT_SCALARS, ListStorage,
     MapKey, MapVal, Obj, OrderedMap, StructData,
 };
-use crate::vm::{CallFrame, MAX_CALL_DEPTH, RuntimeError, Vm};
+use crate::vm::{CallFrame, RuntimeError, Vm};
 
 #[cold]
 #[inline(never)]
@@ -48,7 +48,7 @@ pub(crate) fn map_set_int_cow(arc: &mut Arc<OrderedMap>, key: i64, val: u64) {
 }
 
 #[inline(always)]
-fn map_set_int_slot(slot: &mut Obj, key: i64, val: u64) -> Result<(), RuntimeError> {
+pub(crate) fn map_set_int_slot(slot: &mut Obj, key: i64, val: u64) -> Result<(), RuntimeError> {
     match slot {
         Obj::Map(arc) => {
             if let Some(m) = Arc::get_mut(arc) {
@@ -63,7 +63,7 @@ fn map_set_int_slot(slot: &mut Obj, key: i64, val: u64) -> Result<(), RuntimeErr
 }
 
 #[inline(always)]
-fn map_get_int_or_slot(slot: &Obj, key: i64, def: u64) -> Result<u64, RuntimeError> {
+pub(crate) fn map_get_int_or_slot(slot: &Obj, key: i64, def: u64) -> Result<u64, RuntimeError> {
     match slot {
         Obj::Map(arc) => Ok(match arc.get(&MapKey::Int(key)) {
             Some(MapVal::Scalar(v)) => *v,
@@ -71,6 +71,38 @@ fn map_get_int_or_slot(slot: &Obj, key: i64, def: u64) -> Result<u64, RuntimeErr
         }),
         _ => Err(err_msg("Expected Map in MapGetIntIntOr")),
     }
+}
+
+pub(crate) fn sum_int_map_range(
+    slot: &Obj,
+    keys: std::ops::Range<i64>,
+    mut sum: i64,
+    default: i64,
+) -> Result<i64, RuntimeError> {
+    let Obj::Map(map) = slot else {
+        return Err(err_msg("Expected Map in MapGetIntIntOr"));
+    };
+    if map.dense_ints
+        && let (Ok(start), Ok(end)) = (usize::try_from(keys.start), usize::try_from(keys.end))
+        && let Some(entries) = map.entries().get(start..end)
+    {
+        for (_, value) in entries {
+            let addend = match value {
+                MapVal::Scalar(v) => *v as i64,
+                _ => default,
+            };
+            sum = sum.checked_add(addend).ok_or_else(err_overflow)?;
+        }
+    } else {
+        for key in keys {
+            let addend = match map.get(&MapKey::Int(key)) {
+                Some(MapVal::Scalar(v)) => *v as i64,
+                _ => default,
+            };
+            sum = sum.checked_add(addend).ok_or_else(err_overflow)?;
+        }
+    }
+    Ok(sum)
 }
 
 #[inline(always)]
@@ -161,294 +193,84 @@ pub(crate) unsafe fn build_record_into_reg(
     unsafe { *o_ptr.add(dst_obj as usize) = rec };
 }
 
-#[inline]
-fn is_branchless_scalar_body_op(op: Op, idx_reg: u16, limit_reg: u16) -> bool {
-    match op {
-        Op::MapSetIntInt { .. } => return true,
-        Op::MapGetIntIntOr { dst_s, .. } => return dst_s != idx_reg && dst_s != limit_reg,
-        _ => {}
-    }
-    let dst = match op {
-        Op::LoadImmInt { dst, .. }
-        | Op::LoadConstInt { dst, .. }
-        | Op::LoadConstFloat { dst, .. }
-        | Op::LoadBool { dst, .. }
-        | Op::MoveScalar { dst, .. }
-        | Op::AddInt { dst, .. }
-        | Op::AddIntImm { dst, .. }
-        | Op::SubInt { dst, .. }
-        | Op::MulInt { dst, .. }
-        | Op::DivInt { dst, .. }
-        | Op::ModInt { dst, .. }
-        | Op::ModIntImm { dst, .. }
-        | Op::NegInt { dst, .. }
-        | Op::AddFloat { dst, .. }
-        | Op::SubFloat { dst, .. }
-        | Op::MulFloat { dst, .. }
-        | Op::DivFloat { dst, .. }
-        | Op::FmaFloat { dst, .. }
-        | Op::IntToFloat { dst, .. }
-        | Op::FloatFloor { dst, .. }
-        | Op::FloatRound { dst, .. }
-        | Op::EqInt { dst, .. }
-        | Op::NeInt { dst, .. }
-        | Op::LtInt { dst, .. }
-        | Op::LeInt { dst, .. }
-        | Op::GtInt { dst, .. }
-        | Op::GeInt { dst, .. }
-        | Op::EqIntImm { dst, .. }
-        | Op::LtIntImm { dst, .. }
-        | Op::EqFloat { dst, .. }
-        | Op::LtFloat { dst, .. }
-        | Op::LeFloat { dst, .. }
-        | Op::NotBool { dst, .. } => dst,
-        _ => return false,
-    };
-    dst != idx_reg && dst != limit_reg
-}
-
-#[allow(clippy::too_many_arguments)]
-#[inline(never)]
-pub(crate) unsafe fn exec_for_range_fast(
+// Keep the arithmetic kernels that meet the range and float benchmark gates.
+#[cold]
+pub(crate) fn finish_range_kernel(
     body: &[Op],
-    s_ptr: *mut u64,
-    o_ptr: *mut Obj,
-    int_consts: *const i64,
-    float_consts: *const f64,
-    idx_reg: u16,
-    limit_reg: u16,
-    cur: i64,
-    limit: i64,
+    scalars: &mut [u64],
+    int_consts: &[i64],
+    idx: u16,
+    limit: u16,
+    start: i64,
+    end: i64,
 ) -> Result<bool, RuntimeError> {
     match *body {
-        [Op::AddInt { dst, a, b }]
-            if dst == a && b == idx_reg && dst != idx_reg && dst != limit_reg =>
-        {
-            let mut acc = unsafe { *s_ptr.add(dst as usize) } as i64;
-            for k in (cur + 1)..limit {
-                let Some(next_acc) = acc.checked_add(k) else {
-                    return Err(err_overflow());
-                };
-                acc = next_acc;
+        [Op::AddInt { dst, a, b }] if dst == a && b == idx && dst != idx && dst != limit => {
+            let mut acc = scalars[usize::from(dst)] as i64;
+            for k in start..end {
+                acc = acc.checked_add(k).ok_or_else(err_overflow)?;
             }
-            unsafe {
-                *s_ptr.add(dst as usize) = acc as u64;
-                *s_ptr.add(idx_reg as usize) = limit as u64;
-            }
-            Ok(true)
-        }
-        [Op::ListAppendInt { list_obj, val_s }] if val_s == idx_reg => {
-            match unsafe { &mut *o_ptr.add(list_obj as usize) } {
-                Obj::List(ListStorage::Int(arc)) => {
-                    let start = cur + 1;
-                    if start < limit {
-                        let vec = Arc::make_mut(arc);
-                        vec.reserve((limit - start) as usize);
-                        for k in start..limit {
-                            vec.push(k);
-                        }
-                    }
-                    unsafe { *s_ptr.add(idx_reg as usize) = limit as u64 };
-                    Ok(true)
-                }
-                _ => Err(err_msg("Expected [Int] list in ListAppendInt")),
-            }
+            scalars[usize::from(dst)] = acc as u64;
         }
         [
-            Op::IntToFloat { dst: fi, src },
-            Op::FmaFloat {
-                dst: tmp,
-                a: fa,
-                b: cm,
-                c: ca,
-            },
-            Op::AddFloat {
-                dst: acc,
-                a: aa,
-                b: ab,
-            },
-        ] if src == idx_reg
-            && fa == fi
-            && aa == acc
-            && ab == tmp
-            && fi != acc
-            && tmp != acc
-            && cm != fi
-            && ca != fi
-            && cm != tmp
-            && ca != tmp
-            && cm != acc
-            && ca != acc
-            && fi != idx_reg
-            && tmp != idx_reg
-            && acc != idx_reg
-            && acc != limit_reg =>
+            Op::MulAddInt { dst: t0, a: acc_in, b: mul_reg, c: add_reg },
+            Op::AddInt { dst: t1, a: add_lhs, b: add_rhs },
+            Op::ModIntConst { dst: acc_out, a: mod_src, divisor, magic_idx, shift },
+        ] if acc_in == acc_out
+            && mod_src == t1
+            && ((add_lhs == t0 && add_rhs == idx) || (add_lhs == idx && add_rhs == t0))
+            && t0 != t1
+            && t0 != acc_out
+            && t1 != acc_out
+            && [acc_out, t0, t1].into_iter().all(|r| ![mul_reg, add_reg, idx, limit].contains(&r)) =>
         {
-            let cm_f = f64::from_bits(unsafe { *s_ptr.add(cm as usize) });
-            let ca_f = f64::from_bits(unsafe { *s_ptr.add(ca as usize) });
-            let mut acc_f = f64::from_bits(unsafe { *s_ptr.add(acc as usize) });
-            let mut last_fi = 0.0f64;
-            let mut last_tmp = 0.0f64;
-            for k in (cur + 1)..limit {
-                last_fi = k as f64;
-                last_tmp = last_fi * cm_f + ca_f;
-                acc_f += last_tmp;
+            let Some(&magic) = int_consts.get(usize::from(magic_idx)) else {
+                return Ok(false);
+            };
+            let mut acc = scalars[usize::from(acc_out)] as i64;
+            let mul_val = scalars[usize::from(mul_reg)] as i64;
+            let add_val = scalars[usize::from(add_reg)] as i64;
+            let mut last_t0 = scalars[usize::from(t0)] as i64;
+            let mut last_t1 = scalars[usize::from(t1)] as i64;
+            for k in start..end {
+                last_t0 = acc
+                    .checked_mul(mul_val)
+                    .and_then(|v| v.checked_add(add_val))
+                    .ok_or_else(err_overflow)?;
+                last_t1 = last_t0.checked_add(k).ok_or_else(err_overflow)?;
+                acc = crate::vm::opcode::remainder_by_constant(last_t1, divisor, magic, shift);
             }
-            unsafe {
-                *s_ptr.add(fi as usize) = last_fi.to_bits();
-                *s_ptr.add(tmp as usize) = last_tmp.to_bits();
-                *s_ptr.add(acc as usize) = acc_f.to_bits();
-                *s_ptr.add(idx_reg as usize) = limit as u64;
-            }
-            Ok(true)
+            scalars[usize::from(t0)] = last_t0 as u64;
+            scalars[usize::from(t1)] = last_t1 as u64;
+            scalars[usize::from(acc_out)] = acc as u64;
         }
-        _ if !body.is_empty()
-            && body
-                .iter()
-                .copied()
-                .all(|op| is_branchless_scalar_body_op(op, idx_reg, limit_reg)) =>
+        [
+            Op::IntToFloat { dst: x, src },
+            Op::FmaFloat { dst: term, a: factor, b, c },
+            Op::AddFloat { dst: acc, a, b: term_src },
+        ] if src == idx && factor == x && a == acc && term_src == term
+            && x != acc && term != acc
+            && [b, c].into_iter().all(|reg| ![x, term, acc, idx].contains(&reg))
+            && [x, term, acc].into_iter().all(|reg| reg != idx && reg != limit) =>
         {
-            macro_rules! s_get {
-                ($r:expr) => {
-                    unsafe { *s_ptr.add($r as usize) }
-                };
+            let multiplier = f64::from_bits(scalars[usize::from(b)]);
+            let constant = f64::from_bits(scalars[usize::from(c)]);
+            let mut sum = f64::from_bits(scalars[usize::from(acc)]);
+            let mut last_x = 0.0;
+            let mut last_term = 0.0;
+            for k in start..end {
+                last_x = k as f64;
+                last_term = last_x * multiplier + constant;
+                sum += last_term;
             }
-            macro_rules! s_set {
-                ($r:expr, $val:expr) => {{
-                    let val = $val;
-                    unsafe { *s_ptr.add($r as usize) = val };
-                }};
-            }
-
-            for k in (cur + 1)..limit {
-                s_set!(idx_reg, k as u64);
-                for &op in body {
-                    match op {
-                        Op::LoadImmInt { dst, imm } => s_set!(dst, (imm as i64) as u64),
-                        Op::LoadConstInt { dst, idx } => {
-                            s_set!(dst, unsafe { *int_consts.add(idx as usize) } as u64);
-                        }
-                        Op::LoadConstFloat { dst, idx } => {
-                            s_set!(dst, unsafe { *float_consts.add(idx as usize) }.to_bits());
-                        }
-                        Op::LoadBool { dst, val } => s_set!(dst, val as u64),
-                        Op::MoveScalar { dst, src } => s_set!(dst, s_get!(src)),
-                        Op::AddInt { dst, a, b } => {
-                            let Some(res) = (s_get!(a) as i64).checked_add(s_get!(b) as i64) else {
-                                return Err(err_overflow());
-                            };
-                            s_set!(dst, res as u64);
-                        }
-                        Op::AddIntImm { dst, a, imm } => {
-                            let Some(res) = (s_get!(a) as i64).checked_add(imm as i64) else {
-                                return Err(err_overflow());
-                            };
-                            s_set!(dst, res as u64);
-                        }
-                        Op::SubInt { dst, a, b } => {
-                            let Some(res) = (s_get!(a) as i64).checked_sub(s_get!(b) as i64) else {
-                                return Err(err_overflow());
-                            };
-                            s_set!(dst, res as u64);
-                        }
-                        Op::MulInt { dst, a, b } => {
-                            let Some(res) = (s_get!(a) as i64).checked_mul(s_get!(b) as i64) else {
-                                return Err(err_overflow());
-                            };
-                            s_set!(dst, res as u64);
-                        }
-                        Op::DivInt { dst, a, b } => {
-                            let rhs = s_get!(b) as i64;
-                            if rhs == 0 {
-                                return Err(err_div_zero());
-                            }
-                            let Some(res) = (s_get!(a) as i64).checked_div(rhs) else {
-                                return Err(err_overflow());
-                            };
-                            s_set!(dst, res as u64);
-                        }
-                        Op::ModInt { dst, a, b } => {
-                            let rhs = s_get!(b) as i64;
-                            if rhs == 0 {
-                                return Err(err_div_zero());
-                            }
-                            let Some(res) = (s_get!(a) as i64).checked_rem(rhs) else {
-                                return Err(err_overflow());
-                            };
-                            s_set!(dst, res as u64);
-                        }
-                        Op::ModIntImm { dst, a, imm } => {
-                            let rhs = imm as i64;
-                            if rhs == 0 {
-                                return Err(err_div_zero());
-                            }
-                            let Some(res) = (s_get!(a) as i64).checked_rem(rhs) else {
-                                return Err(err_overflow());
-                            };
-                            s_set!(dst, res as u64);
-                        }
-                        Op::NegInt { dst, src } => {
-                            let Some(res) = (s_get!(src) as i64).checked_neg() else {
-                                return Err(err_overflow());
-                            };
-                            s_set!(dst, res as u64);
-                        }
-                        Op::AddFloat { dst, a, b } => s_set!(dst, (f64::from_bits(s_get!(a)) + f64::from_bits(s_get!(b))).to_bits()),
-                        Op::SubFloat { dst, a, b } => s_set!(dst, (f64::from_bits(s_get!(a)) - f64::from_bits(s_get!(b))).to_bits()),
-                        Op::MulFloat { dst, a, b } => s_set!(dst, (f64::from_bits(s_get!(a)) * f64::from_bits(s_get!(b))).to_bits()),
-                        Op::DivFloat { dst, a, b } => {
-                            let rhs = f64::from_bits(s_get!(b));
-                            if rhs == 0.0 {
-                                return Err(err_div_zero());
-                            }
-                            s_set!(dst, (f64::from_bits(s_get!(a)) / rhs).to_bits());
-                        }
-                        Op::FmaFloat { dst, a, b, c } => {
-                            let res = f64::from_bits(s_get!(a)) * f64::from_bits(s_get!(b))
-                                + f64::from_bits(s_get!(c));
-                            s_set!(dst, res.to_bits());
-                        }
-                        Op::IntToFloat { dst, src } => {
-                            s_set!(dst, ((s_get!(src) as i64) as f64).to_bits());
-                        }
-                        Op::FloatFloor { dst, src } => {
-                            s_set!(dst, f64::from_bits(s_get!(src)).floor().to_bits());
-                        }
-                        Op::FloatRound { dst, src } => {
-                            s_set!(dst, f64::from_bits(s_get!(src)).round().to_bits());
-                        }
-                        Op::EqInt { dst, a, b } => s_set!(dst, ((s_get!(a) as i64) == (s_get!(b) as i64)) as u64),
-                        Op::NeInt { dst, a, b } => s_set!(dst, ((s_get!(a) as i64) != (s_get!(b) as i64)) as u64),
-                        Op::LtInt { dst, a, b } => s_set!(dst, ((s_get!(a) as i64) < (s_get!(b) as i64)) as u64),
-                        Op::LeInt { dst, a, b } => s_set!(dst, ((s_get!(a) as i64) <= (s_get!(b) as i64)) as u64),
-                        Op::GtInt { dst, a, b } => s_set!(dst, ((s_get!(a) as i64) > (s_get!(b) as i64)) as u64),
-                        Op::GeInt { dst, a, b } => s_set!(dst, ((s_get!(a) as i64) >= (s_get!(b) as i64)) as u64),
-                        Op::EqIntImm { dst, a, imm } => s_set!(dst, ((s_get!(a) as i64) == imm as i64) as u64),
-                        Op::LtIntImm { dst, a, imm } => s_set!(dst, ((s_get!(a) as i64) < imm as i64) as u64),
-                        Op::EqFloat { dst, a, b } => s_set!(dst, (f64::from_bits(s_get!(a)) == f64::from_bits(s_get!(b))) as u64),
-                        Op::LtFloat { dst, a, b } => s_set!(dst, (f64::from_bits(s_get!(a)) < f64::from_bits(s_get!(b))) as u64),
-                        Op::LeFloat { dst, a, b } => s_set!(dst, (f64::from_bits(s_get!(a)) <= f64::from_bits(s_get!(b))) as u64),
-                        Op::NotBool { dst, src } => s_set!(dst, (s_get!(src) == 0) as u64),
-                        Op::MapSetIntInt { map_obj, key_s, val_s } => {
-                            let key = s_get!(key_s) as i64;
-                            let val = s_get!(val_s);
-                            map_set_int_slot(unsafe { &mut *o_ptr.add(map_obj as usize) }, key, val)?;
-                        }
-                        Op::MapGetIntIntOr { dst_s, map_obj, key_s, def_s } => {
-                            let key = s_get!(key_s) as i64;
-                            let def = s_get!(def_s);
-                            let val = map_get_int_or_slot(unsafe { &*o_ptr.add(map_obj as usize) }, key, def)?;
-                            s_set!(dst_s, val);
-                        }
-                        _ => return Ok(false),
-                    }
-                }
-            }
-            s_set!(idx_reg, limit as u64);
-            Ok(true)
+            scalars[usize::from(x)] = last_x.to_bits();
+            scalars[usize::from(term)] = last_term.to_bits();
+            scalars[usize::from(acc)] = sum.to_bits();
         }
-        _ => Ok(false),
+        _ => return Ok(false),
     }
+    scalars[usize::from(idx)] = end as u64;
+    Ok(true)
 }
 
 impl Vm {
@@ -569,38 +391,6 @@ impl Vm {
         }
     }
 
-    #[inline(always)]
-    pub(crate) fn exec_map_set_int(
-        &mut self,
-        s_base: usize,
-        o_base: usize,
-        map_obj: u16,
-        key_s: u16,
-        val_s: u16,
-    ) -> Result<(), RuntimeError> {
-        let key = self.scalars[s_base + key_s as usize] as i64;
-        let val = self.scalars[s_base + val_s as usize];
-        map_set_int_slot(&mut self.objs[o_base + map_obj as usize], key, val)
-    }
-
-    #[inline(always)]
-    pub(crate) fn exec_map_get_int_or(
-        &mut self,
-        s_base: usize,
-        o_base: usize,
-        dst_s: u16,
-        map_obj: u16,
-        key_s: u16,
-        def_s: u16,
-    ) -> Result<(), RuntimeError> {
-        let key = self.scalars[s_base + key_s as usize] as i64;
-        let def = self.scalars[s_base + def_s as usize];
-        let val = map_get_int_or_slot(&self.objs[o_base + map_obj as usize], key, def)?;
-        self.scalars[s_base + dst_s as usize] = val;
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
     #[inline(never)]
     pub(crate) fn exec_call_callable(
         &mut self,
@@ -617,9 +407,6 @@ impl Vm {
         arg_base_o: u16,
         ret_reg: u16,
     ) -> Result<(u32, usize, usize, usize), RuntimeError> {
-        if self.frames.len() >= MAX_CALL_DEPTH {
-            return Err(err_call_depth());
-        }
         let slot = cur_o_base + callee_obj as usize;
         let (next_fid, next_cslot) = match &self.objs[slot] {
             Obj::Func(fid) => (*fid, usize::MAX),
@@ -641,14 +428,14 @@ impl Vm {
         {
             return Err(err_msg("Dynamic call register mismatch"));
         }
-        self.frames.push(CallFrame {
+        self.push_frame(CallFrame {
             func_id: caller_func_id,
             return_ip: return_ip as u32,
             s_base: cur_s_base as u32,
             o_base: cur_o_base as u32,
             ret_reg,
             prev_closure_slot: CallFrame::pack_closure_slot(cur_closure_slot),
-        });
+        })?;
         let next_s_base = cur_s_base + arg_base_s as usize;
         let next_o_base = cur_o_base + arg_base_o as usize;
         self.ensure_capacity(

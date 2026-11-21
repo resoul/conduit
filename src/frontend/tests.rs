@@ -169,6 +169,111 @@ fn cow_list_and_map_shorthand_isolation_from_cdt() {
 }
 
 #[test]
+fn string_integer_keys_and_checked_arithmetic_round_trip() {
+    use crate::ir::bundle::{decode_bundle, encode_bundle, RET_OBJ};
+
+    let module = compile_source(r#"
+        export func key(prefix: String, value: Int) -> String {
+            var result = prefix
+            result = result + value.to_string()
+            return result
+        }
+        export func mix(a: Int, b: Int, c: Int) -> Int {
+            var n = a * b + c
+            n = n % -1000000007
+            return n
+        }
+    "#).unwrap();
+    let key = module.func_id("key").unwrap();
+    let mix = module.func_id("mix").unwrap();
+    assert!(module.functions[key as usize].ops.iter().any(|op| matches!(op, Op::StrConcatInt { .. })));
+    let ops = &module.functions[mix as usize].ops;
+    assert!(ops.iter().any(|op| matches!(op, Op::MulAddInt { .. })));
+    assert!(ops.iter().any(|op| matches!(op, Op::ModIntConst { divisor: 1_000_000_007, .. })));
+    let (mut module, _, _) = decode_bundle(&encode_bundle(&module, key, RET_OBJ).unwrap()).unwrap();
+
+    let mut vm = Vm::new();
+    for prefix in ["", "k", "é", "ключ длиннее двадцати двух байт"] {
+        for n in [i64::MIN, -1, 0, 8191, i64::MAX] {
+            let actual = vm.call_obj(&module, key, &[n as u64], &[Obj::str(prefix)]).unwrap();
+            assert_eq!(actual, Obj::str(format!("{prefix}{n}")));
+        }
+    }
+    for (a, b, c) in [(i64::MIN, 1, 0), (-17, 70000, 42), (i64::MAX, 1, 0)] {
+        let actual = vm.call_scalar(&module, mix, &[a as u64, b as u64, c as u64], &[]).unwrap();
+        assert_eq!(actual as i64, (a * b + c) % -1_000_000_007);
+    }
+    for (a, b, c) in [(i64::MAX, 2, -i64::MAX), (i64::MAX, 1, 1)] {
+        let err = vm.call_scalar(&module, mix, &[a as u64, b as u64, c as u64], &[]).unwrap_err();
+        assert!(err.message.contains("Integer overflow"));
+    }
+
+    let op = module.functions[mix as usize].ops.iter_mut()
+        .find(|op| matches!(op, Op::ModIntConst { .. })).unwrap();
+    let Op::ModIntConst { shift, .. } = op else { unreachable!() };
+    *shift = 64;
+    assert!(module.validate().is_err());
+}
+
+#[test]
+fn fused_map_sum_round_trips_and_checks_overflow() {
+    use crate::ir::bundle::{decode_bundle, encode_bundle, RET_INT};
+
+    let module = compile_source(r#"
+        export func total(m: Map<Int, Int>, key: Int, start: Int) -> Int {
+            var sum = start
+            sum = sum + (m.get(key) ?? -4)
+            return sum
+        }
+        export func total_range(m: Map<Int, Int>, begin: Int, end: Int, start: Int) -> Int {
+            var i = begin
+            var sum = start
+            while i < end {
+                sum = sum + (m.get(i) ?? -4)
+                i = i + 1
+            }
+            return sum + i
+        }
+    "#).unwrap();
+    let fid = module.func_id("total").unwrap();
+    assert!(module.functions[fid as usize].ops.iter().any(|op| {
+        matches!(op, Op::AddIntMapGetOrImm { default: -4, .. })
+    }));
+    let range_fid = module.func_id("total_range").unwrap();
+    assert!(module.functions[range_fid as usize].ops.iter().any(|op| {
+        matches!(op, Op::SumIntMapRangeTail { default: -4, .. })
+    }));
+    let bundle = encode_bundle(&module, fid, RET_INT).unwrap();
+    let (module, fid, _) = decode_bundle(&bundle).unwrap();
+
+    let mut map = OrderedMap::new();
+    map.set(MapKey::Int(0), MapVal::Scalar(7));
+    let mut vm = Vm::new();
+    for key in [0, 10] {
+        if key != 0 {
+            map.set(MapKey::Int(key), MapVal::Scalar(7));
+        }
+        let args = &[Obj::Map(Arc::new(map.clone()))];
+        assert_eq!(vm.call_scalar(&module, fid, &[key as u64, 9], args).unwrap(), 16);
+        assert_eq!(vm.call_scalar(&module, fid, &[1, 9], args).unwrap(), 5);
+        assert!(vm.call_scalar(&module, fid, &[key as u64, i64::MAX as u64], args)
+            .unwrap_err().message.contains("Integer overflow"));
+    }
+    let sparse = [Obj::Map(Arc::new(map))];
+    assert_eq!(vm.call_scalar(&module, range_fid, &[8, 12, 9], &sparse).unwrap(), 16);
+    let mut dense = OrderedMap::new();
+    dense.set(MapKey::Int(0), MapVal::Scalar(7));
+    dense.set(MapKey::Int(1), MapVal::Scalar(9));
+    let dense = [Obj::Map(Arc::new(dense))];
+    assert_eq!(vm.call_scalar(&module, range_fid, &[0, 2, 9], &dense).unwrap(), 27);
+    assert_eq!(vm.call_scalar(&module, range_fid, &[u64::MAX, 3, 9], &dense).unwrap(), 20);
+    assert_eq!(vm.call_scalar(&module, range_fid, &[3, 2, 9], &dense).unwrap(), 12);
+    let error = vm.call_scalar(&module, range_fid, &[0, 2, (i64::MAX - 7) as u64], &dense)
+        .unwrap_err();
+    assert!(error.message.contains("Integer overflow"));
+}
+
+#[test]
 fn record_spread_json_attr_and_type_alias_roundtrip() {
     let src = "import cdt.json\n\
                type UserId = Int\n\
@@ -426,4 +531,158 @@ fn enum_and_const_interp_cross_module() {
     let fid = module.func_id("run").unwrap();
     let res = Vm::new().call_obj(&module, fid, &[], &[]).unwrap();
     assert_eq!(res, Obj::str("local:mod_a:user:true"));
+}
+
+#[test]
+fn bitwise_and_bytes_round_trip_in_a_bundle() {
+    use crate::ir::bundle::{decode_bundle, encode_bundle, RET_INT};
+
+    let module = compile_source(r#"
+        const base = (1 << 6) | 5
+        export func run(shift: Int) -> Int {
+            b := Bytes([0, 255, 128])
+            assert(b.len() == 3)
+            assert((b[1]?) == 255)
+            assert(b.to_list().len() == 3)
+            assert(b.slice(1, 3) == Bytes([255, 128]))
+            assert((b.get(1) ?? 0) == 255)
+            assert(Bytes("hi") == Bytes([104, 105]))
+            assert(Bytes("hi").to_string() == "hi")
+            return ((base & 63) ^ 1) + (-32 >> shift)
+        }
+    "#).unwrap();
+    let fid = module.func_id("run").unwrap();
+    let bytes = encode_bundle(&module, fid, RET_INT).unwrap();
+    let (module, fid, _) = decode_bundle(&bytes).unwrap();
+    let mut vm = Vm::new();
+    assert_eq!(vm.call_scalar(&module, fid, &[3], &[]).unwrap(), 0);
+    assert!(vm.call_scalar(&module, fid, &[64], &[]).unwrap_err().message.contains("Shift count"));
+}
+
+#[test]
+fn fused_integer_multiply_add_checks_both_operations() {
+    let module = compile_source("func scaled(n: Int) -> Int { return n * 2 + -1 }").unwrap();
+    let fid = module.func_id("scaled").unwrap();
+    assert!(module.functions[fid as usize].ops.iter().any(|op| {
+        matches!(op, Op::MulAddIntImm { mul: 2, add: -1, .. })
+    }));
+    let mut vm = Vm::new();
+    assert_eq!(vm.call_scalar(&module, fid, &[20], &[]).unwrap(), 39);
+    for n in [i64::MAX / 2 + 1, i64::MIN / 2] {
+        let error = vm.call_scalar(&module, fid, &[n as u64], &[]).unwrap_err();
+        assert!(error.message.contains("overflow"));
+    }
+}
+
+#[test]
+fn dense_int_if_chain_preserves_signed_cases_and_default() {
+    use crate::ir::bundle::{RET_INT, decode_bundle, encode_bundle};
+
+    let module = compile_source(r#"
+        export func pick(n: Int) -> Int {
+            if -2 == n { return 20 }
+            else if n == 0 { return 30 }
+            else if n == 3 { return 40 }
+            else { return 50 }
+        }
+    "#).unwrap();
+    let fid = module.func_id("pick").unwrap();
+    assert!(matches!(module.functions[fid as usize].ops[0], Op::SwitchIntImm {
+        first: -2, count: 6, ..
+    }));
+    let bundle = encode_bundle(&module, fid, RET_INT).unwrap();
+    let (module, fid, _) = decode_bundle(&bundle).unwrap();
+    let mut vm = Vm::new();
+    for (value, expected) in [(-2, 20), (0, 30), (3, 40), (2, 50), (i64::MIN, 50), (i64::MAX, 50)] {
+        assert_eq!(vm.call_scalar(&module, fid, &[value as u64], &[]).unwrap(), expected);
+    }
+}
+
+#[test]
+fn scalar_self_calls_keep_checked_arithmetic_and_depth_limit() {
+    use crate::ir::bundle::{RET_INT, decode_bundle, encode_bundle};
+
+    let module = compile_source(r#"
+        export func recur(n: Int) -> Int {
+            if n < 3 { return n }
+            return recur(n - 1) + recur(n - 2)
+        }
+        export func countdown(n: Int) -> Int {
+            if n < 2 { return n }
+            return countdown(n - 1)
+        }
+        export func step_up(n: Int) -> Int {
+            if n < 0 { return n }
+            return step_up(n + 1)
+        }
+        export func with_objects(n: Int) -> Int {
+            if n < 2 { return n }
+            xs := [n]
+            return with_objects(n - 1) + xs.len()
+        }
+    "#).unwrap();
+    let func_id = module.func_id("recur").unwrap();
+    let ops = &module.functions[func_id as usize].ops;
+    assert!(ops.iter().any(|op| matches!(op, Op::CallSelfIntImm { .. })));
+    assert!(matches!(ops.last(), Some(Op::ReturnAddInt { .. })));
+    let bundle = encode_bundle(&module, func_id, RET_INT).unwrap();
+    let (module, func_id, _) = decode_bundle(&bundle).unwrap();
+    let mut vm = Vm::new();
+    assert_eq!(vm.call_scalar(&module, func_id, &[8], &[]).unwrap(), 34);
+    let countdown = module.func_id("countdown").unwrap();
+    let max = crate::vm::MAX_CALL_DEPTH as u64;
+    assert_eq!(vm.call_scalar(&module, countdown, &[max + 1], &[]).unwrap(), 1);
+    let error = vm.call_scalar(&module, countdown, &[max + 2], &[]).unwrap_err();
+    assert!(error.message.contains("depth"));
+    let step_up = module.func_id("step_up").unwrap();
+    let error = vm.call_scalar(&module, step_up, &[i64::MAX as u64], &[]).unwrap_err();
+    assert!(error.message.contains("overflow"));
+    let with_objects = module.func_id("with_objects").unwrap();
+    assert_eq!(vm.call_scalar(&module, with_objects, &[8], &[]).unwrap(), 8);
+}
+
+#[test]
+fn compact_enum_switch_accepts_boxed_assignments_and_closure_captures() {
+    use crate::ir::bundle::{decode_bundle, encode_bundle, RET_INT};
+
+    let module = compile_source(r#"
+        enum Event {
+            Tick,
+            Add(a: Int, b: Int)
+        }
+        func from_call(x: Int) -> Event { return Event.Add(x, 2) }
+        func unit() -> Event { return Event.Tick }
+        export func run(x: Int) -> Int {
+            var event = Event.Tick
+            var value = 0
+            if x < 4 { event = Event.Add(x, 10) }
+            else { event = from_call(x) }
+            switch event {
+                case Event.Tick: value = 100
+                case Event.Add(a, b): value = a + b
+            }
+            captured := () -> Event => event
+            event = unit()
+            assert(event == Event.Tick)
+            assert(captured() != event)
+            return value
+        }
+    "#).unwrap();
+    let fid = module.func_id("run").unwrap();
+    let ops = &module.functions[fid as usize].ops;
+    assert!(ops.iter().any(|op| matches!(op, Op::SwitchScalarTag { .. })));
+    assert!(ops.iter().any(|op| matches!(op, Op::MakeScalarEnum { len: 2, .. })));
+    assert!(ops.iter().any(|op| matches!(op, Op::ReadScalarEnumPair { .. })));
+    assert!(ops.windows(2).any(|window| matches!(
+        window,
+        [Op::MakeScalarEnum { .. }, Op::Jump { target }]
+            if matches!(ops[*target as usize], Op::ReadScalarEnumPair { .. })
+    )));
+    let unit = module.func_id("unit").unwrap();
+    assert!(matches!(module.functions[unit as usize].ops[0], Op::LoadConstObj { .. }));
+    let bytes = encode_bundle(&module, fid, RET_INT).unwrap();
+    let (module, fid, _) = decode_bundle(&bytes).unwrap();
+    let mut vm = Vm::new();
+    assert_eq!(vm.call_scalar(&module, fid, &[3], &[]).unwrap(), 13);
+    assert_eq!(vm.call_scalar(&module, fid, &[4], &[]).unwrap(), 6);
 }

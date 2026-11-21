@@ -44,6 +44,7 @@ pub fn shake_unreachable_funcs(
             if let ItemKind::Func { name, .. } = &item.kind {
                 if (!item.is_imported && (item.is_exported || name == "main"))
                     || export_list_funcs.contains(name)
+                    || crate::ir::is_lifecycle_hook_name(name)
                 {
                     entry_roots.push(name.clone());
                 }
@@ -222,7 +223,7 @@ fn collect_block_refs(
                 collect_expr_refs(e, checked, struct_fields, scopes, out);
             }
             StmtKind::Return(None) | StmtKind::Break | StmtKind::Continue => {}
-            StmtKind::Defer(block) => {
+            StmtKind::Defer(block) | StmtKind::Spawn(block) => {
                 collect_block_refs(block, checked, struct_fields, scopes, out);
             }
             StmtKind::If {
@@ -542,7 +543,7 @@ fn expand_block_aliases(
             }
             StmtKind::Return(Some(e)) => expand_expr_aliases(e, aliases)?,
             StmtKind::Return(None) | StmtKind::Break | StmtKind::Continue => {}
-            StmtKind::Defer(block) => expand_block_aliases(block, aliases)?,
+            StmtKind::Defer(block) | StmtKind::Spawn(block) => expand_block_aliases(block, aliases)?,
             StmtKind::If {
                 condition,
                 then_block,

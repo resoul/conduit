@@ -1,6 +1,6 @@
 [package]
 name = "conduit"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2024"
 
 [lib]
@@ -17,4 +17,3 @@ path = "src/main.rs"
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-panic = "abort"

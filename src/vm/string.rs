@@ -30,7 +30,45 @@ enum Storage {
     },
 }
 
+/// Formats the full signed range into caller-provided storage.
+#[inline]
+pub(crate) fn format_i64(val: i64, buf: &mut [u8; 20]) -> &str {
+    let mut idx = buf.len();
+    let neg = val < 0;
+    let mut n = val.unsigned_abs();
+    loop {
+        idx -= 1;
+        buf[idx] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    if neg {
+        idx -= 1;
+        buf[idx] = b'-';
+    }
+    // SAFETY: Every byte in the suffix is an ASCII digit or the minus sign.
+    unsafe { std::str::from_utf8_unchecked(&buf[idx..]) }
+}
+
 impl VmString {
+    pub(crate) fn concat_int(prefix: &str, value: i64) -> Self {
+        let mut buf = [0; 20];
+        let suffix = format_i64(value, &mut buf);
+        let len = prefix.len() + suffix.len();
+        if len <= INLINE_CAPACITY {
+            let mut bytes = [0; INLINE_CAPACITY];
+            bytes[..prefix.len()].copy_from_slice(prefix.as_bytes());
+            bytes[prefix.len()..len].copy_from_slice(suffix.as_bytes());
+            return Self { storage: Storage::Inline { bytes, len: len as u8 } };
+        }
+        let mut text = String::with_capacity(len);
+        text.push_str(prefix);
+        text.push_str(suffix);
+        Self::from(text)
+    }
+
     pub(crate) fn shared(text: Arc<String>, range: Range<usize>) -> Self {
         assert!(
             text.get(range.clone()).is_some(),
@@ -74,7 +112,7 @@ impl VmString {
         match &self.storage {
             Storage::Owned(text) => text,
             Storage::Inline { bytes, len } => {
-                // SAFETY: From<&str> copies a complete UTF-8 string into this prefix.
+                // SAFETY: Inline constructors copy complete UTF-8 strings into this prefix.
                 unsafe { std::str::from_utf8_unchecked(&bytes[..*len as usize]) }
             }
             Storage::Shared { text, range } => {

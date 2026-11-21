@@ -21,6 +21,7 @@ const libraryItems = [
   { text: 'cdt.cron', link: '/library/cron' },
   { text: 'cdt.jwt', link: '/library/jwt' },
   { text: 'cdt.lock', link: '/library/lock' },
+  { text: 'cdt.chan', link: '/library/chan' },
   { text: 'cdt.cache', link: '/library/cache' },
   { text: 'cdt.redis', link: '/library/redis' },
 ]

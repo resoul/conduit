@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use crate::vm::string::VmString;
 use crate::vm::value::{MapKey, MapVal, Obj, OrderedMap, SCHEMA_URL, SCHEMA_URL_ERROR, StructData};
@@ -25,7 +25,12 @@ fn sub_range(full: &str, part: &str) -> std::ops::Range<usize> {
 
 #[inline]
 fn slice_obj(base: &Arc<VmString>, full: &str, part: &str) -> Obj {
-    Obj::Str(Arc::new(VmString::slice_arc(base, sub_range(full, part))))
+    static EMPTY: LazyLock<Arc<VmString>> = LazyLock::new(|| Arc::new(VmString::from("")));
+    if part.is_empty() {
+        Obj::Str(Arc::clone(&EMPTY))
+    } else {
+        Obj::Str(Arc::new(VmString::slice_arc(base, sub_range(full, part))))
+    }
 }
 
 pub fn url_parse(raw: &Arc<VmString>) -> Obj {
@@ -103,9 +108,9 @@ pub fn url_parse(raw: &Arc<VmString>) -> Obj {
     rec.set_scalar(0, port as u64);
     rec.set_obj(0, scheme_obj);
     rec.set_obj(1, slice_obj(raw, full, host));
-    rec.set_obj(2, if path.is_empty() { Obj::Str(Arc::new(VmString::slice_arc(raw, 0..0))) } else { slice_obj(raw, full, path) });
-    rec.set_obj(3, if query.is_empty() { Obj::Str(Arc::new(VmString::slice_arc(raw, 0..0))) } else { slice_obj(raw, full, query) });
-    rec.set_obj(4, if fragment.is_empty() { Obj::Str(Arc::new(VmString::slice_arc(raw, 0..0))) } else { slice_obj(raw, full, fragment) });
+    rec.set_obj(2, slice_obj(raw, full, path));
+    rec.set_obj(3, slice_obj(raw, full, query));
+    rec.set_obj(4, slice_obj(raw, full, fragment));
     Obj::Record(Arc::new(rec))
 }
 

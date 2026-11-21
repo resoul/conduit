@@ -20,8 +20,8 @@ Conduit is designed from first principles with a strong focus on runtime perform
 4. **Typed Errors as First-Class Values**
    Conduit eliminates hidden exception handling and unchecked runtime failures. Functions declare error types directly in union signatures (`T | Error`). The compiler strictly prevents discarding error values, enforces exhaustive pattern matching with `switch`, and provides ergonomic propagation with the `?` operator.
 
-5. **First-Class Standard Library (`cdt.*`)**
-   Standard modules—`cdt.json`, `cdt.time`, `cdt.validation`, `cdt.env`, and `cdt.cli`—are implemented natively in pure Rust and integrated directly with the type checker and VM.
+5. **First-Class Standard Library (`cdt.*`) & Built-In Concurrency**
+   Standard modules—`cdt.http`, `cdt.db`, `cdt.redis`, `cdt.jwt`, `cdt.cache`, `cdt.lock`, `cdt.chan`, `cdt.cron`, `cdt.process`, `cdt.fs`, `cdt.crypto`, `cdt.json`, `cdt.time`, `cdt.validation`, `cdt.env`, `cdt.cli`, `cdt.path`, `cdt.url`, `cdt.csv`, `cdt.math`, and `cdt.log`—are implemented natively in pure Rust alongside built-in `spawn` background tasks, typed `cdt.chan` (`Chan<T>`) channels, and server lifecycle hooks (`on start` / `on stop`), integrated directly with the type checker and VM.
 
 ---
 

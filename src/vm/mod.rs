@@ -1,5 +1,6 @@
 pub mod exec;
 pub(crate) mod exec_cache;
+pub(crate) mod exec_chan;
 pub(crate) mod exec_cold;
 pub mod exec_cron;
 pub mod exec_db;
@@ -39,7 +40,7 @@ impl std::fmt::Display for RuntimeError {
 
 impl std::error::Error for RuntimeError {}
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct CallFrame {
     pub func_id: u32,
     pub return_ip: u32,
@@ -82,9 +83,54 @@ pub(crate) struct DbConnSlot {
     pub(crate) owner: Option<Arc<crate::native::db_pool::DbPoolState>>,
 }
 
+#[derive(Clone)]
 pub(crate) struct DbPoolSlot {
     pub(crate) generation: u32,
     pub(crate) pool: Option<Arc<crate::native::db_pool::DbPoolState>>,
+}
+
+#[derive(Default)]
+pub(crate) struct SpawnTracker {
+    active: std::sync::Mutex<usize>,
+    cv: std::sync::Condvar,
+}
+
+impl SpawnTracker {
+    pub(crate) fn on_spawn(&self) {
+        if let Ok(mut guard) = self.active.lock() {
+            *guard += 1;
+        }
+    }
+
+    pub(crate) fn on_finish(&self) {
+        if let Ok(mut guard) = self.active.lock() {
+            *guard = guard.saturating_sub(1);
+            if *guard == 0 {
+                self.cv.notify_all();
+            }
+        }
+    }
+
+    pub(crate) fn active_count(&self) -> usize {
+        self.active.lock().map(|g| *g).unwrap_or(0)
+    }
+
+    pub(crate) fn wait_idle(&self, timeout: std::time::Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        if let Ok(mut guard) = self.active.lock() {
+            while *guard > 0 {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                let (g, _) = match self.cv.wait_timeout(guard, deadline - now) {
+                    Ok(res) => res,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard = g;
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -99,6 +145,10 @@ pub(crate) struct VmHostState {
     pub(crate) db_pool_free: Vec<usize>,
     pub(crate) cron_schedulers: Vec<Option<crate::native::cron::CronSchedulerState>>,
     pub(crate) cached_http_req: Option<(Arc<StructData>, Arc<StructData>)>,
+    pub(crate) spawn_tracker: Arc<SpawnTracker>,
+    pub(crate) shared_module: Option<Arc<Module>>,
+    pub(crate) lifecycle_started: bool,
+    pub(crate) lifecycle_stopped: bool,
 }
 
 impl VmHostState {
@@ -210,7 +260,8 @@ impl VmHostState {
 pub struct Vm {
     pub scalars: Vec<u64>,
     pub objs: Vec<Obj>,
-    pub(crate) frames: Vec<CallFrame>,
+    frames: Box<[CallFrame; MAX_CALL_DEPTH]>,
+    frame_depth: usize,
     pub script_args: Option<Vec<String>>,
     pub(crate) host: Box<VmHostState>,
 }
@@ -220,10 +271,30 @@ impl Vm {
         Self {
             scalars: vec![0u64; 4096],
             objs: vec![Obj::Empty; 4096],
-            frames: Vec::with_capacity(MAX_CALL_DEPTH),
+            frames: Box::new([CallFrame::default(); MAX_CALL_DEPTH]),
+            frame_depth: 0,
             script_args: None,
             host: Box::default(),
         }
+    }
+
+    #[inline(always)]
+    fn push_frame(&mut self, frame: CallFrame) -> Result<(), RuntimeError> {
+        let Some(slot) = self.frames.get_mut(self.frame_depth) else {
+            return Err(exec_cold::err_call_depth());
+        };
+        *slot = frame;
+        self.frame_depth += 1;
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn pop_frame(&mut self, base_depth: usize) -> Option<CallFrame> {
+        if self.frame_depth == base_depth {
+            return None;
+        }
+        self.frame_depth -= 1;
+        Some(self.frames[self.frame_depth])
     }
 
     #[inline(always)]
@@ -388,6 +459,62 @@ impl Vm {
         }
     }
 
+    pub(crate) fn run_module_on_start(
+        &mut self,
+        module: &Module,
+        s_top: usize,
+        o_top: usize,
+    ) -> Result<(), String> {
+        self.host.lifecycle_started = true;
+        for &fid in &module.on_start_funcs {
+            match self.invoke_zero_arg_cb(module, s_top, o_top, &Obj::Func(fid), 0) {
+                Ok(obj)
+                    if crate::native::validation::is_err_or_nil_obj(module, &obj)
+                        && !matches!(obj, Obj::Empty) =>
+                {
+                    return Err(format!("on start hook failed: {}", obj.format_obj()));
+                }
+                Ok(_) => {}
+                Err(e) => return Err(e.message),
+            }
+        }
+        exec_map::flush_stdout();
+        Ok(())
+    }
+
+    pub(crate) fn run_module_on_stop(
+        &mut self,
+        module: &Module,
+        s_top: usize,
+        o_top: usize,
+    ) -> Result<(), String> {
+        self.host.lifecycle_stopped = true;
+        let mut first_err: Option<String> = None;
+        for &fid in module.on_stop_funcs.iter().rev() {
+            match self.invoke_zero_arg_cb(module, s_top, o_top, &Obj::Func(fid), 0) {
+                Ok(obj)
+                    if crate::native::validation::is_err_or_nil_obj(module, &obj)
+                        && !matches!(obj, Obj::Empty) =>
+                {
+                    if first_err.is_none() {
+                        first_err = Some(format!("on stop hook failed: {}", obj.format_obj()));
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e.message);
+                    }
+                }
+            }
+        }
+        exec_map::flush_stdout();
+        match first_err {
+            Some(msg) => Err(msg),
+            None => Ok(()),
+        }
+    }
+
     pub fn call(
         &mut self,
         module: &Module,
@@ -415,7 +542,15 @@ impl Vm {
                 ),
             });
         }
-        self.frames.clear();
+        let is_lifecycle_hook = module.on_start_funcs.contains(&func_id)
+            || module.on_stop_funcs.contains(&func_id);
+        self.host.lifecycle_started = false;
+        self.host.lifecycle_stopped = false;
+        if !is_lifecycle_hook && !module.on_start_funcs.is_empty() {
+            self.run_module_on_start(module, 0, 0)
+                .map_err(|message| RuntimeError { message })?;
+        }
+        self.frame_depth = 0;
         self.ensure_capacity(func.num_scalars as usize, func.num_objs as usize);
         if !scalar_args.is_empty() {
             self.scalars[..scalar_args.len()].copy_from_slice(scalar_args);
@@ -424,6 +559,20 @@ impl Vm {
             self.objs[idx] = obj.clone();
         }
         let res = self.exec_from(module, func_id, 0, 0, usize::MAX);
+        if !is_lifecycle_hook && self.host.spawn_tracker.active_count() > 0 {
+            self.host
+                .spawn_tracker
+                .wait_idle(std::time::Duration::from_secs(5));
+        }
+        if !is_lifecycle_hook
+            && !module.on_stop_funcs.is_empty()
+            && !self.host.lifecycle_stopped
+        {
+            let stop_res = self.run_module_on_stop(module, 0, 0);
+            if res.is_ok() {
+                stop_res.map_err(|message| RuntimeError { message })?;
+            }
+        }
         exec_map::flush_stdout();
         res
     }

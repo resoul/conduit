@@ -41,6 +41,7 @@ pub enum TokenKind {
     KwBreak,
     KwContinue,
     KwDefer,
+    KwSpawn,
     KwError,
     KwSwitch,
     KwCase,
@@ -53,6 +54,8 @@ pub enum TokenKind {
     FatArrow,
     Pipe,
     Bar,
+    Ampersand,
+    Caret,
     Underscore,
     Eq,
     NotEq,
@@ -333,6 +336,7 @@ impl<'a> Lexer<'a> {
             "break" => TokenKind::KwBreak,
             "continue" => TokenKind::KwContinue,
             "defer" => TokenKind::KwDefer,
+            "spawn" => TokenKind::KwSpawn,
             "error" => TokenKind::KwError,
             "switch" => TokenKind::KwSwitch,
             "case" => TokenKind::KwCase,
@@ -461,12 +465,10 @@ impl<'a> Lexer<'a> {
                     self.bump_char();
                     TokenKind::And
                 } else {
-                    return Err(LexerError {
-                        message: "Unexpected character '&', expected '&&'".to_string(),
-                        span: start_span,
-                    });
+                    TokenKind::Ampersand
                 }
             }
+            '^' => TokenKind::Caret,
             '|' => {
                 if self.peek_char() == Some('|') {
                     self.bump_char();

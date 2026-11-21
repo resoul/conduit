@@ -552,7 +552,19 @@ fn rewrite_type_expr(te: &mut TypeExpr, env: &RewriteEnv) -> Result<(), String> 
                 *name = mapped.clone();
             }
         }
-        TypeExpr::Generic { type_args, .. } => {
+        TypeExpr::Generic { name, type_args } => {
+            if let Some(dot) = name.find('.') {
+                let (ns, member) = (&name[..dot], &name[dot + 1..]);
+                if let Some(exports) = env.ns_map.get(ns) {
+                    if let Some(resolved) = exports.get(member) {
+                        *name = resolved.clone();
+                    }
+                } else if let Some(scoped) = env.nat_ns_rename.get(ns) {
+                    *name = format!("{}.{}", scoped, member);
+                }
+            } else if let Some(mapped) = env.sym_map.get(name) {
+                *name = mapped.clone();
+            }
             for a in type_args {
                 rewrite_type_expr(a, env)?;
             }
@@ -676,7 +688,7 @@ fn rewrite_block_stmts(
                 rewrite_expr(condition, env, scopes)?;
                 rewrite_block_stmts(body, env, scopes)?;
             }
-            StmtKind::Defer(block) => {
+            StmtKind::Defer(block) | StmtKind::Spawn(block) => {
                 rewrite_block_stmts(block, env, scopes)?;
             }
             StmtKind::Switch { expr, cases } => {

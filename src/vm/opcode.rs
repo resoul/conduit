@@ -1,4 +1,26 @@
-/// Compact 3-address typed register instructions (<= 16 bytes, Copy).
+/// Non-power-of-two divisors use a rounded-up fixed-point reciprocal.
+pub(crate) fn remainder_magic(divisor: u32) -> Option<(i64, u8)> {
+    if divisor < 3 || divisor.is_power_of_two() {
+        return None;
+    }
+    let shift = divisor.ilog2();
+    let scale = 1u128 << (64 + shift);
+    let reciprocal = scale.div_ceil(u128::from(divisor));
+    Some((reciprocal as u64 as i64, shift as u8))
+}
+
+#[inline]
+pub(crate) fn remainder_by_constant(value: i64, divisor: u32, magic: i64, shift: u8) -> i64 {
+    // The reciprocal is in (2^63, 2^64). Adding value restores the high
+    // bit omitted by treating it as signed for the high-half multiply.
+    let high = ((i128::from(value) * i128::from(magic)) >> 64) as i64;
+    // Reciprocal rounding contributes less than 1/divisor to the quotient.
+    // Negative exact multiples round down too, so add one for all negatives.
+    let quotient = ((high + value) >> shift) - (value >> 63);
+    value - quotient * i64::from(divisor)
+}
+
+/// Compact 3-address typed register instructions (<= 12 bytes, Copy).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
     // --- Scalars & Arithmetic ---
@@ -10,10 +32,19 @@ pub enum Op {
     AddInt { dst: u16, a: u16, b: u16 },
     AddIntImm { dst: u16, a: u16, imm: i16 },
     SubInt { dst: u16, a: u16, b: u16 },
+    MulAddIntImm { dst: u16, src: u16, mul: i16, add: i16 },
+    MulAddInt { dst: u16, a: u16, b: u16, c: u16 },
+    MulIntImm { dst: u16, a: u16, imm: i16 },
     MulInt { dst: u16, a: u16, b: u16 },
     DivInt { dst: u16, a: u16, b: u16 },
     ModInt { dst: u16, a: u16, b: u16 },
+    ModIntConst { dst: u16, a: u16, divisor: u32, magic_idx: u16, shift: u8 },
     ModIntImm { dst: u16, a: u16, imm: i16 },
+    BitAndInt { dst: u16, a: u16, b: u16 },
+    BitOrInt { dst: u16, a: u16, b: u16 },
+    BitXorInt { dst: u16, a: u16, b: u16 },
+    ShiftLeftInt { dst: u16, a: u16, b: u16 },
+    ShiftRightInt { dst: u16, a: u16, b: u16 },
     NegInt { dst: u16, src: u16 },
     AddFloat { dst: u16, a: u16, b: u16 },
     SubFloat { dst: u16, a: u16, b: u16 },
@@ -43,21 +74,39 @@ pub enum Op {
     Jump { target: u32 },
     JumpIfFalse { cond: u16, target: u32 },
     JumpIfTrue { cond: u16, target: u32 },
+    JumpIfLtInt { a: u16, b: u16, target: u32, when_true: bool },
+    JumpIfEqIntImm { a: u16, imm: i16, target: u32, when_true: bool },
+    JumpIfLtIntImm { a: u16, imm: i16, target: u32, when_true: bool },
+    ReturnScalarIfLtIntImm { a: u16, imm: i16, src: u16 },
+    // Followed by the default Jump and one Jump per consecutive tag.
+    SwitchIntImm { src: u16, first: i16, count: u16 },
+    SwitchScalarTag { tag_s: u16, src_obj: u16, first_tag: u32, tag_count: u16 },
+    MakeScalarEnum { dst_s: u16, schema_id: u32, a: u16, b: u16, len: u8 },
+    BoxScalarEnum { dst_obj: u16, src_obj: u16, tag_s: u16, width: u8 },
+    ReadScalarEnumPair { dst_a: u16, dst_b: u16, tag_s: u16, src_obj: u16, field_a: u8, field_b: u8 },
+    ReadScalarEnumField { dst_s: u16, tag_s: u16, src_obj: u16, field_idx: u8 },
+    SwitchTag { src_obj: u16, first_tag: u32, tag_count: u16 },
+    AppendIntRangeTail { list_obj: u16, idx_s: u16, limit_s: u16 },
     ForRangeStep { idx_reg: u16, limit_reg: u16, target: u32 },
 
     // --- Calls & Closures ---
+    CallSelfIntImm { arg_s: u16, arg_o: u16, src: u16, imm: i16 },
     CallDirect { func_id: u16, arg_base_s: u16, arg_base_o: u16, ret_reg: u16 },
     CallCallable { callee_obj: u16, arg_base_s: u16, arg_base_o: u16, ret_reg: u16 },
     MakeClosure { dst_obj: u16, proto_idx: u16 },
     LoadUpvalueScalar { dst: u16, idx: u16 },
     LoadUpvalueObj { dst: u16, idx: u16 },
     LoadFuncObj { dst_obj: u16, func_id: u16 },
+    ReturnAddInt { a: u16, b: u16 },
     ReturnScalar { src: u16 },
     ReturnObj { src: u16 },
     ReturnVoid,
 
     // --- Collections & Records ---
     LoadConstObj { dst_obj: u16, idx: u16 },
+    ToBytes { dst_obj: u16, src_obj: u16 },
+    BytesToList { dst_obj: u16, src_obj: u16 },
+    NewHttpRequest { dst_obj: u16, desc_idx: u16 },
     MoveObj { dst_obj: u16, src: u16 },
     MakeRangeList { dst_obj: u16, start_s: u16, end_s: u16 },
     NewListInt { dst_obj: u16, cap: u16 },
@@ -69,6 +118,7 @@ pub enum Op {
     ListLen { dst_s: u16, list_obj: u16 },
     StrLen { dst_s: u16, str_obj: u16 },
     StrConcat { dst_obj: u16, a_obj: u16, b_obj: u16 },
+    StrConcatInt { dst_obj: u16, prefix_obj: u16, src_s: u16 },
     ScalarToStr { dst_obj: u16, src_s: u16, tag: u8 },
     ObjToStr { dst_obj: u16, src_obj: u16 },
     StrMethod { dst_obj: u16, src_obj: u16, kind: u8 },
@@ -85,6 +135,7 @@ pub enum Op {
     TupleGetScalar { dst_s: u16, tuple_obj: u16, idx: u16 },
     TupleGetObj { dst_obj: u16, tuple_obj: u16, idx: u16 },
     ForListInt { list_obj: u16, idx_s: u16, elem_s: u16, exit_target: u32 },
+    SumListIntTail { list_obj: u16, idx_s: u16, elem_s: u16, acc_s: u16 },
     ForListIntStep { list_obj: u16, idx_s: u16, elem_s: u16, target: u32 },
     ForListObj { list_obj: u16, idx_s: u16, elem_obj: u16, exit_target: u32 },
     NewRecord { dst_obj: u16, desc_idx: u16 },
@@ -93,6 +144,9 @@ pub enum Op {
     GetFieldObj { dst_obj: u16, rec_obj: u16, field_idx: u16 },
     NewMap { dst_obj: u16 },
     MapSetIntInt { map_obj: u16, key_s: u16, val_s: u16 },
+    MapGetIntIntOrImm { dst_s: u16, map_obj: u16, key_s: u16, default: i16 },
+    AddIntMapGetOrImm { dst_s: u16, a: u16, map_obj: u16, key_s: u16, default: i16 },
+    SumIntMapRangeTail { acc_s: u16, map_obj: u16, idx_s: u16, limit_s: u16, default: i16 },
     MapGetIntIntOr { dst_s: u16, map_obj: u16, key_s: u16, def_s: u16 },
     MapLen { dst_s: u16, map_obj: u16 },
 
@@ -169,15 +223,41 @@ pub const EXT_JWT_OP: u8 = 46;
 pub const EXT_LOCK_OP: u8 = 47;
 pub const EXT_CACHE_OP: u8 = 48;
 pub const EXT_REDIS_OP: u8 = 49;
+pub const EXT_SPAWN: u8 = 50;
+pub const EXT_CHAN_OP: u8 = 51;
 
 #[cfg(test)]
 mod tests {
     use super::Op;
 
     #[test]
+    fn reciprocal_remainder_matches_signed_division() {
+        use super::{remainder_by_constant, remainder_magic};
+        for divisor in [3, 5, 6, 7, 97, 32767, 32769, 1_000_000_007, u32::MAX] {
+            let (magic, shift) = remainder_magic(divisor).unwrap();
+            let d = i64::from(divisor);
+            let check = |n| assert_eq!(remainder_by_constant(n, divisor, magic, shift), n % d);
+            for n in [i64::MIN, i64::MAX, -1, 0, 1] {
+                check(n);
+                let multiple = (n / d) * d;
+                for offset in -2..=2 {
+                    if let Some(value) = multiple.checked_add(offset) {
+                        check(value);
+                    }
+                }
+            }
+            let mut bits = 1u64;
+            for _ in 0..1024 {
+                bits = bits.wrapping_mul(6364136223846793005).wrapping_add(1);
+                check(bits as i64);
+            }
+        }
+    }
+
+    #[test]
     fn op_size_is_compact() {
         assert!(
-            std::mem::size_of::<Op>() <= 16,
+            std::mem::size_of::<Op>() <= 12,
             "Op size was {} bytes",
             std::mem::size_of::<Op>()
         );

@@ -48,23 +48,8 @@ pub(crate) fn write_escaped_bytes(s: &str, out: &mut Vec<u8>) {
 
 #[inline]
 pub(crate) fn write_i64(out: &mut Vec<u8>, val: i64) {
-    let mut buf = [0u8; 20];
-    let mut idx = 20usize;
-    let neg = val < 0;
-    let mut n = val.unsigned_abs();
-    loop {
-        idx -= 1;
-        buf[idx] = b'0' + (n % 10) as u8;
-        n /= 10;
-        if n == 0 {
-            break;
-        }
-    }
-    if neg {
-        idx -= 1;
-        buf[idx] = b'-';
-    }
-    out.extend_from_slice(&buf[idx..]);
+    let mut buf = [0; 20];
+    out.extend_from_slice(crate::vm::string::format_i64(val, &mut buf).as_bytes());
 }
 
 #[inline]
@@ -127,6 +112,15 @@ pub fn encode_json_obj(val: &Obj, schemas: &[StructSchema]) -> Result<String, Js
 
 pub fn encode_obj(val: &Obj, schemas: &[StructSchema], out: &mut Vec<u8>) -> Result<(), JsonError> {
     match val {
+        Obj::DeferredField(_) => return encode_obj(val.resolved(), schemas, out),
+        Obj::Bytes(bytes) => {
+            out.push(b'[');
+            for (i, byte) in bytes.iter().enumerate() {
+                if i > 0 { out.push(b','); }
+                write_i64(out, i64::from(*byte));
+            }
+            out.push(b']');
+        }
         Obj::Empty => out.extend_from_slice(b"null"),
         Obj::Str(s) => write_escaped_bytes(s, out),
         Obj::List(storage) => encode_list(storage, schemas, out)?,

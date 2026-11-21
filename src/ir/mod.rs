@@ -10,13 +10,13 @@ pub(crate) mod lower_prealloc;
 use std::fmt::Write;
 
 use crate::vm::opcode::{
-    EXT_ASSERT, EXT_CACHE_OP, EXT_CLI_HELP, EXT_CLI_PARSE, EXT_CLI_PARSE_ARGS, EXT_ENV_ARGS,
-    EXT_ENV_GET, EXT_ENV_LOAD, EXT_ENV_REQUIRE, EXT_FLOAT_CEIL, EXT_FLOAT_MATH, EXT_FS_BINARY,
-    EXT_FS_UNARY, EXT_INT_MATH, EXT_JWT_OP, EXT_LIST_FIRST, EXT_LIST_IS_EMPTY, EXT_LIST_LAST,
-    EXT_LIST_SORT, EXT_LOCK_OP, EXT_MAP_CONTAINS_KEY, EXT_MAP_ENTRIES, EXT_MAP_FROM, EXT_MAP_GET,
-    EXT_MAP_INDEX, EXT_MAP_KEYS, EXT_MAP_REMOVE, EXT_MAP_SET, EXT_MAP_VALUES, EXT_PRINT_OBJ,
-    EXT_PRINT_SCALAR, EXT_REDIS_OP, EXT_STR_IS_EMPTY, EXT_STR_PRED, EXT_STR_SPLIT,
-    EXT_STR_TO_FLOAT, EXT_STR_TO_INT, EXT_TIME_OP, Op,
+    EXT_ASSERT, EXT_CACHE_OP, EXT_CHAN_OP, EXT_CLI_HELP, EXT_CLI_PARSE, EXT_CLI_PARSE_ARGS,
+    EXT_ENV_ARGS, EXT_ENV_GET, EXT_ENV_LOAD, EXT_ENV_REQUIRE, EXT_FLOAT_CEIL, EXT_FLOAT_MATH,
+    EXT_FS_BINARY, EXT_FS_UNARY, EXT_INT_MATH, EXT_JWT_OP, EXT_LIST_FIRST, EXT_LIST_IS_EMPTY,
+    EXT_LIST_LAST, EXT_LIST_SORT, EXT_LOCK_OP, EXT_MAP_CONTAINS_KEY, EXT_MAP_ENTRIES,
+    EXT_MAP_FROM, EXT_MAP_GET, EXT_MAP_INDEX, EXT_MAP_KEYS, EXT_MAP_REMOVE, EXT_MAP_SET,
+    EXT_MAP_VALUES, EXT_PRINT_OBJ, EXT_PRINT_SCALAR, EXT_REDIS_OP, EXT_STR_IS_EMPTY,
+    EXT_STR_PRED, EXT_STR_SPLIT, EXT_STR_TO_FLOAT, EXT_STR_TO_INT, EXT_TIME_OP, Op,
 };
 use crate::vm::value::Obj;
 
@@ -151,6 +151,18 @@ pub struct HttpQueryPlan {
     pub fields: Vec<HttpQueryFieldPlan>,
 }
 
+pub fn is_on_start_hook_name(name: &str) -> bool {
+    name.starts_with("__cdt_on_start_") || name.contains("___cdt_on_start_")
+}
+
+pub fn is_on_stop_hook_name(name: &str) -> bool {
+    name.starts_with("__cdt_on_stop_") || name.contains("___cdt_on_stop_")
+}
+
+pub fn is_lifecycle_hook_name(name: &str) -> bool {
+    is_on_start_hook_name(name) || is_on_stop_hook_name(name)
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct Module {
     pub functions: Vec<FunctionProto>,
@@ -170,11 +182,25 @@ pub struct Module {
     pub schedules: Vec<SchedulePlan>,
     pub tests: Vec<TestSpec>,
     pub http_query_plans: Vec<HttpQueryPlan>,
+    pub on_start_funcs: Vec<u32>,
+    pub on_stop_funcs: Vec<u32>,
 }
 
 impl Module {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn populate_lifecycle_hooks(&mut self) {
+        self.on_start_funcs.clear();
+        self.on_stop_funcs.clear();
+        for (fid, f) in self.functions.iter().enumerate() {
+            if is_on_start_hook_name(&f.name) {
+                self.on_start_funcs.push(fid as u32);
+            } else if is_on_stop_hook_name(&f.name) {
+                self.on_stop_funcs.push(fid as u32);
+            }
+        }
     }
 
     pub fn func_id(&self, name: &str) -> Option<u32> {
@@ -184,8 +210,7 @@ impl Module {
             .map(|i| i as u32)
     }
 
-    /// Validates all register indices, constant indices, function IDs, and jump targets once
-    /// so the VM execution loop can rely on these invariants.
+    /// Validates register indices, constants, function IDs, jump targets, and return register banks.
     pub fn validate(&self) -> Result<(), String> {
         for (fid, func) in self.functions.iter().enumerate() {
             let Some(&last_op) = func.ops.last() else {
@@ -194,6 +219,7 @@ impl Module {
             if !matches!(
                 last_op,
                 Op::ReturnScalar { .. }
+                    | Op::ReturnAddInt { .. }
                     | Op::ReturnObj { .. }
                     | Op::ReturnVoid
                     | Op::Jump { .. }
@@ -244,6 +270,17 @@ impl Module {
                 Ok(())
             };
 
+            let check_switch_table = |ip: usize, count: u16, ctx: &str| -> Result<(), String> {
+                let end = ip + 2 + usize::from(count);
+                let table = func.ops.get(ip + 1..end);
+                if count == 0
+                    || !table.is_some_and(|entries| entries.iter().all(|op| matches!(op, Op::Jump { .. })))
+                {
+                    return Err(format!("{}: invalid switch jump table", ctx));
+                }
+                Ok(())
+            };
+
             for (ip, op) in func.ops.iter().copied().enumerate() {
                 let ctx = format!("op@{}", ip);
                 match op {
@@ -262,6 +299,14 @@ impl Module {
                             return Err(format!("{}: float_const {} out of bounds", ctx, idx));
                         }
                     }
+                    Op::ModIntConst { dst, a, divisor, magic_idx, shift } => {
+                        check_s(dst, &ctx)?;
+                        check_s(a, &ctx)?;
+                        let actual = self.int_consts.get(usize::from(magic_idx)).map(|&magic| (magic, shift));
+                        if actual.is_none() || actual != crate::vm::opcode::remainder_magic(divisor) {
+                            return Err(format!("{}: invalid constant remainder operands", ctx));
+                        }
+                    }
                     Op::MoveScalar { dst, src }
                     | Op::NegInt { dst, src }
                     | Op::IntToFloat { dst, src }
@@ -271,6 +316,8 @@ impl Module {
                     | Op::AddIntImm { dst, a: src, .. }
                     | Op::ModIntImm { dst, a: src, .. }
                     | Op::EqIntImm { dst, a: src, .. }
+                    | Op::MulIntImm { dst, a: src, .. }
+                    | Op::MulAddIntImm { dst, src, .. }
                     | Op::LtIntImm { dst, a: src, .. } => {
                         check_s(dst, &ctx)?;
                         check_s(src, &ctx)?;
@@ -286,6 +333,11 @@ impl Module {
                     | Op::DivFloat { dst, a, b }
                     | Op::EqInt { dst, a, b }
                     | Op::NeInt { dst, a, b }
+                    | Op::BitAndInt { dst, a, b }
+                    | Op::BitOrInt { dst, a, b }
+                    | Op::BitXorInt { dst, a, b }
+                    | Op::ShiftLeftInt { dst, a, b }
+                    | Op::ShiftRightInt { dst, a, b }
                     | Op::LtInt { dst, a, b }
                     | Op::LeInt { dst, a, b }
                     | Op::GtInt { dst, a, b }
@@ -297,7 +349,7 @@ impl Module {
                         check_s(a, &ctx)?;
                         check_s(b, &ctx)?;
                     }
-                    Op::FmaFloat { dst, a, b, c } => {
+                    Op::MulAddInt { dst, a, b, c } | Op::FmaFloat { dst, a, b, c } => {
                         check_s(dst, &ctx)?;
                         check_s(a, &ctx)?;
                         check_s(b, &ctx)?;
@@ -313,10 +365,86 @@ impl Module {
                         check_s(cond, &ctx)?;
                         check_jmp(target, &ctx)?;
                     }
+                    Op::JumpIfLtInt { a, b, target, .. } => {
+                        check_s(a, &ctx)?;
+                        check_s(b, &ctx)?;
+                        check_jmp(target, &ctx)?;
+                    }
+                    Op::JumpIfLtIntImm { a, target, .. }
+                    | Op::JumpIfEqIntImm { a, target, .. } => {
+                        check_s(a, &ctx)?;
+                        check_jmp(target, &ctx)?;
+                    }
+                    Op::ReturnScalarIfLtIntImm { a, src, .. } => {
+                        check_s(a, &ctx)?;
+                        check_s(src, &ctx)?;
+                        if func.returns_obj {
+                            return Err(format!("{}: conditional scalar return in object function", ctx));
+                        }
+                    }
+                    Op::MakeScalarEnum { dst_s, a, b, len, .. } => {
+                        if len > 2 || usize::from(dst_s) + usize::from(len) >= usize::from(func.num_scalars) {
+                            return Err(format!("{}: invalid scalar enum payload registers", ctx));
+                        }
+                        if len >= 1 { check_s(a, &ctx)?; }
+                        if len == 2 { check_s(b, &ctx)?; }
+                    }
+                    Op::BoxScalarEnum { dst_obj, src_obj, tag_s, width } => {
+                        check_o(dst_obj, &ctx)?;
+                        check_o(src_obj, &ctx)?;
+                        if width > 2 || usize::from(tag_s) + usize::from(width) >= usize::from(func.num_scalars) {
+                            return Err(format!("{}: invalid scalar enum payload registers", ctx));
+                        }
+                    }
+                    Op::ReadScalarEnumPair { dst_a, dst_b, tag_s, src_obj, field_a, field_b } => {
+                        check_s(dst_a, &ctx)?;
+                        check_s(dst_b, &ctx)?;
+                        check_o(src_obj, &ctx)?;
+                        let field = field_a.max(field_b);
+                        if field >= 2 || usize::from(tag_s) + 1 + usize::from(field) >= usize::from(func.num_scalars) {
+                            return Err(format!("{}: invalid scalar enum field register", ctx));
+                        }
+                    }
+                    Op::ReadScalarEnumField { dst_s, tag_s, src_obj, field_idx } => {
+                        check_s(dst_s, &ctx)?;
+                        check_o(src_obj, &ctx)?;
+                        if field_idx >= 2 || usize::from(tag_s) + 1 + usize::from(field_idx) >= usize::from(func.num_scalars) {
+                            return Err(format!("{}: invalid scalar enum field register", ctx));
+                        }
+                    }
+                    Op::SwitchIntImm { src, count, .. } => {
+                        check_s(src, &ctx)?;
+                        check_switch_table(ip, count, &ctx)?;
+                    }
+                    Op::SwitchTag { src_obj, first_tag, tag_count }
+                    | Op::SwitchScalarTag { src_obj, first_tag, tag_count, .. } => {
+                        check_o(src_obj, &ctx)?;
+                        if let Op::SwitchScalarTag { tag_s, .. } = op {
+                            check_s(tag_s, &ctx)?;
+                        }
+                        check_switch_table(ip, tag_count, &ctx)?;
+                        if first_tag.checked_add(u32::from(tag_count) - 1).is_none() {
+                            return Err(format!("{}: invalid switch tag range", ctx));
+                        }
+                    }
+                    Op::AppendIntRangeTail { list_obj, idx_s, limit_s } => {
+                        check_o(list_obj, &ctx)?;
+                        check_s(idx_s, &ctx)?;
+                        check_s(limit_s, &ctx)?;
+                    }
                     Op::ForRangeStep { idx_reg, limit_reg, target } => {
                         check_s(idx_reg, &ctx)?;
                         check_s(limit_reg, &ctx)?;
                         check_jmp(target, &ctx)?;
+                    }
+                    Op::CallSelfIntImm { arg_s, arg_o, src, .. } => {
+                        check_s(src, &ctx)?;
+                        check_s(arg_s, &ctx)?;
+                        if func.returns_obj || func.scalar_params != 1 || func.obj_params != 0
+                            || arg_o > func.num_objs || arg_s == 0
+                        {
+                            return Err(format!("{}: invalid scalar self-call", ctx));
+                        }
                     }
                     Op::CallDirect {
                         func_id,
@@ -386,14 +514,39 @@ impl Module {
                             return Err(format!("{}: LoadFuncObj func_id out of bounds", ctx));
                         }
                     }
+                    Op::ReturnScalar { .. } | Op::ReturnAddInt { .. } if func.returns_obj => {
+                        return Err(format!(
+                            "func {} ({}): {} returns a scalar but the function declares an object result",
+                            fid, func.name, ctx
+                        ));
+                    }
+                    Op::ReturnObj { .. }
+                    | Op::TryUnwrapScalar { ret_on_err: true, .. }
+                    | Op::TryCheckObj { ret_on_err: true, .. }
+                        if !func.returns_obj =>
+                    {
+                        return Err(format!(
+                            "func {} ({}): {} can return an object but the function declares no object result",
+                            fid, func.name, ctx
+                        ));
+                    }
                     Op::ReturnScalar { src } => check_s(src, &ctx)?,
+                    Op::ReturnAddInt { a, b } => {
+                        check_s(a, &ctx)?;
+                        check_s(b, &ctx)?;
+                    }
                     Op::ReturnObj { src } => check_o(src, &ctx)?,
+                    // Also used as an unreachable end-of-function terminator.
                     Op::ReturnVoid => {}
                     Op::LoadConstObj { dst_obj, idx } => {
                         check_o(dst_obj, &ctx)?;
                         if (idx as usize) >= self.obj_consts.len() {
                             return Err(format!("{}: obj_const {} out of bounds", ctx, idx));
                         }
+                    }
+                    Op::ToBytes { dst_obj, src_obj } | Op::BytesToList { dst_obj, src_obj } => {
+                        check_o(dst_obj, &ctx)?;
+                        check_o(src_obj, &ctx)?;
                     }
                     Op::MoveObj { dst_obj, src } => {
                         check_o(dst_obj, &ctx)?;
@@ -428,6 +581,11 @@ impl Module {
                         check_o(dst_obj, &ctx)?;
                         check_o(a_obj, &ctx)?;
                         check_o(b_obj, &ctx)?;
+                    }
+                    Op::StrConcatInt { dst_obj, prefix_obj, src_s } => {
+                        check_o(dst_obj, &ctx)?;
+                        check_o(prefix_obj, &ctx)?;
+                        check_s(src_s, &ctx)?;
                     }
                     Op::ScalarToStr { dst_obj, src_s, .. } => {
                         check_o(dst_obj, &ctx)?;
@@ -479,6 +637,12 @@ impl Module {
                         check_s(dst_s, &ctx)?;
                         check_o(tuple_obj, &ctx)?;
                     }
+                    Op::SumListIntTail { list_obj, idx_s, elem_s, acc_s } => {
+                        check_o(list_obj, &ctx)?;
+                        check_s(idx_s, &ctx)?;
+                        check_s(elem_s, &ctx)?;
+                        check_s(acc_s, &ctx)?;
+                    }
                     Op::ForListInt {
                         list_obj,
                         idx_s,
@@ -507,6 +671,17 @@ impl Module {
                         check_o(elem_obj, &ctx)?;
                         check_jmp(exit_target, &ctx)?;
                     }
+                    Op::NewHttpRequest { dst_obj, desc_idx } => {
+                        check_o(dst_obj, &ctx)?;
+                        let desc = self.records.get(desc_idx as usize)
+                            .ok_or_else(|| format!("{}: missing HTTP request descriptor", ctx))?;
+                        if desc.schema_id != crate::vm::value::SCHEMA_HTTP_REQUEST
+                            || desc.obj_regs.len() != 6 || !desc.scalar_regs.is_empty()
+                        {
+                            return Err(format!("{}: invalid HTTP request descriptor", ctx));
+                        }
+                        for &reg in desc.obj_regs.iter() { check_o(reg, &ctx)?; }
+                    }
                     Op::NewRecord { dst_obj, desc_idx }
                     | Op::NewRecordMove { dst_obj, desc_idx } => {
                         check_o(dst_obj, &ctx)?;
@@ -532,6 +707,26 @@ impl Module {
                         check_o(map_obj, &ctx)?;
                         check_s(key_s, &ctx)?;
                         check_s(val_s, &ctx)?;
+                    }
+                    Op::MapGetIntIntOrImm { dst_s, map_obj, key_s, .. } => {
+                        check_s(dst_s, &ctx)?;
+                        check_o(map_obj, &ctx)?;
+                        check_s(key_s, &ctx)?;
+                    }
+                    Op::AddIntMapGetOrImm { dst_s, a, map_obj, key_s, .. } => {
+                        check_s(dst_s, &ctx)?;
+                        check_s(a, &ctx)?;
+                        check_o(map_obj, &ctx)?;
+                        check_s(key_s, &ctx)?;
+                    }
+                    Op::SumIntMapRangeTail { acc_s, map_obj, idx_s, limit_s, .. } => {
+                        check_s(acc_s, &ctx)?;
+                        check_o(map_obj, &ctx)?;
+                        check_s(idx_s, &ctx)?;
+                        check_s(limit_s, &ctx)?;
+                        if acc_s == idx_s || acc_s == limit_s {
+                            return Err(format!("{}: map sum overlaps the range registers", ctx));
+                        }
                     }
                     Op::MapGetIntIntOr {
                         dst_s,
@@ -809,7 +1004,7 @@ impl Module {
                                         check_o(c, &ctx)?;
                                     }
                                     2 => check_o(a, &ctx)?,
-                                    3 => {
+                                    3 | 6 => {
                                         check_o(a, &ctx)?;
                                         check_o(b, &ctx)?;
                                     }
@@ -908,7 +1103,7 @@ impl Module {
                                 }
                             }
                             crate::vm::opcode::EXT_HTTP_OP => match aux {
-                                0..=2 | 11 | 13 | 19..=23 => {
+                                0..=2 | 11 | 13 | 19..=23 | 50 | 51 => {
                                     check_o(a, &ctx)?;
                                     check_o(b, &ctx)?;
                                 }
@@ -1133,7 +1328,7 @@ impl Module {
                                     check_s(a, &ctx)?;
                                     check_o(b, &ctx)?;
                                 }
-                                3..=9 | 11 | 13 | 16 | 17 => {
+                                3..=9 | 11 | 13 | 16 | 17 | 19 => {
                                     check_o(a, &ctx)?;
                                     check_o(b, &ctx)?;
                                     check_o(c, &ctx)?;
@@ -1157,6 +1352,37 @@ impl Module {
                                     check_o(c, &ctx)?;
                                 }
                                 _ => return Err(format!("Invalid redis aux {}", aux)),
+                            },
+                            crate::vm::opcode::EXT_SPAWN => {
+                                check_o(a, &ctx)?;
+                            }
+                            EXT_CHAN_OP => match aux {
+                                0 => {
+                                    check_o(a, &ctx)?;
+                                    check_s(b, &ctx)?;
+                                }
+                                1 | 2 => {
+                                    check_s(a, &ctx)?;
+                                    check_o(b, &ctx)?;
+                                    check_o(c, &ctx)?;
+                                }
+                                3 | 4 => {
+                                    check_o(a, &ctx)?;
+                                    check_o(b, &ctx)?;
+                                }
+                                5 => {
+                                    check_o(a, &ctx)?;
+                                    check_o(b, &ctx)?;
+                                    check_s(c, &ctx)?;
+                                }
+                                6 => {
+                                    check_o(b, &ctx)?;
+                                }
+                                7..=10 => {
+                                    check_s(a, &ctx)?;
+                                    check_o(b, &ctx)?;
+                                }
+                                _ => return Err(format!("Invalid chan aux {}", aux)),
                             },
                             _ => return Err(format!("Invalid ExtOp kind {}", kind)),
                         }
@@ -1207,5 +1433,80 @@ impl Module {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FunctionProto, Module, Op};
+
+    #[test]
+    fn validates_fused_branch_registers_and_switch_entries() {
+        let mut module = Module::new();
+        module.functions.push(FunctionProto {
+            name: "branch".into(), num_scalars: 1, num_objs: 1,
+            scalar_params: 0, obj_params: 0, returns_obj: false,
+            ops: Box::new([
+                Op::JumpIfLtIntImm { a: 0, imm: 2, target: 3, when_true: true },
+                Op::SwitchTag { src_obj: 0, first_tag: 5, tag_count: 1 },
+                Op::Jump { target: 4 },
+                Op::Jump { target: 4 },
+                Op::ReturnVoid,
+            ]),
+        });
+        assert!(module.validate().is_ok());
+        module.functions[0].ops[3] = Op::Jump { target: 5 };
+        assert!(module.validate().unwrap_err().contains("jump target"));
+        module.functions[0].ops[3] = Op::ReturnVoid;
+        assert!(module.validate().unwrap_err().contains("switch jump table"));
+        module.functions[0].ops[0] = Op::JumpIfLtInt { a: 0, b: 1, target: 4, when_true: false };
+        assert!(module.validate().unwrap_err().contains("scalar reg"));
+    }
+
+    #[test]
+    fn validates_register_bank_for_explicit_and_early_returns() {
+        for (op, required_returns_obj) in [
+            (Op::ReturnScalar { src: 0 }, Some(false)),
+            (Op::ReturnObj { src: 0 }, Some(true)),
+            (
+                Op::TryUnwrapScalar { dst_s: 0, src_obj: 0, ret_on_err: true },
+                Some(true),
+            ),
+            (
+                Op::TryCheckObj { src_obj: 0, ret_on_err: true, empty_is_err: false },
+                Some(true),
+            ),
+            (
+                Op::TryUnwrapScalar { dst_s: 0, src_obj: 0, ret_on_err: false },
+                None,
+            ),
+            (
+                Op::TryCheckObj { src_obj: 0, ret_on_err: false, empty_is_err: false },
+                None,
+            ),
+            (Op::ReturnVoid, None),
+        ] {
+            let mut module = Module::new();
+            module.functions.push(FunctionProto {
+                name: "test_return".into(),
+                num_scalars: 1,
+                num_objs: 1,
+                scalar_params: 0,
+                obj_params: 0,
+                returns_obj: false,
+                ops: Box::new([op, Op::ReturnVoid]),
+            });
+
+            for returns_obj in [false, true] {
+                module.functions[0].returns_obj = returns_obj;
+                let result = module.validate();
+                if required_returns_obj.is_some_and(|required| required != returns_obj) {
+                    let err = result.expect_err("incompatible return bank should be rejected");
+                    assert!(err.contains("test_return): op@0"), "{op:?}: {err}");
+                } else {
+                    assert_eq!(result, Ok(()), "{op:?} with returns_obj={returns_obj}");
+                }
+            }
+        }
     }
 }

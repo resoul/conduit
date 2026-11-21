@@ -65,7 +65,7 @@ func make_pair<A, B>(a: A, b: B) -> Pair<A, B> {
 }
 
 func fold<T, Acc>(items: [T], init: Acc, f: (Acc, T) -> Acc) -> Acc {
-    acc := init
+    var acc = init
     for item in items {
         acc = f(acc, item)
     }
@@ -165,7 +165,7 @@ func test_explicit_and_inferred_switch(ok: Bool) -> String {
 
 func test_explicit_case_and_json_inner() -> String | json.EncodeError | json.DecodeError | IndexError {
     res := make_page_or_err(true)
-    label := ""
+    var label = ""
     switch res {
         case Page<User>(p): label = json.encode(p)?
         case val.ValidationError(_): label = "err"
@@ -293,13 +293,13 @@ func test_list_methods_inner() -> String | IndexError {
     up := trimmed.upper()
     joined := [up, low].join("-")
 
-    enum_acc := ""
+    var enum_acc = ""
     for (i, w) in rev.enumerate() {
         enum_acc = "{enum_acc}{i}={w};"
     }
 
     (a, b) := (123, "pair")
-    sw := ""
+    var sw = ""
     switch (4, 5) {
         case (x, y):
             sum_xy := x + y
@@ -321,7 +321,7 @@ func test_float_lists_inner() -> String | IndexError {
     fs := [1.5, 2.5]
     fs.append(3.5)
     has := fs.contains(2.5)
-    sum := 0.0
+    var sum = 0.0
     for f in fs {
         sum = sum + f
     }
@@ -599,4 +599,55 @@ export func test_bool_float_and_int_str_maps() -> String {
     assert!(check_source("func f() -> Map<Float, Int> { return Map<Float, Int>() }").is_err());
     assert!(check_source("func f() { m := Map.from([(1.5, 2)]) }").is_err());
     assert!(check_source("func f() -> Map<[Int], Int> { return Map<[Int], Int>() }").is_err());
+}
+
+#[test]
+fn immutable_bindings_and_typed_empty_list_ctor() {
+    let src = r#"
+struct Item {
+    id: Int
+}
+
+func make_empty<T>() -> [T] {
+    return [T]()
+}
+
+func test_empty_and_var() -> String {
+    ints := [Int]()
+    ints.append(7)
+    ints.append(8)
+
+    strs := List<String>()
+    strs.append("ok")
+
+    items := make_empty<Item>()
+    items.append(Item(id: 3))
+
+    var total = 0
+    for n in ints {
+        total = total + n
+    }
+    first_item := items.get(0)?.id ?? 0
+    slen := strs.len()
+    return "{total}:{slen}:{first_item}"
+}
+"#;
+    let m = compile_source(src).expect("typed empty list and var should compile");
+    let mut vm = Vm::new();
+    let res = vm
+        .call_obj(&m, m.func_id("test_empty_and_var").unwrap(), &[], &[])
+        .unwrap();
+    match res {
+        Obj::Str(s) => assert_eq!(s.as_str(), "15:1:3"),
+        other => panic!("expected String, got {:?}", other),
+    }
+
+    let imm_err = check_source("func f() -> Void {\n x := 1\n x = 2\n}")
+        .expect_err("reassigning := binding must fail");
+    assert!(imm_err.contains("immutable"), "got: {imm_err}");
+
+    assert!(check_source("func f(x: Int) -> Void {\n x = 2\n}").is_err());
+    assert!(check_source("func f() -> Void {\n (a, b) := (1, 2)\n a = 3\n}").is_err());
+    assert!(check_source("func f() -> Void {\n for i in 3 { i = 1 }\n}").is_err());
+    assert!(check_source("func f() { xs := [Void]() }").is_err());
 }

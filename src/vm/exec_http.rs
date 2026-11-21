@@ -6,16 +6,16 @@ use std::time::Duration;
 use crate::ir::Module;
 use crate::native::http::{
     HttpClientState, MatchedParams, ReadHttpError, RouteEntry, RouterState,
-    http_client_bytes_request, http_client_pooled_request, http_client_request,
+    header_key, http_client_bytes_request, http_client_pooled_request, http_client_request,
     http_client_request_with_timeout, lookup_route, make_http_client_obj, make_http_error,
-    make_request_obj, make_response_obj, make_response_with_body_obj, make_router_obj,
+    make_response_obj, make_response_with_body_obj, make_router_obj,
     read_http_request, reader_writer_pair, resolve_client_url, route_prefix_matches,
     try_serve_static, write_error_response, write_http_response_ext,
 };
 use crate::vm::exec_cold::err_msg;
 use crate::vm::value::{
     ListStorage, MapKey, MapVal, Obj, OrderedMap, SCHEMA_HTTP_CLIENT, SCHEMA_HTTP_REQUEST,
-    SCHEMA_HTTP_RESPONSE, SCHEMA_HTTP_ROUTER, SMALL_MAP_LIMIT, StructData,
+    SCHEMA_HTTP_RESPONSE, SCHEMA_HTTP_ROUTER, StructData,
 };
 use crate::vm::{ExecResult, RuntimeError, Vm};
 
@@ -85,43 +85,61 @@ pub const HTTP_CLIENT_GET_JSON: u8 = 46;
 pub const HTTP_CLIENT_POST_JSON: u8 = 47;
 pub const HTTP_CLIENT_CLOSE: u8 = 48;
 pub const HTTP_CLIENT_POOL_STATS: u8 = 49;
+pub const HTTP_ROUTE_ON_START: u8 = 50;
+pub const HTTP_ROUTE_ON_STOP: u8 = 51;
 
-#[inline]
-fn populate_ordered_map_from_params(map: &mut OrderedMap, params: MatchedParams) {
-    map.entries.clear();
-    if !map.index.is_empty() {
-        map.index.clear();
+pub static SIGNAL_STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn on_os_signal(_sig: i32) {
+    SIGNAL_STOP.store(true, Ordering::SeqCst);
+}
+
+#[cfg(unix)]
+pub fn install_signal_handlers() {
+    unsafe extern "C" {
+        fn signal(signum: i32, handler: extern "C" fn(i32)) -> usize;
     }
-    map.dense_ints = false;
-    match params {
-        MatchedParams::None => {}
-        MatchedParams::One(k, v) => {
-            map.entries.push((MapKey::Str(k), MapVal::Obj(v)));
-        }
-        MatchedParams::Many(vec) => {
-            map.entries.extend(vec);
-            if map.entries.len() > SMALL_MAP_LIMIT {
-                map.materialize_index();
-            }
-        }
+    unsafe {
+        signal(2, on_os_signal);
+        signal(15, on_os_signal);
     }
 }
 
-#[inline]
-fn set_matched_params_on_record(req_mut: &mut StructData, params: MatchedParams) {
-    if let Obj::Map(m_arc) = req_mut.get_obj_mut(5)
-        && let Some(map) = Arc::get_mut(m_arc)
-    {
-        populate_ordered_map_from_params(map, params);
-        return;
+#[cfg(windows)]
+pub fn install_signal_handlers() {
+    type HandlerRoutine = unsafe extern "system" fn(ctrl_type: u32) -> i32;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetConsoleCtrlHandler(handler: Option<HandlerRoutine>, add: i32) -> i32;
     }
-    let mut map = match &params {
-        MatchedParams::One(_, _) => OrderedMap::with_capacity(1),
-        MatchedParams::Many(vec) => OrderedMap::with_capacity(vec.len()),
-        MatchedParams::None => OrderedMap::new(),
+    unsafe extern "system" fn on_ctrl(ctrl_type: u32) -> i32 {
+        match ctrl_type {
+            0 | 1 | 2 | 5 | 6 => {
+                SIGNAL_STOP.store(true, Ordering::SeqCst);
+                1
+            }
+            _ => 0,
+        }
+    }
+    unsafe {
+        SetConsoleCtrlHandler(Some(on_ctrl), 1);
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn install_signal_handlers() {}
+
+#[inline]
+fn set_matched_params_on_record(req: &mut StructData, params: MatchedParams) {
+    let params = match params {
+        MatchedParams::None => Obj::Map(Arc::new(OrderedMap::new())),
+        MatchedParams::One(key, value) => Obj::deferred_map_entry(key, value),
+        MatchedParams::Many(entries) => Obj::deferred_field(move || {
+            Obj::Map(Arc::new(OrderedMap::from_vec(entries)))
+        }),
     };
-    populate_ordered_map_from_params(&mut map, params);
-    req_mut.set_obj(5, Obj::Map(Arc::new(map)));
+    req.set_obj(5, params);
 }
 
 impl Vm {
@@ -249,33 +267,31 @@ impl Vm {
         router_id: usize,
         mut req_obj: Obj,
     ) -> Result<Obj, RuntimeError> {
-        let (req_method, req_path) = match &req_obj {
-            Obj::Record(rec) if rec.schema_id == SCHEMA_HTTP_REQUEST => {
-                let m = match rec.get_obj(0) {
-                    Obj::Str(s) => s.as_str().to_string(),
-                    _ => "GET".to_string(),
-                };
-                let p = match rec.get_obj(1) {
-                    Obj::Str(s) => s.as_str().to_string(),
-                    _ => "/".to_string(),
-                };
-                (m, p)
-            }
+        let source = match &req_obj {
+            Obj::Record(rec) if rec.schema_id == SCHEMA_HTTP_REQUEST => Arc::clone(rec),
             _ => return Err(err_msg("Expected Request")),
+        };
+        let req_method = match source.get_obj(0) {
+            Obj::Str(s) => s.as_str(),
+            _ => "GET",
+        };
+        let req_path = match source.get_obj(1) {
+            Obj::Str(s) => s.as_str(),
+            _ => "/",
         };
 
         let cors_origin = self.host.routers[router_id].cors_origin.clone();
         let mut resp = if req_method == "OPTIONS"
             && cors_origin.is_some()
-            && lookup_route(&self.host.routers[router_id].routes, &req_method, &req_path).is_err()
+            && lookup_route(&self.host.routers[router_id].routes, req_method, req_path).is_err()
         {
             let mut hdrs = OrderedMap::with_capacity(3);
             hdrs.set(
-                MapKey::Str(Arc::new("access-control-allow-methods".into())),
+                MapKey::Str(header_key("access-control-allow-methods")),
                 MapVal::Obj(Obj::str("GET, POST, PUT, PATCH, DELETE, OPTIONS")),
             );
             hdrs.set(
-                MapKey::Str(Arc::new("access-control-allow-headers".into())),
+                MapKey::Str(header_key("access-control-allow-headers")),
                 MapVal::Obj(Obj::str("Content-Type, Authorization")),
             );
             let mut s = StructData::new(SCHEMA_HTTP_RESPONSE, 1, 2);
@@ -292,7 +308,7 @@ impl Vm {
                 let hook = {
                     let (prefix, h) = &self.host.routers[router_id].before[idx];
                     if let Some(p) = prefix
-                        && !route_prefix_matches(p, &req_path)
+                        && !route_prefix_matches(p, req_path)
                     {
                         continue;
                     }
@@ -318,7 +334,7 @@ impl Vm {
             None => {
                 let matched = {
                     let routes = &self.host.routers[router_id].routes;
-                    match lookup_route(routes, &req_method, &req_path) {
+                    match lookup_route(routes, req_method, req_path) {
                         Ok((entry, params)) => Ok((
                             entry.handler.clone(),
                             entry.query_plan,
@@ -349,11 +365,14 @@ impl Vm {
                             return Err(err_msg("Expected Request"));
                         };
                         if let Some((ref mut last_src, ref mut cached_rec)) = cached
+                            && cached_rec.obj_len == rec_arc.obj_len
                             && let Some(cached_mut) = Arc::get_mut(cached_rec)
                         {
                             if !Arc::ptr_eq(last_src, rec_arc) {
-                                for idx in 0..5 {
-                                    cached_mut.set_obj(idx, rec_arc.get_obj(idx).clone());
+                                for idx in 0..rec_arc.obj_len as usize {
+                                    if idx != 5 {
+                                        cached_mut.set_obj(idx, rec_arc.raw_obj(idx).clone());
+                                    }
                                 }
                                 *last_src = Arc::clone(rec_arc);
                             }
@@ -383,8 +402,8 @@ impl Vm {
                     Err(status) => {
                         if let Some(static_resp) = try_serve_static(
                             &self.host.routers[router_id].statics,
-                            &req_method,
-                            &req_path,
+                            req_method,
+                            req_path,
                         ) {
                             static_resp
                         } else if status == 405 {
@@ -402,7 +421,7 @@ impl Vm {
             let hook = {
                 let (prefix, h) = &self.host.routers[router_id].after[idx];
                 if let Some(p) = prefix
-                    && !route_prefix_matches(p, &req_path)
+                    && !route_prefix_matches(p, req_path)
                 {
                     continue;
                 }
@@ -426,7 +445,7 @@ impl Vm {
                 _ => OrderedMap::with_capacity(1),
             };
             hdrs.set(
-                MapKey::Str(Arc::new("access-control-allow-origin".into())),
+                MapKey::Str(header_key("access-control-allow-origin")),
                 MapVal::Obj(Obj::str(origin.as_ref())),
             );
             rec_mut.set_obj(1, Obj::Map(Arc::new(hdrs)));
@@ -450,6 +469,42 @@ impl Vm {
         auto_resp_kind: Option<u8>,
         req_obj: &Obj,
     ) -> Result<Obj, RuntimeError> {
+        if guard.is_none() && query_plan.is_none() && body_json_plan.is_none() {
+            if auto_resp_kind.is_none()
+                && let Obj::Func(fid) = handler
+                && let [
+                    crate::vm::opcode::Op::LoadConstObj { dst_obj: r0, idx },
+                    crate::vm::opcode::Op::ExtOp {
+                        kind: crate::vm::opcode::EXT_HTTP_OP,
+                        aux,
+                        a: r1,
+                        b: r0_b,
+                        c: 0,
+                    },
+                    crate::vm::opcode::Op::ReturnObj { src: r1_b },
+                ] = module.functions[*fid as usize].ops.as_ref()
+                && r0 == r0_b
+                && r1 == r1_b
+                && matches!(*aux, HTTP_TEXT | HTTP_HTML | HTTP_JSON)
+                && let Some(body @ Obj::Str(_)) = module.obj_consts.get(*idx as usize)
+            {
+                let ct = match *aux {
+                    HTTP_TEXT => Some("text/plain; charset=utf-8"),
+                    HTTP_HTML => Some("text/html; charset=utf-8"),
+                    _ => Some("application/json"),
+                };
+                return Ok(make_response_with_body_obj(200, body.clone(), ct));
+            }
+            let raw_res = self.invoke_http_fn_raw(
+                module,
+                s_top,
+                o_top,
+                handler,
+                std::slice::from_ref(req_obj),
+            )?;
+            return convert_auto_http_response(module, raw_res, auto_resp_kind);
+        }
+
         let guard_ctx = if let Some(g) = guard {
             let res = self.invoke_http_fn(module, s_top, o_top, g, std::slice::from_ref(req_obj))?;
             if matches!(&res, Obj::Record(rec) if rec.schema_id == SCHEMA_HTTP_RESPONSE) {
@@ -484,14 +539,26 @@ impl Vm {
 
         if let Some(plan_idx) = body_json_plan {
             let body_str = match req_obj {
-                Obj::Record(rec) => match rec.get_obj(2) {
-                    Obj::Str(s) => s.as_str().to_string(),
-                    _ => String::new(),
-                },
-                _ => String::new(),
+                Obj::Record(rec) => {
+                    if rec.obj_len >= 7
+                        && let Obj::Bytes(bytes) = rec.get_obj(6)
+                        && std::str::from_utf8(bytes).is_err()
+                    {
+                        return Ok(make_response_obj(
+                            400,
+                            r#"{"error":"invalid_json","message":"Request body is not valid UTF-8"}"#,
+                            Some("application/json; charset=utf-8"),
+                        ));
+                    }
+                    match rec.get_obj(2) {
+                        Obj::Str(s) => s.as_str(),
+                        _ => "",
+                    }
+                }
+                _ => "",
             };
             let decoded = match crate::native::json_decode::decode_json_with_plan(
-                &body_str,
+                body_str,
                 &module.json_plans[plan_idx as usize],
             ) {
                 Ok(v) => v,
@@ -606,6 +673,16 @@ impl Vm {
                 let handler = self.objs[o_base + b as usize].clone();
                 self.host.routers[rid].after.push((None, handler));
             }
+            HTTP_ROUTE_ON_START => {
+                let rid = self.extract_router_id(&self.objs[o_base + a as usize])?;
+                let handler = self.objs[o_base + b as usize].clone();
+                self.host.routers[rid].on_start.push(handler);
+            }
+            HTTP_ROUTE_ON_STOP => {
+                let rid = self.extract_router_id(&self.objs[o_base + a as usize])?;
+                let handler = self.objs[o_base + b as usize].clone();
+                self.host.routers[rid].on_stop.push(handler);
+            }
             HTTP_ROUTE_GROUP_BEFORE => {
                 let rid = self.extract_router_id(&self.objs[o_base + a as usize])?;
                 let prefix = self.sys_str(o_base, b, "router group before")?.as_str().into();
@@ -678,7 +755,7 @@ impl Vm {
                 let url = self.sys_str(o_base, c, "http.redirect()")?;
                 let mut hdrs = OrderedMap::with_capacity(1);
                 hdrs.set(
-                    MapKey::Str(Arc::new("location".into())),
+                    MapKey::Str(header_key("location")),
                     MapVal::Obj(Obj::Str(url)),
                 );
                 let mut s = StructData::new(SCHEMA_HTTP_RESPONSE, 1, 2);
@@ -700,29 +777,51 @@ impl Vm {
                     HTTP_REQ_QUERY_PARAM => 4,
                     _ => 5,
                 };
-                let found = match rec.get_obj(field_idx) {
-                    Obj::Map(map) => {
-                        if aux == HTTP_REQ_HEADER {
-                            let lower = key.as_str().to_ascii_lowercase();
-                            map.get(&MapKey::Str(Arc::new(lower.as_str().into())))
-                                .or_else(|| {
-                                    map.entries.iter().find_map(|(k, v)| match k {
-                                        MapKey::Str(ks) if ks.as_str().eq_ignore_ascii_case(key.as_str()) => Some(v),
-                                        _ => None,
-                                    })
-                                })
-                                .and_then(|v| match v {
-                                    MapVal::Obj(o) => Some(o.clone()),
-                                    _ => None,
-                                })
-                        } else {
+                let found = match rec.raw_obj(field_idx) {
+                    Obj::DeferredField(df) if aux != HTTP_REQ_HEADER => {
+                        if let Some((ek, ev)) = df.as_single_map_entry() {
+                            if ek.as_str() == key.as_str() {
+                                Some(ev.clone())
+                            } else {
+                                None
+                            }
+                        } else if let Obj::Map(map) = df.value() {
                             map.get(&MapKey::Str(key)).and_then(|v| match v {
                                 MapVal::Obj(o) => Some(o.clone()),
                                 _ => None,
                             })
+                        } else {
+                            None
                         }
                     }
-                    _ => None,
+                    _ => match rec.get_obj(field_idx) {
+                        Obj::Map(map) => {
+                            if aux == HTTP_REQ_HEADER {
+                                let lower = if key.bytes().any(|b| b.is_ascii_uppercase()) {
+                                    std::borrow::Cow::Owned(key.as_str().to_ascii_lowercase())
+                                } else {
+                                    std::borrow::Cow::Borrowed(key.as_str())
+                                };
+                                map.get_str(&lower)
+                                    .or_else(|| {
+                                        map.entries.iter().find_map(|(k, v)| match k {
+                                            MapKey::Str(ks) if ks.as_str().eq_ignore_ascii_case(key.as_str()) => Some(v),
+                                            _ => None,
+                                        })
+                                    })
+                                    .and_then(|v| match v {
+                                        MapVal::Obj(o) => Some(o.clone()),
+                                        _ => None,
+                                    })
+                            } else {
+                                map.get(&MapKey::Str(key)).and_then(|v| match v {
+                                    MapVal::Obj(o) => Some(o.clone()),
+                                    _ => None,
+                                })
+                            }
+                        }
+                        _ => None,
+                    },
                 };
                 self.objs[o_base + a as usize] = found.unwrap_or(Obj::Empty);
             }
@@ -975,6 +1074,35 @@ impl Vm {
             HTTP_SERVE => {
                 let rid = self.extract_router_id(&self.objs[o_base + b as usize])?;
                 let addr = self.sys_str(o_base, c, "router.serve()")?;
+                if !module.on_start_funcs.is_empty()
+                    && !self.host.lifecycle_started
+                    && let Err(msg) = self.run_module_on_start(module, s_top, o_top)
+                {
+                    self.objs[o_base + a as usize] = make_http_error("startup_error", msg);
+                    return Ok(());
+                }
+                let on_start_hooks = self.host.routers[rid].on_start.clone();
+                for hook in on_start_hooks {
+                    match self.invoke_zero_arg_cb(module, s_top, o_top, &hook, 0) {
+                        Ok(obj)
+                            if crate::native::validation::is_err_or_nil_obj(module, &obj)
+                                && !matches!(obj, Obj::Empty) =>
+                        {
+                            self.objs[o_base + a as usize] = make_http_error(
+                                "startup_error",
+                                format!("router on_start hook failed: {}", obj.format_obj()),
+                            );
+                            return Ok(());
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            self.objs[o_base + a as usize] =
+                                make_http_error("startup_error", e.message);
+                            return Ok(());
+                        }
+                    }
+                }
+                crate::vm::exec_map::flush_stdout();
                 let listener = match TcpListener::bind(addr.as_str()) {
                     Ok(l) => l,
                     Err(e) => {
@@ -982,14 +1110,26 @@ impl Vm {
                         return Ok(());
                     }
                 };
-                if let Ok(local) = listener.local_addr()
+                let bound_addr = listener.local_addr().ok();
+                if let Some(local) = bound_addr
                     && let Ok(mut guard) = self.host.routers[rid].listen_addr.lock()
                 {
                     *guard = Some(local);
                 }
                 self.host.routers[rid].stop_flag.store(false, Ordering::Release);
+                SIGNAL_STOP.store(false, Ordering::Release);
+                install_signal_handlers();
                 let stop_flag = Arc::clone(&self.host.routers[rid].stop_flag);
-                let router_state = self.host.routers[rid].clone();
+                let shared_mod = self
+                    .host
+                    .shared_module
+                    .get_or_insert_with(|| Arc::new(module.clone()))
+                    .clone();
+                let routers = self.host.routers.clone();
+                let http_clients = self.host.http_clients.clone();
+                let db_pools = self.host.db_pools.clone();
+                let db_pool_free = self.host.db_pool_free.clone();
+                let spawn_tracker = Arc::clone(&self.host.spawn_tracker);
                 let script_args = self.script_args.clone();
                 let workers = std::thread::available_parallelism()
                     .map(|n| n.get().clamp(4, 16))
@@ -999,12 +1139,22 @@ impl Vm {
                 std::thread::scope(|scope| {
                     for _ in 0..workers {
                         let rx = Arc::clone(&rx);
-                        let router_state = router_state.clone();
+                        let routers = routers.clone();
+                        let http_clients = http_clients.clone();
+                        let db_pools = db_pools.clone();
+                        let db_pool_free = db_pool_free.clone();
+                        let spawn_tracker = Arc::clone(&spawn_tracker);
+                        let shared_mod = Arc::clone(&shared_mod);
                         let script_args = script_args.clone();
                         scope.spawn(move || {
                             let mut worker_vm = Vm::new();
                             worker_vm.script_args = script_args;
-                            worker_vm.host.routers.push(router_state);
+                            worker_vm.host.routers = routers;
+                            worker_vm.host.http_clients = http_clients;
+                            worker_vm.host.db_pools = db_pools;
+                            worker_vm.host.db_pool_free = db_pool_free;
+                            worker_vm.host.spawn_tracker = spawn_tracker;
+                            worker_vm.host.shared_module = Some(shared_mod);
                             loop {
                                 let stream = {
                                     let Ok(guard) = rx.lock() else { break };
@@ -1013,10 +1163,38 @@ impl Vm {
                                         Err(_) => break,
                                     }
                                 };
-                                serve_connection(&mut worker_vm, module, 0, stream);
+                                serve_connection_isolated(&mut worker_vm, module, rid, stream);
+                                crate::vm::exec_map::flush_stdout();
                             }
                         });
                     }
+                    let watch_stop = Arc::clone(&stop_flag);
+                    let watch_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let watch_done_flag = Arc::clone(&watch_done);
+                    let watcher = scope.spawn(move || {
+                        while !watch_done_flag.load(Ordering::Acquire)
+                            && !watch_stop.load(Ordering::Acquire)
+                        {
+                            if SIGNAL_STOP.load(Ordering::Acquire) {
+                                watch_stop.store(true, Ordering::Release);
+                                if let Some(mut wake_addr) = bound_addr {
+                                    if wake_addr.ip().is_unspecified() {
+                                        wake_addr.set_ip(if wake_addr.is_ipv4() {
+                                            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+                                        } else {
+                                            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+                                        });
+                                    }
+                                    let _ = TcpStream::connect_timeout(
+                                        &wake_addr,
+                                        Duration::from_millis(50),
+                                    );
+                                }
+                                break;
+                            }
+                            std::thread::park_timeout(Duration::from_millis(50));
+                        }
+                    });
                     while !stop_flag.load(Ordering::Acquire) {
                         match listener.accept() {
                             Ok((stream, _)) => {
@@ -1032,11 +1210,52 @@ impl Vm {
                         }
                     }
                     drop(tx);
+                    watch_done.store(true, Ordering::Release);
+                    watcher.thread().unpark();
                 });
                 if let Ok(mut guard) = self.host.routers[rid].listen_addr.lock() {
                     *guard = None;
                 }
-                self.objs[o_base + a as usize] = Obj::Empty;
+                if self.host.spawn_tracker.active_count() > 0 {
+                    self.host
+                        .spawn_tracker
+                        .wait_idle(Duration::from_secs(5));
+                }
+                let mut stop_err: Option<String> = None;
+                let on_stop_hooks = self.host.routers[rid].on_stop.clone();
+                for hook in on_stop_hooks {
+                    match self.invoke_zero_arg_cb(module, s_top, o_top, &hook, 0) {
+                        Ok(obj)
+                            if crate::native::validation::is_err_or_nil_obj(module, &obj)
+                                && !matches!(obj, Obj::Empty) =>
+                        {
+                            if stop_err.is_none() {
+                                stop_err = Some(format!(
+                                    "router on_stop hook failed: {}",
+                                    obj.format_obj()
+                                ));
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            if stop_err.is_none() {
+                                stop_err = Some(e.message);
+                            }
+                        }
+                    }
+                }
+                if !module.on_stop_funcs.is_empty()
+                    && !self.host.lifecycle_stopped
+                    && let Err(msg) = self.run_module_on_stop(module, s_top, o_top)
+                    && stop_err.is_none()
+                {
+                    stop_err = Some(msg);
+                }
+                crate::vm::exec_map::flush_stdout();
+                self.objs[o_base + a as usize] = match stop_err {
+                    Some(msg) => make_http_error("shutdown_error", msg),
+                    None => Obj::Empty,
+                };
             }
             HTTP_STOP => {
                 let rid = self.extract_router_id(&self.objs[o_base + b as usize])?;
@@ -1111,24 +1330,31 @@ impl Vm {
                     Obj::Str(s) => s.as_str().to_string(),
                     _ => return Err(err_msg("http.request_bytes expects String url")),
                 };
-                let mut body_bytes = Vec::new();
-                if let Obj::List(ListStorage::Int(items)) = sd.get_obj(2) {
-                    for &v in items.iter() {
-                        match u8::try_from(v) {
-                            Ok(byte) => body_bytes.push(byte),
-                            Err(_) => {
-                                self.objs[o_base + a as usize] = make_http_error(
-                                    "invalid_body",
-                                    format!("byte value {} out of range 0..=255", v),
-                                );
-                                return Ok(());
+                let converted;
+                let body_bytes = match sd.get_obj(2) {
+                    Obj::Bytes(bytes) => bytes.as_slice(),
+                    Obj::List(ListStorage::Int(items)) => {
+                        let mut bytes = Vec::with_capacity(items.len());
+                        for &v in items.iter() {
+                            match u8::try_from(v) {
+                                Ok(byte) => bytes.push(byte),
+                                Err(_) => {
+                                    self.objs[o_base + a as usize] = make_http_error(
+                                        "invalid_body",
+                                        format!("byte value {} out of range 0..=255", v),
+                                    );
+                                    return Ok(());
+                                }
                             }
                         }
+                        converted = bytes;
+                        &converted
                     }
-                }
+                    _ => return Err(err_msg("http.request_bytes expects Bytes or [Int] body")),
+                };
                 let hdrs = extract_header_pairs(sd.get_obj(3));
                 self.objs[o_base + a as usize] =
-                    http_client_bytes_request(&method, &url, &body_bytes, &hdrs, 30_000);
+                    http_client_bytes_request(&method, &url, body_bytes, &hdrs, 30_000);
             }
             _ => return Err(err_msg("Unknown http sub-op")),
         }
@@ -1183,6 +1409,19 @@ fn extract_header_pairs(obj: &Obj) -> Vec<(String, String)> {
     hdrs
 }
 
+fn serve_connection_isolated(vm: &mut Vm, module: &Module, rid: usize, stream: TcpStream) {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        serve_connection(vm, module, rid, stream);
+    }))
+    .is_err()
+    {
+        eprintln!("[http] worker recovered from request panic");
+        vm.frame_depth = 0;
+        let obj_len = vm.objs.len();
+        vm.clear_obj_range(0, obj_len);
+    }
+}
+
 fn serve_connection(vm: &mut Vm, module: &Module, rid: usize, stream: TcpStream) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
@@ -1199,14 +1438,8 @@ fn serve_connection(vm: &mut Vm, module: &Module, rid: usize, stream: TcpStream)
         match read_http_request(&mut reader) {
             Ok(raw) => {
                 let head_only = raw.method.eq_ignore_ascii_case("HEAD");
-                let req_obj = make_request_obj(
-                    &raw.method,
-                    &raw.path,
-                    raw.body,
-                    raw.headers,
-                    raw.query,
-                    Vec::new(),
-                );
+                let keep_alive = raw.keep_alive;
+                let req_obj = raw.into_request_obj();
                 match vm.dispatch_router_request(module, 0, 0, rid, req_obj) {
                     Ok(resp_obj) => {
                         let Ok((status, body, headers)) = vm.extract_response_fields(&resp_obj) else {
@@ -1218,7 +1451,7 @@ fn serve_connection(vm: &mut Vm, module: &Module, rid: usize, stream: TcpStream)
                             status,
                             body,
                             headers,
-                            raw.keep_alive,
+                            keep_alive,
                             head_only,
                         )
                         .is_err()
@@ -1231,7 +1464,7 @@ fn serve_connection(vm: &mut Vm, module: &Module, rid: usize, stream: TcpStream)
                         break;
                     }
                 }
-                if !raw.keep_alive || vm.host.routers[rid].stop_flag.load(Ordering::Acquire) {
+                if !keep_alive || vm.host.routers[rid].stop_flag.load(Ordering::Acquire) {
                     break;
                 }
             }
@@ -1284,7 +1517,7 @@ fn lookup_req_str_map<'a>(map_obj: &'a Obj, key: &str) -> Option<&'a str> {
     let Obj::Map(m) = map_obj else {
         return None;
     };
-    let val = m.get(&MapKey::Str(Arc::new(key.to_string().into())))?;
+    let val = m.get_str(key)?;
     match val {
         MapVal::Obj(Obj::Str(s)) => Some(s.as_str()),
         _ => None,

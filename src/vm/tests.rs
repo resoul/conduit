@@ -755,8 +755,7 @@ fn pipeline_reduce_fast_path_matches_interpreter_on_edge_cases() {
         }
 
         export func div_zero_empty() -> Int {
-            xs := [0]
-            xs = []
+            xs := [Int]()
             return xs |> filter((x: Int) => x % 0 == 0) |> map((x: Int) => x * 3 + 1) |> reduce(42, (acc: Int, x: Int) => acc + x)
         }
 
@@ -1078,11 +1077,9 @@ fn list_sum_min_max_methods() {
     let src = r#"
         export func test_agg() -> String {
             ints := [10, -3, 25, 4]
-            empty_i := [0]
-            empty_i = []
+            empty_i := [Int]()
             floats := [1.5, -2.5, 4.0]
-            empty_f := [0.0]
-            empty_f = []
+            empty_f := [Float]()
             imin := ints.min() ?? -999
             imax := ints.max() ?? -999
             emin := empty_i.min() ?? -999

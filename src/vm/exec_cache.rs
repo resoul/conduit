@@ -5,8 +5,8 @@ use crate::ir::Module;
 use crate::native::cache::{
     CACHE_CLEAR, CACHE_COMPACT, CACHE_DEL, CACHE_DROP, CACHE_GET, CACHE_GET_JSON, CACHE_GET_OR_SET,
     CACHE_HAS, CACHE_INCR, CACHE_KEYS, CACHE_LEN, CACHE_LOAD, CACHE_OPEN, CACHE_OPEN_FILE,
-    CACHE_PRUNE, CACHE_SAVE, CACHE_SET, CACHE_SET_JSON, CACHE_TTL, CacheStore, drop_cache,
-    get_cache_store, make_cache_error, make_cache_handle, open_cache, open_cache_file,
+    CACHE_PRUNE, CACHE_SAVE, CACHE_SET, CACHE_SET_JSON, CACHE_SET_NO_TTL, CACHE_TTL, CacheStore,
+    drop_cache, get_cache_store, make_cache_error, make_cache_handle, open_cache, open_cache_file,
 };
 use crate::native::json_decode::decode_json_with_plan;
 use crate::native::json_encode::encode_json_obj;
@@ -79,7 +79,7 @@ impl Vm {
                 };
                 let key = self.sys_str(o_base, c, "Cache.get()")?;
                 self.objs[o_base + a as usize] = match store.get_str(key.as_str()) {
-                    Some(v) => Obj::str(v),
+                    Some(v) => Obj::Str(v),
                     None => Obj::Empty,
                 };
             }
@@ -105,7 +105,25 @@ impl Vm {
                     return Err(err_msg("Expected String value in Cache.set()"));
                 };
                 self.objs[o_base + a as usize] =
-                    match store.set_str(key.as_str(), val.as_str(), ttl_ms) {
+                    match store.set_str(key, Arc::clone(val), ttl_ms) {
+                        Ok(()) => Obj::Empty,
+                        Err((k, msg)) => make_cache_error(k, msg),
+                    };
+            }
+            CACHE_SET_NO_TTL => {
+                let Some(store) = self.extract_cache_store(o_base, a, "Cache.set()")? else {
+                    self.objs[o_base + a as usize] =
+                        make_cache_error("dropped", "Cache handle has been dropped");
+                    return Ok(());
+                };
+                let Obj::Str(key) = &self.objs[o_base + b as usize] else {
+                    return Err(err_msg("Expected String key in Cache.set()"));
+                };
+                let Obj::Str(val) = &self.objs[o_base + c as usize] else {
+                    return Err(err_msg("Expected String value in Cache.set()"));
+                };
+                self.objs[o_base + a as usize] =
+                    match store.set_str(key, Arc::clone(val), None) {
                         Ok(()) => Obj::Empty,
                         Err((k, msg)) => make_cache_error(k, msg),
                     };
@@ -155,7 +173,7 @@ impl Vm {
                 self.objs[o_base + a as usize] =
                     match encode_json_obj(val_obj, &module.struct_schemas) {
                         Err(e) => make_cache_error("encode", e.to_string()),
-                        Ok(json) => match store.set_str(key.as_str(), &json, ttl_ms) {
+                        Ok(json) => match store.set_str(key, Arc::new(json.into()), ttl_ms) {
                             Ok(()) => Obj::Empty,
                             Err((k, msg)) => make_cache_error(k, msg),
                         },
@@ -179,18 +197,18 @@ impl Vm {
                 let Obj::Str(key_s) = packed.get_obj(0) else {
                     return Err(err_msg("Expected String key in Cache.get_or_set()"));
                 };
-                let key = key_s.as_str().to_string();
+                let key = Arc::clone(key_s);
                 let cb = packed.get_obj(1).clone();
 
                 if let Some(hit) = store.get_str(&key) {
-                    self.objs[o_base + a as usize] = Obj::str(hit);
+                    self.objs[o_base + a as usize] = Obj::Str(hit);
                     return Ok(());
                 }
 
                 let key_lock = store.key_lock(&key);
                 let _kguard = key_lock.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(hit) = store.get_str(&key) {
-                    self.objs[o_base + a as usize] = Obj::str(hit);
+                    self.objs[o_base + a as usize] = Obj::Str(hit);
                     return Ok(());
                 }
 
@@ -203,7 +221,7 @@ impl Vm {
                     return Err(err_msg("Cache.get_or_set() callback must return String"));
                 };
                 self.objs[o_base + a as usize] =
-                    match store.set_str(&key, val_s.as_str(), Some(ttl_ms)) {
+                    match store.set_str(&key, Arc::clone(val_s), Some(ttl_ms)) {
                         Ok(()) => res,
                         Err((k, msg)) => make_cache_error(k, msg),
                     };
@@ -227,7 +245,7 @@ impl Vm {
                 let Obj::Str(key) = packed.get_obj(0) else {
                     return Err(err_msg("Expected String key in Cache.incr()"));
                 };
-                self.objs[o_base + a as usize] = match store.incr(key.as_str(), delta, ttl_ms) {
+                self.objs[o_base + a as usize] = match store.incr(key, delta, ttl_ms) {
                     Ok(v) => Obj::boxed_int(v),
                     Err((k, msg)) => make_cache_error(k, msg),
                 };

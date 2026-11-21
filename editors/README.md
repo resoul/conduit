@@ -22,7 +22,7 @@ Conduit includes a TextMate syntax grammar under `editors/textmate` and a built-
 4. Click **+** and select `editors/textmate` from this repository.
 5. Click **Apply**.
 
-JetBrains IDEs automatically map the upgraded semantic TextMate scopes in `conduit.tmLanguage.json` (declarations, DSL blocks, HTTP methods, annotations, properties, constants, operators) to your active JetBrains Color Scheme.
+JetBrains IDEs automatically map the upgraded semantic TextMate scopes in `conduit.tmLanguage.json` (declarations, `spawn` concurrency via `keyword.control.concurrency.conduit` in `#E06C75` bold, DSL blocks such as `router`, `on start`, `on stop`, HTTP methods, annotations, properties, constants, operators) to your active JetBrains Color Scheme.
 
 ### Diagnostics, Hover & Completion (LSP4IJ)
 1. Install **LSP4IJ** from JetBrains Marketplace.

@@ -14,6 +14,7 @@ Conduit features built-in primitive types:
 | `Float` | 64-bit floating-point number | `3.14`, `-0.5` |
 | `Bool` | Boolean truth value | `true`, `false` |
 | `String` | UTF-8 encoded text string | `"hello"`, `"Conduit"` |
+| `Bytes` | Immutable sequence of raw bytes | `Bytes([0, 255])`, `Bytes("hello")` |
 | `Void` | Represents the absence of a meaningful return value | Returned by functions without a return value |
 
 ---
@@ -57,6 +58,28 @@ Conduit enforces strict separation between `Int` and `Float` (`f64`): arithmetic
 - Convert integers explicitly via `n.to_float() -> Float`.
 - Round or format floats via `.floor() -> Float`, `.ceil() -> Float`, `.round() -> Float`, and `.to_string() -> String`.
 - Both `Int` and `Float` provide `.abs()`, `.min(other)`, `.max(other)`, and `.clamp(lo, hi)`.
+
+### Bitwise operators
+
+`Int` supports `&`, `|`, `^`, `<<`, and `>>`. Shifts take counts from 0 through 63.
+Left shift discards bits past the 64-bit boundary. Right shift preserves the sign bit.
+Shifts bind below arithmetic and above comparisons. The remaining bitwise operators bind
+below comparisons in this order, from highest to lowest precedence: `&`, `^`, `|`.
+
+```conduit
+mask := 1 << 5
+flags := (3 | mask) ^ 1
+enabled := (flags & mask) != 0
+```
+
+### Binary data
+
+`Bytes(text)` copies the UTF-8 bytes of a `String`. `Bytes([0, 255])` builds a
+sequence from integers in the range 0 through 255. `bytes.len()` returns the byte count,
+and `bytes[index]` returns an `Int | IndexError`. `bytes.get(index)` returns an optional byte
+and `bytes.slice(start, end)` returns a `Bytes` subsequence. `bytes.to_list()` produces a
+`[Int]` representation. `bytes.to_string()` decodes UTF-8 with replacement characters
+for invalid sequences.
 
 ## Optional Types (`T?`) and `nil`
 

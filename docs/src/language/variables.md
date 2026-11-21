@@ -6,34 +6,32 @@ Conduit offers concise and type-safe variable declarations. Variables can have t
 
 ## Variable Definitions
 
-### Inferred Type Definitions (`:=`)
+### Inferred Immutable Bindings (`:=`)
 
-The `:=` operator declares a new variable and infers its type from the right-hand expression:
+The `:=` operator declares a new **immutable** local binding and infers its type from the right-hand expression:
 
 ```conduit
 name := "Conduit"
 version := 1
 ```
 
-Here, `name` is inferred as `String` and `version` as `Int`.
+Here, `name` is inferred as `String` and `version` as `Int`. Reassigning a binding declared with `:=` (or a function/closure parameter) is a compile-time error—use `:=` by default unless reassignment is actually needed.
 
-### Explicit Type Declarations (`var`)
+### Mutable Variable Declarations (`var`)
 
-To explicitly annotate the type of a variable, use the `var` keyword:
+Use the `var` keyword when a variable needs to be reassigned (with an optional type annotation):
 
 ```conduit
 var count: Int = 10
-```
-
-### Mutability & Reassignment
-
-Variables declared with `var` can be reassigned with the assignment operator `=`:
-
-```conduit
-var score: Int = 0
+var score = 0
 score = score + 5
 score = score * 2
 ```
+
+### Summary of Reassignment Rules
+
+* Bindings introduced with `:=` cannot be reassigned with `=`.
+* Bindings introduced with `var` can be reassigned with `=`.
 
 ---
 

@@ -29,7 +29,7 @@ func check_dur_ms(v: Int) -> Int {
 
 func check_elapsed() -> Int {
     t0 := time.monotonic()
-    acc := 0
+    var acc = 0
     for i in 0..100 { acc = acc + i }
     d := time.elapsed(t0)?
     return d.nanoseconds()? + (acc * 0)
@@ -180,7 +180,7 @@ func validate_user(u: User) -> String {
     switch val.check(u) {
         case User(ok): return "ok:" + ok.email
         case val.ValidationError(err):
-            out := ""
+            var out = ""
             for v in err.issues {
                 out = out + v.path + "=" + v.code + ";"
             }
@@ -409,13 +409,13 @@ export func run_dsl(raw: [String]) -> String {
         case CliError(e):
             return e.kind + ":" + e.message
         case Tool(app):
-            v := "0"
+            var v = "0"
             if app.verbose { v = "1" }
             switch app.db {
                 case Tool_db(db):
                     switch db.migrate {
                         case Tool_db_migrate(m):
-                            dr := "live"
+                            var dr = "live"
                             if m.dry_run { dr = "dry" }
                             return "migrate:" + m.target + ":" + dr + ":" + v + ":" + app.port.to_string()
                     }
@@ -435,7 +435,7 @@ export func run_ann(raw: [String]) -> String {
         case CliError(e):
             return e.kind
         case AnnTool(app):
-            v := "0"
+            var v = "0"
             if app.verbose { v = "1" }
             switch app.run {
                 case AnnRun(r):
@@ -624,7 +624,7 @@ fn cdt_fs_basic_and_streaming() {
             wa.close()
 
             r := fs.open_read(sp)?
-            out := ""
+            var out = ""
             while true {
                 maybe := r.read_line()
                 switch maybe {
@@ -645,7 +645,7 @@ fn cdt_fs_basic_and_streaming() {
             c3 := r2.read_chunk(10)
             r2.close()
 
-            s1 := ""
+            var s1 = ""
             switch c1 {
                 case nil:
                     s1 = "NIL"
@@ -654,7 +654,7 @@ fn cdt_fs_basic_and_streaming() {
                 case String(s):
                     s1 = s
             }
-            s2 := ""
+            var s2 = ""
             switch c2 {
                 case nil:
                     s2 = "NIL"
@@ -663,7 +663,7 @@ fn cdt_fs_basic_and_streaming() {
                 case String(s):
                     s2 = s
             }
-            s3 := ""
+            var s3 = ""
             switch c3 {
                 case nil:
                     s3 = "NIL"
@@ -680,7 +680,7 @@ fn cdt_fs_basic_and_streaming() {
             up := base + "/utf8.txt"
             fs.write_text(up, "Привет🦀мир")?
             r := fs.open_read(up)?
-            acc := ""
+            var acc = ""
             while true {
                 ch := r.read_chunk(3)
                 switch ch {
@@ -1012,6 +1012,125 @@ fn cdt_path_process_and_crypto_e2e() {
         Obj::str(
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad|f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8|SGVsbG8sIENvbmR1aXQh|Hello, Conduit!|415a|AZ|36|16|true"
         )
+    );
+}
+
+#[test]
+fn cdt_process_pipe_e2e_and_errors() {
+    let src = if cfg!(windows) {
+        r#"
+            import * as process from "cdt.process"
+
+            export func test_pipe_ok() -> String | process.ProcessError {
+                out := process.pipe([
+                    ["cmd", "/c", "echo", "hello-pipe"],
+                    ["findstr", "hello"]
+                ])?
+                return out.code.to_string() + ":" + out.stdout.trim()
+            }
+
+            export func test_pipe_empty() -> String {
+                switch process.pipe([]) {
+                    case process.ProcessError(e): return e.kind
+                    case process.Output(o): return "unexpected:" + o.code.to_string()
+                }
+                return ""
+            }
+
+            export func test_pipe_empty_cmd() -> String {
+                switch process.pipe([[]]) {
+                    case process.ProcessError(e): return e.kind
+                    case process.Output(o): return "unexpected:" + o.code.to_string()
+                }
+                return ""
+            }
+
+            export func test_pipe_not_found() -> String {
+                switch process.pipe([
+                    ["cmd", "/c", "echo", "hi"],
+                    ["definitely_no_such_conduit_pipe_cmd_xyz"]
+                ]) {
+                    case process.ProcessError(e): return e.kind
+                    case process.Output(o): return "unexpected:" + o.code.to_string()
+                }
+                return ""
+            }
+        "#
+    } else {
+        r#"
+            import * as process from "cdt.process"
+
+            export func test_pipe_ok() -> String | process.ProcessError {
+                out := process.pipe([
+                    ["printf", "b\na\nc\n"],
+                    ["sort"],
+                    ["head", "-n", "2"]
+                ])?
+                return out.code.to_string() + ":" + out.stdout.trim().replace("\n", ",")
+            }
+
+            export func test_pipe_empty() -> String {
+                switch process.pipe([]) {
+                    case process.ProcessError(e): return e.kind
+                    case process.Output(o): return "unexpected:" + o.code.to_string()
+                }
+                return ""
+            }
+
+            export func test_pipe_empty_cmd() -> String {
+                switch process.pipe([[]]) {
+                    case process.ProcessError(e): return e.kind
+                    case process.Output(o): return "unexpected:" + o.code.to_string()
+                }
+                return ""
+            }
+
+            export func test_pipe_not_found() -> String {
+                switch process.pipe([
+                    ["echo", "hi"],
+                    ["definitely_no_such_conduit_pipe_cmd_xyz"]
+                ]) {
+                    case process.ProcessError(e): return e.kind
+                    case process.Output(o): return "unexpected:" + o.code.to_string()
+                }
+                return ""
+            }
+        "#
+    };
+
+    let module = crate::frontend::compile_source(src).expect("compile process.pipe");
+    let mut vm = Vm::new();
+
+    let ok_fid = module.func_id("test_pipe_ok").unwrap();
+    let expected_ok = if cfg!(windows) { "0:hello-pipe" } else { "0:a,b" };
+    assert_eq!(
+        vm.call_obj(&module, ok_fid, &[], &[]).unwrap(),
+        Obj::str(expected_ok)
+    );
+
+    for (fn_name, expected_kind) in [
+        ("test_pipe_empty", "invalid_input"),
+        ("test_pipe_empty_cmd", "invalid_input"),
+        ("test_pipe_not_found", "not_found"),
+    ] {
+        let fid = module.func_id(fn_name).unwrap();
+        assert_eq!(
+            vm.call_obj(&module, fid, &[], &[]).unwrap(),
+            Obj::str(expected_kind),
+            "unexpected result for {}",
+            fn_name
+        );
+    }
+
+    let bad_type = r#"
+        import * as process from "cdt.process"
+        export func main() -> Void {
+            _ := process.pipe(["echo"])
+        }
+    "#;
+    assert!(
+        crate::frontend::compile_source(bad_type).is_err(),
+        "process.pipe([\"echo\"]) must fail type checking"
     );
 }
 
@@ -1356,6 +1475,10 @@ fn cdt_http_server_graceful_shutdown_e2e() {
             r.get("/hello", (req: http.Request) -> http.Response => {{
                 return http.text("hi")
             }})
+            r.post("/upload", (req: http.Request) -> http.Response => {{
+                second := req.body_bytes.get(1) ?? 0
+                return http.text(second.to_string())
+            }})
             r.post("/stop", (req: http.Request) -> http.Response => {{
                 r.stop()
                 return http.text("stopping")
@@ -1374,6 +1497,11 @@ fn cdt_http_server_graceful_shutdown_e2e() {
             return r.status.to_string() + ":" + r.body
         }}
 
+        export func hit_upload() -> String | http.HttpError {{
+            r := http.request_bytes("POST", "http://127.0.0.1:{port}/upload", Bytes([0, 255]), Map<String, String>())?
+            return r.status.to_string() + ":" + r.body.to_string()
+        }}
+
         export func hit_stop() -> String | http.HttpError {{
             r := http.post("http://127.0.0.1:{port}/stop", "")?
             return r.status.to_string() + ":" + r.body
@@ -1385,6 +1513,7 @@ fn cdt_http_server_graceful_shutdown_e2e() {
     let cli_mod = crate::frontend::compile_source(&client_src).expect("compile client");
     let srv_fid = srv_mod.func_id("run_server").unwrap();
     let hello_fid = cli_mod.func_id("hit_hello").unwrap();
+    let upload_fid = cli_mod.func_id("hit_upload").unwrap();
     let stop_fid = cli_mod.func_id("hit_stop").unwrap();
 
     let srv_handle = std::thread::spawn(move || Vm::new().call_obj(&srv_mod, srv_fid, &[], &[]).unwrap());
@@ -1400,6 +1529,9 @@ fn cdt_http_server_graceful_shutdown_e2e() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     assert_eq!(hello_res, Obj::str("200:hi"));
+
+    let upload_res = client_vm.call_obj(&cli_mod, upload_fid, &[], &[]).unwrap();
+    assert_eq!(upload_res, Obj::str("200:255"));
 
     let stop_res = client_vm.call_obj(&cli_mod, stop_fid, &[], &[]).unwrap();
     assert_eq!(stop_res, Obj::str("200:stopping"));
@@ -3362,4 +3494,441 @@ export func bulk(conn: db.Connection) -> Int | db.DbError {
         ]
     );
     assert!(build_insert_all_and_cells(model, schema, &[]).unwrap().is_empty());
+}
+
+#[test]
+fn spawn_background_tasks_e2e_and_compile_errors() {
+    let src = r#"
+        import * as cache from "cdt.cache"
+        import * as time from "cdt.time"
+
+        func write_later(store_name: String, key: String, val: String, delay: Int) -> Void {
+            _s := time.sleep(delay)
+            c := cache.open(store_name)
+            c.set(key, val)
+        }
+
+        on stop {
+            c := cache.open("spawn_test_store")
+            a := c.get("block_key") ?? "missing"
+            b := c.get("fn_key") ?? "missing"
+            c.set("stop_saw", a + "|" + b)
+        }
+
+        export func main() -> String {
+            store := "spawn_test_store"
+            delay := 25
+            spawn {
+                _s := time.sleep(delay)
+                c := cache.open(store)
+                c.set("block_key", "from_block")
+            }
+            spawn write_later(store, "fn_key", "from_fn", 25)
+            return "started"
+        }
+    "#;
+
+    let reader_src = r#"
+        import * as cache from "cdt.cache"
+        export func read_val(key: String) -> String {
+            c := cache.open("spawn_test_store")
+            return c.get(key) ?? "missing"
+        }
+    "#;
+
+    let module = crate::frontend::compile_source(src).expect("compile spawn test");
+    let reader_mod = crate::frontend::compile_source(reader_src).expect("compile reader");
+    let main_fid = module.func_id("main").unwrap();
+    let read_fid = reader_mod.func_id("read_val").unwrap();
+
+    let mut vm = Vm::new();
+    let res = vm.call_obj(&module, main_fid, &[], &[]).unwrap();
+    assert_eq!(res, Obj::str("started"));
+
+    let mut reader_vm = Vm::new();
+    let stop_saw = reader_vm
+        .call_obj(&reader_mod, read_fid, &[], &[Obj::str("stop_saw")])
+        .unwrap();
+    assert_eq!(stop_saw, Obj::str("from_block|from_fn"));
+
+    for bad_src in [
+        r#"
+        export func main() -> Void {
+            while true {
+                spawn { break }
+            }
+        }
+        "#,
+        r#"
+        export func main() -> Void {
+            while true {
+                spawn { continue }
+            }
+        }
+        "#,
+        r#"
+        export func main() -> Int {
+            spawn { return 42 }
+            return 0
+        }
+        "#,
+        r#"
+        on start -> Int {
+            return 1
+        }
+        export func main() -> Void {}
+        "#,
+    ] {
+        assert!(
+            crate::frontend::compile_source(bad_src).is_err(),
+            "expected compile error for:\n{}",
+            bad_src
+        );
+    }
+}
+
+#[test]
+fn http_server_lifecycle_hooks_and_graceful_shutdown_e2e() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let store_name = format!("lifecycle_seq_{}_{}", std::process::id(), port);
+    let server_src = format!(
+        r#"
+        import * as http from "cdt.http"
+        import * as cache from "cdt.cache"
+        import * as time from "cdt.time"
+
+        func append_seq(step: String) -> Void {{
+            c := cache.open("{store_name}")
+            prev := c.get("seq") ?? ""
+            if prev == "" {{
+                c.set("seq", step)
+            }} else {{
+                c.set("seq", prev + "|" + step)
+            }}
+        }}
+
+        on start {{
+            append_seq("top_start")
+        }}
+
+        on stop {{
+            append_seq("top_stop")
+        }}
+
+        func decl_start() -> Void {{
+            append_seq("decl_start")
+        }}
+
+        func decl_stop() -> Void {{
+            append_seq("decl_stop")
+        }}
+
+        func imp_start() -> Void {{
+            append_seq("imp_start")
+        }}
+
+        func imp_stop() -> Void {{
+            append_seq("imp_stop")
+        }}
+
+        func work(_req: http.Request) -> http.Response {{
+            spawn {{
+                _s := time.sleep(30)
+                append_seq("spawn_done")
+            }}
+            return http.text("accepted")
+        }}
+
+        router Api {{
+            on_start => decl_start
+            on_stop => decl_stop
+            get "/work" => work
+        }}
+
+        export func run_server() -> String {{
+            r := http.build<Api>()
+            r.on_start(imp_start)
+            r.on_stop(imp_stop)
+            r.post("/stop", (_req: http.Request) -> http.Response => {{
+                r.stop()
+                return http.text("stopping")
+            }})
+            switch r.serve("127.0.0.1:{port}") {{
+                case http.HttpError(e): return "err:" + e.kind + ":" + e.message
+                case _: return "ok"
+            }}
+            return "ok"
+        }}
+        "#
+    );
+
+    let fail_src = r#"
+        import * as http from "cdt.http"
+
+        error BootErr { message: String }
+
+        func fail_boot() -> Void | BootErr {
+            return BootErr(message: "db unavailable")
+        }
+
+        func ok_handler(_req: http.Request) -> http.Response {
+            return http.text("ok")
+        }
+
+        router FailingApi {
+            on_start => fail_boot
+            get "/" => ok_handler
+        }
+
+        export func test_startup_fail() -> String {
+            switch http.serve<FailingApi>("127.0.0.1:0") {
+                case http.HttpError(e): return e.kind + ":" + e.message
+                case _: return "unexpected"
+            }
+            return ""
+        }
+    "#;
+
+    let reader_src = format!(
+        r#"
+        import * as cache from "cdt.cache"
+        export func read_seq() -> String {{
+            c := cache.open("{store_name}")
+            return c.get("seq") ?? ""
+        }}
+        "#
+    );
+
+    let client_src = format!(
+        r#"
+        import * as http from "cdt.http"
+
+        export func hit_work() -> String | http.HttpError {{
+            r := http.get("http://127.0.0.1:{port}/work")?
+            return r.status.to_string() + ":" + r.body
+        }}
+
+        export func hit_stop() -> String | http.HttpError {{
+            r := http.post("http://127.0.0.1:{port}/stop", "")?
+            return r.status.to_string() + ":" + r.body
+        }}
+        "#
+    );
+
+    let srv_mod = crate::frontend::compile_source(&server_src).expect("compile lifecycle server");
+    let fail_mod = crate::frontend::compile_source(fail_src).expect("compile failing server");
+    let reader_mod = crate::frontend::compile_source(&reader_src).expect("compile reader");
+    let cli_mod = crate::frontend::compile_source(&client_src).expect("compile client");
+
+    let fail_fid = fail_mod.func_id("test_startup_fail").unwrap();
+    let fail_res = Vm::new().call_obj(&fail_mod, fail_fid, &[], &[]).unwrap();
+    let Obj::Str(fail_str) = fail_res else {
+        panic!("expected Str startup error, got {:?}", fail_res);
+    };
+    assert!(fail_str.starts_with("startup_error:"), "got {}", fail_str);
+    assert!(fail_str.contains("db unavailable"), "got {}", fail_str);
+
+    let srv_fid = srv_mod.func_id("run_server").unwrap();
+    let work_fid = cli_mod.func_id("hit_work").unwrap();
+    let stop_fid = cli_mod.func_id("hit_stop").unwrap();
+    let read_fid = reader_mod.func_id("read_seq").unwrap();
+
+    let srv_handle = std::thread::spawn(move || Vm::new().call_obj(&srv_mod, srv_fid, &[], &[]).unwrap());
+
+    let mut client_vm = Vm::new();
+    let mut work_res = Obj::Empty;
+    for _ in 0..50 {
+        let res = client_vm.call_obj(&cli_mod, work_fid, &[], &[]).unwrap();
+        if matches!(res, Obj::Str(_)) {
+            work_res = res;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(work_res, Obj::str("200:accepted"));
+
+    let stop_res = client_vm.call_obj(&cli_mod, stop_fid, &[], &[]).unwrap();
+    assert_eq!(stop_res, Obj::str("200:stopping"));
+
+    let srv_ret = srv_handle.join().unwrap();
+    assert_eq!(srv_ret, Obj::str("ok"));
+
+    let seq = Vm::new().call_obj(&reader_mod, read_fid, &[], &[]).unwrap();
+    assert_eq!(
+        seq,
+        Obj::str("top_start|decl_start|imp_start|spawn_done|decl_stop|imp_stop|top_stop")
+    );
+}
+
+#[test]
+fn cdt_chan_and_for_range_e2e_and_compile_errors() {
+    let src = r#"
+    import * as chan from "cdt.chan"
+    import { Chan } from "cdt.chan"
+    import * as time from "cdt.time"
+
+    struct Msg {
+        id: Int
+        text: String
+    }
+
+    func send_generic<T>(c: Chan<T>, val: T) -> Bool {
+        return c.send(val)
+    }
+
+    func collect_sum(c: chan.Chan<Int>) -> Int {
+        var total = 0
+        for n in c {
+            if n == 2 {
+                continue
+            }
+            if n > 4 {
+                break
+            }
+            total = total + n
+        }
+        return total
+    }
+
+    export func run_chan_and_ranges() -> String {
+        // 1. Go 1.22 integer range loops and wildcard forms
+        var r_sum = 0
+        for i in 5 {
+            r_sum = r_sum + i
+        }
+        var neg_runs = 0
+        for _ in -2 {
+            neg_runs = neg_runs + 1
+        }
+        var bare_in = 0
+        for in 4 {
+            bare_in = bare_in + 1
+        }
+        var bare_range = 0
+        for range 3 {
+            bare_range = bare_range + 1
+        }
+        var var_named_range = 0
+        for range in [10, 20] {
+            var_named_range = var_named_range + range
+        }
+
+        // 2. Unbounded Chan + spawn + for-in iteration with continue/break
+        var unbounded: Chan<Int> = chan.open<Int>()
+        assert_eq(unbounded.cap(), 0)
+        spawn {
+            for i in 1..7 {
+                unbounded.send(i)
+            }
+            unbounded.close()
+        }
+        c_sum := collect_sum(unbounded)
+
+        // 3. Bounded channel backpressure, try_send/try_recv, recv_timeout, close
+        b := Chan<String>(2)
+        var b_alias: chan.Chan<String> = b
+        assert_eq(b_alias.cap(), 2)
+        assert(b.is_empty())
+        assert(b.try_send("first"))
+        assert(send_generic<String>(b, "second"))
+        assert(!b.try_send("full"))
+        assert_eq(b.len(), 2)
+        assert(!b.is_empty())
+        assert(!b.is_closed())
+
+        empty_ch := chan.open<Int>(1)
+        assert_eq(empty_ch.try_recv(), nil)
+        assert_eq(empty_ch.recv_timeout(15), nil)
+
+        spawn {
+            _s := time.sleep(20)
+            // Blocked until main calls recv()
+            ok1 := b.send("third")
+            assert(ok1)
+            b.close()
+            ok2 := b.send("after_close")
+            assert(!ok2)
+            assert(!b.try_send("after_close"))
+        }
+
+        m1 := b.recv() ?? ""
+        m2 := b.recv_timeout(500) ?? ""
+        var rest = ""
+        for item in b {
+            rest = rest + item
+        }
+        assert(b.is_closed())
+        assert_eq(b.recv(), nil)
+
+        // 4. Structs and tuples over Chan<T>
+        msgs := chan.open<Msg>(4)
+        pairs := chan.open<(String, Int)>(2)
+        spawn {
+            msgs.send(Msg(id: 7, text: "hi"))
+            msgs.close()
+            pairs.send(("alpha", 99))
+            pairs.close()
+        }
+        var msg_out = ""
+        for m in msgs {
+            msg_out = "{m.id}:{m.text}"
+        }
+        var pair_out = ""
+        for (k, v) in pairs {
+            pair_out = "{k}={v}"
+        }
+
+        return "{r_sum}|{neg_runs}|{bare_in}|{bare_range}|{var_named_range}|{c_sum}|{m1},{m2},{rest}|{msg_out}|{pair_out}"
+    }
+    "#;
+
+    let module = crate::frontend::compile_source(src).expect("compile cdt.chan & range program");
+    let fid = module.func_id("run_chan_and_ranges").unwrap();
+    let res = Vm::new().call_obj(&module, fid, &[], &[]).unwrap();
+    assert_eq!(res, Obj::str("10|0|4|3|30|8|first,second,third|7:hi|alpha=99"));
+
+    // Compile-time rejections
+    let bad_no_targs = r#"
+        import { Chan } from "cdt.chan"
+        func f(c: Chan) -> Void {}
+    "#;
+    assert!(crate::frontend::compile_source(bad_no_targs).is_err());
+
+    let bad_void = r#"
+        import * as chan from "cdt.chan"
+        func main() -> Void {
+            _c := chan.open<Void>()
+        }
+    "#;
+    assert!(crate::frontend::compile_source(bad_void).is_err());
+
+    let bad_send_ty = r#"
+        import * as chan from "cdt.chan"
+        func main() -> Void {
+            c := chan.open<Int>()
+            c.send("oops")
+        }
+    "#;
+    assert!(crate::frontend::compile_source(bad_send_ty).is_err());
+
+    let bad_recv_assign = r#"
+        import * as chan from "cdt.chan"
+        func main() -> Void {
+            c := chan.open<Int>()
+            var x: Int = c.recv()
+        }
+    "#;
+    assert!(crate::frontend::compile_source(bad_recv_assign).is_err());
+
+    let bad_iter = r#"
+        func main() -> Void {
+            for x in "abc" {
+                print(x)
+            }
+        }
+    "#;
+    assert!(crate::frontend::compile_source(bad_iter).is_err());
 }

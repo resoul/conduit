@@ -2,7 +2,7 @@
   "name": "conduit-textmate",
   "displayName": "Conduit TextMate Grammar",
   "description": "TextMate grammar for Conduit .cdt files",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "publisher": "resoul",
   "categories": [
     "Programming Languages",

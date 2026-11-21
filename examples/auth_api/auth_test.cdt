@@ -6,6 +6,7 @@ import * as jwt from "cdt.jwt"
 import * as lock from "cdt.lock"
 import * as path from "cdt.path"
 import * as process from "cdt.process"
+import * as time from "cdt.time"
 import { Claims, TokenReply, build_auth_router, setup_state } from "./main"
 
 test "auth_api login validation, JWT auth middleware, and rate limiting" {
@@ -46,6 +47,15 @@ test "auth_api login validation, JWT auth middleware, and rate limiting" {
     claims := jwt.verify<Claims>(reply.token, "dev-conduit-jwt-secret")?
     assert_eq(claims.sub, "alice@conduit.dev")
     assert_eq(claims.role, "admin")
+
+    // Verify background spawn telemetry captured login asynchronously
+    tel := cache.open("auth_api_telemetry")
+    var tel_wait = 0
+    while tel_wait < 30 && (tel.get("last_user") ?? "") != "alice@conduit.dev" {
+        _s := time.sleep(10)
+        tel_wait = tel_wait + 1
+    }
+    assert_eq(tel.get("last_user") ?? "", "alice@conduit.dev")
 
     // Protected route with valid JWT succeeds
     auth_h := Map.from([("Authorization", "Bearer {reply.token}")])

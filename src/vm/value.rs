@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hasher};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use crate::vm::string::VmString;
 
@@ -207,6 +207,7 @@ pub const SCHEMA_BOXED_BOOL: u32 = 0xFFFF_0003;
 pub const SCHEMA_STR_TAG: u32 = 0xFFFF_0004;
 pub const SCHEMA_LIST_TAG: u32 = 0xFFFF_0005;
 pub const SCHEMA_MAP_TAG: u32 = 0xFFFF_0006;
+pub const SCHEMA_BYTES_TAG: u32 = 0xFFFF_0007;
 
 pub const SCHEMA_TIME_TIMESTAMP: u32 = 0xFFFF_0010;
 pub const SCHEMA_TIME_INSTANT: u32 = 0xFFFF_0011;
@@ -254,6 +255,7 @@ pub const SCHEMA_REDIS_LOCK: u32 = 0xFFFF_0052;
 pub const SCHEMA_DB_QUERY: u32 = 0xFFFF_0053;
 pub const SCHEMA_DB_POOL: u32 = 0xFFFF_0054;
 pub const SCHEMA_HTTP_CLIENT: u32 = 0xFFFF_0055;
+pub const SCHEMA_CHAN_HANDLE: u32 = 0xFFFF_0056;
 
 #[inline]
 pub fn is_builtin_error_schema(schema_id: u32) -> bool {
@@ -373,6 +375,21 @@ impl StructData {
 
     #[inline(always)]
     pub fn get_obj(&self, idx: usize) -> &Obj {
+        self.raw_obj(idx).resolved()
+    }
+
+    #[inline(always)]
+    pub(crate) fn get_obj_keep_single_map(&self, idx: usize) -> &Obj {
+        let raw = self.raw_obj(idx);
+        if matches!(raw, Obj::DeferredField(df) if df.as_single_map_entry().is_some()) {
+            raw
+        } else {
+            raw.resolved()
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn raw_obj(&self, idx: usize) -> &Obj {
         if idx < INLINE_STRUCT_OBJS {
             &self.inline_objs[idx]
         } else {
@@ -388,7 +405,7 @@ impl StructData {
 
     #[inline(always)]
     pub fn get_obj_mut(&mut self, idx: usize) -> &mut Obj {
-        if idx < INLINE_STRUCT_OBJS {
+        let slot = if idx < INLINE_STRUCT_OBJS {
             &mut self.inline_objs[idx]
         } else {
             let ov = self.overflow.as_mut().unwrap();
@@ -398,7 +415,11 @@ impl StructData {
             } else {
                 &mut ov.extra_objs[ov_idx - OVERFLOW_INLINE_OBJS]
             }
+        };
+        if matches!(slot, Obj::DeferredField(_)) {
+            *slot = slot.resolved().clone();
         }
+        slot
     }
 
     #[inline(always)]
@@ -520,20 +541,26 @@ impl OrderedMap {
 
     #[inline]
     pub fn set(&mut self, key: MapKey, val: MapVal) {
-        if self.dense_ints {
-            if let MapKey::Int(k) = key
-                && k >= 0
-            {
-                let idx = k as usize;
-                if idx < self.entries.len() {
-                    self.entries[idx].1 = val;
-                    return;
-                }
-                if idx == self.entries.len() {
-                    self.entries.push((MapKey::Int(k), val));
-                    return;
-                }
+        if self.dense_ints
+            && let MapKey::Int(k) = key
+            && let Ok(idx) = usize::try_from(k)
+        {
+            if idx < self.entries.len() {
+                self.entries[idx].1 = val;
+                return;
             }
+            if idx == self.entries.len() {
+                self.entries.push((MapKey::Int(k), val));
+                return;
+            }
+        }
+        self.set_indexed(key, val);
+    }
+
+    // Keep hash-table transitions and insertion out of the dense-key path.
+    #[inline(never)]
+    fn set_indexed(&mut self, key: MapKey, val: MapVal) {
+        if self.dense_ints {
             self.dense_ints = false;
             if self.entries.len() >= SMALL_MAP_LIMIT {
                 self.materialize_index();
@@ -581,6 +608,16 @@ impl OrderedMap {
                 .map(|(_, v)| v);
         }
         self.index.get(key).map(|&pos| &self.entries[pos].1)
+    }
+
+    pub(crate) fn get_str(&self, key: &str) -> Option<&MapVal> {
+        if self.dense_ints {
+            return None;
+        }
+        self.entries.iter().find_map(|(entry, val)| match entry {
+            MapKey::Str(name) if name.as_str() == key => Some(val),
+            _ => None,
+        })
     }
 
     #[inline]
@@ -672,12 +709,52 @@ impl PartialEq for ClosureData {
     }
 }
 
+type DeferredFieldInitializer = Box<dyn FnOnce() -> Obj + Send + Sync>;
+
+pub enum DeferredField {
+    Init(LazyLock<Obj, DeferredFieldInitializer>),
+    SingleMapEntry {
+        key: Arc<VmString>,
+        value: Obj,
+        resolved: OnceLock<Obj>,
+    },
+}
+
+impl DeferredField {
+    #[inline(always)]
+    pub(crate) fn as_single_map_entry(&self) -> Option<(&Arc<VmString>, &Obj)> {
+        match self {
+            Self::SingleMapEntry { key, value, .. } => Some((key, value)),
+            Self::Init(_) => None,
+        }
+    }
+
+    pub(crate) fn value(&self) -> &Obj {
+        match self {
+            Self::Init(value) => value,
+            Self::SingleMapEntry { key, value, resolved } => resolved.get_or_init(|| {
+                let entry = (MapKey::Str(Arc::clone(key)), MapVal::Obj(value.clone()));
+                Obj::Map(Arc::new(OrderedMap::from_vec(vec![entry])))
+            }),
+        }
+    }
+}
+
+impl std::fmt::Debug for DeferredField {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<deferred field>")
+    }
+}
+
 /// Heap-allocated or reference-counted object register value (<= 16 bytes).
 #[derive(Debug, Clone, Default)]
 pub enum Obj {
     #[default]
     Empty,
     Str(Arc<VmString>),
+    // A thin Arc keeps object registers at 16 bytes and adopts the I/O buffer.
+    Bytes(Arc<Vec<u8>>),
+    DeferredField(Arc<DeferredField>),
     List(ListStorage),
     Record(Arc<StructData>),
     Map(Arc<OrderedMap>),
@@ -690,6 +767,25 @@ impl Obj {
     #[inline]
     pub fn str(s: impl Into<String>) -> Self {
         Obj::Str(Arc::new(VmString::from(s.into())))
+    }
+
+    #[inline]
+    pub(crate) fn deferred_field(init: impl FnOnce() -> Obj + Send + Sync + 'static) -> Self {
+        Obj::DeferredField(Arc::new(DeferredField::Init(LazyLock::new(Box::new(init)))))
+    }
+
+    pub(crate) fn deferred_map_entry(key: Arc<VmString>, value: Obj) -> Self {
+        Obj::DeferredField(Arc::new(DeferredField::SingleMapEntry {
+            key, value, resolved: OnceLock::new(),
+        }))
+    }
+
+    #[inline]
+    pub(crate) fn resolved(&self) -> &Obj {
+        match self {
+            Obj::DeferredField(field) => field.value(),
+            _ => self,
+        }
     }
 
     #[inline]
@@ -717,6 +813,8 @@ impl Obj {
         match self {
             Obj::Empty => "nil".to_string(),
             Obj::Str(s) => s.as_str().to_owned(),
+            Obj::Bytes(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+            Obj::DeferredField(field) => field.value().format_obj(),
             Obj::Record(rec) => match rec.schema_id {
                 SCHEMA_BOXED_INT => (rec.inline_scalars[0] as i64).to_string(),
                 SCHEMA_BOXED_FLOAT => format_float(f64::from_bits(rec.inline_scalars[0])),
@@ -741,6 +839,7 @@ impl Obj {
                     rec.inline_objs[1].format_obj()
                 }
                 SCHEMA_FS_ERROR if rec.obj_len >= 3 => rec.get_obj(2).format_obj(),
+                SCHEMA_CHAN_HANDLE => "<chan>".to_string(),
                 _ if !rec.inline_objs.is_empty() && matches!(&rec.inline_objs[0], Obj::Str(_)) => {
                     rec.inline_objs[0].format_obj()
                 }
@@ -772,10 +871,11 @@ pub fn format_float(v: f64) -> String {
 
 impl PartialEq for Obj {
     fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
+        match (self.resolved(), other.resolved()) {
             (Obj::Empty, Obj::Empty) => true,
             (Obj::Str(a), Obj::Str(b)) => Arc::ptr_eq(a, b) || a.as_str() == b.as_str(),
             (Obj::List(a), Obj::List(b)) => a == b,
+            (Obj::Bytes(a), Obj::Bytes(b)) => Arc::ptr_eq(a, b) || a == b,
             (Obj::Record(a), Obj::Record(b)) => Arc::ptr_eq(a, b) || a.as_ref() == b.as_ref(),
             (Obj::Map(a), Obj::Map(b)) => Arc::ptr_eq(a, b) || a.as_ref() == b.as_ref(),
             (Obj::Closure(a), Obj::Closure(b)) => Arc::ptr_eq(a, b) || a.as_ref() == b.as_ref(),

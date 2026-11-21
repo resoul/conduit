@@ -134,6 +134,12 @@ pub fn format_routes(
                 HttpRouterDeclKind::Static(url_prefix, dir_path) => {
                     let _ = writeln!(out, "  static: {} -> {}", url_prefix, dir_path);
                 }
+                HttpRouterDeclKind::OnStart => {
+                    let _ = writeln!(out, "  on_start: {}", clean_symbol_name(&e.handler_name));
+                }
+                HttpRouterDeclKind::OnStop => {
+                    let _ = writeln!(out, "  on_stop: {}", clean_symbol_name(&e.handler_name));
+                }
                 _ => {}
             }
         }
@@ -442,7 +448,7 @@ fn visit_stmt_for_responses(
             visit_expr_for_responses(condition, checked, out);
             visit_block_for_responses(body, checked, out);
         }
-        StmtKind::Defer(block) => visit_block_for_responses(block, checked, out),
+        StmtKind::Defer(block) | StmtKind::Spawn(block) => visit_block_for_responses(block, checked, out),
         StmtKind::Switch { expr, cases } => {
             visit_expr_for_responses(expr, checked, out);
             for case in cases {

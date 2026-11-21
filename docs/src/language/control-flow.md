@@ -22,9 +22,21 @@ The condition must evaluate strictly to `Bool`. Conduit does not perform implici
 
 ## Loops (`for` / `in` and `while`)
 
-The `for` loop iterates over lists, ranges, or `Map<K, V>` entries (in deterministic insertion order) and supports tuple destructuring:
+The `for` loop iterates over integer ranges (`start..end` or `N` for `0..N`, like Go 1.22), lists, `Map<K, V>` entries (in deterministic insertion order), and `Chan<T>` channels, with optional tuple destructuring or wildcard form (`for in N` / `for range N`):
 
 ```conduit
+for i in 5 {
+    print(i) // 0, 1, 2, 3, 4
+}
+
+for in 3 {
+    print("tick") // repeat 3 times without a loop variable
+}
+
+for range 3 {
+    print("also repeats 3 times")
+}
+
 for item in [1, 2, 3, 4, 5] {
     if item == 2 {
         continue // Skip to next iteration
@@ -98,6 +110,70 @@ func handle_conn(db: db.Conn) -> Void | db.DbError {
 - **LIFO order**: Defers run in reverse order of registration (most recently executed `defer` runs first).
 - **All exit paths**: Defers trigger on normal function fallthrough, explicit `return` (after evaluating the return value), and `?` error propagation.
 - **Compile-time restrictions**: `return`, `?`, and nested `defer` statements are not allowed inside a `defer` body.
+
+---
+
+## Background Tasks (`spawn`)
+
+Use `spawn` to launch a concurrent background task on a dedicated OS thread without blocking the current function or HTTP request handler:
+
+```conduit
+import * as cache from "cdt.cache"
+import * as time from "cdt.time"
+
+func send_welcome_async(user_id: String) -> Void {
+    spawn {
+        _s := time.sleep(50)
+        c := cache.open("audit")
+        _r := c.set(user_id, "welcomed")
+    }
+}
+
+func notify(msg: String) -> Void {
+    print(msg)
+}
+
+func main() -> Void {
+    spawn notify("running in background")
+}
+```
+
+- **Forms**: Both block form (`spawn { ... }`) and single-expression form (`spawn send_email(id)`) are supported.
+- **Lexical captures**: Captured values are copied by value into the background VM (thread-safe shared primitives such as `cdt.cache`, `cdt.lock`, `cdt.db.Pool`, `cdt.http.Client`, and `cdt.http.Router` handles share underlying host state).
+- **Graceful draining**: Before a program exits or an `http.serve` server shuts down and runs `on stop` hooks, the runtime waits up to 5 seconds for active `spawn` tasks to finish.
+- **Compile-time isolation**: Loop control (`break`, `continue`) cannot cross a `spawn` boundary, and `return` inside `spawn` returns from the spawned task (`Void`) rather than the enclosing function.
+
+### Passing Data Between Threads
+
+Conduit threads do not share mutable local variables directly. You have two complementary tools for passing data between `spawn` threads and callers:
+
+1. **Channels (`cdt.chan` / `Chan<T>`)** — Go-style thread-safe FIFO queues for typed messaging with blocking `send`/`recv`, non-blocking `try_send`/`try_recv`, `recv_timeout(ms)`, and `for item in ch` iteration:
+
+```conduit
+import * as chan from "cdt.chan"
+
+struct WorkerResult {
+    worker: String
+    total: Int
+}
+
+func main() -> Void {
+    ch := chan.open<WorkerResult>(4)
+
+    spawn {
+        for i in 3 {
+            ch.send(WorkerResult(worker: "w{i}", total: (i + 1) * 10))
+        }
+        ch.close()
+    }
+
+    for res in ch {
+        print("{res.worker} = {res.total}")
+    }
+}
+```
+
+2. **Shared In-Memory Cache (`cdt.cache` + `cdt.lock`)** — Ideal for shared counters, rate limits, and stateful key-value stores accessed concurrently across handlers and `spawn` tasks.
 
 ---
 

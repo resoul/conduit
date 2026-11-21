@@ -238,10 +238,32 @@
           }
         },
         {
-          "match": "^\\s*(before|after)\\s+([a-zA-Z_][a-zA-Z0-9_]*)(?=\\s*(?://.*)?$)",
+          "match": "^\\s*(before|after|on_start|on_stop)\\s+([a-zA-Z_][a-zA-Z0-9_]*)(?=\\s*(?://.*)?$)",
           "captures": {
             "1": { "name": "keyword.other.dsl.clause.conduit" },
             "2": { "name": "entity.name.function.handler.conduit" }
+          }
+        },
+        {
+          "match": "^\\s*(on)\\s+(start|stop)\\s*(=>)\\s*([a-zA-Z_][a-zA-Z0-9_]*)(?=\\s*(?://.*)?$)",
+          "captures": {
+            "1": { "name": "keyword.other.dsl.clause.conduit" },
+            "2": { "name": "keyword.other.dsl.clause.conduit" },
+            "3": { "name": "keyword.control.arrow.conduit" },
+            "4": { "name": "entity.name.function.handler.conduit" }
+          }
+        },
+        {
+          "match": "^\\s*(on)\\s+(start|stop)(?=\\s*(?:->|\\{))",
+          "captures": {
+            "1": { "name": "keyword.other.dsl.block.conduit" },
+            "2": { "name": "keyword.other.dsl.block.conduit" }
+          }
+        },
+        {
+          "match": "^\\s*(on_start|on_stop)(?=\\s*(?:->|\\{))",
+          "captures": {
+            "1": { "name": "keyword.other.dsl.block.conduit" }
           }
         },
         {
@@ -272,6 +294,10 @@
     },
     "keywords": {
       "patterns": [
+        {
+          "name": "keyword.control.concurrency.conduit",
+          "match": "\\b(spawn)\\b"
+        },
         {
           "name": "keyword.control.flow.conduit",
           "match": "\\b(if|else|guard|defer|return|switch|case|for|while|in|break|continue)\\b"
@@ -362,7 +388,7 @@
         },
         {
           "name": "support.type.conduit",
-          "match": "\\b(Reader|Writer|Output|Url|Request|Response|BinaryResponse|Router|Connection|Param|Scheduler|Violation|Duration|Instant|Timestamp|Issue)\\b"
+          "match": "\\b(Reader|Writer|Output|Url|Request|Response|BinaryResponse|Router|Connection|Param|Scheduler|Chan|Violation|Duration|Instant|Timestamp|Issue)\\b"
         },
         {
           "name": "constant.other.conduit",

@@ -809,6 +809,7 @@ pub fn is_type_tag_match(obj: &Obj, expected_tag: u32) -> bool {
     match expected_tag {
         SCHEMA_EMPTY_TAG => matches!(obj, Obj::Empty),
         SCHEMA_STR_TAG => matches!(obj, Obj::Str(_)),
+        crate::vm::value::SCHEMA_BYTES_TAG => matches!(obj, Obj::Bytes(_)),
         SCHEMA_LIST_TAG => matches!(obj, Obj::List(_)),
         SCHEMA_MAP_TAG => matches!(obj, Obj::Map(_)),
         id => matches!(obj, Obj::Record(r) if r.schema_id == id),

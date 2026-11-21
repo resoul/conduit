@@ -1,6 +1,6 @@
 use crate::frontend::ast::*;
-use crate::frontend::types::Type;
-use crate::ir::lower::{FnLowerer, LoopPrealloc};
+use crate::frontend::types::{ModuleId, Type};
+use crate::ir::lower::{CompactEnum, FnLowerer, LoopPrealloc, VarSlot};
 
 impl<'a, 'b> FnLowerer<'a, 'b> {
     pub(crate) fn prealloc_block(&mut self, block: &Block) {
@@ -9,12 +9,29 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
         }
     }
 
+    fn prealloc_initialized_local(&mut self, ty: &Type) -> VarSlot {
+        let slot = self.prealloc_slot_for_ty(ty);
+        if let Type::DataEnum(name) = ty
+            && let Some(width) = self.mc.checked.data_enums[name].iter().try_fold(0, |width, variant| {
+                let st = &self.mc.checked.structs[self.mc.checked.struct_by_name[&variant.struct_name]];
+                (st.obj_len == 0 && st.scalar_len <= 2).then_some(width.max(st.scalar_len))
+            })
+        {
+            let tag_s = self.alloc_local_s();
+            for _ in 0..width {
+                self.alloc_local_s();
+            }
+            self.compact_enums.insert(slot.reg, CompactEnum { tag_s, width: width as u8 });
+        }
+        slot
+    }
+
     fn prealloc_stmt(&mut self, stmt: &Stmt) {
         let key = stmt as *const Stmt as usize;
         match &stmt.kind {
             StmtKind::Define { value, .. } => {
                 self.collect_loop_consts_expr(value);
-                let slot = self.prealloc_slot_for_ty(&value.ty);
+                let slot = self.prealloc_initialized_local(&value.ty);
                 self.stmt_slots.insert(key, slot);
             }
             StmtKind::VarDecl { ty, init, .. } => {
@@ -28,7 +45,11 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 } else {
                     Type::Any
                 };
-                let slot = self.prealloc_slot_for_ty(&var_ty);
+                let slot = if init.is_some() {
+                    self.prealloc_initialized_local(&var_ty)
+                } else {
+                    self.prealloc_slot_for_ty(&var_ty)
+                };
                 self.stmt_slots.insert(key, slot);
             }
             StmtKind::DestructureDefine { pattern, value } => {
@@ -57,6 +78,12 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 let elem_ty = match &iterable.ty {
                     Type::List(inner) => (**inner).clone(),
                     Type::Map(k, v) => Type::Tuple(vec![(**k).clone(), (**v).clone()]),
+                    Type::Generic { type_id, type_args }
+                        if type_id.module == ModuleId::Native("cdt.chan".to_string())
+                            && type_id.name == "Chan" =>
+                    {
+                        type_args.first().cloned().unwrap_or(Type::Any)
+                    }
                     _ => Type::Int,
                 };
                 let idx_s = self.alloc_local_s();
@@ -93,6 +120,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 self.has_defer = true;
                 self.prealloc_block(block);
             }
+            StmtKind::Spawn(_) => {}
         }
     }
 

@@ -100,6 +100,7 @@ impl<'a> Checker<'a> {
             "cdt.lock" => self.check_lock_call(sym, type_args, args, named_args),
             "cdt.cache" => self.check_cache_call(sym, type_args, args, named_args),
             "cdt.redis" => self.check_redis_call(sym, type_args, args, named_args),
+            "cdt.chan" => self.check_chan_call(sym, type_args, args, named_args),
             other => Err(format!("Unknown native module '{}'", other)),
         }
     }
@@ -143,6 +144,17 @@ impl<'a> Checker<'a> {
             && self.lookup(name).is_none()
         {
             match name.as_str() {
+                "Bytes" => {
+                    if !type_args.is_empty() || !named_args.is_empty() || args.len() != 1 {
+                        return Err("Bytes() expects a String or [Int]".to_owned());
+                    }
+                    let int_list = Type::List(Box::new(Type::Int));
+                    self.check_expr(&mut args[0], Some(&int_list))?;
+                    if args[0].ty != Type::String && args[0].ty != int_list {
+                        return Err(format!("Bytes() expects a String or [Int], got {}", args[0].ty));
+                    }
+                    return Ok(Type::Bytes);
+                }
                 "map" => return self.check_builtin_map(args, named_args),
                 "filter" => return self.check_builtin_filter(args, named_args),
                 "reduce" => return self.check_builtin_reduce(args, named_args),
@@ -243,6 +255,20 @@ impl<'a> Checker<'a> {
                     let v = self.checked.resolve_type_mut(&type_args[1])?;
                     return Ok(Type::Map(Box::new(k), Box::new(v)));
                 }
+                "List" => {
+                    if type_args.len() != 1 || !args.is_empty() || !named_args.is_empty() {
+                        return Err(
+                            "List<T>() / [T]() expects 1 type argument and 0 value arguments"
+                                .to_string(),
+                        );
+                    }
+                    let elem = self.checked.resolve_type_mut(&type_args[0])?;
+                    if elem == Type::Void {
+                        return Err("List element type cannot be Void".to_string());
+                    }
+                    return Ok(Type::List(Box::new(elem)));
+                }
+                "Chan" => return self.check_chan_call("open", type_args, args, named_args),
                 "IndexError" | "KeyError" | "ParseError" => {
                     return self.check_prelude_error_ctor(name, type_args, args, named_args);
                 }
@@ -394,11 +420,18 @@ impl<'a> Checker<'a> {
             return Err(format!("Method '.{}()' does not accept type arguments", method));
         }
         match (&target.ty, method) {
-            (Type::List(_), "len") | (Type::String, "len") | (Type::Map(_, _), "len") => {
+            (Type::List(_), "len") | (Type::String | Type::Bytes, "len")
+            | (Type::Map(_, _), "len") => {
                 if !args.is_empty() {
                     return Err(".len() takes 0 arguments".to_string());
                 }
                 Ok(Type::Int)
+            }
+            (Type::Bytes, "to_list") => {
+                if !args.is_empty() {
+                    return Err(".to_list() takes 0 arguments".to_owned());
+                }
+                Ok(Type::List(Box::new(Type::Int)))
             }
             (Type::List(_), "is_empty") => {
                 if !args.is_empty() {
@@ -487,7 +520,11 @@ impl<'a> Checker<'a> {
                 }
                 Ok(Type::Void)
             }
-            (Type::List(elem), "get") => {
+            (ty @ (Type::List(_) | Type::Bytes), "get") => {
+                let elem = match ty {
+                    Type::List(elem) => elem.clone(),
+                    _ => Box::new(Type::Int),
+                };
                 if args.len() != 1 {
                     return Err(".get(index) expects 1 argument".to_string());
                 }
@@ -498,9 +535,9 @@ impl<'a> Checker<'a> {
                 if matches!(elem.as_ref(), Type::Optional(_))
                     || matches!(elem.as_ref(), Type::Union(vs) if vs.contains(&Type::Nil))
                 {
-                    Ok((**elem).clone())
+                    Ok(*elem)
                 } else {
-                    Ok(Type::Optional(elem.clone()))
+                    Ok(Type::Optional(elem))
                 }
             }
             (Type::List(elem), "contains") => {
@@ -513,7 +550,7 @@ impl<'a> Checker<'a> {
                 }
                 Ok(Type::Bool)
             }
-            (Type::List(elem), "slice") => {
+            (ty @ (Type::List(_) | Type::Bytes), "slice") => {
                 if args.len() != 2 {
                     return Err(".slice(start, end) expects 2 arguments".to_string());
                 }
@@ -523,7 +560,7 @@ impl<'a> Checker<'a> {
                         return Err(format!(".slice expects Int bounds, got {}", a.ty));
                     }
                 }
-                Ok(Type::List(elem.clone()))
+                Ok(ty.clone())
             }
             (Type::List(elem), "reverse") => {
                 if !args.is_empty() {
@@ -709,6 +746,12 @@ impl<'a> Checker<'a> {
             {
                 let target_targs = target_targs.clone();
                 self.check_db_query_method(&target_targs, m, type_args, args)
+            }
+            (Type::Generic { type_id: tid, type_args: target_targs }, m)
+                if tid.module == ModuleId::Native("cdt.chan".to_string()) && tid.name == "Chan" =>
+            {
+                let target_targs = target_targs.clone();
+                self.check_chan_method(&target_targs, m, type_args, args)
             }
             (ty, m) => Err(format!("Type {} has no method '.{}()'", ty, m)),
         }
@@ -955,6 +998,14 @@ impl<'a> Checker<'a> {
                         "Invalid arithmetic {:?} operands: {} and {}",
                         op, left.ty, right.ty
                     ))
+                }
+            }
+            BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor
+            | BinaryOp::ShiftLeft | BinaryOp::ShiftRight => {
+                if left.ty == Type::Int && right.ty == Type::Int {
+                    Ok(Type::Int)
+                } else {
+                    Err(format!("Bitwise op requires Int, got {} and {}", left.ty, right.ty))
                 }
             }
             BinaryOp::Eq | BinaryOp::NotEq => {

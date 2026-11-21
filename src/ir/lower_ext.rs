@@ -4,10 +4,11 @@ use crate::frontend::types::Type;
 use crate::ir::RecordDesc;
 use crate::ir::lower::FnLowerer;
 use crate::native::cache::*;
+use crate::native::chan::*;
 use crate::native::jwt::{JWT_DECODE_UNVERIFIED, JWT_SIGN, JWT_VERIFY};
 use crate::native::lock::*;
 use crate::native::redis::*;
-use crate::vm::opcode::{EXT_CACHE_OP, EXT_JWT_OP, EXT_LOCK_OP, EXT_REDIS_OP, Op};
+use crate::vm::opcode::{EXT_CACHE_OP, EXT_CHAN_OP, EXT_JWT_OP, EXT_LOCK_OP, EXT_REDIS_OP, Op};
 use crate::vm::value::{
     SCHEMA_CACHE_ERROR, SCHEMA_CACHE_HANDLE, SCHEMA_JWT_ERROR, SCHEMA_LOCK_ERROR,
     SCHEMA_LOCK_GUARD, SCHEMA_REDIS_CLIENT, SCHEMA_REDIS_ERROR,
@@ -466,35 +467,49 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 });
             }
             "set" | "set_json" => {
-                let aux = if method == "set" {
-                    CACHE_SET
-                } else {
-                    CACHE_SET_JSON
-                };
                 let key_o = self.lower_obj(&args[0])?;
                 let val_o = self.lower_obj(&args[1])?;
-                let ttl_s = self.alloc_temp_s();
-                let has_ttl_s = self.alloc_temp_s();
-                if let Some(ttl_expr) = args.get(2) {
-                    let v = self.lower_scalar(ttl_expr)?;
-                    self.ops.push(Op::MoveScalar { dst: ttl_s, src: v });
-                    self.load_int_into(has_ttl_s, 1)?;
+                if method == "set" && args.len() == 2 {
+                    self.ops.push(Op::MoveObj {
+                        dst_obj: dst,
+                        src: cache_o,
+                    });
+                    self.ops.push(Op::ExtOp {
+                        kind: EXT_CACHE_OP,
+                        aux: CACHE_SET_NO_TTL,
+                        a: dst,
+                        b: key_o,
+                        c: val_o,
+                    });
                 } else {
-                    self.load_int_into(ttl_s, 0)?;
-                    self.load_int_into(has_ttl_s, 0)?;
+                    let aux = if method == "set" {
+                        CACHE_SET
+                    } else {
+                        CACHE_SET_JSON
+                    };
+                    let ttl_s = self.alloc_temp_s();
+                    let has_ttl_s = self.alloc_temp_s();
+                    if let Some(ttl_expr) = args.get(2) {
+                        let v = self.lower_scalar(ttl_expr)?;
+                        self.ops.push(Op::MoveScalar { dst: ttl_s, src: v });
+                        self.load_int_into(has_ttl_s, 1)?;
+                    } else {
+                        self.load_int_into(ttl_s, 0)?;
+                        self.load_int_into(has_ttl_s, 0)?;
+                    }
+                    let packed = self.pack_record(
+                        SCHEMA_CACHE_HANDLE,
+                        &[ttl_s, has_ttl_s],
+                        &[key_o, val_o],
+                    )?;
+                    self.ops.push(Op::ExtOp {
+                        kind: EXT_CACHE_OP,
+                        aux,
+                        a: dst,
+                        b: cache_o,
+                        c: packed,
+                    });
                 }
-                let packed = self.pack_record(
-                    SCHEMA_CACHE_HANDLE,
-                    &[ttl_s, has_ttl_s],
-                    &[key_o, val_o],
-                )?;
-                self.ops.push(Op::ExtOp {
-                    kind: EXT_CACHE_OP,
-                    aux,
-                    a: dst,
-                    b: cache_o,
-                    c: packed,
-                });
             }
             "get_json" => {
                 let plan_idx = self.json_plan_for_type(&type_args[0], "Cache.get_json()")?;
@@ -830,5 +845,127 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             _ => return Err(format!("Unsupported redis.Client method '.{}()'", method)),
         }
         Ok(dst)
+    }
+
+    // ── cdt.chan ────────────────────────────────────────────────────────────
+
+    pub(crate) fn lower_chan_call(&mut self, sym: &str, args: &[Expr]) -> Result<u16, String> {
+        if !matches!(sym, "open" | "Chan") {
+            return Err(format!("Unsupported cdt.chan symbol '{}'", sym));
+        }
+        let cap_s = if let Some(cap) = args.first() {
+            self.lower_scalar(cap)?
+        } else {
+            let r = self.alloc_temp_s();
+            self.load_int_into(r, 0)?;
+            r
+        };
+        let dst = self.alloc_temp_o();
+        self.ops.push(Op::ExtOp {
+            kind: EXT_CHAN_OP,
+            aux: CHAN_OPEN,
+            a: dst,
+            b: cap_s,
+            c: 0,
+        });
+        Ok(dst)
+    }
+
+    pub(crate) fn lower_chan_scalar_method(
+        &mut self,
+        target: &Expr,
+        method: &str,
+        args: &[Expr],
+    ) -> Result<u16, String> {
+        let chan_o = self.lower_obj(target)?;
+        let dst_s = self.alloc_temp_s();
+        match method {
+            "send" | "try_send" => {
+                let aux = if method == "send" {
+                    CHAN_SEND
+                } else {
+                    CHAN_TRY_SEND
+                };
+                let val_o = self.lower_obj(&args[0])?;
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_CHAN_OP,
+                    aux,
+                    a: dst_s,
+                    b: chan_o,
+                    c: val_o,
+                });
+            }
+            "len" | "cap" | "is_empty" | "is_closed" => {
+                let aux = match method {
+                    "len" => CHAN_LEN,
+                    "cap" => CHAN_CAP,
+                    "is_empty" => CHAN_IS_EMPTY,
+                    _ => CHAN_IS_CLOSED,
+                };
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_CHAN_OP,
+                    aux,
+                    a: dst_s,
+                    b: chan_o,
+                    c: 0,
+                });
+            }
+            _ => return Err(format!("Unsupported scalar Chan method '.{}()'", method)),
+        }
+        Ok(dst_s)
+    }
+
+    pub(crate) fn lower_chan_method(
+        &mut self,
+        type_name: &str,
+        target: &Expr,
+        method: &str,
+        args: &[Expr],
+    ) -> Result<u16, String> {
+        if type_name != "Chan" {
+            return Err(format!("Unsupported chan method '{}.{}()'", type_name, method));
+        }
+        let chan_o = self.lower_obj(target)?;
+        match method {
+            "recv" | "try_recv" => {
+                let dst = self.alloc_temp_o();
+                let aux = if method == "recv" {
+                    CHAN_RECV
+                } else {
+                    CHAN_TRY_RECV
+                };
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_CHAN_OP,
+                    aux,
+                    a: dst,
+                    b: chan_o,
+                    c: 0,
+                });
+                Ok(dst)
+            }
+            "recv_timeout" => {
+                let ms_s = self.lower_scalar(&args[0])?;
+                let dst = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_CHAN_OP,
+                    aux: CHAN_RECV_TIMEOUT,
+                    a: dst,
+                    b: chan_o,
+                    c: ms_s,
+                });
+                Ok(dst)
+            }
+            "close" => {
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_CHAN_OP,
+                    aux: CHAN_CLOSE,
+                    a: 0,
+                    b: chan_o,
+                    c: 0,
+                });
+                Ok(0)
+            }
+            _ => Err(format!("Unsupported chan.Chan method '.{}()'", method)),
+        }
     }
 }

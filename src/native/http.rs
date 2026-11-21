@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -9,7 +10,7 @@ use crate::native::tls::{TlsConfig, TlsVersion, Transport, VerifyMode};
 
 use crate::vm::string::VmString;
 use crate::vm::value::{
-    ListStorage, MapKey, MapVal, Obj, OrderedMap, SCHEMA_HTTP_BINARY_RESPONSE, SCHEMA_HTTP_CLIENT,
+    MapKey, MapVal, Obj, OrderedMap, SCHEMA_HTTP_BINARY_RESPONSE, SCHEMA_HTTP_CLIENT,
     SCHEMA_HTTP_ERROR, SCHEMA_HTTP_REQUEST, SCHEMA_HTTP_RESPONSE, SCHEMA_HTTP_ROUTER, StructData,
 };
 
@@ -76,6 +77,8 @@ pub struct RouterState {
     pub routes: Vec<RouteEntry>,
     pub before: Vec<(Option<Box<str>>, Obj)>,
     pub after: Vec<(Option<Box<str>>, Obj)>,
+    pub on_start: Vec<Obj>,
+    pub on_stop: Vec<Obj>,
     pub statics: Vec<(Box<str>, Box<str>)>,
     pub cors_origin: Option<Box<str>>,
     pub stop_flag: Arc<AtomicBool>,
@@ -350,11 +353,36 @@ pub fn make_router_obj(handle: i64) -> Obj {
     Obj::Record(Arc::new(s))
 }
 
+pub(crate) fn header_key(name: &str) -> Arc<VmString> {
+    macro_rules! common_headers {
+        ($($key:literal => $slot:ident),+ $(,)?) => {{
+            $(static $slot: LazyLock<Arc<VmString>> = LazyLock::new(|| Arc::new(VmString::from($key)));)+
+            match name {
+                $($key => Arc::clone(&$slot),)+
+                _ => Arc::new(VmString::from(name)),
+            }
+        }};
+    }
+    common_headers!(
+        "accept" => ACCEPT,
+        "authorization" => AUTHORIZATION,
+        "connection" => CONNECTION,
+        "content-length" => CONTENT_LENGTH,
+        "content-type" => CONTENT_TYPE,
+        "host" => HOST,
+        "location" => LOCATION,
+        "user-agent" => USER_AGENT,
+        "access-control-allow-headers" => CORS_HEADERS,
+        "access-control-allow-methods" => CORS_METHODS,
+        "access-control-allow-origin" => CORS_ORIGIN,
+    )
+}
+
 fn make_static_ct_headers(ct: Option<&str>) -> Obj {
     let mut headers = OrderedMap::default();
     if let Some(ct) = ct {
         headers.set(
-            MapKey::Str(Arc::new(VmString::from("content-type"))),
+            MapKey::Str(header_key("content-type")),
             MapVal::Obj(Obj::str(ct)),
         );
     }
@@ -404,6 +432,44 @@ pub fn map_from_pairs(pairs: Vec<(String, String)>) -> Obj {
     Obj::Map(Arc::new(map))
 }
 
+pub(crate) fn request_from_fields(mut fields: [Obj; 6]) -> Obj {
+    let mut s = StructData::new(SCHEMA_HTTP_REQUEST, 0, 8);
+    match &fields[2] {
+        Obj::Str(text) => {
+            let text = Arc::clone(text);
+            s.set_obj(6, Obj::deferred_field(move || Obj::Bytes(Arc::new(text.as_bytes().to_vec()))));
+        }
+        Obj::Bytes(bytes) => {
+            s.set_obj(6, Obj::Bytes(Arc::clone(bytes)));
+            let bytes = Arc::clone(bytes);
+            fields[2] = Obj::deferred_field(move || {
+                Obj::str(String::from_utf8_lossy(&bytes).into_owned())
+            });
+        }
+        _ => {}
+    }
+    let headers = if matches!(&fields[3], Obj::Map(map) if map.is_empty()) {
+        HEADERS_EMPTY.clone()
+    } else {
+        let headers = fields[3].clone();
+        Obj::deferred_field(move || {
+            let Obj::Map(headers) = headers.resolved() else { return HEADERS_EMPTY.clone() };
+            let mut raw = OrderedMap::with_capacity(headers.len());
+            for (key, value) in headers.entries() {
+                if let MapVal::Obj(Obj::Str(text)) = value {
+                    raw.set(key.clone(), MapVal::Obj(Obj::Bytes(Arc::new(text.as_bytes().to_vec()))));
+                }
+            }
+            Obj::Map(Arc::new(raw))
+        })
+    };
+    s.set_obj(7, headers);
+    for (idx, value) in fields.into_iter().enumerate() {
+        s.set_obj(idx, value);
+    }
+    Obj::Record(Arc::new(s))
+}
+
 pub fn make_request_obj(
     method: &str,
     path: &str,
@@ -412,23 +478,80 @@ pub fn make_request_obj(
     query: Vec<(String, String)>,
     params: Vec<(String, String)>,
 ) -> Obj {
-    let mut s = StructData::new(SCHEMA_HTTP_REQUEST, 0, 6);
-    s.set_obj(0, Obj::str(method));
-    s.set_obj(1, Obj::str(path));
-    s.set_obj(2, Obj::str(body));
-    s.set_obj(3, map_from_pairs(headers));
-    s.set_obj(4, map_from_pairs(query));
-    s.set_obj(5, map_from_pairs(params));
-    Obj::Record(Arc::new(s))
+    fn deferred_pairs(pairs: Vec<(String, String)>) -> Obj {
+        if pairs.is_empty() { HEADERS_EMPTY.clone() }
+        else { Obj::deferred_field(move || map_from_pairs(pairs)) }
+    }
+    request_from_fields([
+        Obj::str(method),
+        Obj::str(path),
+        Obj::str(body),
+        deferred_pairs(headers),
+        deferred_pairs(query),
+        deferred_pairs(params),
+    ])
 }
 
 pub struct RawHttpRequest {
     pub method: String,
     pub path: String,
-    pub query: Vec<(String, String)>,
-    pub headers: Vec<(String, String)>,
-    pub body: String,
+    pub query: String,
+    pub headers: Vec<(String, Vec<u8>)>,
+    pub body: Vec<u8>,
     pub keep_alive: bool,
+}
+
+impl RawHttpRequest {
+    pub(crate) fn into_request_obj(self) -> Obj {
+        let mut req = StructData::new(SCHEMA_HTTP_REQUEST, 0, 8);
+        req.set_obj(0, Obj::str(self.method));
+        req.set_obj(1, Obj::str(self.path));
+        let body = Arc::new(self.body);
+        let text = Arc::clone(&body);
+        req.set_obj(2, Obj::deferred_field(move || {
+            Obj::str(String::from_utf8_lossy(&text).into_owned())
+        }));
+        req.set_obj(6, Obj::Bytes(body));
+        if self.headers.is_empty() {
+            req.set_obj(3, HEADERS_EMPTY.clone());
+            req.set_obj(7, HEADERS_EMPTY.clone());
+        } else {
+            let headers = Arc::new(self.headers);
+            let text_headers = Arc::clone(&headers);
+            req.set_obj(3, Obj::deferred_field(move || build_request_headers(&text_headers, false)));
+            req.set_obj(7, Obj::deferred_field(move || build_request_headers(&headers, true)));
+        }
+        let query = self.query;
+        req.set_obj(4, if query.is_empty() { HEADERS_EMPTY.clone() } else {
+            Obj::deferred_field(move || query_map(&query))
+        });
+        req.set_obj(5, HEADERS_EMPTY.clone());
+        Obj::Record(Arc::new(req))
+    }
+}
+
+fn build_request_headers(headers: &[(String, Vec<u8>)], binary: bool) -> Obj {
+    let mut map = OrderedMap::with_capacity(headers.len());
+    for (key, value) in headers {
+        let value = if binary {
+            Obj::Bytes(Arc::new(value.clone()))
+        } else {
+            Obj::str(String::from_utf8_lossy(value).into_owned())
+        };
+        map.set(MapKey::Str(header_key(key)), MapVal::Obj(value));
+    }
+    Obj::Map(Arc::new(map))
+}
+
+fn query_map(raw: &str) -> Obj {
+    let pairs = raw.split('&').filter(|pair| !pair.is_empty()).map(|pair| {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        (
+            crate::native::url::percent_decode(k, true).unwrap_or_else(|_| k.to_string()),
+            crate::native::url::percent_decode(v, true).unwrap_or_else(|_| v.to_string()),
+        )
+    }).collect();
+    map_from_pairs(pairs)
 }
 
 #[derive(Debug)]
@@ -448,7 +571,7 @@ fn is_http_tchar(b: u8) -> bool {
         )
 }
 
-fn read_crlf_line<R: BufRead>(reader: &mut R) -> Result<Option<String>, ReadHttpError> {
+fn read_crlf_line<R: BufRead>(reader: &mut R) -> Result<Option<Vec<u8>>, ReadHttpError> {
     let mut buf = Vec::new();
     let n = reader
         .by_ref()
@@ -464,15 +587,15 @@ fn read_crlf_line<R: BufRead>(reader: &mut R) -> Result<Option<String>, ReadHttp
     while buf.last().is_some_and(|&b| b == b'\n' || b == b'\r') {
         buf.pop();
     }
-    String::from_utf8(buf)
-        .map(Some)
-        .map_err(|_| ReadHttpError::Bad("Invalid UTF-8 in HTTP header".to_string()))
+    Ok(Some(buf))
 }
 
 pub fn read_http_request<R: BufRead>(reader: &mut R) -> Result<RawHttpRequest, ReadHttpError> {
     let Some(req_line) = read_crlf_line(reader)? else {
         return Err(ReadHttpError::Closed);
     };
+    let req_line = std::str::from_utf8(&req_line)
+        .map_err(|_| ReadHttpError::Bad("Request line is not valid UTF-8".to_owned()))?;
     let mut parts = req_line.split_whitespace();
     let Some(method) = parts.next() else {
         return Err(ReadHttpError::Bad("Missing HTTP method".to_string()));
@@ -485,20 +608,6 @@ pub fn read_http_request<R: BufRead>(reader: &mut R) -> Result<RawHttpRequest, R
         Some((p, q)) => (p, q),
         None => (target, ""),
     };
-    let mut query = Vec::new();
-    if !raw_query.is_empty() {
-        for pair in raw_query.split('&') {
-            if pair.is_empty() {
-                continue;
-            }
-            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-            query.push((
-                crate::native::url::percent_decode(k, true).unwrap_or_else(|_| k.to_string()),
-                crate::native::url::percent_decode(v, true).unwrap_or_else(|_| v.to_string()),
-            ));
-        }
-    }
-
     let mut headers = Vec::new();
     let mut content_length: usize = 0;
     let mut saw_content_length = false;
@@ -513,14 +622,26 @@ pub fn read_http_request<R: BufRead>(reader: &mut R) -> Result<RawHttpRequest, R
         if headers.len() >= MAX_HEADERS {
             return Err(ReadHttpError::TooLarge);
         }
-        let Some((name, val)) = line.split_once(':') else {
+        let Some(colon) = line.iter().position(|&b| b == b':') else {
             return Err(ReadHttpError::Bad("Malformed HTTP header".to_string()));
         };
-        if name.is_empty() || !name.bytes().all(is_http_tchar) {
+        let name = &line[..colon];
+        if name.is_empty() || !name.iter().copied().all(is_http_tchar) {
             return Err(ReadHttpError::Bad("Invalid HTTP header name".to_string()));
         }
+        let name = std::str::from_utf8(name)
+            .map_err(|_| ReadHttpError::Bad("Invalid HTTP header name".to_string()))?;
         let lname = name.to_ascii_lowercase();
-        let val = val.trim().to_string();
+        let mut val = &line[colon + 1..];
+        while val.first().is_some_and(|&b| matches!(b, b' ' | b'\t')) {
+            val = &val[1..];
+        }
+        while val.last().is_some_and(|&b| matches!(b, b' ' | b'\t')) {
+            val = &val[..val.len() - 1];
+        }
+        if val.iter().any(|&b| (b < b' ' && b != b'\t') || b == 127) {
+            return Err(ReadHttpError::Bad("Invalid HTTP header value".to_string()));
+        }
         if lname == "transfer-encoding" {
             return Err(ReadHttpError::Bad(
                 "Transfer-Encoding is not supported".to_string(),
@@ -530,27 +651,25 @@ pub fn read_http_request<R: BufRead>(reader: &mut R) -> Result<RawHttpRequest, R
                 return Err(ReadHttpError::Bad("Duplicate Content-Length header".to_string()));
             }
             saw_content_length = true;
-            if val.is_empty() || !val.bytes().all(|b| b.is_ascii_digit()) {
+            if val.is_empty() || !val.iter().all(u8::is_ascii_digit) {
                 return Err(ReadHttpError::Bad("Invalid Content-Length".to_string()));
             }
-            content_length = val
-                .parse::<usize>()
+            content_length = std::str::from_utf8(val).ok().and_then(|val| val.parse::<usize>().ok())
+                .ok_or(())
                 .map_err(|_| ReadHttpError::Bad("Invalid Content-Length".to_string()))?;
             if content_length > MAX_BODY {
                 return Err(ReadHttpError::TooLarge);
             }
         } else if lname == "connection" {
-            conn_header = Some(val.to_ascii_lowercase());
+            conn_header = Some(String::from_utf8_lossy(val).to_ascii_lowercase());
         }
-        headers.push((lname, val));
+        headers.push((lname, val.to_vec()));
     }
 
     let mut body_bytes = vec![0u8; content_length];
     if content_length > 0 {
         reader.read_exact(&mut body_bytes).map_err(ReadHttpError::Io)?;
     }
-    let body = String::from_utf8(body_bytes)
-        .map_err(|_| ReadHttpError::Bad("Request body is not valid UTF-8".to_string()))?;
 
     let keep_alive = if version == "HTTP/1.0" {
         conn_header.as_deref().is_some_and(|c| c.contains("keep-alive"))
@@ -561,9 +680,9 @@ pub fn read_http_request<R: BufRead>(reader: &mut R) -> Result<RawHttpRequest, R
     Ok(RawHttpRequest {
         method: method.to_string(),
         path: raw_path.to_string(),
-        query,
+        query: raw_query.to_owned(),
         headers,
-        body,
+        body: body_bytes,
         keep_alive,
     })
 }
@@ -633,21 +752,31 @@ pub fn reader_writer_pair(stream: TcpStream) -> io::Result<(BufReader<TcpStream>
 
 const MAX_CLIENT_BODY: usize = 16 * 1024 * 1024;
 
+fn response_headers(headers: Vec<(String, String)>) -> Obj {
+    if headers.is_empty() {
+        return HEADERS_EMPTY.clone();
+    }
+    let mut map = OrderedMap::with_capacity(headers.len());
+    for (key, val) in headers {
+        map.set(MapKey::Str(header_key(&key)), MapVal::Obj(Obj::str(val)));
+    }
+    Obj::Map(Arc::new(map))
+}
+
 fn build_response_obj(status: i64, body: &[u8], headers: Vec<(String, String)>) -> Obj {
     let body_str = String::from_utf8_lossy(body);
     let mut s = StructData::new(SCHEMA_HTTP_RESPONSE, 1, 2);
     s.set_scalar(0, status as u64);
     s.set_obj(0, Obj::str(body_str.as_ref()));
-    s.set_obj(1, map_from_pairs(headers));
+    s.set_obj(1, response_headers(headers));
     Obj::Record(Arc::new(s))
 }
 
-fn build_binary_response_obj(status: i64, body: &[u8], headers: Vec<(String, String)>) -> Obj {
-    let ints: Vec<i64> = body.iter().map(|&b| b as i64).collect();
+fn build_binary_response_obj(status: i64, body: Vec<u8>, headers: Vec<(String, String)>) -> Obj {
     let mut s = StructData::new(SCHEMA_HTTP_BINARY_RESPONSE, 1, 2);
     s.set_scalar(0, status as u64);
-    s.set_obj(0, Obj::List(ListStorage::Int(Arc::new(ints))));
-    s.set_obj(1, map_from_pairs(headers));
+    s.set_obj(0, Obj::Bytes(Arc::new(body)));
+    s.set_obj(1, response_headers(headers));
     Obj::Record(Arc::new(s))
 }
 
@@ -940,6 +1069,35 @@ fn resolve_redirect_url(base: &ParsedUrl, location: &str) -> String {
     format!("{}://{}{}{}", scheme, base.host_header, dir, loc)
 }
 
+fn redirect_headers<'a>(
+    mut headers: Cow<'a, [(String, String)]>,
+    previous: &ParsedUrl,
+    next: &ParsedUrl,
+    discard_body: bool,
+) -> Cow<'a, [(String, String)]> {
+    if previous.is_https != next.is_https
+        || previous.port != next.port
+        || !previous.host.eq_ignore_ascii_case(&next.host)
+    {
+        // Arbitrary caller-supplied headers may carry credentials.
+        return Cow::Borrowed(&[]);
+    }
+    if discard_body && !headers.is_empty() {
+        headers.to_mut().retain(|(name, _)| {
+            ![
+                "Content-Length",
+                "Transfer-Encoding",
+                "Content-Type",
+                "Content-Encoding",
+                "Expect",
+            ]
+            .iter()
+            .any(|header| name.eq_ignore_ascii_case(header))
+        });
+    }
+    headers
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct PoolKey {
     is_https: bool,
@@ -1185,6 +1343,23 @@ fn build_http_request_bytes(
     Ok(req)
 }
 
+fn send_http_request(
+    reader: &mut BufReader<Transport>,
+    method: &str,
+    request: &[u8],
+) -> Result<(RawHttpResponse, bool), Obj> {
+    let transport = reader.get_mut();
+    transport
+        .write_all(request)
+        .and_then(|_| transport.flush())
+        .map_err(|err| make_http_error("io_error", format!("failed to send request: {err}")))?;
+    parse_http_response_raw(reader, method, false).map_err(|err| make_http_error("http_error", err))
+}
+
+fn can_retry_pooled_request(method: &str) -> bool {
+    matches!(method, "GET" | "HEAD" | "OPTIONS" | "TRACE" | "PUT" | "DELETE")
+}
+
 fn tcp_http_request_once(
     method: &str,
     parsed: &ParsedUrl,
@@ -1206,28 +1381,22 @@ fn tcp_http_request_once(
     {
         let _ = reader.get_ref().set_read_timeout(Some(timeout));
         let _ = reader.get_ref().set_write_timeout(Some(timeout));
-        if reader
-            .get_mut()
-            .write_all(&req)
-            .and_then(|_| reader.get_mut().flush())
-            .is_ok()
-            && let Ok((resp, can_ka)) = parse_http_response_raw(&mut reader, method, false)
-        {
-            if can_ka {
-                p.put(pool_key, reader);
+        match send_http_request(&mut reader, method, &req) {
+            Ok((resp, can_ka)) => {
+                if can_ka {
+                    p.put(pool_key, reader);
+                }
+                return Ok(resp);
             }
-            return Ok(resp);
+            // The peer may already have handled the request before the error.
+            Err(err) if !can_retry_pooled_request(method) => return Err(err),
+            Err(_) => {}
         }
-        // Stale pooled connection closed by peer: fall through to fresh connection.
     }
 
     let transport = open_http_transport(parsed, timeout)?;
     let mut reader = BufReader::new(transport);
-    if let Err(e) = reader.get_mut().write_all(&req).and_then(|_| reader.get_mut().flush()) {
-        return Err(make_http_error("io_error", format!("failed to send request: {}", e)));
-    }
-    let (resp, can_ka) = parse_http_response_raw(&mut reader, method, false)
-        .map_err(|e| make_http_error("http_error", e))?;
+    let (resp, can_ka) = send_http_request(&mut reader, method, &req)?;
     if let Some(p) = pool
         && can_ka
     {
@@ -1259,15 +1428,13 @@ fn http_client_request_raw(
             format!("invalid HTTP method: {:?}", method),
         ));
     }
-    let mut cur_url = url.trim().to_string();
-    let mut cur_body = body.to_vec();
+    let mut parsed = parse_http_url(url).map_err(|err| make_http_error("invalid_url", err))?;
+    let mut cur_body = body;
+    let mut cur_headers = Cow::Borrowed(headers);
 
     for hop in 0..=MAX_REDIRECTS {
-        let parsed = match parse_http_url(&cur_url) {
-            Ok(p) => p,
-            Err(e) => return Err(make_http_error("invalid_url", e)),
-        };
-        let resp = tcp_http_request_once(&cur_method, &parsed, &cur_body, headers, timeout, pool)?;
+        let resp =
+            tcp_http_request_once(&cur_method, &parsed, cur_body, &cur_headers, timeout, pool)?;
         if matches!(resp.status, 301..=303 | 307 | 308)
             && let Some((_, loc)) = resp.headers.iter().find(|(k, _)| k == "location")
         {
@@ -1278,17 +1445,21 @@ fn http_client_request_raw(
                 ));
             }
             let next_url = resolve_redirect_url(&parsed, loc);
-            if parsed.is_https && next_url.starts_with("http://") {
+            let next =
+                parse_http_url(&next_url).map_err(|err| make_http_error("invalid_url", err))?;
+            if parsed.is_https && !next.is_https {
                 return Err(make_http_error(
                     "tls_error",
                     "refusing insecure redirect from https:// to http://",
                 ));
             }
-            cur_url = next_url;
-            if matches!(resp.status, 301..=303) && cur_method != "HEAD" {
+            let discard_body = matches!(resp.status, 301..=303) && cur_method != "HEAD";
+            cur_headers = redirect_headers(cur_headers, &parsed, &next, discard_body);
+            if discard_body {
                 cur_method = "GET".to_string();
-                cur_body.clear();
+                cur_body = &[];
             }
+            parsed = next;
             continue;
         }
         return Ok(resp);
@@ -1344,7 +1515,7 @@ pub fn http_client_bytes_request(
     timeout_ms: i64,
 ) -> Obj {
     match http_client_request_raw(method, url, body, headers, timeout_ms, None) {
-        Ok(resp) => build_binary_response_obj(resp.status, &resp.body, resp.headers),
+        Ok(resp) => build_binary_response_obj(resp.status, resp.body, resp.headers),
         Err(err_obj) => err_obj,
     }
 }
@@ -1353,6 +1524,20 @@ pub fn http_client_bytes_request(
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn binary_request_retains_body_and_header_bytes() {
+        let wire = b"POST /upload?k=a+b HTTP/1.1\r\nContent-Length: 3\r\nX-Data: \xff\t \r\n\r\n\0\xff\x80";
+        let request = read_http_request(&mut wire.as_slice()).unwrap();
+        let Obj::Record(request) = request.into_request_obj() else { panic!("expected Request") };
+        assert!(matches!(request.raw_obj(4), Obj::DeferredField(_)));
+        assert!(matches!(request.get_obj(6), Obj::Bytes(bytes) if bytes.as_slice() == [0, 255, 128]));
+        assert!(matches!(request.get_obj(2), Obj::Str(text) if text.as_str() == "\0��"));
+        let Obj::Map(headers) = request.get_obj(7) else { panic!("expected headers") };
+        assert!(matches!(headers.get_str("x-data"), Some(MapVal::Obj(Obj::Bytes(bytes))) if bytes.as_slice() == [255]));
+        let Obj::Map(query) = request.get_obj(4) else { panic!("expected query") };
+        assert!(matches!(query.get_str("k"), Some(MapVal::Obj(Obj::Str(value))) if value.as_str() == "a b"));
+    }
 
     #[test]
     fn resolve_client_url_joins_base_and_paths() {
@@ -1372,6 +1557,53 @@ mod tests {
             resolve_client_url("https://api.example.com/v1", "http://other.local/x"),
             "http://other.local/x"
         );
+    }
+
+    #[test]
+    fn redirect_headers_are_scoped_to_the_original_origin() {
+        let original = parse_http_url("https://api.example.test/start").unwrap();
+        let headers = [("X-Service-Key".into(), "test-only".into())];
+        let same_origin = parse_http_url("https://API.example.test:443/next").unwrap();
+        assert_eq!(
+            redirect_headers(Cow::Borrowed(&headers), &original, &same_origin, false).as_ref(),
+            &headers
+        );
+
+        for url in [
+            "https://other.example.test/next",
+            "https://api.example.test:8443/next",
+            "http://api.example.test:443/next",
+        ] {
+            let next = parse_http_url(url).unwrap();
+            let forwarded = redirect_headers(Cow::Borrowed(&headers), &original, &next, false);
+            assert!(forwarded.is_empty());
+            assert!(redirect_headers(forwarded, &next, &original, false).is_empty());
+        }
+    }
+
+    #[test]
+    fn redirect_drops_body_headers_when_it_discards_the_body() {
+        let origin = parse_http_url("https://api.example.test/").unwrap();
+        let headers = [
+            ("aUtHoRiZaTiOn".into(), "test-only".into()),
+            ("content-length".into(), "4".into()),
+            ("Content-Type".into(), "text/plain".into()),
+            ("Expect".into(), "100-continue".into()),
+        ];
+        assert_eq!(
+            redirect_headers(Cow::Borrowed(&headers), &origin, &origin, true).as_ref(),
+            &headers[..1]
+        );
+    }
+
+    #[test]
+    fn pooled_retries_are_always_limited_to_known_idempotent_methods() {
+        for method in ["GET", "HEAD", "OPTIONS", "TRACE", "PUT", "DELETE"] {
+            assert!(can_retry_pooled_request(method), "{method}");
+        }
+        for method in ["POST", "PATCH", "CONNECT", "CUSTOM"] {
+            assert!(!can_retry_pooled_request(method), "{method}");
+        }
     }
 
     #[test]

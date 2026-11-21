@@ -5,7 +5,7 @@ End-to-end zero-dependency backend showcase combining:
 * **`cdt.jwt`**: HS256 token issuance (`jwt.sign`) and verification middleware (`jwt.verify<Claims>`).
 * **`cdt.cache`**: In-memory rate limiting (`incr`), stampede-safe profile caching (`get_or_set`), WAL persistence (`open_file` + `compact`), and atomic snapshots (`save` / `load`).
 * **`cdt.lock`**: OS advisory file lock (`lock.file`) around append-only audit logging.
-* **`cdt.http` & `cdt.validation`**: Typed route validation (`422`), `group "/api"` auth middleware (`401`), and `cors "*"`.
+* **`cdt.http` & `cdt.validation`**: Typed route validation (`422`), `group "/api"` auth middleware (`401`), `on_start` / `on_stop` lifecycle hooks, `spawn` async login telemetry, and `cors "*"`.
 * **`cdt.cron` & `cdt.time`**: Scheduled WAL compaction job (`schedule Maintenance`) and UTC ISO-8601 timestamps.
 
 ## Usage

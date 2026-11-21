@@ -95,7 +95,7 @@ func handle_check(_c: CdtCurl_check) -> Void | EnvError | ValidationError {
 
 func handle_events(c: CdtCurl_events) -> Void | EnvError | ValidationError | fs.FsError | DecodeError | EncodeError | TimeError {
     cfg := load_config()?
-    threshold := cfg.min_score
+    var threshold = cfg.min_score
     if c.min_score >= 0 {
         threshold = c.min_score
     }

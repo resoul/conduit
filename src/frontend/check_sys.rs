@@ -119,6 +119,17 @@ impl Checker<'_> {
                     Ok(Type::union(vec![Type::Int, proc_err]))
                 }
             }
+            "pipe" => {
+                if !type_args.is_empty() || !named_args.is_empty() || args.len() != 1 {
+                    return Err("process.pipe(commands) expects 1 [[String]] argument".to_string());
+                }
+                let expected = Type::List(Box::new(Type::List(Box::new(Type::String))));
+                self.check_expr(&mut args[0], Some(&expected))?;
+                if args[0].ty != expected {
+                    return Err(format!("process.pipe expects [[String]], got {}", args[0].ty));
+                }
+                Ok(Type::union(vec![proc_out, proc_err]))
+            }
             "cwd" | "pid" => {
                 if !type_args.is_empty() || !named_args.is_empty() || !args.is_empty() {
                     return Err(format!("process.{}() takes 0 arguments", sym));
@@ -570,7 +581,7 @@ impl Checker<'_> {
                     &[
                         ("method", Type::String),
                         ("path", Type::String),
-                        ("body", Type::String),
+                        ("body", Type::union(vec![Type::String, Type::Bytes])),
                         ("headers", str_map.clone()),
                         ("query", str_map.clone()),
                         ("params", str_map),
@@ -606,7 +617,7 @@ impl Checker<'_> {
                     "BinaryResponse",
                     &[
                         ("status", Type::Int),
-                        ("body", int_list),
+                        ("body", Type::union(vec![Type::Bytes, int_list])),
                         ("headers", str_map),
                     ],
                     args,
@@ -804,7 +815,7 @@ impl Checker<'_> {
             "request_bytes" => {
                 if !type_args.is_empty() || !named_args.is_empty() || args.len() != 4 {
                     return Err(
-                        "http.request_bytes(method, url, body, headers) expects (String, String, [Int], Map<String, String>)"
+                        "http.request_bytes(method, url, body, headers) expects (String, String, Bytes | [Int], Map<String, String>)"
                             .to_string(),
                     );
                 }
@@ -818,9 +829,9 @@ impl Checker<'_> {
                     }
                 }
                 self.check_expr(&mut args[2], Some(&int_list))?;
-                if args[2].ty != int_list {
+                if args[2].ty != int_list && args[2].ty != Type::Bytes {
                     return Err(format!(
-                        "http.request_bytes body expects [Int], got {}",
+                        "http.request_bytes body expects Bytes or [Int], got {}",
                         args[2].ty
                     ));
                 }
@@ -1154,6 +1165,32 @@ impl Checker<'_> {
                 }
                 Ok(Type::Void)
             }
+            ("Router", "on_start" | "on_stop") => {
+                if args.len() != 1 {
+                    return Err(format!(
+                        "Router.{}(handler) expects 1 function argument",
+                        method
+                    ));
+                }
+                let expected_cb = Type::Function {
+                    params: Vec::new(),
+                    return_type: Box::new(Type::Void),
+                };
+                self.check_expr(&mut args[0], Some(&expected_cb))?;
+                let Type::Function { params, return_type } = &args[0].ty else {
+                    return Err(format!(
+                        "Router.{} handler must be () -> Void or () -> Void | Error, got {}",
+                        method, args[0].ty
+                    ));
+                };
+                if !params.is_empty() || !is_cron_handler_return(return_type, self.checked) {
+                    return Err(format!(
+                        "Router.{} handler must be () -> Void or () -> Void | Error, got {}",
+                        method, args[0].ty
+                    ));
+                }
+                Ok(Type::Void)
+            }
             _ => Err(format!("Type 'http.{}' has no method '.{}()'", type_name, method)),
         }
     }
@@ -1425,6 +1462,35 @@ pub(crate) fn ensure_http_router_plan(
                 entries.push(HttpRouterDeclEntry {
                     kind: HttpRouterDeclKind::Cors(origin.clone()),
                     handler_name: String::new(),
+                    query_struct: None,
+                    body_struct: None,
+                    guard_handler: None,
+                    auto_response: false,
+                });
+            }
+            "router.on_start" | "router.on_stop" => {
+                let is_start = ann.target == "router.on_start";
+                let hook_label = if is_start { "on_start" } else { "on_stop" };
+                let Some(Expr { kind: ExprKind::Ident(handler_name), .. }) = ann.args.first() else {
+                    return Err(format!("Invalid {} handler in router '{}'", hook_label, router_name));
+                };
+                let fid = *checked.func_by_name.get(handler_name).ok_or_else(|| {
+                    format!("Unknown handler '{}' in router '{}'", handler_name, router_name)
+                })?;
+                let sig = &checked.funcs[fid as usize];
+                if !sig.params.is_empty() || !is_cron_handler_return(&sig.return_type, checked) {
+                    return Err(format!(
+                        "router '{}' {} handler '{}' must have signature () -> Void or () -> Void | Error",
+                        router_name, hook_label, handler_name
+                    ));
+                }
+                entries.push(HttpRouterDeclEntry {
+                    kind: if is_start {
+                        HttpRouterDeclKind::OnStart
+                    } else {
+                        HttpRouterDeclKind::OnStop
+                    },
+                    handler_name: handler_name.clone(),
                     query_struct: None,
                     body_struct: None,
                     guard_handler: None,

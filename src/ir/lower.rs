@@ -13,13 +13,314 @@ use crate::vm::value::Obj;
 pub fn compile_program(program: &Program, checked: &CheckedProgram) -> Result<Module, String> {
     let mut mc = ModuleCompiler::new(checked);
     mc.compile_all(program)?;
+    inline_scalar_leaves(&mut mc.module.functions);
     Ok(mc.module)
+}
+
+// A single result-producing instruction can replace its direct call in place.
+// Restrict inputs to parameters so a caller never depends on a callee's register file.
+fn inline_scalar_leaves(functions: &mut [FunctionProto]) {
+    let leaves: Vec<_> = functions.iter().map(|func| {
+        if func.returns_obj || func.num_objs != 0 {
+            return None;
+        }
+        let params = func.scalar_params;
+        let leaf = match func.ops.as_ref() {
+            [Op::ReturnScalar { src }] if *src < params => Op::MoveScalar { dst: 0, src: *src },
+            [op, Op::ReturnScalar { src }] => {
+                rebase_leaf(*op, params, *src, 0, 0)?
+            }
+            _ => return None,
+        };
+        Some((leaf, params))
+    }).collect();
+
+    for function in functions {
+        for instruction in &mut function.ops {
+            if let Op::CallDirect { func_id, arg_base_s, ret_reg, .. } = *instruction
+                && let Some((leaf, params)) = leaves.get(func_id as usize).copied().flatten()
+                && let Some(inlined) = rebase_leaf(leaf, params, 0, arg_base_s, ret_reg)
+            {
+                *instruction = inlined;
+            }
+        }
+    }
+}
+
+fn rebase_leaf(op: Op, params: u16, return_src: u16, base: u16, dst: u16) -> Option<Op> {
+    macro_rules! unary {
+        ($name:ident, $from:ident $(, $other:ident)?) => {
+            if let Op::$name { dst: result, $from, $($other,)? } = op
+                && result == return_src && $from < params
+            {
+                return Some(Op::$name { dst, $from: base.checked_add($from)?, $($other,)? });
+            }
+        };
+    }
+    macro_rules! binary {
+        ($name:ident) => {
+            if let Op::$name { dst: result, a, b } = op
+                && result == return_src && a < params && b < params
+            {
+                return Some(Op::$name { dst, a: base.checked_add(a)?, b: base.checked_add(b)? });
+            }
+        };
+    }
+    unary!(MoveScalar, src);
+    unary!(NegInt, src);
+    unary!(NotBool, src);
+    unary!(AddIntImm, a, imm);
+    unary!(MulIntImm, a, imm);
+    unary!(ModIntImm, a, imm);
+    unary!(LtIntImm, a, imm);
+    unary!(EqIntImm, a, imm);
+    binary!(AddInt);
+    binary!(SubInt);
+    binary!(MulInt);
+    binary!(DivInt);
+    binary!(ModInt);
+    binary!(AddFloat);
+    binary!(SubFloat);
+    binary!(MulFloat);
+    binary!(DivFloat);
+
+    match op {
+        Op::MulAddInt { dst: result, a, b, c } if result == return_src && a < params && b < params && c < params => {
+            Some(Op::MulAddInt { dst, a: base.checked_add(a)?, b: base.checked_add(b)?, c: base.checked_add(c)? })
+        }
+        Op::ModIntConst { dst: result, a, divisor, magic_idx, shift } if result == return_src && a < params => {
+            Some(Op::ModIntConst { dst, a: base.checked_add(a)?, divisor, magic_idx, shift })
+        }
+        Op::MulAddIntImm { dst: result, src, mul, add } if result == return_src && src < params => {
+            Some(Op::MulAddIntImm { dst, src: base.checked_add(src)?, mul, add })
+        }
+        Op::LoadImmInt { dst: result, imm } if result == return_src => Some(Op::LoadImmInt { dst, imm }),
+        Op::LoadConstInt { dst: result, idx } if result == return_src => Some(Op::LoadConstInt { dst, idx }),
+        Op::LoadConstFloat { dst: result, idx } if result == return_src => Some(Op::LoadConstFloat { dst, idx }),
+        Op::LoadBool { dst: result, val } if result == return_src => Some(Op::LoadBool { dst, val }),
+        _ => None,
+    }
+}
+
+fn jump_target(op: Op) -> Option<u32> {
+    match op {
+        Op::Jump { target }
+        | Op::JumpIfFalse { target, .. }
+        | Op::JumpIfTrue { target, .. }
+        | Op::JumpIfLtInt { target, .. }
+        | Op::JumpIfLtIntImm { target, .. }
+        | Op::JumpIfEqIntImm { target, .. }
+        | Op::ForRangeStep { target, .. }
+        | Op::ForListInt { exit_target: target, .. }
+        | Op::ForListIntStep { target, .. }
+        | Op::ForListObj { exit_target: target, .. } => Some(target),
+        _ => None,
+    }
+}
+
+fn op_reads_scalar(op: Op, reg: u16, records: &[RecordDesc]) -> bool {
+    match op {
+        Op::MoveScalar { src, .. }
+        | Op::NegInt { src, .. }
+        | Op::IntToFloat { src, .. }
+        | Op::FloatFloor { src, .. }
+        | Op::FloatRound { src, .. }
+        | Op::NotBool { src, .. }
+        | Op::AddIntImm { a: src, .. }
+        | Op::MulIntImm { a: src, .. }
+        | Op::MulAddIntImm { src, .. }
+        | Op::ModIntImm { a: src, .. }
+        | Op::ModIntConst { a: src, .. }
+        | Op::EqIntImm { a: src, .. }
+        | Op::LtIntImm { a: src, .. }
+        | Op::JumpIfFalse { cond: src, .. }
+        | Op::JumpIfTrue { cond: src, .. }
+        | Op::JumpIfEqIntImm { a: src, .. }
+        | Op::JumpIfLtIntImm { a: src, .. }
+        | Op::SwitchIntImm { src, .. }
+        | Op::ListAppendInt { val_s: src, .. }
+        | Op::ListAppendFloat { val_s: src, .. }
+        | Op::StrConcatInt { src_s: src, .. }
+        | Op::ScalarToStr { src_s: src, .. }
+        | Op::BoxScalar { src_s: src, .. }
+        | Op::ListContainsScalar { val_s: src, .. }
+        | Op::ReturnScalar { src }
+        | Op::CallSelfIntImm { src, .. } => src == reg,
+        Op::AddInt { a, b, .. }
+        | Op::SubInt { a, b, .. }
+        | Op::MulInt { a, b, .. }
+        | Op::DivInt { a, b, .. }
+        | Op::ModInt { a, b, .. }
+        | Op::BitAndInt { a, b, .. }
+        | Op::BitOrInt { a, b, .. }
+        | Op::BitXorInt { a, b, .. }
+        | Op::ShiftLeftInt { a, b, .. }
+        | Op::ShiftRightInt { a, b, .. }
+        | Op::AddFloat { a, b, .. }
+        | Op::SubFloat { a, b, .. }
+        | Op::MulFloat { a, b, .. }
+        | Op::DivFloat { a, b, .. }
+        | Op::EqInt { a, b, .. }
+        | Op::NeInt { a, b, .. }
+        | Op::LtInt { a, b, .. }
+        | Op::LeInt { a, b, .. }
+        | Op::GtInt { a, b, .. }
+        | Op::GeInt { a, b, .. }
+        | Op::EqFloat { a, b, .. }
+        | Op::LtFloat { a, b, .. }
+        | Op::LeFloat { a, b, .. }
+        | Op::JumpIfLtInt { a, b, .. }
+        | Op::ReturnAddInt { a, b }
+        | Op::ReturnScalarIfLtIntImm { a, src: b, .. }
+        | Op::MakeRangeList { start_s: a, end_s: b, .. }
+        | Op::ListSlice { start_s: a, end_s: b, .. }
+        | Op::ForRangeStep { idx_reg: a, limit_reg: b, .. }
+        | Op::MapSetIntInt { key_s: a, val_s: b, .. }
+        | Op::MapGetIntIntOr { key_s: a, def_s: b, .. }
+        | Op::AppendIntRangeTail { idx_s: a, limit_s: b, .. } => a == reg || b == reg,
+        Op::MulAddInt { a, b, c, .. }
+        | Op::FmaFloat { a, b, c, .. }
+        | Op::ClampScalar { val_s: a, lo_s: b, hi_s: c, .. } => a == reg || b == reg || c == reg,
+        Op::ListIndex { idx_s: a, .. }
+        | Op::ListGet { idx_s: a, .. }
+        | Op::MapGetIntIntOrImm { key_s: a, .. }
+        | Op::SumListIntTail { idx_s: a, .. } => a == reg,
+        Op::AddIntMapGetOrImm { a, key_s: b, .. } => a == reg || b == reg,
+        Op::SumIntMapRangeTail { idx_s, limit_s, acc_s, .. } => {
+            idx_s == reg || limit_s == reg || acc_s == reg
+        }
+        Op::SwitchScalarTag { tag_s, .. }
+        | Op::BoxScalarEnum { tag_s, .. }
+        | Op::ReadScalarEnumField { tag_s, .. }
+        | Op::ReadScalarEnumPair { tag_s, .. } => tag_s == reg,
+        Op::MakeScalarEnum { a, b, len, .. } => {
+            (len >= 1 && a == reg) || (len >= 2 && b == reg)
+        }
+        Op::CallDirect { arg_base_s, .. } | Op::CallCallable { arg_base_s, .. } => reg >= arg_base_s,
+        Op::NewRecord { desc_idx, .. } | Op::NewRecordMove { desc_idx, .. } => records
+            .get(desc_idx as usize)
+            .is_some_and(|desc| desc.scalar_regs.contains(&reg)),
+        Op::ExtOp { a, b, c, .. } => a == reg || b == reg || c == reg,
+        _ => false,
+    }
+}
+
+fn tag_used_only_for_single_switch(ops: &[Op], tag_s: u16, records: &[RecordDesc]) -> bool {
+    let mut switch_count = 0usize;
+    for &op in ops {
+        match op {
+            Op::SwitchScalarTag { tag_s: t, .. } if t == tag_s => {
+                switch_count += 1;
+                if switch_count > 1 {
+                    return false;
+                }
+            }
+            Op::ReadScalarEnumPair { tag_s: t, dst_a, dst_b, .. }
+                if t == tag_s && dst_a != tag_s && dst_b != tag_s => {}
+            Op::BoxScalarEnum { tag_s: t, .. } | Op::ReadScalarEnumField { tag_s: t, .. }
+                if t == tag_s =>
+            {
+                return false;
+            }
+            other if op_reads_scalar(other, tag_s, records) => return false,
+            _ => {}
+        }
+    }
+    switch_count == 1
+}
+
+// A jump immediately following a tag write already knows its switch arm,
+// provided no branch can enter at the jump and bypass that write.
+fn thread_scalar_enum_jumps(ops: &mut [Op], records: &[RecordDesc]) {
+    if !ops.iter().any(|op| matches!(op, Op::SwitchScalarTag { .. })) {
+        return;
+    }
+    let mut targets = vec![false; ops.len()];
+    for &op in ops.iter() {
+        if let Some(target) = jump_target(op)
+            && let Some(entry) = targets.get_mut(target as usize)
+        {
+            *entry = true;
+        }
+    }
+    for pc in 1..ops.len() {
+        if targets[pc] {
+            continue;
+        }
+        let Op::Jump { target } = ops[pc] else { continue };
+        let switch = target as usize;
+        let Some(Op::SwitchScalarTag { tag_s, first_tag, tag_count, .. }) = ops.get(switch).copied() else {
+            continue;
+        };
+        let tag_write_pc = if pc >= 2
+            && !targets[pc - 1]
+            && matches!(ops[pc - 1], Op::SwitchIntImm { .. })
+        {
+            pc - 2
+        } else {
+            pc - 1
+        };
+        let tag = match ops[tag_write_pc] {
+            Op::MakeScalarEnum { dst_s, schema_id, .. } if dst_s == tag_s => schema_id,
+            Op::LoadImmInt { dst, imm } if dst == tag_s && imm >= 0 => imm as u32,
+            _ => continue,
+        };
+        let slot = tag.wrapping_sub(first_tag);
+        let offset = if slot < u32::from(tag_count) { slot as usize + 1 } else { 0 };
+        if let Some(Op::Jump { target }) = ops.get(switch + 1 + offset).copied() {
+            ops[pc] = Op::Jump { target };
+            // A new edge can enter a later candidate, so include it in the guard.
+            if let Some(entry) = targets.get_mut(target as usize) {
+                *entry = true;
+            }
+        }
+    }
+
+    for pc in 2..ops.len() {
+        if targets[pc] || targets[pc - 1] {
+            continue;
+        }
+        let Op::Jump { target } = ops[pc] else { continue };
+        let arm_pc = target as usize;
+        let Op::MakeScalarEnum { dst_s, a, b, len: 2, .. } = ops[pc - 1] else { continue };
+        let Op::LoadImmInt { dst: tmp, imm } = ops[pc - 2] else { continue };
+        if tmp != b || tmp == a || tmp == dst_s {
+            continue;
+        }
+        if !tag_used_only_for_single_switch(ops, dst_s, records) {
+            continue;
+        }
+        let Some(Op::ReadScalarEnumPair {
+            dst_a,
+            dst_b,
+            tag_s,
+            field_a: 0,
+            field_b: 1,
+            ..
+        }) = ops.get(arm_pc).copied()
+        else {
+            continue;
+        };
+        if tag_s != dst_s || dst_b == a || dst_a == dst_b || arm_pc + 1 >= ops.len() {
+            continue;
+        }
+        ops[pc - 2] = Op::LoadImmInt { dst: dst_b, imm };
+        ops[pc - 1] = Op::MoveScalar { dst: dst_a, src: a };
+        ops[pc] = Op::Jump { target: (arm_pc + 1) as u32 };
+        targets[arm_pc + 1] = true;
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct VarSlot {
     pub is_scalar: bool,
     pub reg: u16,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CompactEnum {
+    pub tag_s: u16,
+    pub width: u8,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -42,6 +343,7 @@ pub(crate) struct ModuleCompiler<'a> {
     float_consts: HashMap<u64, u16>,
     str_consts: HashMap<String, u16>,
     empty_const: Option<u16>,
+    unit_record_consts: HashMap<u32, u16>,
     desc_cache: HashMap<(u32, Vec<u16>, Vec<u16>), u32>,
     closure_counter: usize,
     pub(crate) email_fn_id: Option<u32>,
@@ -76,6 +378,7 @@ impl<'a> ModuleCompiler<'a> {
             float_consts: HashMap::new(),
             str_consts: HashMap::new(),
             empty_const: None,
+            unit_record_consts: HashMap::new(),
             desc_cache: HashMap::new(),
             closure_counter: 0,
             email_fn_id: None,
@@ -92,6 +395,7 @@ impl<'a> ModuleCompiler<'a> {
                 let sig = self.checked.funcs[fn_idx].clone();
                 let proto = self.lower_function(
                     name,
+                    Some(fn_idx as u32),
                     params,
                     &sig.params,
                     &sig.return_type,
@@ -125,6 +429,7 @@ impl<'a> ModuleCompiler<'a> {
             {
                 let up_proto = self.lower_function(
                     &format!("__cdt_mig_{}_up", version),
+                    None,
                     std::slice::from_ref(&db_param),
                     std::slice::from_ref(&db_conn_ty),
                     &mig_ret_ty,
@@ -137,6 +442,7 @@ impl<'a> ModuleCompiler<'a> {
 
                 let down_proto = self.lower_function(
                     &format!("__cdt_mig_{}_down", version),
+                    None,
                     std::slice::from_ref(&db_param),
                     std::slice::from_ref(&db_conn_ty),
                     &mig_ret_ty,
@@ -161,6 +467,7 @@ impl<'a> ModuleCompiler<'a> {
             if let ItemKind::Test { name, body } = &item.kind {
                 let test_proto = self.lower_function(
                     &format!("__cdt_test_{}", test_idx),
+                    None,
                     &[],
                     &[],
                     &Type::Void,
@@ -195,6 +502,7 @@ impl<'a> ModuleCompiler<'a> {
                 jobs,
             });
         }
+        self.module.populate_lifecycle_hooks();
         Ok(())
     }
 
@@ -202,6 +510,7 @@ impl<'a> ModuleCompiler<'a> {
     pub(crate) fn lower_function(
         &mut self,
         name: &str,
+        function_id: Option<u32>,
         params: &[Param],
         param_tys: &[Type],
         return_ty: &Type,
@@ -211,6 +520,7 @@ impl<'a> ModuleCompiler<'a> {
     ) -> Result<FunctionProto, String> {
         let mut lowerer = FnLowerer::new(
             self,
+            function_id,
             params,
             param_tys,
             return_ty.clone(),
@@ -225,15 +535,21 @@ impl<'a> ModuleCompiler<'a> {
         lowerer.lower_block_stmts(&body.stmts)?;
         lowerer.emit_defer_epilogue()?;
         lowerer.ensure_trailing_return(return_ty);
+        let num_scalars = lowerer.max_s.max(lowerer.scalar_params_count).max(1);
+        let num_objs = lowerer.max_o.max(lowerer.obj_params_count);
+        let scalar_params = lowerer.scalar_params_count;
+        let obj_params = lowerer.obj_params_count;
+        let mut ops = lowerer.ops.into_boxed_slice();
+        thread_scalar_enum_jumps(&mut ops, &self.module.records);
 
         Ok(FunctionProto {
             name: name.to_string(),
-            num_scalars: lowerer.max_s.max(lowerer.scalar_params_count).max(1),
-            num_objs: lowerer.max_o.max(lowerer.obj_params_count),
-            scalar_params: lowerer.scalar_params_count,
-            obj_params: lowerer.obj_params_count,
+            num_scalars,
+            num_objs,
+            scalar_params,
+            obj_params,
             returns_obj: return_ty.is_obj(),
-            ops: lowerer.ops.into_boxed_slice(),
+            ops,
         })
     }
 
@@ -251,7 +567,7 @@ impl<'a> ModuleCompiler<'a> {
         let name = format!("__closure_{}", cid);
         let s_upv: Vec<(String, Type)> = cap_scalars.iter().map(|(n, t, _)| (n.clone(), t.clone())).collect();
         let o_upv: Vec<(String, Type)> = cap_objs.iter().map(|(n, t, _)| (n.clone(), t.clone())).collect();
-        let proto = self.lower_function(&name, params, param_tys, return_ty, body, &s_upv, &o_upv)?;
+        let proto = self.lower_function(&name, None, params, param_tys, return_ty, body, &s_upv, &o_upv)?;
         let fid = self.module.functions.len() as u32;
         self.module.functions.push(proto);
 
@@ -294,6 +610,18 @@ impl<'a> ModuleCompiler<'a> {
             .map_err(|_| "Too many object constants".to_string())?;
         self.module.obj_consts.push(Obj::Empty);
         self.empty_const = Some(idx);
+        Ok(idx)
+    }
+
+    pub(crate) fn intern_unit_record(&mut self, schema_id: u32) -> Result<u16, String> {
+        if let Some(&idx) = self.unit_record_consts.get(&schema_id) {
+            return Ok(idx);
+        }
+        let idx = u16::try_from(self.module.obj_consts.len())
+            .map_err(|_| "Too many object constants".to_string())?;
+        let record = crate::vm::value::StructData::new(schema_id, 0, 0);
+        self.module.obj_consts.push(Obj::Record(std::sync::Arc::new(record)));
+        self.unit_record_consts.insert(schema_id, idx);
         Ok(idx)
     }
 
@@ -342,6 +670,7 @@ impl<'a> ModuleCompiler<'a> {
 
 pub(crate) struct FnLowerer<'a, 'b> {
     pub mc: &'b mut ModuleCompiler<'a>,
+    pub function_id: Option<u32>,
     pub return_ty: Type,
     pub ops: Vec<Op>,
     pub scalar_params_count: u16,
@@ -354,6 +683,7 @@ pub(crate) struct FnLowerer<'a, 'b> {
     pub temp_o: u16,
     pub max_s: u16,
     pub max_o: u16,
+    pub compact_enums: HashMap<u16, CompactEnum>,
     pub stmt_slots: HashMap<usize, VarSlot>,
     pub pat_slots: HashMap<(usize, String), VarSlot>,
     pub loop_slots: HashMap<usize, LoopPrealloc>,
@@ -381,6 +711,7 @@ pub(crate) type DeferSite = (Block, Vec<HashMap<String, (VarSlot, Type)>>);
 impl<'a, 'b> FnLowerer<'a, 'b> {
     fn new(
         mc: &'b mut ModuleCompiler<'a>,
+        function_id: Option<u32>,
         params: &[Param],
         param_tys: &[Type],
         return_ty: Type,
@@ -418,6 +749,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
 
         Self {
             mc,
+            function_id,
             return_ty,
             ops: Vec::new(),
             scalar_params_count,
@@ -430,6 +762,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             temp_o: o_idx,
             max_s: s_idx,
             max_o: o_idx,
+            compact_enums: HashMap::new(),
             stmt_slots: HashMap::new(),
             pat_slots: HashMap::new(),
             loop_slots: HashMap::new(),
@@ -599,23 +932,14 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
     }
 
     fn has_jump_to_end(&self) -> bool {
-        let end = self.ops.len() as u32;
-        self.ops.iter().any(|op| match *op {
-            Op::Jump { target }
-            | Op::JumpIfFalse { target, .. }
-            | Op::JumpIfTrue { target, .. }
-            | Op::ForRangeStep { target, .. }
-            | Op::ForListInt { exit_target: target, .. }
-            | Op::ForListIntStep { target, .. }
-            | Op::ForListObj { exit_target: target, .. } => target == end,
-            _ => false,
-        })
+        let end = Some(self.ops.len() as u32);
+        self.ops.iter().any(|op| jump_target(*op) == end)
     }
 
     fn ensure_trailing_return(&mut self, return_ty: &Type) {
         let ends_ret = matches!(
             self.ops.last(),
-            Some(Op::ReturnScalar { .. } | Op::ReturnObj { .. } | Op::ReturnVoid)
+            Some(Op::ReturnScalar { .. } | Op::ReturnAddInt { .. } | Op::ReturnObj { .. } | Op::ReturnVoid)
         );
         if !ends_ret || self.has_jump_to_end() {
             if matches!(return_ty, Type::Void) {
@@ -723,17 +1047,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
         match &stmt.kind {
             StmtKind::Define { name, value } => {
                 let slot = self.stmt_slots[&skey];
-                if slot.is_scalar {
-                    let r = self.lower_scalar(value)?;
-                    if r != slot.reg {
-                        self.ops.push(Op::MoveScalar { dst: slot.reg, src: r });
-                    }
-                } else {
-                    let r = self.lower_obj(value)?;
-                    if r != slot.reg {
-                        self.ops.push(Op::MoveObj { dst_obj: slot.reg, src: r });
-                    }
-                }
+                self.lower_into_slot(value, slot)?;
                 self.bind_var(name.clone(), slot, value.ty.clone());
             }
             StmtKind::VarDecl { name, ty, init } => {
@@ -746,17 +1060,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                     Type::Any
                 };
                 if let Some(init_expr) = init {
-                    if slot.is_scalar {
-                        let r = self.lower_scalar(init_expr)?;
-                        if r != slot.reg {
-                            self.ops.push(Op::MoveScalar { dst: slot.reg, src: r });
-                        }
-                    } else {
-                        let r = self.lower_obj(init_expr)?;
-                        if r != slot.reg {
-                            self.ops.push(Op::MoveObj { dst_obj: slot.reg, src: r });
-                        }
-                    }
+                    self.lower_into_slot(init_expr, slot)?;
                 }
                 self.bind_var(name.clone(), slot, var_ty);
             }
@@ -779,17 +1083,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 if slot.is_scalar && self.try_lower_inplace_scalar_assign(name, slot.reg, value)? {
                     return Ok(());
                 }
-                if slot.is_scalar {
-                    let r = self.lower_scalar(value)?;
-                    if r != slot.reg {
-                        self.ops.push(Op::MoveScalar { dst: slot.reg, src: r });
-                    }
-                } else {
-                    let r = self.lower_obj(value)?;
-                    if r != slot.reg {
-                        self.ops.push(Op::MoveObj { dst_obj: slot.reg, src: r });
-                    }
-                }
+                self.lower_into_slot(value, slot)?;
             }
             StmtKind::Return(opt) => {
                 if self.has_defer {
@@ -840,8 +1134,17 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 }
                 if let Some(expr) = opt {
                     if self.return_ty.is_scalar() && expr.ty.is_scalar() {
+                        let first = self.ops.len();
                         let r = self.lower_scalar(expr)?;
-                        self.ops.push(Op::ReturnScalar { src: r });
+                        if let Some(Op::AddInt { dst, a, b }) = self.ops.last().copied()
+                            && dst == r
+                            && self.ops[first..].iter().any(|op| matches!(op, Op::CallSelfIntImm { .. }))
+                        {
+                            self.ops.pop();
+                            self.ops.push(Op::ReturnAddInt { a, b });
+                        } else {
+                            self.ops.push(Op::ReturnScalar { src: r });
+                        }
                     } else if self.return_ty.is_obj() {
                         if expr.ty == Type::Void {
                             self.lower_expr_discard(expr)?;
@@ -873,10 +1176,22 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 }
             }
             StmtKind::If { condition, then_block, else_block } => {
-                let cond_r = self.lower_scalar(condition)?;
-                let jf_pc = self.ops.len();
-                self.ops.push(Op::JumpIfFalse { cond: cond_r, target: 0 });
+                if self.try_lower_int_if_chain(condition, then_block, else_block.as_ref())? {
+                    return Ok(());
+                }
+                let jf_pc = self.lower_conditional_jump(condition, false)?;
                 self.lower_block_stmts(&then_block.stmts)?;
+                if self.ops.len() == jf_pc + 2
+                    && let Op::JumpIfLtIntImm { a, imm, .. } = self.ops[jf_pc]
+                    && let Op::ReturnScalar { src } = self.ops[jf_pc + 1]
+                {
+                    self.ops[jf_pc] = Op::ReturnScalarIfLtIntImm { a, imm, src };
+                    self.ops.pop();
+                    if let Some(eb) = else_block {
+                        self.lower_block_stmts(&eb.stmts)?;
+                    }
+                    return Ok(());
+                }
                 if let Some(eb) = else_block {
                     let j_end_pc = self.ops.len();
                     self.ops.push(Op::Jump { target: 0 });
@@ -888,9 +1203,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 }
             }
             StmtKind::Guard { condition, else_block } => {
-                let cond_r = self.lower_scalar(condition)?;
-                let jt_pc = self.ops.len();
-                self.ops.push(Op::JumpIfTrue { cond: cond_r, target: 0 });
+                let jt_pc = self.lower_conditional_jump(condition, true)?;
                 self.lower_block_stmts(&else_block.stmts)?;
                 self.patch_here(jt_pc);
             }
@@ -916,6 +1229,20 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 self.ops.push(Op::ListAppendInt {
                     list_obj: self.defer_list_o,
                     val_s: id_s,
+                });
+            }
+            StmtKind::Spawn(block) => {
+                let closure_ty = Type::Function {
+                    params: Vec::new(),
+                    return_type: Box::new(Type::Void),
+                };
+                let closure_obj = self.lower_closure(&[], &None, block, &closure_ty)?;
+                self.ops.push(Op::ExtOp {
+                    kind: crate::vm::opcode::EXT_SPAWN,
+                    aux: 0,
+                    a: closure_obj,
+                    b: 0,
+                    c: 0,
                 });
             }
             StmtKind::Break => {

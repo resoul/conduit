@@ -38,6 +38,7 @@
 - [cdt.cron](library/cron.md)
 - [cdt.jwt](library/jwt.md)
 - [cdt.lock](library/lock.md)
+- [cdt.chan](library/chan.md)
 - [cdt.cache](library/cache.md)
 - [cdt.redis](library/redis.md)
 
