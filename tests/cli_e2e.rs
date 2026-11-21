@@ -81,7 +81,7 @@ export func main() -> Void | crypto.CryptoError {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("true:CREATE TABLE IF NOT EXISTS accounts (id BIGSERIAL PRIMARY KEY, email TEXT NOT NULL UNIQUE)"));
+    assert!(stdout.contains(r#"true:CREATE TABLE IF NOT EXISTS "accounts" ("id" BIGSERIAL PRIMARY KEY, "email" TEXT NOT NULL UNIQUE)"#));
 }
 
 #[test]
