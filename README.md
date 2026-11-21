@@ -92,6 +92,23 @@ conduit bench --strict
 conduit db status main.cdt --url postgres://conduit:secret@127.0.0.1:5432/app
 ```
 
+### Permissions & Sandbox
+
+For local convenience, bare `conduit run main.cdt` (and `watch`, `test`, `cron run`) allows all host capabilities by default. **When running scripts from untrusted sources, enable the capability sandbox with `--sandbox`** (or pass scoped `--allow-*` flags, which automatically deny everything not explicitly granted):
+
+```bash
+# Deny all host access (filesystem, network, subprocesses, environment)
+conduit run --sandbox main.cdt
+
+# Allow only HTTP client/server on loopback and reading ./public
+conduit run --allow-net=127.0.0.1:8080 --allow-read=./public server.cdt
+
+# Allow everything except specific sensitive env vars or metadata hosts
+conduit run --allow-all --deny-env=AWS_SECRET_ACCESS_KEY --deny-net=169.254.169.254 app.cdt
+```
+
+Supported capability flags: `--sandbox` (`--deny-all`, `--no-permissions`), `--allow-all` (`-A`), and scoped `--allow-read[=paths]`, `--deny-read[=paths]`, `--allow-write[=paths]`, `--deny-write[=paths]`, `--allow-net[=hosts]`, `--deny-net[=hosts]`, `--allow-run[=cmds]`, `--deny-run[=cmds]`, `--allow-env[=vars]`, `--deny-env[=vars]`. Explicit `--deny-*` rules always override `--allow-*`.
+
 ## Documentation
 
 For syntax guides, language rules, and standard library references, see the documentation:

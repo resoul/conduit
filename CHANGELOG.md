@@ -7,8 +7,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-11-22
+
 ### Added
 
+* **Capability-Based Runtime Sandbox (`--sandbox`, `--allow-*`, `--deny-*`)**:
+  * Added opt-in runtime permissions policy (`src/vm/permissions.rs`) enforced across filesystem I/O, environment variables, subprocesses, outbound HTTP/HTTPS/redirects, inbound server listeners & static directories, DB, Redis, file locks, file caches, and inherited by child VMs (`spawn`, HTTP workers, `cron`, `app`).
+  * Resolves relative paths and symlink chains/loops against startup cwd with deny precedence and macOS/Windows case + Unicode NFD folding for `--deny-read`, `--deny-write`, and `--deny-run`.
+* **Non-Blocking `kqueue`/`epoll` HTTP/1.1 Reactor & Password Hashing Backpressure**:
+  * Added zero-dependency `kqueue`/`epoll` HTTP reactor (`src/native/http_reactor.rs`) with indexed `DeadlineQueue` heap, static-file streaming & metadata `HEAD`, indexed HTTP route lookup, `http.Client.deny_private_addrs`, and `Router` / `CONDUIT_HTTP_*` configuration controls (`workers`, `timeouts`, `max_conns`, `max_conns_per_ip`, `trusted_proxies`).
+  * Added RFC 9106 Argon2id (`19 MiB / t=2 / p=1`) password hashing + `password_needs_rehash`, plus a bounded concurrency gate (`CONDUIT_PASSWORD_HASH_CONCURRENCY`, `CONDUIT_PASSWORD_HASH_MAX_QUEUE`, `CONDUIT_PASSWORD_HASH_QUEUE_TIMEOUT_MS`) returning `CryptoError { kind: "overloaded" }` and automatic HTTP `503 Service Unavailable` + `Retry-After` shedding.
+* **TLS 1.3 Session Resumption, Asymmetric JWT & `path.safe_join`**:
+  * Added TLS 1.3 session resumption ticket cache (`src/native/tls/session.rs`) scoped by host, port, ALPN, verification mode, and root CA hash.
+  * Added asymmetric JWT verification (`RS`/`PS`/`ES` algorithms, `iss`/`aud` claims) and `path.safe_join`.
 * **Unified Declarative `app` Lifecycle (`cdt.app`, `app`)**:
   * Added top-level `app Name { config, http <Router> on "<addr>", schedule, shutdown <duration>, on start, on stop }` declarations (`src/frontend/parser_cli.rs`, `src/frontend/check_sys.rs`, `src/frontend/reachability.rs`, `src/ir/{mod,bundle,lower_native}.rs`) coordinating validated configuration loading, HTTP serving, background `cron` scheduling, OS signal handling (`SIGINT`/`SIGTERM`), active `spawn` / `worker` task draining (`shutdown`, default `5s`), and ordered startup / reverse-order (`LIFO`) shutdown hooks.
   * Added `cdt.app` runtime coordinator (`src/vm/exec_app.rs`) exposing `app.run<T>() -> Void | AppError`, `app.start<T>() -> App | AppError`, `App` (`.stop()`, `.is_running()`), and `AppError { kind, message }` (`"config_error"`, `"startup_error"`, `"bind_error"`, `"schedule_error"`, `"shutdown_error"`), plus LSP docs, TextMate/VitePress syntax highlighting, `docs/src/library/app.md`, and `examples/app_service/`.
@@ -21,11 +32,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Security
 
+* Hardened HTTP accept loop backoff (`503 + Retry-After`), IPv6 `/64` connection limiter + `CONDUIT_HTTP_TRUSTED_PROXIES`, and strict bare CR/LF & `MAX_HEADER_BYTES` (64 KiB) header framing.
+* Enforced JWT `weak_secret` (<32 bytes), duplicate JSON key rejection, and token size limits; added one-time non-loopback DB/Redis plaintext TLS deprecation warnings (`rediss://` defaults to `VerifyFull`).
+* Enabled `overflow-checks = true` in release profile and randomized `FxHasher` seed; fixed VM `unsafe` Stacked Borrows & panic-safety issues, added Miri CI job, zero-dep Wycheproof crypto vectors, and deterministic parser, HTTP reactor timeout/abort/fd-leak, and TLS ticket fuzz/stress tests.
 * Discard caller-supplied HTTP headers for the rest of a redirect chain when the scheme, host, or port changes. This includes `http.Client` defaults, authentication headers, cookies, and custom headers.
 * Reject bytecode before execution when an explicit value return or an early return through `?` uses a different register bank from the function's declared result.
 
 ### Fixed
 
+* Fixed Windows HTTP read timeouts (`WSAECONNRESET`) using `WSAPoll` and graceful write shutdown, fixed `cron` shutdown race, and resolved `aarch64` `clippy::needless_bool` in `b64_simd::available`.
 * Limit retries after sending or parsing errors on pooled HTTP requests to known idempotent methods. `POST`, `PATCH`, and custom methods return the original error to the caller.
 
 ### Changed

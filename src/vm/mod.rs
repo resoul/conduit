@@ -34,6 +34,27 @@ pub const MAX_CALL_DEPTH: usize = 256;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeError {
     pub message: String,
+    pub(crate) retry_after_secs: Option<u32>,
+}
+
+impl RuntimeError {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retry_after_secs: None,
+        }
+    }
+
+    pub(crate) fn overloaded(message: impl Into<String>, retry_after_secs: u32) -> Self {
+        Self {
+            message: message.into(),
+            retry_after_secs: Some(retry_after_secs.max(1)),
+        }
+    }
+
+    pub fn retry_after_secs(&self) -> Option<u32> {
+        self.retry_after_secs
+    }
 }
 
 impl std::fmt::Display for RuntimeError {
@@ -154,6 +175,7 @@ pub(crate) struct VmHostState {
     pub(crate) lifecycle_started: bool,
     pub(crate) lifecycle_stopped: bool,
     pub(crate) permissions: Arc<Permissions>,
+    pub(crate) password_hash_gate: Option<Arc<crate::native::crypto::PasswordHashGate>>,
 }
 
 impl Default for VmHostState {
@@ -175,6 +197,7 @@ impl Default for VmHostState {
             lifecycle_started: false,
             lifecycle_stopped: false,
             permissions: Arc::new(Permissions::allow_all()),
+            password_hash_gate: None,
         }
     }
 }
@@ -321,6 +344,21 @@ impl Vm {
     /// Returns a reference to the active runtime capability policy.
     pub fn permissions(&self) -> &Permissions {
         &self.host.permissions
+    }
+
+    pub(crate) fn password_hash_gate(&self) -> &Arc<crate::native::crypto::PasswordHashGate> {
+        match self.host.password_hash_gate.as_ref() {
+            Some(gate) => gate,
+            None => crate::native::crypto::default_password_hash_gate(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_password_hash_gate(
+        &mut self,
+        gate: Arc<crate::native::crypto::PasswordHashGate>,
+    ) {
+        self.host.password_hash_gate = Some(gate);
     }
 
     #[inline(always)]
@@ -483,9 +521,7 @@ impl Vm {
         match self.call(module, func_id, scalar_args, obj_args)? {
             ExecResult::Scalar(v) => Ok(v),
             ExecResult::Void => Ok(0),
-            ExecResult::Obj(_) => Err(RuntimeError {
-                message: "Expected scalar return value".to_string(),
-            }),
+            ExecResult::Obj(_) => Err(RuntimeError::new("Expected scalar return value")),
         }
     }
 
@@ -498,9 +534,7 @@ impl Vm {
     ) -> Result<Obj, RuntimeError> {
         match self.call(module, func_id, scalar_args, obj_args)? {
             ExecResult::Obj(v) => Ok(v),
-            _ => Err(RuntimeError {
-                message: "Expected object return value".to_string(),
-            }),
+            _ => Err(RuntimeError::new("Expected object return value")),
         }
     }
 
@@ -567,25 +601,22 @@ impl Vm {
         scalar_args: &[u64],
         obj_args: &[Obj],
     ) -> Result<ExecResult, RuntimeError> {
-        module
-            .validate()
-            .map_err(|message| RuntimeError { message })?;
-        let func = module.functions.get(func_id as usize).ok_or_else(|| RuntimeError {
-            message: format!("Function {} not found", func_id),
-        })?;
+        module.validate().map_err(RuntimeError::new)?;
+        let func = module
+            .functions
+            .get(func_id as usize)
+            .ok_or_else(|| RuntimeError::new(format!("Function {} not found", func_id)))?;
         if scalar_args.len() != func.scalar_params as usize
             || obj_args.len() != func.obj_params as usize
         {
-            return Err(RuntimeError {
-                message: format!(
-                    "Arity mismatch calling '{}': expected ({}, {}), got ({}, {})",
-                    func.name,
-                    func.scalar_params,
-                    func.obj_params,
-                    scalar_args.len(),
-                    obj_args.len()
-                ),
-            });
+            return Err(RuntimeError::new(format!(
+                "Arity mismatch calling '{}': expected ({}, {}), got ({}, {})",
+                func.name,
+                func.scalar_params,
+                func.obj_params,
+                scalar_args.len(),
+                obj_args.len()
+            )));
         }
         let is_lifecycle_hook = module.on_start_funcs.contains(&func_id)
             || module.on_stop_funcs.contains(&func_id);
@@ -593,7 +624,7 @@ impl Vm {
         self.host.lifecycle_stopped = false;
         if !is_lifecycle_hook && !module.on_start_funcs.is_empty() {
             self.run_module_on_start(module, 0, 0)
-                .map_err(|message| RuntimeError { message })?;
+                .map_err(RuntimeError::new)?;
         }
         self.frame_depth = 0;
         self.ensure_capacity(func.num_scalars as usize, func.num_objs as usize);
@@ -615,7 +646,7 @@ impl Vm {
         {
             let stop_res = self.run_module_on_stop(module, 0, 0);
             if res.is_ok() {
-                stop_res.map_err(|message| RuntimeError { message })?;
+                stop_res.map_err(RuntimeError::new)?;
             }
         }
         exec_map::flush_stdout();

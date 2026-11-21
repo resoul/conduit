@@ -16,7 +16,17 @@ func sign_payload(secret: String, body: String) -> String | crypto.CryptoError {
 
 ## Types
 
-* `CryptoError { kind: String, message: String }` (`"invalid_base64"`, `"invalid_hex"`, `"invalid_utf8"`, `"invalid_input"`, `"rng_failed"`, `"hash_failed"`)
+* `CryptoError { kind: String, message: String }` (`"invalid_base64"`, `"invalid_hex"`, `"invalid_utf8"`, `"invalid_input"`, `"rng_failed"`, `"hash_failed"`, `"overloaded"`)
+
+## Password Hashing Concurrency
+
+`hash_password` and `verify_password` share a bounded Argon2id semaphore with a bounded wait queue and timeout so concurrent password operations cannot exhaust server CPU or starve unrelated HTTP routes:
+
+- `CONDUIT_PASSWORD_HASH_CONCURRENCY` (`1..=64`; default `clamp(cpus / 2, 2, 4)`)
+- `CONDUIT_PASSWORD_HASH_MAX_QUEUE` (`0..=1024`; default `max(concurrency, 2)`)
+- `CONDUIT_PASSWORD_HASH_QUEUE_TIMEOUT_MS` (`10..=60000`; default `2000`)
+
+When both active slots and the wait queue are full (or waiting times out), `hash_password` returns `CryptoError { kind: "overloaded", ... }` and `verify_password` sheds load so HTTP servers automatically respond with `503 Service Unavailable` and `Retry-After`.
 
 ## API
 

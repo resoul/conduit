@@ -342,6 +342,7 @@ impl Vm {
                             Arc::clone(&self.host.spawn_tracker),
                             self.script_args.clone(),
                             Arc::clone(&perms),
+                            self.host.password_hash_gate.clone(),
                             r_id,
                             l,
                             stop_flag,
@@ -381,6 +382,7 @@ impl Vm {
                         let spawn_tracker = Arc::clone(&self.host.spawn_tracker);
                         let script_args = self.script_args.clone();
                         let perms_bg = Arc::clone(&perms);
+                        let password_gate_bg = self.host.password_hash_gate.clone();
                         let mod_bg = Arc::clone(&shared_mod);
                         let handle = std::thread::spawn(move || {
                             serve_http_listener(
@@ -392,6 +394,7 @@ impl Vm {
                                 spawn_tracker,
                                 script_args,
                                 perms_bg,
+                                password_gate_bg,
                                 r_id,
                                 l,
                                 stop_bg,

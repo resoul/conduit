@@ -789,6 +789,7 @@ mod tests {
                 let _ = crate::native::tls::handshake::parse_encrypted_extensions(data);
                 let _ = crate::native::tls::handshake::parse_tls13_certificate(data);
                 let _ = crate::native::tls::handshake::parse_certificate_verify(data);
+                let _ = crate::native::tls::handshake::parse_new_session_ticket(data);
                 let _ = crate::native::tls::x509::parse_x509(data);
                 let mut dr = crate::native::tls::asn1::DerReader::new(data);
                 let _ = dr.read_tlv();

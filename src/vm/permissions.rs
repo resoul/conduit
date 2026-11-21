@@ -79,6 +79,17 @@ impl<T> RuleSet<T> {
         self.allow.matches(pred)
     }
 
+    fn is_allowed_with(
+        &self,
+        allow_pred: impl Fn(&T) -> bool,
+        deny_pred: impl Fn(&T) -> bool,
+    ) -> bool {
+        if self.deny.matches(deny_pred) {
+            return false;
+        }
+        self.allow.matches(allow_pred)
+    }
+
     fn has_any(&self) -> bool {
         !self.deny.is_all() && !self.allow.is_empty_effective()
     }
@@ -107,8 +118,20 @@ impl PathRule {
         })
     }
 
-    fn matches(&self, target: &Path) -> bool {
-        path_has_prefix(target, &self.path)
+    fn matches_allow(&self, target: &Path) -> bool {
+        // On Windows (NTFS), paths are case-insensitive; on Unix/macOS keep allow matching exact
+        // (existing paths already canonicalize to on-disk spelling) so case-sensitive volumes remain strict.
+        path_has_prefix(target, &self.path, cfg!(windows))
+    }
+
+    fn matches_deny(&self, target: &Path) -> bool {
+        // On Windows and macOS (case-insensitive / NFD-normalized by default), deny rules must match
+        // across ASCII/Unicode case and NFC/NFD forms even on non-existent trailing components.
+        path_has_prefix(
+            target,
+            &self.path,
+            cfg!(any(windows, target_os = "macos")),
+        )
     }
 }
 
@@ -188,7 +211,15 @@ impl RunRule {
         }
     }
 
-    fn matches(&self, cmd: &str) -> bool {
+    fn matches_allow(&self, cmd: &str) -> bool {
+        self.matches_with_fold(cmd, cfg!(windows))
+    }
+
+    fn matches_deny(&self, cmd: &str) -> bool {
+        self.matches_with_fold(cmd, cfg!(any(windows, target_os = "macos")))
+    }
+
+    fn matches_with_fold(&self, cmd: &str, fold_unicode_case: bool) -> bool {
         let cmd_trimmed = cmd.trim();
         if cmd_trimmed.is_empty() {
             return false;
@@ -200,16 +231,25 @@ impl RunRule {
             let Ok(norm) = normalize_path_for_policy(Path::new(cmd_trimmed)) else {
                 return false;
             };
-            paths_equal(&norm, expected)
+            paths_equal(&norm, expected, fold_unicode_case)
         } else {
             let Self::Bare(expected) = self else {
                 return false;
             };
-            if cfg!(windows) {
+            let candidate = if cfg!(windows) {
                 strip_windows_exe(cmd_trimmed)
-                    .eq_ignore_ascii_case(strip_windows_exe(expected))
             } else {
-                cmd_trimmed == expected
+                cmd_trimmed
+            };
+            let rule = if cfg!(windows) {
+                strip_windows_exe(expected)
+            } else {
+                expected.as_str()
+            };
+            if fold_unicode_case {
+                unicode_nfd_casefold(candidate) == unicode_nfd_casefold(rule)
+            } else {
+                candidate == rule
             }
         }
     }
@@ -293,7 +333,8 @@ impl Permissions {
         let Ok(norm) = normalize_path_for_policy(path.as_ref()) else {
             return false;
         };
-        self.read.is_allowed(|r| r.matches(&norm))
+        self.read
+            .is_allowed_with(|r| r.matches_allow(&norm), |r| r.matches_deny(&norm))
     }
 
     /// Enforces filesystem read permission on `path`.
@@ -303,7 +344,10 @@ impl Permissions {
         }
         let p = path.as_ref();
         let norm = normalize_path_for_policy(p)?;
-        if self.read.is_allowed(|r| r.matches(&norm)) {
+        if self
+            .read
+            .is_allowed_with(|r| r.matches_allow(&norm), |r| r.matches_deny(&norm))
+        {
             return Ok(());
         }
         Err(format!(
@@ -327,7 +371,10 @@ impl Permissions {
         let cwd = std::env::current_dir()
             .map_err(|e| format!("Failed to resolve current directory: {e}"))?;
         let norm = normalize_path_for_policy(&cwd)?;
-        if self.read.is_allowed(|r| r.matches(&norm)) {
+        if self
+            .read
+            .is_allowed_with(|r| r.matches_allow(&norm), |r| r.matches_deny(&norm))
+        {
             return Ok(());
         }
         Err(format!(
@@ -343,7 +390,10 @@ impl Permissions {
         }
         let p = path.as_ref();
         let norm = normalize_path_for_policy(p)?;
-        if self.write.is_allowed(|r| r.matches(&norm)) {
+        if self
+            .write
+            .is_allowed_with(|r| r.matches_allow(&norm), |r| r.matches_deny(&norm))
+        {
             return Ok(());
         }
         Err(format!(
@@ -395,7 +445,11 @@ impl Permissions {
 
     /// Enforces subprocess execution permission for `cmd`.
     pub fn check_run(&self, cmd: &str) -> Result<(), String> {
-        if self.run.is_unrestricted() || self.run.is_allowed(|r| r.matches(cmd)) {
+        if self.run.is_unrestricted()
+            || self
+                .run
+                .is_allowed_with(|r| r.matches_allow(cmd), |r| r.matches_deny(cmd))
+        {
             return Ok(());
         }
         Err(format!(
@@ -822,14 +876,223 @@ fn normalize_components(
     Ok(())
 }
 
-fn component_eq(a: Component<'_>, b: Component<'_>) -> bool {
-    if !cfg!(windows) {
+fn canonical_combining_class(ch: char) -> u16 {
+    match ch as u32 {
+        0x0327 | 0x0328 => 202, // cedilla, ogonek
+        0x0316..=0x0319
+        | 0x031C..=0x0326
+        | 0x0329..=0x0333
+        | 0x0339..=0x033C
+        | 0x0347..=0x0349
+        | 0x034D..=0x034E
+        | 0x0353..=0x0356
+        | 0x0359..=0x035A => 220, // marks below
+        0x0315 | 0x031A | 0x0358 => 232, // marks above right
+        0x0300..=0x0314
+        | 0x033D..=0x0344
+        | 0x0346
+        | 0x034A..=0x034C
+        | 0x0350..=0x0352
+        | 0x0357
+        | 0x035B
+        | 0x0363..=0x036F => 230, // marks above
+        0x0345 => 240, // Greek ypogegrammeni
+        _ => 0,
+    }
+}
+
+fn push_nfd_char(ch: char, out: &mut Vec<(char, u16)>) {
+    let code = ch as u32;
+    if (0xAC00..=0xD7A3).contains(&code) {
+        let s_idx = code - 0xAC00;
+        let l = 0x1100 + s_idx / 588;
+        let v = 0x1161 + (s_idx % 588) / 28;
+        let t = s_idx % 28;
+        if let Some(lc) = char::from_u32(l) {
+            out.push((lc, 0));
+        }
+        if let Some(vc) = char::from_u32(v) {
+            out.push((vc, 0));
+        }
+        if t > 0
+            && let Some(tc) = char::from_u32(0x11A7 + t)
+        {
+            out.push((tc, 0));
+        }
+        return;
+    }
+
+    let decomp: Option<&[char]> = match ch {
+        // Latin-1 Supplement (lowercase precomposed)
+        '\u{00E0}' => Some(&['a', '\u{0300}']),
+        '\u{00E1}' => Some(&['a', '\u{0301}']),
+        '\u{00E2}' => Some(&['a', '\u{0302}']),
+        '\u{00E3}' => Some(&['a', '\u{0303}']),
+        '\u{00E4}' => Some(&['a', '\u{0308}']),
+        '\u{00E5}' => Some(&['a', '\u{030A}']),
+        '\u{00E7}' => Some(&['c', '\u{0327}']),
+        '\u{00E8}' => Some(&['e', '\u{0300}']),
+        '\u{00E9}' => Some(&['e', '\u{0301}']),
+        '\u{00EA}' => Some(&['e', '\u{0302}']),
+        '\u{00EB}' => Some(&['e', '\u{0308}']),
+        '\u{00EC}' => Some(&['i', '\u{0300}']),
+        '\u{00ED}' => Some(&['i', '\u{0301}']),
+        '\u{00EE}' => Some(&['i', '\u{0302}']),
+        '\u{00EF}' => Some(&['i', '\u{0308}']),
+        '\u{00F1}' => Some(&['n', '\u{0303}']),
+        '\u{00F2}' => Some(&['o', '\u{0300}']),
+        '\u{00F3}' => Some(&['o', '\u{0301}']),
+        '\u{00F4}' => Some(&['o', '\u{0302}']),
+        '\u{00F5}' => Some(&['o', '\u{0303}']),
+        '\u{00F6}' => Some(&['o', '\u{0308}']),
+        '\u{00F9}' => Some(&['u', '\u{0300}']),
+        '\u{00FA}' => Some(&['u', '\u{0301}']),
+        '\u{00FB}' => Some(&['u', '\u{0302}']),
+        '\u{00FC}' => Some(&['u', '\u{0308}']),
+        '\u{00FD}' => Some(&['y', '\u{0301}']),
+        '\u{00FF}' => Some(&['y', '\u{0308}']),
+        // Latin Extended-A/B & Additional
+        '\u{0101}' => Some(&['a', '\u{0304}']),
+        '\u{0103}' => Some(&['a', '\u{0306}']),
+        '\u{0105}' => Some(&['a', '\u{0328}']),
+        '\u{0107}' => Some(&['c', '\u{0301}']),
+        '\u{0109}' => Some(&['c', '\u{0302}']),
+        '\u{010B}' => Some(&['c', '\u{0307}']),
+        '\u{010D}' => Some(&['c', '\u{030C}']),
+        '\u{010F}' => Some(&['d', '\u{030C}']),
+        '\u{0113}' => Some(&['e', '\u{0304}']),
+        '\u{0115}' => Some(&['e', '\u{0306}']),
+        '\u{0117}' => Some(&['e', '\u{0307}']),
+        '\u{0119}' => Some(&['e', '\u{0328}']),
+        '\u{011B}' => Some(&['e', '\u{030C}']),
+        '\u{011D}' => Some(&['g', '\u{0302}']),
+        '\u{011F}' => Some(&['g', '\u{0306}']),
+        '\u{0121}' => Some(&['g', '\u{0307}']),
+        '\u{0123}' => Some(&['g', '\u{0327}']),
+        '\u{0125}' => Some(&['h', '\u{0302}']),
+        '\u{0129}' => Some(&['i', '\u{0303}']),
+        '\u{012B}' => Some(&['i', '\u{0304}']),
+        '\u{012D}' => Some(&['i', '\u{0306}']),
+        '\u{012F}' => Some(&['i', '\u{0328}']),
+        '\u{0135}' => Some(&['j', '\u{0302}']),
+        '\u{0137}' => Some(&['k', '\u{0327}']),
+        '\u{013A}' => Some(&['l', '\u{0301}']),
+        '\u{013C}' => Some(&['l', '\u{0327}']),
+        '\u{013E}' => Some(&['l', '\u{030C}']),
+        '\u{0144}' => Some(&['n', '\u{0301}']),
+        '\u{0146}' => Some(&['n', '\u{0327}']),
+        '\u{0148}' => Some(&['n', '\u{030C}']),
+        '\u{014D}' => Some(&['o', '\u{0304}']),
+        '\u{014F}' => Some(&['o', '\u{0306}']),
+        '\u{0151}' => Some(&['o', '\u{030B}']),
+        '\u{0155}' => Some(&['r', '\u{0301}']),
+        '\u{0157}' => Some(&['r', '\u{0327}']),
+        '\u{0159}' => Some(&['r', '\u{030C}']),
+        '\u{015B}' => Some(&['s', '\u{0301}']),
+        '\u{015D}' => Some(&['s', '\u{0302}']),
+        '\u{015F}' => Some(&['s', '\u{0327}']),
+        '\u{0161}' => Some(&['s', '\u{030C}']),
+        '\u{0163}' => Some(&['t', '\u{0327}']),
+        '\u{0165}' => Some(&['t', '\u{030C}']),
+        '\u{0169}' => Some(&['u', '\u{0303}']),
+        '\u{016B}' => Some(&['u', '\u{0304}']),
+        '\u{016D}' => Some(&['u', '\u{0306}']),
+        '\u{016F}' => Some(&['u', '\u{030A}']),
+        '\u{0171}' => Some(&['u', '\u{030B}']),
+        '\u{0173}' => Some(&['u', '\u{0328}']),
+        '\u{0175}' => Some(&['w', '\u{0302}']),
+        '\u{0177}' => Some(&['y', '\u{0302}']),
+        '\u{017A}' => Some(&['z', '\u{0301}']),
+        '\u{017C}' => Some(&['z', '\u{0307}']),
+        '\u{017E}' => Some(&['z', '\u{030C}']),
+        '\u{0219}' => Some(&['s', '\u{0326}']),
+        '\u{021B}' => Some(&['t', '\u{0326}']),
+        '\u{1E09}' => Some(&['c', '\u{0327}', '\u{0301}']),
+        // Cyrillic
+        '\u{0439}' => Some(&['\u{0438}', '\u{0306}']),
+        '\u{0450}' => Some(&['\u{0435}', '\u{0300}']),
+        '\u{0451}' => Some(&['\u{0435}', '\u{0308}']),
+        '\u{0453}' => Some(&['\u{0433}', '\u{0301}']),
+        '\u{0457}' => Some(&['\u{0456}', '\u{0308}']),
+        '\u{045C}' => Some(&['\u{043A}', '\u{0301}']),
+        '\u{045D}' => Some(&['\u{0438}', '\u{0300}']),
+        '\u{045E}' => Some(&['\u{0443}', '\u{0306}']),
+        '\u{04D1}' => Some(&['\u{0430}', '\u{0306}']),
+        '\u{04D3}' => Some(&['\u{0430}', '\u{0308}']),
+        '\u{04D7}' => Some(&['\u{0435}', '\u{0306}']),
+        '\u{04DF}' => Some(&['\u{0437}', '\u{0308}']),
+        '\u{04E3}' => Some(&['\u{0438}', '\u{0304}']),
+        '\u{04E5}' => Some(&['\u{0438}', '\u{0308}']),
+        '\u{04E7}' => Some(&['\u{043E}', '\u{0308}']),
+        '\u{04EF}' => Some(&['\u{0443}', '\u{0304}']),
+        '\u{04F1}' => Some(&['\u{0443}', '\u{0308}']),
+        '\u{04F3}' => Some(&['\u{0443}', '\u{030B}']),
+        '\u{04F5}' => Some(&['\u{0447}', '\u{0308}']),
+        // Greek
+        '\u{0390}' => Some(&['\u{03B9}', '\u{0308}', '\u{0301}']),
+        '\u{03AC}' => Some(&['\u{03B1}', '\u{0301}']),
+        '\u{03AD}' => Some(&['\u{03B5}', '\u{0301}']),
+        '\u{03AE}' => Some(&['\u{03B7}', '\u{0301}']),
+        '\u{03AF}' => Some(&['\u{03B9}', '\u{0301}']),
+        '\u{03B0}' => Some(&['\u{03C5}', '\u{0308}', '\u{0301}']),
+        '\u{03CA}' => Some(&['\u{03B9}', '\u{0308}']),
+        '\u{03CB}' => Some(&['\u{03C5}', '\u{0308}']),
+        '\u{03CC}' => Some(&['\u{03BF}', '\u{0301}']),
+        '\u{03CD}' => Some(&['\u{03C5}', '\u{0301}']),
+        '\u{03CE}' => Some(&['\u{03C9}', '\u{0301}']),
+        _ => None,
+    };
+
+    if let Some(parts) = decomp {
+        for &c in parts {
+            out.push((c, canonical_combining_class(c)));
+        }
+    } else {
+        out.push((ch, canonical_combining_class(ch)));
+    }
+}
+
+/// Lowercases and decomposes common precomposed characters to NFD with canonical mark ordering
+/// so case-insensitive / NFC-NFD filesystems (Windows NTFS, macOS APFS/HFS+) cannot bypass deny rules.
+fn unicode_nfd_casefold(s: &str) -> String {
+    if s.is_ascii() {
+        return s.to_ascii_lowercase();
+    }
+    let mut seq: Vec<(char, u16)> = Vec::with_capacity(s.len() + 8);
+    for ch in s.chars() {
+        for lc in ch.to_lowercase() {
+            let folded = match lc {
+                '\u{03C2}' => '\u{03C3}', // Greek final sigma
+                other => other,
+            };
+            push_nfd_char(folded, &mut seq);
+        }
+    }
+    let mut i = 0usize;
+    while i < seq.len() {
+        if seq[i].1 == 0 {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < seq.len() && seq[i].1 != 0 {
+            i += 1;
+        }
+        seq[start..i].sort_by_key(|&(_, ccc)| ccc);
+    }
+    seq.into_iter().map(|(c, _)| c).collect()
+}
+
+fn component_eq(a: Component<'_>, b: Component<'_>, fold_unicode_case: bool) -> bool {
+    if !fold_unicode_case {
         return a == b;
     }
     match (a, b) {
-        (Component::Normal(sa), Component::Normal(sb)) => sa
-            .to_string_lossy()
-            .eq_ignore_ascii_case(&sb.to_string_lossy()),
+        (Component::Normal(sa), Component::Normal(sb)) => {
+            let ta = sa.to_string_lossy();
+            let tb = sb.to_string_lossy();
+            unicode_nfd_casefold(&ta) == unicode_nfd_casefold(&tb)
+        }
         (Component::Prefix(pa), Component::Prefix(pb)) => pa
             .as_os_str()
             .to_string_lossy()
@@ -838,26 +1101,26 @@ fn component_eq(a: Component<'_>, b: Component<'_>) -> bool {
     }
 }
 
-fn path_has_prefix(target: &Path, prefix: &Path) -> bool {
+fn path_has_prefix(target: &Path, prefix: &Path, fold_unicode_case: bool) -> bool {
     let mut t = target.components();
     for p_comp in prefix.components() {
         let Some(t_comp) = t.next() else {
             return false;
         };
-        if !component_eq(t_comp, p_comp) {
+        if !component_eq(t_comp, p_comp, fold_unicode_case) {
             return false;
         }
     }
     true
 }
 
-fn paths_equal(a: &Path, b: &Path) -> bool {
+fn paths_equal(a: &Path, b: &Path, fold_unicode_case: bool) -> bool {
     let mut ca = a.components();
     let mut cb = b.components();
     loop {
         match (ca.next(), cb.next()) {
             (None, None) => return true,
-            (Some(xa), Some(xb)) if component_eq(xa, xb) => {}
+            (Some(xa), Some(xb)) if component_eq(xa, xb, fold_unicode_case) => {}
             _ => return false,
         }
     }
@@ -1209,6 +1472,132 @@ mod tests {
         // Child worker panics/aborts with RuntimeError before ever sending `true` on `ch`.
         let out = spawn_vm.call(&spawn_mod, sfid, &[], &[]).unwrap();
         assert_eq!(out, ExecResult::Scalar(0));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unicode_nfd_casefold_normalizes_case_latin_cyrillic_greek_and_hangul() {
+        assert_eq!(unicode_nfd_casefold("caf\u{00E9}.txt"), "cafe\u{0301}.txt");
+        assert_eq!(unicode_nfd_casefold("CAF\u{00C9}.TXT"), "cafe\u{0301}.txt");
+        assert_eq!(unicode_nfd_casefold("CAFE\u{0301}.TXT"), "cafe\u{0301}.txt");
+
+        assert_eq!(
+            unicode_nfd_casefold("\u{0444}\u{0430}\u{0439}\u{043B}.txt"),
+            "\u{0444}\u{0430}\u{0438}\u{0306}\u{043B}.txt"
+        );
+        assert_eq!(
+            unicode_nfd_casefold("\u{0424}\u{0410}\u{0419}\u{041B}.TXT"),
+            "\u{0444}\u{0430}\u{0438}\u{0306}\u{043B}.txt"
+        );
+        assert_eq!(
+            unicode_nfd_casefold("\u{0401}\u{043B}\u{043A}\u{0430}"),
+            "\u{0435}\u{0308}\u{043B}\u{043A}\u{0430}"
+        );
+
+        assert_eq!(
+            unicode_nfd_casefold("\u{1E09}"),
+            unicode_nfd_casefold("C\u{0301}\u{0327}")
+        );
+        assert_eq!(
+            unicode_nfd_casefold("\u{D55C}\u{AE00}"),
+            "\u{1112}\u{1161}\u{11AB}\u{1100}\u{1173}\u{11AF}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_rules_block_dangling_symlinks_chains_loops_and_parent_escapes() {
+        let root = unique_temp_dir("symlink_bypass");
+        let allowed = root.join("allowed");
+        let allowed_sub = allowed.join("sub");
+        let secret = root.join("secret");
+        std::fs::create_dir_all(&allowed_sub).unwrap();
+        std::fs::create_dir_all(&secret).unwrap();
+        let secret_file = secret.join("key.txt");
+        std::fs::write(&secret_file, b"secret").unwrap();
+
+        // Dangling symlink inside `allowed` targeting a non-existent file inside `secret`.
+        let dangling = allowed.join("dangling_out");
+        std::os::unix::fs::symlink(secret.join("new_secret.txt"), &dangling).unwrap();
+
+        // Relative multi-hop symlink chain: allowed/hop1 -> sub/hop2 -> ../../secret/key.txt
+        let hop2 = allowed_sub.join("hop2");
+        let hop1 = allowed.join("hop1");
+        std::os::unix::fs::symlink(Path::new("../../secret/key.txt"), &hop2).unwrap();
+        std::os::unix::fs::symlink(Path::new("sub/hop2"), &hop1).unwrap();
+
+        // Symlink dir with trailing `..` traversal: allowed/dir_link/../secret/key.txt
+        let dir_link = allowed.join("dir_link");
+        std::os::unix::fs::symlink(&secret, &dir_link).unwrap();
+
+        // Mutual symlink loop: loop_a <-> loop_b
+        let loop_a = allowed.join("loop_a");
+        let loop_b = allowed.join("loop_b");
+        std::os::unix::fs::symlink(&loop_b, &loop_a).unwrap();
+        std::os::unix::fs::symlink(&loop_a, &loop_b).unwrap();
+
+        let perms = build_from_flags(&[
+            &format!("--allow-read={}", allowed.display()),
+            &format!("--allow-write={}", allowed.display()),
+        ])
+        .unwrap();
+
+        assert!(perms.check_read(&dangling).is_err());
+        assert!(perms.check_write(&dangling).is_err());
+        assert!(perms.check_read(&hop1).is_err());
+        assert!(perms.check_read(dir_link.join("key.txt")).is_err());
+        assert!(perms.check_read(dir_link.join("..").join("secret").join("key.txt")).is_err());
+        assert!(perms.check_read(&loop_a).is_err());
+        assert!(perms.check_read("/../../../../etc/hosts").is_err());
+        assert!(perms.check_write(allowed.join("sub").join("..").join("ok.txt")).is_ok());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_deny_rules_resist_case_and_unicode_normalization_bypasses() {
+        let root = unique_temp_dir("macos_deny");
+        let allowed = root.join("allowed");
+        let priv_dir = allowed.join("private");
+        std::fs::create_dir_all(&priv_dir).unwrap();
+        std::fs::write(allowed.join("secret.env"), b"KEY=1").unwrap();
+        std::fs::write(allowed.join("caf\u{00E9}.txt"), b"nfc").unwrap();
+
+        let perms = build_from_flags(&[
+            &format!("--allow-read={}", allowed.display()),
+            &format!("--allow-write={}", allowed.display()),
+            &format!("--deny-read={}", allowed.join("secret.env").display()),
+            &format!("--deny-read={}", allowed.join("caf\u{00E9}.txt").display()),
+            &format!("--deny-read={}", allowed.join("\u{0444}\u{0430}\u{0439}\u{043B}.txt").display()),
+            &format!("--deny-write={}", priv_dir.join("key.pem").display()),
+            &format!("--deny-write={}", allowed.join("caf\u{00E9}-new.txt").display()),
+            "--allow-run",
+            "--deny-run=echo",
+            "--deny-run=/bin/ls",
+        ])
+        .unwrap();
+
+        // Case variations on existing and non-existent files must still trigger deny rules.
+        assert!(perms.check_read(allowed.join("SECRET.ENV")).is_err());
+        assert!(perms.check_read(allowed.join("Secret.Env")).is_err());
+        assert!(perms.check_write(allowed.join("PRIVATE").join("KEY.PEM")).is_err());
+
+        // NFC vs NFD and Cyrillic case variations on existing & non-existent paths.
+        assert!(perms.check_read(allowed.join("cafe\u{0301}.txt")).is_err());
+        assert!(perms.check_read(allowed.join("CAFE\u{0301}.TXT")).is_err());
+        assert!(perms.check_read(allowed.join("\u{0424}\u{0410}\u{0418}\u{0306}\u{041B}.TXT")).is_err());
+        assert!(perms.check_write(allowed.join("CAFE\u{0301}-NEW.TXT")).is_err());
+
+        // Unrelated files in allowed directory remain accessible.
+        assert!(perms.check_read(allowed.join("public.txt")).is_ok());
+        assert!(perms.check_write(allowed.join("public.txt")).is_ok());
+
+        // Process deny rules resist case variations on macOS.
+        assert!(perms.check_run("ECHO").is_err());
+        assert!(perms.check_run("/BIN/LS").is_err());
+        assert!(perms.check_run("cat").is_ok());
 
         let _ = std::fs::remove_dir_all(&root);
     }

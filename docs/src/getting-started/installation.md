@@ -65,7 +65,7 @@ docker run --rm -it -v "$PWD:/work" airlance/conduit:latest watch main.cdt
 You can also use the image as a builder stage with `conduit build` to produce minimal `FROM scratch` production containers:
 
 ```dockerfile
-FROM airlance/conduit:0.3.4 AS builder
+FROM airlance/conduit:0.3.5 AS builder
 WORKDIR /app
 COPY . .
 RUN conduit build main.cdt -o /app/my_app
@@ -90,6 +90,6 @@ conduit --version
 Expected output:
 
 ```text
-Conduit v0.3.4
+Conduit v0.3.5
 ```
 

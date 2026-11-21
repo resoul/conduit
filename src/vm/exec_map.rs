@@ -408,6 +408,7 @@ impl Vm {
                 let db_pools = self.host.db_pools.clone();
                 let db_pool_free = self.host.db_pool_free.clone();
                 let permissions = Arc::clone(&self.host.permissions);
+                let password_hash_gate = self.host.password_hash_gate.clone();
                 flush_stdout();
                 tracker.on_spawn();
                 std::thread::spawn(move || {
@@ -422,6 +423,7 @@ impl Vm {
                         child_vm.host.spawn_tracker = tracker;
                         child_vm.host.shared_module = Some(Arc::clone(&mod_arc));
                         child_vm.host.permissions = permissions;
+                        child_vm.host.password_hash_gate = password_hash_gate;
                         if let Err(e) = child_vm.invoke_zero_arg_cb(&mod_arc, 0, 0, &callee, 0) {
                             eprintln!("[spawn] {}", e.message);
                         }

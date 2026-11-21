@@ -1730,9 +1730,20 @@ pub fn write_error_response(stream: &mut BufWriter<TcpStream>, status: i64, body
     )
 ))]
 pub(crate) fn format_error_response_bytes(status: i64, body: &str) -> Vec<u8> {
+    if status == 503 {
+        return format_503_response_bytes(1);
+    }
     let mut out = Vec::with_capacity(128 + body.len());
     let _ = write_http_response_ext(&mut out, status, body, None, false, false);
     out
+}
+
+pub(crate) fn format_503_response_bytes(retry_after_secs: u32) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 19\r\nRetry-After: {}\r\nConnection: close\r\n\r\nService Unavailable",
+        retry_after_secs.max(1)
+    )
+    .into_bytes()
 }
 
 pub fn reader_writer_pair(stream: TcpStream) -> io::Result<(BufReader<TcpStream>, BufWriter<TcpStream>)> {

@@ -23,9 +23,10 @@ use crate::native::http::{format_error_response_bytes, write_http_response_head}
     )
 ))]
 use crate::native::http_reactor::ReactorFileBody;
+use crate::native::crypto::PasswordHashGate;
 use crate::native::http::{
     HttpClientState, MatchedParams, RouteEntry, RouterServerOptions, RouterState,
-    StaticFileBody, header_key, http_client_bytes_request_checked,
+    StaticFileBody, format_503_response_bytes, header_key, http_client_bytes_request_checked,
     http_client_pooled_request_with_options_checked, http_client_request_checked,
     http_client_request_with_timeout_checked, make_http_client_obj, make_http_error,
     make_response_obj, make_response_with_body_obj, make_router_obj, resolve_client_url,
@@ -471,6 +472,7 @@ pub(crate) fn serve_http_listener(
     spawn_tracker: Arc<crate::vm::SpawnTracker>,
     script_args: Option<Vec<String>>,
     permissions: Arc<Permissions>,
+    password_hash_gate: Option<Arc<PasswordHashGate>>,
     rid: usize,
     listener: TcpListener,
     stop_flag: Arc<std::sync::atomic::AtomicBool>,
@@ -497,6 +499,7 @@ pub(crate) fn serve_http_listener(
         spawn_tracker,
         script_args,
         permissions,
+        password_hash_gate,
         rid,
         listener,
         bound_addr,
@@ -522,12 +525,18 @@ fn dispatch_one_reactor_job(
     head_only: bool,
     keep_alive: bool,
 ) -> (Vec<u8>, Option<ReactorFileBody>, bool) {
-    let Ok(dispatched) = vm.dispatch_router_request_inner(module, 0, 0, rid, req_obj, true) else {
-        return (
-            format_error_response_bytes(500, "Internal Server Error"),
-            None,
-            false,
-        );
+    let dispatched = match vm.dispatch_router_request_inner(module, 0, 0, rid, req_obj, true) {
+        Ok(d) => d,
+        Err(err) => {
+            if let Some(secs) = err.retry_after_secs() {
+                return (format_503_response_bytes(secs), None, false);
+            }
+            return (
+                format_error_response_bytes(500, "Internal Server Error"),
+                None,
+                false,
+            );
+        }
     };
     match dispatched {
         DispatchedHttpResponse::Obj(resp_obj) => {
@@ -600,6 +609,7 @@ fn serve_http_listener_impl(
     spawn_tracker: Arc<crate::vm::SpawnTracker>,
     script_args: Option<Vec<String>>,
     permissions: Arc<Permissions>,
+    password_hash_gate: Option<Arc<PasswordHashGate>>,
     rid: usize,
     listener: TcpListener,
     bound_addr: Option<std::net::SocketAddr>,
@@ -617,6 +627,7 @@ fn serve_http_listener_impl(
         idle_timeout: cfg.idle_timeout,
         header_timeout: cfg.header_timeout,
         body_timeout: cfg.body_timeout,
+        write_timeout: Duration::from_secs(30),
         max_conns: cfg.max_conns,
         max_keepalive_requests: HTTP_MAX_KEEPALIVE_REQUESTS,
     };
@@ -640,6 +651,7 @@ fn serve_http_listener_impl(
             let mod_worker = Arc::clone(&module);
             let script_args = script_args.clone();
             let worker_perms = Arc::clone(&permissions);
+            let worker_hash_gate = password_hash_gate.clone();
             scope.spawn(move || {
                 let mut worker_vm = Vm::new();
                 worker_vm.script_args = script_args;
@@ -650,6 +662,7 @@ fn serve_http_listener_impl(
                 worker_vm.host.spawn_tracker = spawn_tracker;
                 worker_vm.host.shared_module = Some(Arc::clone(&mod_worker));
                 worker_vm.host.permissions = worker_perms;
+                worker_vm.host.password_hash_gate = worker_hash_gate;
                 loop {
                     let job = {
                         let Ok(guard) = job_rx.lock() else { break };
@@ -757,6 +770,7 @@ fn serve_http_listener_impl(
     spawn_tracker: Arc<crate::vm::SpawnTracker>,
     script_args: Option<Vec<String>>,
     permissions: Arc<Permissions>,
+    password_hash_gate: Option<Arc<PasswordHashGate>>,
     rid: usize,
     listener: TcpListener,
     bound_addr: Option<std::net::SocketAddr>,
@@ -782,6 +796,7 @@ fn serve_http_listener_impl(
             let mod_worker = Arc::clone(&module);
             let script_args = script_args.clone();
             let worker_perms = Arc::clone(&permissions);
+            let worker_hash_gate = password_hash_gate.clone();
             scope.spawn(move || {
                 let mut worker_vm = Vm::new();
                 worker_vm.script_args = script_args;
@@ -792,6 +807,7 @@ fn serve_http_listener_impl(
                 worker_vm.host.spawn_tracker = spawn_tracker;
                 worker_vm.host.shared_module = Some(Arc::clone(&mod_worker));
                 worker_vm.host.permissions = worker_perms;
+                worker_vm.host.password_hash_gate = worker_hash_gate;
                 loop {
                     let (stream, permit) = {
                         let Ok(guard) = rx.lock() else { break };
@@ -2105,6 +2121,7 @@ impl Vm {
                     Arc::clone(&self.host.spawn_tracker),
                     self.script_args.clone(),
                     Arc::clone(&self.host.permissions),
+                    self.host.password_hash_gate.clone(),
                     rid,
                     listener,
                     stop_flag,
@@ -2444,8 +2461,14 @@ fn serve_connection(
                             break;
                         }
                     }
-                    Err(_) => {
-                        write_error_response(&mut writer, 500, "Internal Server Error");
+                    Err(err) => {
+                        if let Some(secs) = err.retry_after_secs() {
+                            let bytes = format_503_response_bytes(secs);
+                            let _ = writer.write_all(&bytes);
+                            let _ = writer.flush();
+                        } else {
+                            write_error_response(&mut writer, 500, "Internal Server Error");
+                        }
                         break;
                     }
                 }
@@ -2879,6 +2902,7 @@ mod tests {
                 spawn_tracker,
                 None,
                 permissions,
+                None,
                 rid,
                 listener,
                 srv_stop,
@@ -3053,6 +3077,7 @@ mod tests {
                 spawn_tracker,
                 None,
                 permissions,
+                None,
                 rid,
                 listener,
                 srv_stop,
@@ -3300,5 +3325,152 @@ mod tests {
             "redirect target should never receive a connection"
         );
         h1.join().unwrap();
+    }
+
+    #[test]
+    fn http_password_hash_overload_returns_503_without_starving_health() {
+        use crate::native::crypto::{PasswordHashGate, hash_password};
+        use std::io::{Read, Write};
+
+        let Obj::Str(stored_hash) = hash_password("s3cr3t!") else {
+            panic!("expected password hash string");
+        };
+
+        let src = r#"
+            import * as http from "cdt.http"
+            import * as crypto from "cdt.crypto"
+
+            export func setup_auth_router(stored_hash: String) -> http.Router {
+                r := http.router()
+                r.workers(2)
+                r.get("/health", (_req: http.Request) -> http.Response => {
+                    return http.text("ok")
+                })
+                r.post("/login", (req: http.Request) -> http.Response => {
+                    if crypto.verify_password(req.body, stored_hash) {
+                        return http.text("logged-in")
+                    }
+                    return http.response(401, "unauthorized")
+                })
+                r.post("/register", (req: http.Request) -> http.Response => {
+                    switch crypto.hash_password(req.body) {
+                        case String(h):
+                            return http.text(h)
+                        case crypto.CryptoError(e):
+                            if e.kind == "overloaded" {
+                                hdrs := Map<String, String>()
+                                hdrs.set("retry-after", "1")
+                                return http.response_with(503, e.message, hdrs)
+                            }
+                            return http.response(500, e.message)
+                    }
+                })
+                return r
+            }
+        "#;
+
+        let module = crate::frontend::compile_source(src).expect("compile auth overload router");
+        let setup_fid = module.func_id("setup_auth_router").unwrap();
+        let mut init_vm = Vm::new();
+        let gate = Arc::new(PasswordHashGate::new(1, 0, Duration::from_millis(20)));
+        init_vm.set_password_hash_gate(Arc::clone(&gate));
+
+        let router_obj = init_vm
+            .call_obj(&module, setup_fid, &[], &[Obj::Str(stored_hash)])
+            .unwrap();
+        let Obj::Record(sd) = router_obj else {
+            panic!("expected Router");
+        };
+        let rid = sd.get_scalar(0) as usize;
+        let stop_flag = Arc::clone(&init_vm.host.routers[rid].stop_flag);
+        let routers = init_vm.host.routers.clone();
+        let spawn_tracker = Arc::clone(&init_vm.host.spawn_tracker);
+        let permissions = Arc::clone(&init_vm.host.permissions);
+        let gate_for_srv = Arc::clone(&gate);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shared_mod = Arc::new(module);
+
+        let srv_stop = Arc::clone(&stop_flag);
+        let srv_thread = std::thread::spawn(move || {
+            serve_http_listener(
+                shared_mod,
+                routers,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                spawn_tracker,
+                None,
+                permissions,
+                Some(gate_for_srv),
+                rid,
+                listener,
+                srv_stop,
+                false,
+            );
+        });
+
+        let send_raw = |raw_req: &str| -> String {
+            let mut s = TcpStream::connect(addr).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            s.write_all(raw_req.as_bytes()).unwrap();
+            let mut resp = String::new();
+            s.read_to_string(&mut resp).unwrap();
+            resp
+        };
+
+        // Hold the single password-hashing permit to simulate CPU saturation.
+        let held = gate.try_acquire().unwrap();
+
+        // Unrelated endpoints stay responsive with 200 OK while /login and /register shed with 503.
+        let health = send_raw("GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+        assert!(
+            health.starts_with("HTTP/1.1 200 OK\r\n") && health.ends_with("\r\n\r\nok"),
+            "{health}"
+        );
+
+        let login_503 = send_raw(
+            "POST /login HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 7\r\nConnection: close\r\n\r\ns3cr3t!",
+        );
+        let login_503_lower = login_503.to_ascii_lowercase();
+        assert!(
+            login_503.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
+            "{login_503}"
+        );
+        assert!(
+            login_503_lower.contains("\r\nretry-after: 1\r\n"),
+            "{login_503}"
+        );
+
+        let reg_503 = send_raw(
+            "POST /register HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 7\r\nConnection: close\r\n\r\ns3cr3t!",
+        );
+        assert!(
+            reg_503.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
+            "{reg_503}"
+        );
+
+        // Once capacity frees up, /login verifies normally.
+        drop(held);
+        let login_ok = send_raw(
+            "POST /login HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 7\r\nConnection: close\r\n\r\ns3cr3t!",
+        );
+        assert!(
+            login_ok.starts_with("HTTP/1.1 200 OK\r\n") && login_ok.ends_with("\r\n\r\nlogged-in"),
+            "{login_ok}"
+        );
+
+        let login_bad = send_raw(
+            "POST /login HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 5\r\nConnection: close\r\n\r\nwrong",
+        );
+        assert!(
+            login_bad.starts_with("HTTP/1.1 401 "),
+            "{login_bad}"
+        );
+
+        stop_flag.store(true, Ordering::Release);
+        wake_socket_addr(addr);
+        srv_thread.join().unwrap();
     }
 }

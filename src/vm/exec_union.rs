@@ -5,9 +5,9 @@ use crate::native::validation::{box_scalar_val, is_err_or_nil_obj};
 use crate::vm::exec_cold::err_msg;
 use crate::vm::opcode::Op;
 use crate::vm::value::{
-    ListStorage, Obj, SCHEMA_BOXED_BOOL, SCHEMA_BOXED_FLOAT, SCHEMA_BOXED_INT, SCHEMA_INDEX_ERROR,
-    SCHEMA_JSON_DECODE_ERROR, SCHEMA_JSON_ENCODE_ERROR, SCHEMA_KEY_ERROR, SCHEMA_PARSE_ERROR,
-    SCHEMA_TIME_ERROR, SCHEMA_VALIDATION_ERROR, SCHEMA_VALIDATION_ISSUE,
+    ListStorage, Obj, SCHEMA_BOXED_BOOL, SCHEMA_BOXED_FLOAT, SCHEMA_BOXED_INT, SCHEMA_CRYPTO_ERROR,
+    SCHEMA_INDEX_ERROR, SCHEMA_JSON_DECODE_ERROR, SCHEMA_JSON_ENCODE_ERROR, SCHEMA_KEY_ERROR,
+    SCHEMA_PARSE_ERROR, SCHEMA_TIME_ERROR, SCHEMA_VALIDATION_ERROR, SCHEMA_VALIDATION_ISSUE,
     SCHEMA_VALIDATION_VIOLATION, StructData, append_float_cow, format_float,
 };
 use crate::vm::{CallFrame, RuntimeError, Vm};
@@ -103,6 +103,21 @@ pub(crate) fn format_try_error(obj: &Obj) -> RuntimeError {
                     ));
                 }
                 err_msg("ValidationError unwrapped with '?'")
+            }
+            SCHEMA_CRYPTO_ERROR => {
+                let kind = match rec.get_obj(0) {
+                    Obj::Str(s) => s.as_str(),
+                    _ => "",
+                };
+                let msg = match rec.get_obj(1) {
+                    Obj::Str(s) => s.as_str(),
+                    _ => "Crypto error unwrapped with '?'",
+                };
+                if kind == "overloaded" {
+                    RuntimeError::overloaded(msg, 1)
+                } else {
+                    err_msg(msg)
+                }
             }
             _ => {
                 if !rec.inline_objs.is_empty()

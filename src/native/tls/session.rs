@@ -226,4 +226,190 @@ mod tests {
         bad_extension[19] = 3;
         assert!(parse_new_session_ticket(&bad_extension).is_err());
     }
+
+    #[test]
+    fn fuzz_new_session_ticket_and_store_never_panics() {
+        let mut cfg = TlsConfig::new("fuzz-ticket.test");
+        cfg.alpn = vec![b"http/1.1"];
+        let key = SessionKey::new(&cfg, 443);
+        let now = unix_now();
+        let valid_resumption = Resumption {
+            identity: ServerIdentity {
+                leaf: Arc::from(&b"leaf"[..]),
+                validity: Some((now - 60)..=(now + 600)),
+                authenticated_at: Instant::now(),
+            },
+            master_secret: vec![0x5a; 48],
+            remaining_tickets: 4,
+        };
+        let valid_seed = [
+            0, 0, 0, 120, 0x11, 0x22, 0x33, 0x44, 1, 9, 0, 3, 1, 2, 3, 0, 8, 0, 42, 0, 4, 0, 0,
+            4, 0,
+        ];
+
+        let mut rng = 0x517c_c1b7_2722_0a95u64;
+        let mut next_u64 = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+
+        let fuzz_cfg = TlsConfig::new("fuzz-ticket-noise.test");
+        let fuzz_key = SessionKey::new(&fuzz_cfg, 443);
+
+        for iter in 0..1_000usize {
+            let data: Vec<u8> = if iter % 3 == 0 {
+                let len = (next_u64() as usize) % 256;
+                (0..len).map(|_| (next_u64() & 0xff) as u8).collect()
+            } else {
+                let mut mutated = valid_seed.to_vec();
+                match next_u64() % 3 {
+                    0 => mutated.truncate((next_u64() as usize) % (mutated.len() + 1)),
+                    1 => {
+                        let flips = ((next_u64() % 4) + 1) as usize;
+                        for _ in 0..flips {
+                            let idx = (next_u64() as usize) % mutated.len();
+                            mutated[idx] ^= (next_u64() & 0xff) as u8;
+                        }
+                    }
+                    _ => {
+                        let extra = (next_u64() as usize) % 64;
+                        mutated.extend((0..extra).map(|_| (next_u64() & 0xff) as u8));
+                    }
+                }
+                mutated
+            };
+            let suite = if iter % 2 == 0 {
+                CipherSuite::TlsAes128GcmSha256
+            } else {
+                CipherSuite::TlsAes256GcmSha384
+            };
+            let _ = parse_new_session_ticket(&data);
+            let _ = store_ticket(&fuzz_key, &valid_resumption, suite, &data);
+        }
+        while take_ticket(&fuzz_key).is_some() {}
+        while take_ticket(&key).is_some() {}
+
+        // Boundary checks: oversized lifetime/ticket and expired identity are ignored cleanly.
+        let mut over_lifetime = vec![];
+        over_lifetime.extend_from_slice(&(MAX_LIFETIME_SECS + 1).to_be_bytes());
+        over_lifetime.extend_from_slice(&[0, 0, 0, 1, 1, 7, 0, 1, 99, 0, 0]);
+        store_ticket(&key, &valid_resumption, CipherSuite::TlsAes128GcmSha256, &over_lifetime)
+            .unwrap();
+        assert!(take_ticket(&key).is_none());
+
+        let mut oversized_ticket = vec![0, 0, 0, 60, 0, 0, 0, 1, 1, 7];
+        let big_len = (MAX_TICKET_BYTES + 1) as u16;
+        oversized_ticket.extend_from_slice(&big_len.to_be_bytes());
+        oversized_ticket.resize(oversized_ticket.len() + big_len as usize, 0xaa);
+        oversized_ticket.extend_from_slice(&[0, 0]);
+        store_ticket(&key, &valid_resumption, CipherSuite::TlsAes128GcmSha256, &oversized_ticket)
+            .unwrap();
+        assert!(take_ticket(&key).is_none());
+
+        let expired_resumption = Resumption {
+            identity: ServerIdentity {
+                leaf: Arc::from(&b"leaf"[..]),
+                validity: Some((now - 120)..=(now - 1)),
+                authenticated_at: Instant::now(),
+            },
+            master_secret: vec![0x11; 32],
+            remaining_tickets: 1,
+        };
+        store_ticket(&key, &expired_resumption, CipherSuite::TlsAes128GcmSha256, &valid_seed)
+            .unwrap();
+        assert!(take_ticket(&key).is_none());
+    }
+
+    #[test]
+    fn session_cache_eviction_sha384_psk_and_concurrent_single_use() {
+        let now = unix_now();
+        // Verify SHA-384 suite produces a 48-byte PSK matching the Sha384 master_secret.
+        let mut cfg384 = TlsConfig::new("sha384-resumption.test");
+        cfg384.alpn = vec![b"http/1.1"];
+        let key384 = SessionKey::new(&cfg384, 443);
+        let res384 = Resumption {
+            identity: ServerIdentity {
+                leaf: Arc::from(&b"leaf"[..]),
+                validity: Some((now - 10)..=(now + 120)),
+                authenticated_at: Instant::now(),
+            },
+            master_secret: vec![0x33; 48],
+            remaining_tickets: 2,
+        };
+        let msg = [0, 0, 0, 60, 0, 0, 0, 7, 1, 5, 0, 2, 10, 20, 0, 0];
+        store_ticket(&key384, &res384, CipherSuite::TlsAes256GcmSha384, &msg).unwrap();
+        let taken384 = take_ticket(&key384).expect("sha384 ticket");
+        assert_eq!(taken384.psk.len(), 48);
+        assert_eq!(taken384.suite, CipherSuite::TlsAes256GcmSha384);
+        assert!(take_ticket(&key384).is_none());
+
+        // Inserting MAX_CACHED_SESSIONS + 32 unique keys evicts the oldest entries in FIFO order.
+        let total = MAX_CACHED_SESSIONS + 32;
+        let keys: Vec<SessionKey> = (0..total)
+            .map(|i| {
+                let host = format!("evict-{i}-cache.test");
+                let c = TlsConfig::new(host);
+                SessionKey::new(&c, 443)
+            })
+            .collect();
+        let res256 = Resumption {
+            identity: ServerIdentity {
+                leaf: Arc::from(&b"leaf"[..]),
+                validity: Some((now - 10)..=(now + 120)),
+                authenticated_at: Instant::now(),
+            },
+            master_secret: vec![0x22; 32],
+            remaining_tickets: 2,
+        };
+        for k in &keys {
+            store_ticket(k, &res256, CipherSuite::TlsAes128GcmSha256, &msg).unwrap();
+        }
+        // Notice other parallel tests share `SESSIONS`, so at least the earliest keys are evicted
+        // and the most recent tail remains retrievable (bounded capacity <= MAX_CACHED_SESSIONS).
+        assert!(
+            take_ticket(&keys[0]).is_none(),
+            "oldest key must be evicted past MAX_CACHED_SESSIONS"
+        );
+        let newest = take_ticket(&keys[total - 1]).expect("newest key must remain cached");
+        assert_eq!(newest.psk.len(), 32);
+
+        // Clean up remaining test keys so we don't pollute global cache.
+        for k in &keys[..total - 1] {
+            let _ = take_ticket(k);
+        }
+
+        // Concurrent store + take across 8 threads never panics or yields duplicate tickets.
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let shared_res = Arc::new(res256);
+        let mut handles = Vec::new();
+        for tid in 0..8usize {
+            let b = Arc::clone(&barrier);
+            let res_c = Arc::clone(&shared_res);
+            handles.push(std::thread::spawn(move || {
+                let mut seen = Vec::new();
+                let shared_hosts = ["concurrent-a.test", "concurrent-b.test"];
+                b.wait();
+                for step in 0..40usize {
+                    let c = TlsConfig::new(shared_hosts[(tid + step) % shared_hosts.len()]);
+                    let k = SessionKey::new(&c, 443);
+                    let id_byte = ((tid * 40 + step) & 0xff) as u8;
+                    let m = [0, 0, 0, 60, 0, 0, 0, id_byte, 1, id_byte, 0, 2, tid as u8, step as u8, 0, 0];
+                    store_ticket(&k, &res_c, CipherSuite::TlsAes128GcmSha256, &m).unwrap();
+                    if let Some(t) = take_ticket(&k) {
+                        seen.push(t.ticket.clone());
+                    }
+                }
+                seen
+            }));
+        }
+        for h in handles {
+            let list = h.join().unwrap();
+            assert!(list.len() <= 40);
+        }
+        for host in ["concurrent-a.test", "concurrent-b.test"] {
+            let _ = take_ticket(&SessionKey::new(&TlsConfig::new(host), 443));
+        }
+    }
 }

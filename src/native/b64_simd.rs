@@ -10,16 +10,13 @@ use std::arch::x86_64::*;
 
 #[inline]
 pub(crate) fn available() -> bool {
-    if cfg!(miri) {
-        return false;
-    }
     #[cfg(target_arch = "aarch64")]
     {
-        true
+        !cfg!(miri)
     }
     #[cfg(target_arch = "x86_64")]
     {
-        std::arch::is_x86_feature_detected!("avx2")
+        !cfg!(miri) && std::arch::is_x86_feature_detected!("avx2")
     }
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {

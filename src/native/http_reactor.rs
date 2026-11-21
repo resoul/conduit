@@ -25,7 +25,6 @@ mod imp {
     const TOKEN_LISTENER: u64 = 0;
     const TOKEN_WAKE: u64 = 1;
     const FIRST_CLIENT_TOKEN: u64 = 2;
-    const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
     const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
     const READ_CHUNK_SIZE: usize = 16 * 1024;
     const FILE_WRITE_CHUNK_SIZE: usize = 64 * 1024;
@@ -53,6 +52,7 @@ mod imp {
         pub idle_timeout: Duration,
         pub header_timeout: Duration,
         pub body_timeout: Duration,
+        pub write_timeout: Duration,
         pub max_conns: usize,
         pub max_keepalive_requests: usize,
     }
@@ -858,7 +858,7 @@ mod imp {
             stop_flag: &AtomicBool,
             job_tx: &mpsc::SyncSender<ReactorJob>,
         ) {
-            let write_dl = now + WRITE_TIMEOUT;
+            let write_dl = now + self.cfg.write_timeout;
             let Some(conn) = self.conns.get_mut(&token) else {
                 return;
             };
@@ -1328,9 +1328,10 @@ mod imp {
                                 let mut refreshed_dl = None;
                                 if n > 0
                                     && has_more_file
-                                    && deadline.saturating_duration_since(now) < WRITE_TIMEOUT / 2
+                                    && deadline.saturating_duration_since(now)
+                                        < self.cfg.write_timeout / 2
                                 {
-                                    let dl = now + WRITE_TIMEOUT;
+                                    let dl = now + self.cfg.write_timeout;
                                     *deadline = dl;
                                     refreshed_dl = Some(dl);
                                 }
@@ -1867,6 +1868,580 @@ mod imp {
                     sink_heap,
                 );
             }
+        }
+
+        struct TestPermit(Arc<AtomicUsize>);
+        impl Drop for TestPermit {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        struct TestReactorHarness {
+            addr: std::net::SocketAddr,
+            stop_flag: Arc<AtomicBool>,
+            waker: ReactorWaker,
+            live_permits: Arc<AtomicUsize>,
+            total_accepted: Arc<AtomicUsize>,
+            threads: Option<(std::thread::JoinHandle<()>, std::thread::JoinHandle<()>)>,
+        }
+
+        impl TestReactorHarness {
+            fn spawn<F>(cfg: ReactorConfig, max_per_ip: usize, responder: F) -> Self
+            where
+                F: Fn(&ReactorJob) -> (Vec<u8>, Option<ReactorFileBody>, bool) + Send + 'static,
+            {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let addr = listener.local_addr().unwrap();
+                let stop_flag = Arc::new(AtomicBool::new(false));
+                let wake_pair = ReactorWakePair::new().unwrap();
+                let waker = wake_pair.waker();
+                let (job_tx, job_rx) = mpsc::sync_channel::<ReactorJob>(64);
+                let (res_tx, res_rx) = mpsc::channel::<ReactorResponse>();
+
+                let live_permits = Arc::new(AtomicUsize::new(0));
+                let total_accepted = Arc::new(AtomicUsize::new(0));
+
+                let worker_waker = waker.clone();
+                let worker_handle = std::thread::spawn(move || {
+                    while let Ok(job) = job_rx.recv() {
+                        let (bytes, file_body, keep_alive) = responder(&job);
+                        let _ = res_tx.send(ReactorResponse {
+                            conn_id: job.conn_id,
+                            bytes,
+                            file_body,
+                            keep_alive,
+                        });
+                        worker_waker.wake();
+                    }
+                });
+
+                let r_stop = Arc::clone(&stop_flag);
+                let r_permits = Arc::clone(&live_permits);
+                let r_accepted = Arc::clone(&total_accepted);
+                let reactor_handle = std::thread::spawn(move || {
+                    run_http_reactor(
+                        listener,
+                        r_stop,
+                        cfg,
+                        move |_ip| {
+                            let cur = r_permits.fetch_add(1, Ordering::SeqCst);
+                            if max_per_ip > 0 && cur >= max_per_ip {
+                                r_permits.fetch_sub(1, Ordering::SeqCst);
+                                return None;
+                            }
+                            r_accepted.fetch_add(1, Ordering::SeqCst);
+                            Some(TestPermit(Arc::clone(&r_permits)))
+                        },
+                        |mut s| {
+                            let _ = s.set_nonblocking(true);
+                            let _ = s.write_all(
+                                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 19\r\nRetry-After: 1\r\nConnection: close\r\n\r\nService Unavailable",
+                            );
+                        },
+                        |_e| false,
+                        job_tx,
+                        res_rx,
+                        wake_pair,
+                    );
+                });
+
+                Self {
+                    addr,
+                    stop_flag,
+                    waker,
+                    live_permits,
+                    total_accepted,
+                    threads: Some((reactor_handle, worker_handle)),
+                }
+            }
+
+            fn total_accepted(&self) -> usize {
+                self.total_accepted.load(Ordering::SeqCst)
+            }
+
+            fn wait_accepted_gt(&self, prev: usize) {
+                for _ in 0..200 {
+                    if self.total_accepted.load(Ordering::SeqCst) > prev {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                panic!(
+                    "timed out waiting for total_accepted ({}) > {}",
+                    self.total_accepted.load(Ordering::SeqCst),
+                    prev
+                );
+            }
+
+            fn wait_permits_zero(&self) {
+                for _ in 0..300 {
+                    if self.live_permits.load(Ordering::SeqCst) == 0 {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                assert_eq!(
+                    self.live_permits.load(Ordering::SeqCst),
+                    0,
+                    "timed out waiting for active reactor permits to reach zero"
+                );
+            }
+        }
+
+        impl Drop for TestReactorHarness {
+            fn drop(&mut self) {
+                self.stop_flag.store(true, Ordering::Release);
+                self.waker.wake();
+                let _ = TcpStream::connect_timeout(&self.addr, Duration::from_millis(50));
+                if let Some((rh, wh)) = self.threads.take() {
+                    let _ = rh.join();
+                    let _ = wh.join();
+                }
+            }
+        }
+
+        fn build_ok_response(body: &[u8], keep_alive: bool, head_only: bool) -> Vec<u8> {
+            let mut out = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",
+                body.len(),
+                if keep_alive { "keep-alive" } else { "close" }
+            )
+            .into_bytes();
+            if !head_only {
+                out.extend_from_slice(body);
+            }
+            out
+        }
+
+        fn count_open_fds() -> usize {
+            let dir = if cfg!(target_os = "linux") {
+                "/proc/self/fd"
+            } else {
+                "/dev/fd"
+            };
+            std::fs::read_dir(dir).map(|it| it.count()).unwrap_or(0)
+        }
+
+        use std::sync::atomic::AtomicUsize;
+
+        #[test]
+        fn reactor_enforces_header_body_idle_and_write_timeouts() {
+            let cfg = ReactorConfig {
+                idle_timeout: Duration::from_millis(120),
+                header_timeout: Duration::from_millis(140),
+                body_timeout: Duration::from_millis(140),
+                write_timeout: Duration::from_millis(160),
+                max_conns: 32,
+                max_keepalive_requests: 100,
+            };
+            let big_payload = Arc::new(vec![b'B'; 16 * 1024 * 1024]);
+            let big_clone = Arc::clone(&big_payload);
+
+            let srv = TestReactorHarness::spawn(cfg, 0, move |job| {
+                if job.raw.path == "/big" {
+                    let out = build_ok_response(&big_clone, false, job.head_only);
+                    (out, None, false)
+                } else {
+                    (build_ok_response(b"ok", job.keep_alive, job.head_only), None, job.keep_alive)
+                }
+            });
+
+            // 1. Header timeout -> 408 Request Timeout.
+            {
+                let mut c = TcpStream::connect(srv.addr).unwrap();
+                c.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                c.write_all(b"GET /hello HTTP/1.1\r\nHost: x\r\n").unwrap();
+                let mut resp = String::new();
+                c.read_to_string(&mut resp).unwrap();
+                assert!(resp.starts_with("HTTP/1.1 408 Request Timeout\r\n"), "{resp}");
+            }
+
+            // 2. Body timeout -> 408 Request Timeout.
+            {
+                let mut c = TcpStream::connect(srv.addr).unwrap();
+                c.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                c.write_all(
+                    b"POST /hello HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\nabcd",
+                )
+                .unwrap();
+                let mut resp = String::new();
+                c.read_to_string(&mut resp).unwrap();
+                assert!(resp.starts_with("HTTP/1.1 408 Request Timeout\r\n"), "{resp}");
+            }
+
+            // 3. Keep-alive idle timeout -> clean EOF without 408.
+            {
+                let mut c = TcpStream::connect(srv.addr).unwrap();
+                c.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                c.write_all(b"GET /hello HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+                let mut all = String::new();
+                c.read_to_string(&mut all).unwrap();
+                assert!(
+                    all.starts_with("HTTP/1.1 200 OK\r\n") && all.ends_with("\r\n\r\nok"),
+                    "{all}"
+                );
+                assert!(!all.contains("408 Request Timeout"), "{all}");
+            }
+
+            // 4. Write stall timeout: request 16 MiB and never drain socket until write deadline fires.
+            {
+                let accepted_before = srv.total_accepted();
+                let mut stalled_writer = TcpStream::connect(srv.addr).unwrap();
+                stalled_writer
+                    .write_all(b"GET /big HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                    .unwrap();
+                srv.wait_accepted_gt(accepted_before);
+                srv.wait_permits_zero();
+                stalled_writer
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut drained = Vec::new();
+                let _ = stalled_writer.read_to_end(&mut drained);
+                assert!(
+                    drained.len() < big_payload.len(),
+                    "stalled write should time out and close before delivering full 16 MiB (got {})",
+                    drained.len()
+                );
+            }
+            srv.wait_permits_zero();
+        }
+
+        #[test]
+        fn reactor_handles_abrupt_disconnects_mid_read_write_and_file_stream() {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let tmp_dir = std::env::temp_dir().join(format!(
+                "conduit_reactor_abort_{}_{}",
+                std::process::id(),
+                nanos
+            ));
+            std::fs::create_dir_all(&tmp_dir).unwrap();
+            let file_path = tmp_dir.join("blob.bin");
+            let file_len = 2 * 1024 * 1024usize;
+            let file_bytes: Vec<u8> = (0..file_len).map(|i| ((i * 31) ^ 0xA5) as u8).collect();
+            std::fs::write(&file_path, &file_bytes).unwrap();
+
+            let cfg = ReactorConfig {
+                idle_timeout: Duration::from_millis(500),
+                header_timeout: Duration::from_millis(500),
+                body_timeout: Duration::from_millis(500),
+                write_timeout: Duration::from_secs(2),
+                max_conns: 64,
+                max_keepalive_requests: 100,
+            };
+            let big_buf = Arc::new(vec![b'Z'; 4 * 1024 * 1024]);
+            let big_buf_c = Arc::clone(&big_buf);
+            let fp_c = file_path.clone();
+
+            let srv = TestReactorHarness::spawn(cfg, 0, move |job| match job.raw.path.as_str() {
+                "/big" => (build_ok_response(&big_buf_c, false, job.head_only), None, false),
+                "/file" => {
+                    let file = std::fs::File::open(&fp_c).unwrap();
+                    let head = build_ok_response(&file_bytes, job.keep_alive, true);
+                    (
+                        head,
+                        Some(ReactorFileBody {
+                            file,
+                            remaining: file_len as u64,
+                        }),
+                        job.keep_alive,
+                    )
+                }
+                "/truncated_file" => {
+                    let file = std::fs::File::open(&fp_c).unwrap();
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        file_len + 1024
+                    )
+                    .into_bytes();
+                    (
+                        header,
+                        Some(ReactorFileBody {
+                            file,
+                            remaining: (file_len + 1024) as u64,
+                        }),
+                        false,
+                    )
+                }
+                _ => (
+                    build_ok_response(b"healthy", job.keep_alive, job.head_only),
+                    None,
+                    job.keep_alive,
+                ),
+            });
+
+            // 1. Disconnect mid-header and mid-body.
+            {
+                let mut c = TcpStream::connect(srv.addr).unwrap();
+                c.write_all(b"GET /healthy HTTP/1.1\r\n").unwrap();
+            }
+            {
+                let mut c = TcpStream::connect(srv.addr).unwrap();
+                c.write_all(b"POST /healthy HTTP/1.1\r\nContent-Length: 4096\r\n\r\npart")
+                    .unwrap();
+            }
+
+            // 2. Disconnect mid-buffered-write and mid-file-stream.
+            for path in ["/big", "/file"] {
+                let mut c = TcpStream::connect(srv.addr).unwrap();
+                c.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                c.write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
+                    .unwrap();
+                let mut head_sample = [0u8; 512];
+                let n = c.read(&mut head_sample).unwrap();
+                assert!(n > 0, "expected partial bytes for {path}");
+                drop(c);
+            }
+
+            // 3. Truncated ReactorFileBody (`remaining > actual file size`) hits EOF cleanly.
+            {
+                let mut c = TcpStream::connect(srv.addr).unwrap();
+                c.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                c.write_all(b"GET /truncated_file HTTP/1.1\r\nHost: x\r\n\r\n")
+                    .unwrap();
+                let mut partial = Vec::new();
+                let _ = c.read_to_end(&mut partial);
+                assert!(partial.len() < file_len + 1024);
+            }
+
+            // 4. Reactor remains completely healthy and serves full /file & /healthy responses.
+            {
+                let mut c = TcpStream::connect(srv.addr).unwrap();
+                c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                c.write_all(
+                    b"GET /file HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+                let mut full = Vec::new();
+                c.read_to_end(&mut full).unwrap();
+                let split = find_crlf_crlf(&full).unwrap();
+                let expected: Vec<u8> = (0..file_len).map(|i| ((i * 31) ^ 0xA5) as u8).collect();
+                assert_eq!(&full[split..], expected.as_slice());
+            }
+
+            srv.wait_permits_zero();
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+        }
+
+        #[test]
+        fn reactor_no_fd_leak_across_churn_timeouts_aborts_and_file_streams() {
+            let fds_before_pollers = count_open_fds();
+            for _ in 0..150 {
+                let poller = Poller::new().unwrap();
+                let wake = ReactorWakePair::new().unwrap();
+                poller.register_read(wake.read_fd.0, TOKEN_WAKE).unwrap();
+                poller.deregister(wake.read_fd.0, true, false);
+            }
+            let fds_after_pollers = count_open_fds();
+            assert!(
+                fds_after_pollers.saturating_sub(fds_before_pollers) < 32,
+                "poller/wake-pipe create+drop leaked fds: before={fds_before_pollers}, after={fds_after_pollers}"
+            );
+
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let tmp_dir = std::env::temp_dir().join(format!(
+                "conduit_reactor_fdleak_{}_{}",
+                std::process::id(),
+                nanos
+            ));
+            std::fs::create_dir_all(&tmp_dir).unwrap();
+            let file_path = tmp_dir.join("asset.bin");
+            let file_data = vec![0x42u8; 32 * 1024];
+            std::fs::write(&file_path, &file_data).unwrap();
+
+            let fds_before_srv = count_open_fds();
+            let cfg = ReactorConfig {
+                idle_timeout: Duration::from_millis(80),
+                header_timeout: Duration::from_millis(80),
+                body_timeout: Duration::from_millis(80),
+                write_timeout: Duration::from_secs(2),
+                max_conns: 12,
+                max_keepalive_requests: 10,
+            };
+            let fp = file_path.clone();
+            let fdata_len = file_data.len();
+
+            let srv = TestReactorHarness::spawn(cfg, 0, move |job| {
+                if job.raw.path == "/asset" {
+                    let f = std::fs::File::open(&fp).unwrap();
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",
+                        fdata_len,
+                        if job.keep_alive { "keep-alive" } else { "close" }
+                    )
+                    .into_bytes();
+                    (
+                        head,
+                        Some(ReactorFileBody {
+                            file: f,
+                            remaining: fdata_len as u64,
+                        }),
+                        job.keep_alive,
+                    )
+                } else {
+                    (build_ok_response(b"ok", job.keep_alive, job.head_only), None, job.keep_alive)
+                }
+            });
+
+            // 1. Keep-alive multi-request connections.
+            for _ in 0..30 {
+                let mut c = TcpStream::connect(srv.addr).unwrap();
+                c.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                c.write_all(
+                    b"GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+                let mut buf = Vec::new();
+                let _ = c.read_to_end(&mut buf);
+                assert!(buf.windows(2).any(|w| w == b"ok"));
+            }
+
+            // 2. File streams & abrupt client drops.
+            for idx in 0..24 {
+                let mut c = TcpStream::connect(srv.addr).unwrap();
+                c.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                c.write_all(b"GET /asset HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                    .unwrap();
+                if idx % 2 == 0 {
+                    let mut one = [0u8; 64];
+                    let _ = c.read(&mut one);
+                } else {
+                    let mut buf = Vec::new();
+                    let _ = c.read_to_end(&mut buf);
+                    let split = find_crlf_crlf(&buf).unwrap();
+                    assert_eq!(buf.len() - split, fdata_len);
+                }
+            }
+
+            // 3. Saturated max_conns (12) -> 503 rejections + 408 timeouts + instant drops.
+            {
+                let mut held = Vec::new();
+                for _ in 0..12 {
+                    let mut s = TcpStream::connect(srv.addr).unwrap();
+                    let _ = s.write_all(b"GET /hold HTTP/1.1\r\n");
+                    held.push(s);
+                }
+                for _ in 0..20 {
+                    if let Ok(mut extra) = TcpStream::connect(srv.addr) {
+                        let _ = extra.set_read_timeout(Some(Duration::from_millis(200)));
+                        let _ = extra.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+                        let mut small = [0u8; 256];
+                        let _ = extra.read(&mut small);
+                    }
+                }
+                for mut h in held {
+                    let _ = h.set_read_timeout(Some(Duration::from_secs(2)));
+                    let mut r = Vec::new();
+                    let _ = h.read_to_end(&mut r);
+                }
+            }
+
+            srv.wait_permits_zero();
+            drop(srv);
+            let fds_after_srv = count_open_fds();
+            assert!(
+                fds_after_srv.saturating_sub(fds_before_srv) < 32,
+                "reactor churn leaked fds: before={fds_before_srv}, after={fds_after_srv}"
+            );
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+        }
+
+        #[test]
+        fn reactor_fuzz_incremental_framing_and_pipelining_never_panics() {
+            let cfg = ReactorConfig {
+                idle_timeout: Duration::from_millis(250),
+                header_timeout: Duration::from_millis(250),
+                body_timeout: Duration::from_millis(250),
+                write_timeout: Duration::from_secs(2),
+                max_conns: 64,
+                max_keepalive_requests: 10,
+            };
+            let srv = TestReactorHarness::spawn(cfg, 0, |job| {
+                let body = if job.raw.body.is_empty() {
+                    b"ok".as_slice()
+                } else {
+                    job.raw.body.as_slice()
+                };
+                (
+                    build_ok_response(body, job.keep_alive, job.head_only),
+                    None,
+                    job.keep_alive,
+                )
+            });
+
+            let edge_cases: Vec<Vec<u8>> = vec![
+                b"GET /1 HTTP/1.1\r\nHost: x\r\n\r\nGET /2 HTTP/1.1\r\nHost: x\r\n\r\nPOST /3 HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc".to_vec(),
+                b"GET /bare HTTP/1.1\nHost: x\r\n\r\n".to_vec(),
+                b"GET /cr HTTP/1.1\rHost: x\r\n\r\n".to_vec(),
+                b"POST /badcl HTTP/1.1\r\nHost: x\r\nContent-Length: nope\r\n\r\n".to_vec(),
+                format!("GET /big HTTP/1.1\r\nHost: x\r\nX-Pad: {}\r\n\r\n", "a".repeat(MAX_HEADER_BYTES + 128)).into_bytes(),
+                b"\r\n\r\n\xff\xfe\x00\x01".to_vec(),
+            ];
+
+            for payload in &edge_cases {
+                let mut c = TcpStream::connect(srv.addr).unwrap();
+                c.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let _ = c.write_all(payload);
+                let mut out = Vec::new();
+                let _ = c.read_to_end(&mut out);
+            }
+
+            // Byte-by-byte trickle across header CRLFCRLF and body split.
+            {
+                let msg = b"POST /trickle HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\nConnection: close\r\n\r\nping";
+                let mut c = TcpStream::connect(srv.addr).unwrap();
+                c.set_nodelay(true).unwrap();
+                c.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                for chunk in msg.chunks(3) {
+                    c.write_all(chunk).unwrap();
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let mut resp = String::new();
+                c.read_to_string(&mut resp).unwrap();
+                assert!(
+                    resp.starts_with("HTTP/1.1 200 OK\r\n") && resp.ends_with("\r\n\r\nping"),
+                    "{resp}"
+                );
+            }
+
+            // 60 deterministic fuzzed frames.
+            let mut rng = 0x243f_6a88_85a3_08d3u64;
+            let mut next_u64 = || {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng
+            };
+            for _ in 0..60 {
+                let len = ((next_u64() as usize) % 512) + 1;
+                let data: Vec<u8> = (0..len).map(|_| (next_u64() & 0xff) as u8).collect();
+                let mut c = TcpStream::connect(srv.addr).unwrap();
+                c.set_read_timeout(Some(Duration::from_millis(400))).unwrap();
+                let _ = c.write_all(&data);
+                let _ = c.shutdown(std::net::Shutdown::Write);
+                let mut sink = [0u8; 512];
+                let _ = c.read(&mut sink);
+            }
+
+            // Verify reactor recovers and answers cleanly.
+            let mut healthy = TcpStream::connect(srv.addr).unwrap();
+            healthy.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            healthy
+                .write_all(b"GET /ok HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            let mut ok_resp = String::new();
+            healthy.read_to_string(&mut ok_resp).unwrap();
+            assert!(
+                ok_resp.starts_with("HTTP/1.1 200 OK\r\n") && ok_resp.ends_with("\r\n\r\nok"),
+                "{ok_resp}"
+            );
+            srv.wait_permits_zero();
         }
     }
 }

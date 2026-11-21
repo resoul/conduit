@@ -12,33 +12,25 @@ use crate::vm::{CallFrame, RuntimeError, Vm};
 #[cold]
 #[inline(never)]
 pub(crate) fn err_msg(msg: &str) -> RuntimeError {
-    RuntimeError {
-        message: msg.to_string(),
-    }
+    RuntimeError::new(msg)
 }
 
 #[cold]
 #[inline(never)]
 pub(crate) fn err_overflow() -> RuntimeError {
-    RuntimeError {
-        message: "Integer overflow".to_string(),
-    }
+    RuntimeError::new("Integer overflow")
 }
 
 #[cold]
 #[inline(never)]
 pub(crate) fn err_div_zero() -> RuntimeError {
-    RuntimeError {
-        message: "Division by zero".to_string(),
-    }
+    RuntimeError::new("Division by zero")
 }
 
 #[cold]
 #[inline(never)]
 pub(crate) fn err_call_depth() -> RuntimeError {
-    RuntimeError {
-        message: "Maximum call stack depth (256) exceeded".to_string(),
-    }
+    RuntimeError::new("Maximum call stack depth (256) exceeded")
 }
 
 #[cold]

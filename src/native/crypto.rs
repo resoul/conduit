@@ -22,6 +22,7 @@ use std::fs::File;
 ))]
 use std::io::Read;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::native::argon2::{
     DEFAULT_ARGON2_M_KIB, DEFAULT_ARGON2_P, DEFAULT_ARGON2_T, argon2id_raw, format_argon2id_phc,
@@ -869,42 +870,120 @@ pub fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32, out: &mut [u
     }
 }
 
-struct PasswordHashGate {
-    active: Mutex<usize>,
-    cv: Condvar,
-    max: usize,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PasswordHashOverloaded;
+
+struct PasswordHashState {
+    active: usize,
+    waiting: usize,
 }
 
-struct PasswordHashPermit<'a>(&'a PasswordHashGate);
+pub(crate) struct PasswordHashGate {
+    state: Mutex<PasswordHashState>,
+    cv: Condvar,
+    max_active: usize,
+    max_queued: usize,
+    wait_timeout: Duration,
+}
 
-impl Drop for PasswordHashPermit<'_> {
+pub(crate) struct PasswordHashPermit(Arc<PasswordHashGate>);
+
+impl Drop for PasswordHashPermit {
     fn drop(&mut self) {
-        if let Ok(mut guard) = self.0.active.lock() {
-            *guard = guard.saturating_sub(1);
-            self.0.cv.notify_one();
-        }
+        let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.active = state.active.saturating_sub(1);
+        self.0.cv.notify_one();
     }
 }
 
-static PASSWORD_HASH_GATE: OnceLock<PasswordHashGate> = OnceLock::new();
+impl PasswordHashGate {
+    pub(crate) fn new(max_active: usize, max_queued: usize, wait_timeout: Duration) -> Self {
+        Self {
+            state: Mutex::new(PasswordHashState {
+                active: 0,
+                waiting: 0,
+            }),
+            cv: Condvar::new(),
+            max_active: max_active.max(1),
+            max_queued,
+            wait_timeout,
+        }
+    }
 
-fn acquire_password_hash_permit() -> PasswordHashPermit<'static> {
-    let gate = PASSWORD_HASH_GATE.get_or_init(|| {
-        let max = std::thread::available_parallelism()
+    pub(crate) fn try_acquire(
+        self: &Arc<Self>,
+    ) -> Result<PasswordHashPermit, PasswordHashOverloaded> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.active < self.max_active {
+            state.active += 1;
+            return Ok(PasswordHashPermit(Arc::clone(self)));
+        }
+        if state.waiting >= self.max_queued || self.wait_timeout.is_zero() {
+            return Err(PasswordHashOverloaded);
+        }
+        state.waiting += 1;
+        let deadline = Instant::now() + self.wait_timeout;
+        loop {
+            let now = Instant::now();
+            let Some(remaining) = deadline.checked_duration_since(now) else {
+                state.waiting = state.waiting.saturating_sub(1);
+                return Err(PasswordHashOverloaded);
+            };
+            if remaining.is_zero() {
+                state.waiting = state.waiting.saturating_sub(1);
+                return Err(PasswordHashOverloaded);
+            }
+            let (next, wait_res) = self
+                .cv
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|e| e.into_inner());
+            state = next;
+            if state.active < self.max_active {
+                state.waiting = state.waiting.saturating_sub(1);
+                state.active += 1;
+                return Ok(PasswordHashPermit(Arc::clone(self)));
+            }
+            if wait_res.timed_out() {
+                state.waiting = state.waiting.saturating_sub(1);
+                return Err(PasswordHashOverloaded);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn waiting_count(&self) -> usize {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).waiting
+    }
+}
+
+static PASSWORD_HASH_GATE: OnceLock<Arc<PasswordHashGate>> = OnceLock::new();
+
+pub(crate) fn default_password_hash_gate() -> &'static Arc<PasswordHashGate> {
+    PASSWORD_HASH_GATE.get_or_init(|| {
+        let default_active = std::thread::available_parallelism()
             .map(|n| (n.get() / 2).clamp(2, 4))
             .unwrap_or(2);
-        PasswordHashGate {
-            active: Mutex::new(0),
-            cv: Condvar::new(),
-            max,
-        }
-    });
-    let mut guard = gate.active.lock().unwrap_or_else(|e| e.into_inner());
-    while *guard >= gate.max {
-        guard = gate.cv.wait(guard).unwrap_or_else(|e| e.into_inner());
-    }
-    *guard += 1;
-    PasswordHashPermit(gate)
+        let max_active = std::env::var("CONDUIT_PASSWORD_HASH_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|n| n.clamp(1, 64))
+            .unwrap_or(default_active);
+        let max_queued = std::env::var("CONDUIT_PASSWORD_HASH_MAX_QUEUE")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|n| n.clamp(0, 1024))
+            .unwrap_or_else(|| max_active.max(2));
+        let wait_timeout_ms = std::env::var("CONDUIT_PASSWORD_HASH_QUEUE_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|n| n.clamp(10, 60_000))
+            .unwrap_or(2_000);
+        Arc::new(PasswordHashGate::new(
+            max_active,
+            max_queued,
+            Duration::from_millis(wait_timeout_ms),
+        ))
+    })
 }
 
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -918,14 +997,19 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     std::hint::black_box(diff) == 0
 }
 
-pub fn hash_password(password: &str) -> Obj {
+pub(crate) fn hash_password_with_gate(password: &str, gate: &Arc<PasswordHashGate>) -> Obj {
     let mut salt = [0u8; 16];
     if let Err(e) = fill_random_bytes(&mut salt) {
         return make_crypto_error("rng_failed", e);
     }
     let mut dk = [0u8; 32];
     {
-        let _permit = acquire_password_hash_permit();
+        let Ok(_permit) = gate.try_acquire() else {
+            return make_crypto_error(
+                "overloaded",
+                "Password hashing concurrency limit exceeded; retry later",
+            );
+        };
         if let Err(e) = argon2id_raw(
             password.as_bytes(),
             &salt,
@@ -950,6 +1034,10 @@ pub fn hash_password(password: &str) -> Obj {
     Obj::str(phc)
 }
 
+pub fn hash_password(password: &str) -> Obj {
+    hash_password_with_gate(password, default_password_hash_gate())
+}
+
 fn parse_pbkdf2_hash(stored: &str) -> Option<(u32, Vec<u8>, Vec<u8>)> {
     let mut parts = stored.split('$');
     match (parts.next(), parts.next(), parts.next(), parts.next(), parts.next()) {
@@ -969,8 +1057,12 @@ fn parse_pbkdf2_hash(stored: &str) -> Option<(u32, Vec<u8>, Vec<u8>)> {
     }
 }
 
-pub fn verify_password(password: &str, stored: &str) -> bool {
-    let _permit = acquire_password_hash_permit();
+pub(crate) fn verify_password_with_gate(
+    password: &str,
+    stored: &str,
+    gate: &Arc<PasswordHashGate>,
+) -> Result<bool, PasswordHashOverloaded> {
+    let _permit = gate.try_acquire()?;
     if let Some(parsed) = parse_argon2id_phc(stored) {
         let mut dk = vec![0u8; parsed.hash.len()];
         let ok = argon2id_raw(
@@ -986,13 +1078,13 @@ pub fn verify_password(password: &str, stored: &str) -> bool {
         .is_ok()
             && constant_time_eq(&dk, &parsed.hash);
         dk.zeroize();
-        ok
+        Ok(ok)
     } else if let Some((iters, salt, expected)) = parse_pbkdf2_hash(stored) {
         let mut dk = [0u8; 32];
         pbkdf2_sha256(password.as_bytes(), &salt, iters, &mut dk);
         let ok = constant_time_eq(&dk, &expected);
         dk.zeroize();
-        ok
+        Ok(ok)
     } else {
         // Burn constant-cost Argon2id work on malformed input to prevent timing leaks.
         let mut dk = [0u8; 32];
@@ -1008,8 +1100,12 @@ pub fn verify_password(password: &str, stored: &str) -> bool {
         );
         std::hint::black_box(&dk);
         dk.zeroize();
-        false
+        Ok(false)
     }
+}
+
+pub fn verify_password(password: &str, stored: &str) -> bool {
+    verify_password_with_gate(password, stored, default_password_hash_gate()).unwrap_or(false)
 }
 
 pub fn password_needs_rehash(stored: &str) -> bool {
@@ -1113,5 +1209,67 @@ mod tests {
             assert_eq!(pid, std::process::id());
         });
         assert_ne!(after_fork, [0xAAu8; 32]);
+    }
+
+    #[test]
+    fn password_hash_gate_rejects_excess_queue_and_wait_timeout() {
+        let gate = Arc::new(PasswordHashGate::new(1, 1, Duration::from_millis(120)));
+        let permit = gate.try_acquire().unwrap();
+
+        // Fill the 1-slot wait queue on a background thread.
+        let gate_q = Arc::clone(&gate);
+        let waiter = std::thread::spawn(move || gate_q.try_acquire());
+        for _ in 0..200 {
+            if gate.waiting_count() == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(gate.waiting_count(), 1, "waiter should be queued");
+
+        // While active=1 and waiting=1 == max_queued, a 3rd caller fails immediately.
+        let t_start = Instant::now();
+        assert!(matches!(gate.try_acquire(), Err(PasswordHashOverloaded)));
+        assert!(t_start.elapsed() < Duration::from_millis(50));
+
+        // Let the first queued waiter time out while `permit` stays held.
+        assert!(matches!(waiter.join().unwrap(), Err(PasswordHashOverloaded)));
+        assert_eq!(gate.waiting_count(), 0);
+
+        // Next waiter succeeds as soon as `permit` is released before timeout.
+        let gate_ok = Arc::clone(&gate);
+        let waiter_ok = std::thread::spawn(move || gate_ok.try_acquire());
+        for _ in 0..200 {
+            if gate.waiting_count() == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        drop(permit);
+        assert!(waiter_ok.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn hash_and_verify_with_saturated_gate_return_overloaded() {
+        let gate = Arc::new(PasswordHashGate::new(1, 0, Duration::from_millis(20)));
+        let Obj::Str(existing_hash) = hash_password("hunter2") else {
+            panic!("expected hash string");
+        };
+
+        let _held = gate.try_acquire().unwrap();
+        let hash_err = hash_password_with_gate("hunter2", &gate);
+        let Obj::Record(rec) = hash_err else {
+            panic!("expected CryptoError record, got {:?}", hash_err);
+        };
+        assert_eq!(rec.schema_id, SCHEMA_CRYPTO_ERROR);
+        let Obj::Str(kind) = rec.get_obj(0) else {
+            panic!("expected error kind");
+        };
+        assert_eq!(kind.as_str(), "overloaded");
+
+        assert!(matches!(
+            verify_password_with_gate("hunter2", existing_hash.as_str(), &gate),
+            Err(PasswordHashOverloaded)
+        ));
     }
 }

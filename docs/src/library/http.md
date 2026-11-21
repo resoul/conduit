@@ -123,6 +123,8 @@ Server settings resolve with **`CONDUIT_HTTP_*` environment variables > `Router`
 - `CONDUIT_HTTP_MAX_CONNS` (`16..=65536`; reactor global concurrent connection cap, default `clamp(workers * 128, 512, 8192)`)
 - `CONDUIT_HTTP_TRUSTED_PROXIES` (comma-separated IPs/CIDRs; setting `""` overrides router-configured proxies to empty)
 
+When per-IP limits, reactor capacity, worker queues, or the password-hashing concurrency gate are saturated, the server sheds excess requests with `503 Service Unavailable` and `Retry-After: 1`.
+
 ## `Request` Helper Methods
 
 | Method | Signature | Description |

@@ -9,9 +9,9 @@ The `conduit` CLI provides tools for checking, compiling, executing, disassembli
 | Command | Arguments | Description |
 | :--- | :--- | :--- |
 | `conduit build` | `<file.cdt> [-o <output>]` | Compiles and bundles the program (including relative imports) into a standalone executable. |
-| `conduit run` | `<file.cdt>` | Type-checks, compiles to bytecode, and executes `main()` in the VM. |
-| `conduit test` | `[file_or_dir] [--filter <pat>] [--fail-fast]` | Discovers and runs `test "<name>" { ... }` blocks in `.cdt` files. |
-| `conduit watch` | `<file.cdt> [args...]` | Watches `.cdt` files and automatically recompiles and restarts on changes. |
+| `conduit run` | `[perm-flags...] <file.cdt\|file.cdtb> [-- args...]` | Type-checks, compiles to bytecode (or runs a bundle), and executes `main()` in the VM. |
+| `conduit test` | `[file_or_dir] [perm-flags...] [--filter <pat>] [--fail-fast]` | Discovers and runs `test "<name>" { ... }` blocks in `.cdt` files. |
+| `conduit watch` | `[perm-flags...] <file.cdt> [args...]` | Watches `.cdt` files and automatically recompiles and restarts on changes. |
 | `conduit lsp` | None | Starts the stdio Language Server (diagnostics, hover, definition, symbols, rename, formatting, completion) for IDEs. |
 | `conduit fmt` | `<file_or_dir> [--check]` | Formats `.cdt` source files (or checks formatting with `--check`). |
 | `conduit routes` | `<file.cdt> [--router <name>]` | Prints the declarative HTTP router route table (`METHOD`, `PATH`, `HANDLER`, `BODY`, middleware). |
@@ -92,10 +92,31 @@ Inspects, applies, or rolls back declarative `migration <version> "<name>"` bloc
 ```bash
 conduit cron list main.cdt
 conduit cron run main.cdt cleanup_sessions
+conduit cron run --sandbox --allow-write=./logs main.cdt cleanup_sessions
 conduit cron print main.cdt
 ```
 
 Lists declared `schedule` jobs, runs a single job immediately, or prints ready-to-paste `crontab` lines to `stdout` without modifying the host system.
+
+### Runtime Permissions & Sandbox
+
+> [!IMPORTANT]
+> Bare invocations (`conduit run main.cdt`, `watch`, `test`, `cron run`) allow all host capabilities by default for local convenience. **Always pass `--sandbox` (or scoped `--allow-*` flags) when running `.cdt` programs or `.cdtb` bundles from untrusted sources.**
+
+| Flag | Effect |
+| :--- | :--- |
+| `--sandbox`, `--deny-all`, `--no-permissions` | Deny all host capabilities (filesystem, network, subprocesses, environment) by default |
+| `--allow-all`, `-A` | Explicitly allow all host capabilities (can still be narrowed with `--deny-*`) |
+| `--allow-read[=paths]`, `--deny-read[=paths]` | Allow/deny filesystem reads (comma-separated paths) |
+| `--allow-write[=paths]`, `--deny-write[=paths]` | Allow/deny filesystem writes and mutations (comma-separated paths) |
+| `--allow-net[=hosts]`, `--deny-net[=hosts]` | Allow/deny outbound/inbound network access (`host`, `host:port`, `*.domain:port`, `:port`, `[ipv6]:port`) |
+| `--allow-run[=cmds]`, `--deny-run[=cmds]` | Allow/deny subprocess execution (`cdt.process`) |
+| `--allow-env[=vars]`, `--deny-env[=vars]` | Allow/deny environment variable reads (`cdt.env`) |
+
+Rules:
+- Passing any `--allow-<cap>` automatically sandboxes all other categories to deny-by-default unless `--allow-all` is also given.
+- Explicit `--deny-*` rules always win over `--allow-*` rules (including `-A`), and filesystem paths resolve symlinks and `..` components against the working directory at startup.
+- Child VMs created via `spawn`, HTTP server workers, `cdt.cron`, and `cdt.app` inherit the active permission policy automatically.
 
 ### Running Tests (`conduit test`)
 
