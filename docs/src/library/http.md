@@ -110,12 +110,15 @@ api.close()
 
 ### Server Configuration Precedence
 
+On macOS and Linux (`x86_64` / `aarch64`), `serve` runs an event-driven `kqueue`/`epoll` I/O reactor that keeps idle keep-alive sockets and slow/partial reads off the VM worker thread pool; other targets use a bounded blocking worker pool.
+
 Server settings resolve with **`CONDUIT_HTTP_*` environment variables > `Router` methods > built-in defaults**:
 - `CONDUIT_HTTP_WORKERS` (`1..=256`; default `clamp(cpus, 4, 16)`)
 - `CONDUIT_HTTP_IDLE_TIMEOUT_MS` (`100..=300000`; default `3000`)
 - `CONDUIT_HTTP_HEADER_TIMEOUT_MS` (`500..=300000`; default `10000`)
 - `CONDUIT_HTTP_BODY_TIMEOUT_MS` (`500..=600000`; default `30000`)
 - `CONDUIT_HTTP_MAX_CONNS_PER_IP` (default `max(workers / 2, 4)`; `0` disables)
+- `CONDUIT_HTTP_MAX_CONNS` (`16..=65536`; reactor global concurrent connection cap, default `clamp(workers * 128, 512, 8192)`)
 - `CONDUIT_HTTP_TRUSTED_PROXIES` (comma-separated IPs/CIDRs; setting `""` overrides router-configured proxies to empty)
 
 ## `Request` Helper Methods

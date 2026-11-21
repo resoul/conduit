@@ -18,7 +18,7 @@ pub const MAX_LINE: usize = 8 * 1024;
 pub const MAX_HEADER_BYTES: usize = 64 * 1024;
 pub const MAX_HEADERS: usize = 100;
 pub const MAX_BODY: usize = 1024 * 1024;
-const BODY_INITIAL_CAP: usize = 64 * 1024;
+pub(crate) const BODY_INITIAL_CAP: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub enum RouteSeg {
@@ -756,7 +756,7 @@ pub fn is_valid_header_value(val: &str) -> bool {
 }
 
 #[inline]
-fn find_crlf_crlf(buf: &[u8]) -> Option<usize> {
+pub(crate) fn find_crlf_crlf(buf: &[u8]) -> Option<usize> {
     if buf.len() < 4 {
         return None;
     }
@@ -769,7 +769,7 @@ fn find_crlf_crlf(buf: &[u8]) -> Option<usize> {
 }
 
 #[inline]
-fn has_bare_lf(buf: &[u8], base_prev_byte: Option<u8>) -> bool {
+pub(crate) fn has_bare_lf(buf: &[u8], base_prev_byte: Option<u8>) -> bool {
     for (i, &b) in buf.iter().enumerate() {
         if b == b'\n' {
             let prev = if i == 0 { base_prev_byte } else { Some(buf[i - 1]) };
@@ -856,17 +856,16 @@ fn map_deadline_io_err<R: DeadlineSource>(source: &R, err: io::Error) -> ReadHtt
     }
 }
 
-fn read_http_request_inner<R: BufRead, F, M>(
-    reader: &mut R,
-    on_headers_done: F,
-    map_io_err: M,
-) -> Result<RawHttpRequest, ReadHttpError>
-where
-    F: FnOnce(&mut R),
-    M: Fn(&R, io::Error) -> ReadHttpError,
-{
-    let head = read_http_head(reader, &map_io_err)?;
-    let mut rem = &head[..head.len() - 4];
+pub struct ParsedHttpHead {
+    pub method: Arc<VmString>,
+    pub path: String,
+    pub query: String,
+    pub headers: Vec<(Arc<VmString>, Vec<u8>)>,
+    pub content_length: usize,
+    pub keep_alive: bool,
+}
+
+pub fn parse_http_head(mut rem: &[u8]) -> Result<ParsedHttpHead, ReadHttpError> {
     let req_line_bytes = next_crlf_line(&mut rem).unwrap_or(&[]);
     if req_line_bytes.len() > MAX_LINE {
         return Err(ReadHttpError::TooLarge);
@@ -975,10 +974,38 @@ where
         headers.push((header_key_bytes(name), val.to_vec()));
     }
 
+    let keep_alive = if version == "HTTP/1.0" {
+        conn_keep_alive && !conn_close
+    } else {
+        !conn_close
+    };
+
+    Ok(ParsedHttpHead {
+        method: intern_http_method(method),
+        path: raw_path.to_string(),
+        query: raw_query.to_owned(),
+        headers,
+        content_length,
+        keep_alive,
+    })
+}
+
+fn read_http_request_inner<R: BufRead, F, M>(
+    reader: &mut R,
+    on_headers_done: F,
+    map_io_err: M,
+) -> Result<RawHttpRequest, ReadHttpError>
+where
+    F: FnOnce(&mut R),
+    M: Fn(&R, io::Error) -> ReadHttpError,
+{
+    let head_buf = read_http_head(reader, &map_io_err)?;
+    let parsed = parse_http_head(&head_buf[..head_buf.len() - 4])?;
+
     on_headers_done(reader);
-    let mut body_bytes = Vec::with_capacity(content_length.min(BODY_INITIAL_CAP));
-    if content_length > 0 {
-        let mut remaining = content_length;
+    let mut body_bytes = Vec::with_capacity(parsed.content_length.min(BODY_INITIAL_CAP));
+    if parsed.content_length > 0 {
+        let mut remaining = parsed.content_length;
         let mut chunk = [0u8; 16 * 1024];
         while remaining > 0 {
             let want = remaining.min(chunk.len());
@@ -999,19 +1026,13 @@ where
         }
     }
 
-    let keep_alive = if version == "HTTP/1.0" {
-        conn_keep_alive && !conn_close
-    } else {
-        !conn_close
-    };
-
     Ok(RawHttpRequest {
-        method: intern_http_method(method),
-        path: raw_path.to_string(),
-        query: raw_query.to_owned(),
-        headers,
+        method: parsed.method,
+        path: parsed.path,
+        query: parsed.query,
+        headers: parsed.headers,
         body: body_bytes,
-        keep_alive,
+        keep_alive: parsed.keep_alive,
     })
 }
 
@@ -1121,6 +1142,13 @@ pub fn write_http_response_ext<W: Write>(
 
 pub fn write_error_response(stream: &mut BufWriter<TcpStream>, status: i64, body: &str) {
     let _ = write_http_response_ext(stream, status, body, None, false, false);
+}
+
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn format_error_response_bytes(status: i64, body: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(128 + body.len());
+    let _ = write_http_response_ext(&mut out, status, body, None, false, false);
+    out
 }
 
 pub fn reader_writer_pair(stream: TcpStream) -> io::Result<(BufReader<TcpStream>, BufWriter<TcpStream>)> {

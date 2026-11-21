@@ -16,7 +16,7 @@ func sign_payload(secret: String, body: String) -> String | crypto.CryptoError {
 
 ## Types
 
-* `CryptoError { kind: String, message: String }` (`"invalid_base64"`, `"invalid_hex"`, `"invalid_utf8"`, `"invalid_input"`, `"rng_failed"`)
+* `CryptoError { kind: String, message: String }` (`"invalid_base64"`, `"invalid_hex"`, `"invalid_utf8"`, `"invalid_input"`, `"rng_failed"`, `"hash_failed"`)
 
 ## API
 
@@ -31,7 +31,7 @@ func sign_payload(secret: String, body: String) -> String | crypto.CryptoError {
 | `uuid_v4` | `() -> String` | Random RFC 4122 UUID v4 |
 | `random_bytes_hex` | `(len: Int) -> String \| CryptoError` | `len` random bytes as lowercase hex |
 | `random_int` | `(min: Int, max: Int) -> Int \| CryptoError` | Random integer in `[min, max)` |
-| `hash_password` | `(password: String) -> String \| CryptoError` | PBKDF2-HMAC-SHA256 salted password hash (`pbkdf2-sha256$600000$...`) |
-| `verify_password` | `(password: String, encoded: String) -> Bool` | Constant-time password verification against `pbkdf2-sha256$...` |
-| `password_needs_rehash` | `(encoded: String) -> Bool` | Returns `true` if a stored password hash is malformed, has short salt, or uses fewer than 600,000 iterations |
+| `hash_password` | `(password: String) -> String \| CryptoError` | Argon2id (RFC 9106) salted password hash (`$argon2id$v=19$m=19456,t=2,p=1$...`) |
+| `verify_password` | `(password: String, encoded: String) -> Bool` | Constant-time password verification against `$argon2id$...` and legacy `pbkdf2-sha256$...` hashes |
+| `password_needs_rehash` | `(encoded: String) -> Bool` | Returns `true` if a stored password hash uses legacy PBKDF2, weak/short Argon2id parameters, or is malformed |
 | `constant_time_eq` | `(a: String, b: String) -> Bool` | Constant-time string comparison |

@@ -23,7 +23,12 @@ use std::fs::File;
 use std::io::Read;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
+use crate::native::argon2::{
+    DEFAULT_ARGON2_M_KIB, DEFAULT_ARGON2_P, DEFAULT_ARGON2_T, argon2id_raw, format_argon2id_phc,
+    parse_argon2id_phc,
+};
 use crate::native::b64_simd;
+use crate::native::tls::crypto::Zeroize;
 use crate::vm::value::{Obj, SCHEMA_CRYPTO_ERROR, StructData};
 
 pub const CRYPTO_SHA256: u8 = 0;
@@ -41,7 +46,6 @@ pub const CRYPTO_CONST_TIME_EQ: u8 = 11;
 pub const CRYPTO_PASSWORD_NEEDS_REHASH: u8 = 12;
 
 pub const MAX_PBKDF2_ITERATIONS: u32 = 10_000_000;
-const DEFAULT_PBKDF2_ITERATIONS: u32 = 600_000;
 
 #[inline]
 pub fn make_crypto_error(kind: &str, message: impl Into<String>) -> Obj {
@@ -919,14 +923,28 @@ pub fn hash_password(password: &str) -> Obj {
     let mut dk = [0u8; 32];
     {
         let _permit = acquire_password_hash_permit();
-        pbkdf2_sha256(password.as_bytes(), &salt, DEFAULT_PBKDF2_ITERATIONS, &mut dk);
+        if let Err(e) = argon2id_raw(
+            password.as_bytes(),
+            &salt,
+            &[],
+            &[],
+            DEFAULT_ARGON2_M_KIB,
+            DEFAULT_ARGON2_T,
+            DEFAULT_ARGON2_P,
+            &mut dk,
+        ) {
+            return make_crypto_error("hash_failed", e);
+        }
     }
-    Obj::str(format!(
-        "pbkdf2-sha256${}${}${}",
-        DEFAULT_PBKDF2_ITERATIONS,
-        encode_hex(&salt),
-        encode_hex(&dk)
-    ))
+    let phc = format_argon2id_phc(
+        DEFAULT_ARGON2_M_KIB,
+        DEFAULT_ARGON2_T,
+        DEFAULT_ARGON2_P,
+        &salt,
+        &dk,
+    );
+    dk.zeroize();
+    Obj::str(phc)
 }
 
 fn parse_pbkdf2_hash(stored: &str) -> Option<(u32, Vec<u8>, Vec<u8>)> {
@@ -950,24 +968,57 @@ fn parse_pbkdf2_hash(stored: &str) -> Option<(u32, Vec<u8>, Vec<u8>)> {
 
 pub fn verify_password(password: &str, stored: &str) -> bool {
     let _permit = acquire_password_hash_permit();
-    if let Some((iters, salt, expected)) = parse_pbkdf2_hash(stored) {
+    if let Some(parsed) = parse_argon2id_phc(stored) {
+        let mut dk = vec![0u8; parsed.hash.len()];
+        let ok = argon2id_raw(
+            password.as_bytes(),
+            &parsed.salt,
+            &[],
+            &[],
+            parsed.m_cost,
+            parsed.t_cost,
+            parsed.parallelism,
+            &mut dk,
+        )
+        .is_ok()
+            && constant_time_eq(&dk, &parsed.hash);
+        dk.zeroize();
+        ok
+    } else if let Some((iters, salt, expected)) = parse_pbkdf2_hash(stored) {
         let mut dk = [0u8; 32];
         pbkdf2_sha256(password.as_bytes(), &salt, iters, &mut dk);
-        constant_time_eq(&dk, &expected)
+        let ok = constant_time_eq(&dk, &expected);
+        dk.zeroize();
+        ok
     } else {
-        // Burn constant-cost PBKDF2 work on malformed input to prevent timing leaks.
+        // Burn constant-cost Argon2id work on malformed input to prevent timing leaks.
         let mut dk = [0u8; 32];
-        pbkdf2_sha256(password.as_bytes(), &[0u8; 16], DEFAULT_PBKDF2_ITERATIONS, &mut dk);
+        let _ = argon2id_raw(
+            password.as_bytes(),
+            &[0u8; 16],
+            &[],
+            &[],
+            DEFAULT_ARGON2_M_KIB,
+            DEFAULT_ARGON2_T,
+            DEFAULT_ARGON2_P,
+            &mut dk,
+        );
         std::hint::black_box(&dk);
+        dk.zeroize();
         false
     }
 }
 
 pub fn password_needs_rehash(stored: &str) -> bool {
-    let Some((iters, salt, _expected)) = parse_pbkdf2_hash(stored) else {
+    let Some(parsed) = parse_argon2id_phc(stored) else {
+        // Malformed hashes and legacy PBKDF2-SHA256 hashes both need upgrade to Argon2id.
         return true;
     };
-    salt.len() < 16 || iters < DEFAULT_PBKDF2_ITERATIONS
+    parsed.salt.len() < 16
+        || parsed.hash.len() < 32
+        || parsed.m_cost < DEFAULT_ARGON2_M_KIB
+        || parsed.t_cost < DEFAULT_ARGON2_T
+        || parsed.parallelism < DEFAULT_ARGON2_P
 }
 
 fn decode_hex_bytes(s: &str) -> Option<Vec<u8>> {
@@ -1013,24 +1064,29 @@ mod tests {
         let Obj::Str(h) = hash_password("s3cr3t!") else {
             panic!("expected hashed string");
         };
+        assert!(h.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"));
         assert!(verify_password("s3cr3t!", h.as_str()));
         assert!(!verify_password("wrong", h.as_str()));
         assert!(!verify_password("s3cr3t!", "bad$format"));
         assert!(!password_needs_rehash(h.as_str()));
         assert!(password_needs_rehash("bad$format"));
-        let weak = format!(
+
+        // Weak Argon2id parameters & short salt trigger needs_rehash
+        let weak_argon = "$argon2id$v=19$m=4096,t=1,p=1$BwcHBwcHBwcHBwcHBwcHBw$CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk";
+        assert!(password_needs_rehash(weak_argon));
+
+        // Legacy PBKDF2-SHA256 hashes continue to verify while flagging password_needs_rehash() = true
+        let legacy_salt = [1u8; 16];
+        let mut legacy_dk = [0u8; 32];
+        pbkdf2_sha256(b"s3cr3t!", &legacy_salt, 1000, &mut legacy_dk);
+        let legacy_pbkdf2 = format!(
             "pbkdf2-sha256$1000${}${}",
-            encode_hex(&[1u8; 16]),
-            encode_hex(&[2u8; 32])
+            encode_hex(&legacy_salt),
+            encode_hex(&legacy_dk)
         );
-        assert!(password_needs_rehash(&weak));
-        let short_salt = format!(
-            "pbkdf2-sha256${}${}${}",
-            DEFAULT_PBKDF2_ITERATIONS,
-            encode_hex(&[1u8; 8]),
-            encode_hex(&[2u8; 32])
-        );
-        assert!(password_needs_rehash(&short_salt));
+        assert!(verify_password("s3cr3t!", &legacy_pbkdf2));
+        assert!(!verify_password("wrong", &legacy_pbkdf2));
+        assert!(password_needs_rehash(&legacy_pbkdf2));
     }
 
     #[test]

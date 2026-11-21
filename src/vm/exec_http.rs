@@ -6,13 +6,20 @@ use std::time::Duration;
 
 use crate::ir::Module;
 use crate::native::http::{
-    HttpClientState, MatchedParams, ReadHttpError, RouteEntry, RouterServerOptions, RouterState,
-    deadline_reader_writer_pair, header_key, http_client_bytes_request,
+    HttpClientState, MatchedParams, RouteEntry, RouterServerOptions, RouterState,
+    format_error_response_bytes, header_key, http_client_bytes_request,
     http_client_pooled_request_with_options, http_client_request, http_client_request_with_timeout,
     lookup_route, make_http_client_obj, make_http_error, make_response_obj,
-    make_response_with_body_obj, make_router_obj, read_http_request_deadline,
-    resolve_client_url, route_prefix_matches, try_serve_static, write_error_response,
-    write_http_response_ext,
+    make_response_with_body_obj, make_router_obj, resolve_client_url, route_prefix_matches,
+    try_serve_static, write_http_response_ext,
+};
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))
+)))]
+use crate::native::http::{
+    ReadHttpError, deadline_reader_writer_pair, read_http_request_deadline, write_error_response,
 };
 use crate::vm::exec_cold::err_msg;
 use crate::vm::value::{
@@ -84,6 +91,7 @@ struct HttpServerConfig {
     header_timeout: Duration,
     body_timeout: Duration,
     max_conns_per_ip: usize,
+    max_conns: usize,
     trusted_proxies: Vec<IpNet>,
 }
 
@@ -127,6 +135,11 @@ impl HttpServerConfig {
             .and_then(|v| v.trim().parse::<usize>().ok())
             .or(opts.max_conns_per_ip)
             .unwrap_or_else(|| (workers / 2).max(4));
+        let default_max_conns = (workers * 128).clamp(512, 8192);
+        let max_conns = get_env("CONDUIT_HTTP_MAX_CONNS")
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|n| n.clamp(16, 65_536))
+            .unwrap_or(default_max_conns);
         let trusted_proxies = match get_env("CONDUIT_HTTP_TRUSTED_PROXIES") {
             Some(raw) => raw.split(',').filter_map(IpNet::parse).collect(),
             None => opts
@@ -162,6 +175,7 @@ impl HttpServerConfig {
                 DEFAULT_BODY_TIMEOUT,
             ),
             max_conns_per_ip,
+            max_conns,
             trusted_proxies,
         }
     }
@@ -436,6 +450,222 @@ pub(crate) fn serve_http_listener(
         install_signal_handlers();
     }
     let cfg = HttpServerConfig::resolve(&routers[rid].server_opts);
+    serve_http_listener_impl(
+        module,
+        routers.clone(),
+        http_clients,
+        db_pools,
+        db_pool_free,
+        spawn_tracker,
+        script_args,
+        rid,
+        listener,
+        bound_addr,
+        stop_flag,
+        watch_signals,
+        cfg,
+    );
+    if let Ok(mut guard) = routers[rid].listen_addr.lock() {
+        *guard = None;
+    }
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+fn dispatch_one_reactor_job(
+    vm: &mut Vm,
+    module: &Module,
+    rid: usize,
+    req_obj: Obj,
+    head_only: bool,
+    keep_alive: bool,
+) -> (Vec<u8>, bool) {
+    let Ok(resp_obj) = vm.dispatch_router_request(module, 0, 0, rid, req_obj) else {
+        return (format_error_response_bytes(500, "Internal Server Error"), false);
+    };
+    let Ok((status, body, headers)) = vm.extract_response_fields(&resp_obj) else {
+        return (format_error_response_bytes(500, "Internal Server Error"), false);
+    };
+    let mut out = Vec::with_capacity(256 + body.len());
+    if write_http_response_ext(&mut out, status, body, headers, keep_alive, head_only).is_err() {
+        return (format_error_response_bytes(500, "Internal Server Error"), false);
+    }
+    (out, keep_alive)
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+#[allow(clippy::too_many_arguments)]
+fn serve_http_listener_impl(
+    module: Arc<Module>,
+    routers: Vec<RouterState>,
+    http_clients: Vec<HttpClientState>,
+    db_pools: Vec<crate::vm::DbPoolSlot>,
+    db_pool_free: Vec<usize>,
+    spawn_tracker: Arc<crate::vm::SpawnTracker>,
+    script_args: Option<Vec<String>>,
+    rid: usize,
+    listener: TcpListener,
+    bound_addr: Option<std::net::SocketAddr>,
+    stop_flag: Arc<std::sync::atomic::AtomicBool>,
+    watch_signals: bool,
+    cfg: HttpServerConfig,
+) {
+    use crate::native::http_reactor::{
+        ReactorConfig, ReactorJob, ReactorResponse, ReactorWakePair, run_http_reactor,
+    };
+
+    let workers = cfg.workers;
+    let ip_limiter = IpConnLimiter::with_config(workers, cfg.max_conns_per_ip, cfg.trusted_proxies);
+    let reactor_cfg = ReactorConfig {
+        idle_timeout: cfg.idle_timeout,
+        header_timeout: cfg.header_timeout,
+        body_timeout: cfg.body_timeout,
+        max_conns: cfg.max_conns,
+        max_keepalive_requests: HTTP_MAX_KEEPALIVE_REQUESTS,
+    };
+    let Ok(wake_pair) = ReactorWakePair::new() else {
+        return;
+    };
+    let (job_tx, job_rx) = mpsc::sync_channel::<ReactorJob>(workers * 8);
+    let job_rx = Arc::new(Mutex::new(job_rx));
+    let (res_tx, res_rx) = mpsc::channel::<ReactorResponse>();
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let job_rx = Arc::clone(&job_rx);
+            let res_tx = res_tx.clone();
+            let waker = wake_pair.waker();
+            let routers = routers.clone();
+            let http_clients = http_clients.clone();
+            let db_pools = db_pools.clone();
+            let db_pool_free = db_pool_free.clone();
+            let spawn_tracker = Arc::clone(&spawn_tracker);
+            let mod_worker = Arc::clone(&module);
+            let script_args = script_args.clone();
+            scope.spawn(move || {
+                let mut worker_vm = Vm::new();
+                worker_vm.script_args = script_args;
+                worker_vm.host.routers = routers;
+                worker_vm.host.http_clients = http_clients;
+                worker_vm.host.db_pools = db_pools;
+                worker_vm.host.db_pool_free = db_pool_free;
+                worker_vm.host.spawn_tracker = spawn_tracker;
+                worker_vm.host.shared_module = Some(Arc::clone(&mod_worker));
+                loop {
+                    let job = {
+                        let Ok(guard) = job_rx.lock() else { break };
+                        match guard.recv() {
+                            Ok(job) => job,
+                            Err(_) => break,
+                        }
+                    };
+                    let conn_id = job.conn_id;
+                    let head_only = job.head_only;
+                    let keep_alive = job.keep_alive;
+                    let req_obj = job.raw.into_request_obj();
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        dispatch_one_reactor_job(
+                            &mut worker_vm,
+                            &mod_worker,
+                            rid,
+                            req_obj,
+                            head_only,
+                            keep_alive,
+                        )
+                    }));
+                    let (bytes, keep_alive) = match result {
+                        Ok(pair) => pair,
+                        Err(_) => {
+                            eprintln!("[http] worker recovered from request panic");
+                            worker_vm.frame_depth = 0;
+                            let obj_len = worker_vm.objs.len();
+                            worker_vm.clear_obj_range(0, obj_len);
+                            (format_error_response_bytes(500, "Internal Server Error"), false)
+                        }
+                    };
+                    let _ = res_tx.send(ReactorResponse {
+                        conn_id,
+                        bytes,
+                        keep_alive,
+                    });
+                    waker.wake();
+                    crate::vm::exec_map::flush_stdout();
+                }
+            });
+        }
+        drop(res_tx);
+
+        let watch_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watcher = if watch_signals {
+            let watch_stop = Arc::clone(&stop_flag);
+            let watch_done_flag = Arc::clone(&watch_done);
+            let watch_waker = wake_pair.waker();
+            Some(scope.spawn(move || {
+                while !watch_done_flag.load(Ordering::Acquire)
+                    && !watch_stop.load(Ordering::Acquire)
+                {
+                    if SIGNAL_STOP.load(Ordering::Acquire) {
+                        watch_stop.store(true, Ordering::Release);
+                        watch_waker.wake();
+                        if let Some(wake_addr) = bound_addr {
+                            wake_socket_addr(wake_addr);
+                        }
+                        break;
+                    }
+                    std::thread::park_timeout(Duration::from_millis(50));
+                }
+            }))
+        } else {
+            None
+        };
+
+        run_http_reactor(
+            listener,
+            Arc::clone(&stop_flag),
+            reactor_cfg,
+            |ip| ip_limiter.try_acquire(ip),
+            send_503_nonblocking,
+            is_fatal_accept_error,
+            job_tx,
+            res_rx,
+            wake_pair,
+        );
+
+        if let Some(w) = watcher {
+            watch_done.store(true, Ordering::Release);
+            w.thread().unpark();
+        }
+    });
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))
+)))]
+#[allow(clippy::too_many_arguments)]
+fn serve_http_listener_impl(
+    module: Arc<Module>,
+    routers: Vec<RouterState>,
+    http_clients: Vec<HttpClientState>,
+    db_pools: Vec<crate::vm::DbPoolSlot>,
+    db_pool_free: Vec<usize>,
+    spawn_tracker: Arc<crate::vm::SpawnTracker>,
+    script_args: Option<Vec<String>>,
+    rid: usize,
+    listener: TcpListener,
+    bound_addr: Option<std::net::SocketAddr>,
+    stop_flag: Arc<std::sync::atomic::AtomicBool>,
+    watch_signals: bool,
+    cfg: HttpServerConfig,
+) {
     let workers = cfg.workers;
     let idle_timeout = cfg.idle_timeout;
     let header_timeout = cfg.header_timeout;
@@ -555,9 +785,6 @@ pub(crate) fn serve_http_listener(
             w.thread().unpark();
         }
     });
-    if let Ok(mut guard) = routers[rid].listen_addr.lock() {
-        *guard = None;
-    }
 }
 
 #[inline]
@@ -1831,6 +2058,11 @@ fn extract_header_pairs(obj: &Obj) -> Vec<(String, String)> {
     hdrs
 }
 
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))
+)))]
 fn serve_connection_isolated(
     vm: &mut Vm,
     module: &Module,
@@ -1852,6 +2084,11 @@ fn serve_connection_isolated(
     }
 }
 
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))
+)))]
 fn serve_connection(
     vm: &mut Vm,
     module: &Module,
@@ -2276,5 +2513,132 @@ mod tests {
         assert_eq!(env_cfg.body_timeout, Duration::from_millis(45_000));
         assert_eq!(env_cfg.max_conns_per_ip, 16);
         assert!(env_cfg.trusted_proxies.is_empty());
+    }
+
+    #[test]
+    fn http_reactor_slowloris_keepalive_pipelining_loopback_e2e() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let src = r#"
+            import * as http from "cdt.http"
+
+            export func setup_router() -> http.Router {
+                r := http.router()
+                r.workers(2)
+                r.timeouts(250, 450, 450)
+                r.get("/hello", (_req: http.Request) -> http.Response => {
+                    return http.text("hi")
+                })
+                r.post("/echo", (req: http.Request) -> http.Response => {
+                    return http.text(req.body)
+                })
+                return r
+            }
+        "#;
+
+        let module = crate::frontend::compile_source(src).expect("compile reactor test router");
+        let setup_fid = module.func_id("setup_router").unwrap();
+        let mut init_vm = Vm::new();
+        let router_obj = init_vm.call_obj(&module, setup_fid, &[], &[]).unwrap();
+        let Obj::Record(sd) = router_obj else {
+            panic!("expected Router");
+        };
+        let rid = sd.get_scalar(0) as usize;
+        let stop_flag = Arc::clone(&init_vm.host.routers[rid].stop_flag);
+        let routers = init_vm.host.routers.clone();
+        let spawn_tracker = Arc::clone(&init_vm.host.spawn_tracker);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shared_mod = Arc::new(module);
+
+        let srv_stop = Arc::clone(&stop_flag);
+        let srv_thread = std::thread::spawn(move || {
+            serve_http_listener(
+                shared_mod,
+                routers,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                spawn_tracker,
+                None,
+                rid,
+                listener,
+                srv_stop,
+                false,
+            );
+        });
+
+        // 1. Open 8 Slowloris connections (4x worker count) and leave partial headers stalled.
+        let mut slow_conns = Vec::new();
+        for _ in 0..8 {
+            let mut s = TcpStream::connect(addr).unwrap();
+            s.write_all(b"GET /hello HTTP/1.1\r\nHost: 127.0.0.1\r\n").unwrap();
+            slow_conns.push(s);
+        }
+
+        // 2. While all 8 slow sockets are held open, a normal keep-alive connection must respond immediately.
+        {
+            let mut fast = TcpStream::connect(addr).unwrap();
+            fast.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            for _ in 0..2 {
+                fast.write_all(b"GET /hello HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                    .unwrap();
+                let mut buf = [0u8; 512];
+                let n = fast.read(&mut buf).unwrap();
+                let txt = String::from_utf8_lossy(&buf[..n]);
+                assert!(txt.contains("HTTP/1.1 200 OK") && txt.ends_with("\r\n\r\nhi"), "got: {txt}");
+            }
+
+            // 3. HTTP pipelining: two requests sent in a single write arrive back in order.
+            fast.write_all(
+                b"GET /hello HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\nPOST /echo HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 4\r\nConnection: close\r\n\r\nping",
+            )
+            .unwrap();
+            let mut all = Vec::new();
+            fast.read_to_end(&mut all).unwrap();
+            let combined = String::from_utf8_lossy(&all);
+            assert!(combined.contains("\r\n\r\nhiHTTP/1.1 200 OK"), "pipelined resp 1: {combined}");
+            assert!(combined.ends_with("\r\n\r\nping"), "pipelined resp 2: {combined}");
+        }
+
+        // 4. Split POST body sent across two writes with a short pause.
+        {
+            let mut split = TcpStream::connect(addr).unwrap();
+            split.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            split
+                .write_all(
+                    b"POST /echo HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 6\r\nConnection: close\r\n\r\nab",
+                )
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(30));
+            split.write_all(b"cdef").unwrap();
+            let mut all = String::new();
+            split.read_to_string(&mut all).unwrap();
+            assert!(all.contains("200 OK") && all.ends_with("\r\n\r\nabcdef"), "split body: {all}");
+        }
+
+        // 5. Slowloris partial-header socket receives 408 Request Timeout after header_timeout (~450ms).
+        slow_conns[0]
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut timeout_resp = String::new();
+        slow_conns[0].read_to_string(&mut timeout_resp).unwrap();
+        assert!(
+            timeout_resp.starts_with("HTTP/1.1 408 Request Timeout"),
+            "expected 408 timeout, got: {timeout_resp}"
+        );
+        drop(slow_conns);
+
+        // 6. Stop signal shuts down reactor cleanly and promptly.
+        let stopped_cleanly = Arc::new(AtomicBool::new(false));
+        stop_flag.store(true, Ordering::Release);
+        wake_socket_addr(addr);
+        srv_thread.join().unwrap();
+        stopped_cleanly.store(true, Ordering::Release);
+        assert!(stopped_cleanly.load(Ordering::Acquire));
     }
 }

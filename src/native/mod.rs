@@ -1,3 +1,4 @@
+pub(crate) mod argon2;
 pub(crate) mod b64_simd;
 pub mod cache;
 pub mod chan;
@@ -11,6 +12,7 @@ pub mod db_query;
 pub mod env;
 pub mod fs;
 pub mod http;
+pub(crate) mod http_reactor;
 pub mod json_decode;
 pub mod json_encode;
 pub(crate) mod json_lexer;
