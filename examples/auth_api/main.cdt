@@ -48,7 +48,7 @@ export struct ErrReply {
 }
 
 func jwt_secret() -> String {
-    return env.get("JWT_SECRET") ?? "dev-conduit-jwt-secret"
+    return env.get("JWT_SECRET") ?? "dev-conduit-jwt-secret-0123456789abcdef"
 }
 
 func active_work_dir() -> String {

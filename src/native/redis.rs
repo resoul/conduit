@@ -1036,6 +1036,21 @@ impl RedisConn {
                 return Err(RedisErr::new("invalid_url", "redis-mock:// is only available in tests"));
             }
         } else {
+            match &cfg.tls {
+                None => crate::native::tls::warn_db_insecure_tls_once(
+                    "cdt.redis",
+                    &cfg.host,
+                    "redis:// connects in plaintext without TLS",
+                    "'rediss://...' (or 'rediss://...?tls_verify=ca&ca_file=/path/to/ca.pem' for custom CAs)",
+                ),
+                Some(t) if t.verify == VerifyMode::Disable => crate::native::tls::warn_db_insecure_tls_once(
+                    "cdt.redis",
+                    &cfg.host,
+                    "tls_verify=none disables TLS server certificate verification",
+                    "'tls_verify=full' (default for rediss://) or 'tls_verify=ca&ca_file=/path/to/ca.pem'",
+                ),
+                Some(_) => {}
+            }
             let addr_str = format!("{}:{}", cfg.host, cfg.port);
             let addrs: Vec<_> = addr_str
                 .to_socket_addrs()

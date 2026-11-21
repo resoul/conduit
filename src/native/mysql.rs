@@ -957,7 +957,32 @@ fn read_initial_handshake_raw(stream: &mut TcpStream) -> Result<(u8, Vec<u8>), S
     Ok((hdr[3].wrapping_add(1), body))
 }
 
+fn warn_if_insecure_mysql_tls(config: &MysqlConfig) {
+    match config.ssl_mode {
+        MysqlSslMode::Disabled => crate::native::tls::warn_db_insecure_tls_once(
+            "cdt.db.mysql",
+            &config.host,
+            "ssl-mode=disabled sends data in plaintext",
+            "'?ssl-mode=verify_identity' (or '?ssl-mode=verify_ca&sslrootcert=/path/to/ca.pem' if server cert lacks hostname in SAN)",
+        ),
+        MysqlSslMode::Preferred => crate::native::tls::warn_db_insecure_tls_once(
+            "cdt.db.mysql",
+            &config.host,
+            "ssl-mode=preferred does not verify server certificates and allows plaintext fallback",
+            "'?ssl-mode=verify_identity' (or '?ssl-mode=verify_ca&sslrootcert=/path/to/ca.pem')",
+        ),
+        MysqlSslMode::Required => crate::native::tls::warn_db_insecure_tls_once(
+            "cdt.db.mysql",
+            &config.host,
+            "ssl-mode=required encrypts without verifying the server certificate",
+            "'?ssl-mode=verify_identity' (or '?ssl-mode=verify_ca&sslrootcert=/path/to/ca.pem')",
+        ),
+        MysqlSslMode::VerifyCa | MysqlSslMode::VerifyIdentity => {}
+    }
+}
+
 fn open_connection(config: &MysqlConfig) -> Result<Conn, String> {
+    warn_if_insecure_mysql_tls(config);
     let target = format!("{}:{}", config.host, config.port);
     let addresses = target
         .to_socket_addrs()

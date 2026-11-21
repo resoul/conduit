@@ -1184,7 +1184,34 @@ fn tls_server_end_point_hash(der: &[u8]) -> Vec<u8> {
     sha256_bytes(der).to_vec()
 }
 
+fn warn_if_insecure_pg_tls(config: &PgConfig) {
+    match config.ssl_mode {
+        PgSslMode::Disable => crate::native::tls::warn_db_insecure_tls_once(
+            "cdt.db.pg",
+            &config.host,
+            "sslmode=disable sends credentials and queries in plaintext",
+            "'?sslmode=verify-full' (or '?sslmode=verify-ca&sslrootcert=/path/to/ca.pem' if server cert lacks hostname in SAN, or keep explicit '?sslmode=disable' only on a trusted network)",
+        ),
+        PgSslMode::Allow | PgSslMode::Prefer => crate::native::tls::warn_db_insecure_tls_once(
+            "cdt.db.pg",
+            &config.host,
+            "sslmode=allow/prefer does not verify server certificates and allows plaintext downgrade",
+            "'?sslmode=verify-full' (or '?sslmode=verify-ca&sslrootcert=/path/to/ca.pem' for SAN-less internal certs)",
+        ),
+        PgSslMode::Require if config.ssl_root_cert.is_none() => {
+            crate::native::tls::warn_db_insecure_tls_once(
+                "cdt.db.pg",
+                &config.host,
+                "sslmode=require without sslrootcert encrypts without authenticating the server",
+                "'?sslmode=verify-full' (or '?sslmode=verify-ca&sslrootcert=/path/to/ca.pem')",
+            )
+        }
+        PgSslMode::Require | PgSslMode::VerifyCa | PgSslMode::VerifyFull => {}
+    }
+}
+
 fn open_connection(config: &PgConfig) -> Result<Conn, String> {
+    warn_if_insecure_pg_tls(config);
     let target = format!("{}:{}", config.host, config.port);
     let addresses = target
         .to_socket_addrs()

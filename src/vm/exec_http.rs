@@ -21,63 +21,238 @@ use crate::vm::value::{
 };
 use crate::vm::{ExecResult, RuntimeError, Vm};
 
-const HTTP_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
-const HTTP_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
-const HTTP_BODY_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(3);
+const DEFAULT_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_BODY_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP_MAX_KEEPALIVE_REQUESTS: usize = 100;
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum IpNet {
+    V4 { addr: u32, mask: u32 },
+    V6 { addr: u128, mask: u128 },
+}
+
+impl IpNet {
+    fn parse(raw: &str) -> Option<Self> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let (ip_part, prefix_part) = match trimmed.split_once('/') {
+            Some((ip, p)) => (ip.trim(), Some(p.trim())),
+            None => (trimmed, None),
+        };
+        let ip = ip_part.parse::<IpAddr>().ok()?.to_canonical();
+        match ip {
+            IpAddr::V4(v4) => {
+                let prefix = match prefix_part {
+                    Some(p) => p.parse::<u32>().ok().filter(|&n| n <= 32)?,
+                    None => 32,
+                };
+                let mask = if prefix == 0 { 0 } else { !0u32 << (32 - prefix) };
+                Some(Self::V4 {
+                    addr: u32::from(v4) & mask,
+                    mask,
+                })
+            }
+            IpAddr::V6(v6) => {
+                let prefix = match prefix_part {
+                    Some(p) => p.parse::<u32>().ok().filter(|&n| n <= 128)?,
+                    None => 128,
+                };
+                let mask = if prefix == 0 { 0 } else { !0u128 << (128 - prefix) };
+                Some(Self::V6 {
+                    addr: u128::from(v6) & mask,
+                    mask,
+                })
+            }
+        }
+    }
+
+    fn contains(&self, raw_ip: IpAddr) -> bool {
+        match (self, raw_ip.to_canonical()) {
+            (Self::V4 { addr, mask }, IpAddr::V4(v4)) => (u32::from(v4) & *mask) == *addr,
+            (Self::V6 { addr, mask }, IpAddr::V6(v6)) => (u128::from(v6) & *mask) == *addr,
+            _ => false,
+        }
+    }
+}
+
+struct HttpServerConfig {
+    workers: usize,
+    idle_timeout: Duration,
+    header_timeout: Duration,
+    body_timeout: Duration,
+    max_conns_per_ip: usize,
+    trusted_proxies: Vec<IpNet>,
+}
+
+fn parse_env_duration_ms(var: &str, min_ms: u64, max_ms: u64, default: Duration) -> Duration {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|ms| Duration::from_millis(ms.clamp(min_ms, max_ms)))
+        .unwrap_or(default)
+}
+
+impl HttpServerConfig {
+    fn from_env() -> Self {
+        let default_workers = std::thread::available_parallelism()
+            .map(|n| n.get().clamp(4, 16))
+            .unwrap_or(8);
+        let workers = std::env::var("CONDUIT_HTTP_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|n| n.clamp(1, 256))
+            .unwrap_or(default_workers);
+        let max_conns_per_ip = std::env::var("CONDUIT_HTTP_MAX_CONNS_PER_IP")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or_else(|| (workers / 2).max(4));
+        let trusted_proxies = std::env::var("CONDUIT_HTTP_TRUSTED_PROXIES")
+            .ok()
+            .map(|raw| raw.split(',').filter_map(IpNet::parse).collect())
+            .unwrap_or_default();
+        Self {
+            workers,
+            idle_timeout: parse_env_duration_ms(
+                "CONDUIT_HTTP_IDLE_TIMEOUT_MS",
+                100,
+                300_000,
+                DEFAULT_IDLE_TIMEOUT,
+            ),
+            header_timeout: parse_env_duration_ms(
+                "CONDUIT_HTTP_HEADER_TIMEOUT_MS",
+                500,
+                300_000,
+                DEFAULT_HEADER_TIMEOUT,
+            ),
+            body_timeout: parse_env_duration_ms(
+                "CONDUIT_HTTP_BODY_TIMEOUT_MS",
+                500,
+                600_000,
+                DEFAULT_BODY_TIMEOUT,
+            ),
+            max_conns_per_ip,
+            trusted_proxies,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum IpBucket {
+    LoopbackV4,
+    LoopbackV6,
+    V4([u8; 4]),
+    /// IPv6 clients grouped by /64 prefix to prevent trivial address rotation within a subnet.
+    V6Prefix([u8; 8]),
+}
+
 struct IpConnLimiter {
-    counts: Mutex<HashMap<IpAddr, usize, FxBuildHasher>>,
+    counts: Mutex<HashMap<IpBucket, usize, FxBuildHasher>>,
     max_remote_per_ip: usize,
     max_loopback_per_ip: usize,
+    trusted_proxies: Vec<IpNet>,
 }
 
 struct IpConnPermit {
     limiter: Arc<IpConnLimiter>,
-    ip: IpAddr,
+    bucket: Option<IpBucket>,
 }
 
 impl IpConnLimiter {
+    #[cfg(test)]
     fn new(workers: usize) -> Arc<Self> {
+        Self::with_config(workers, (workers / 2).max(4), Vec::new())
+    }
+
+    fn with_config(
+        workers: usize,
+        max_remote_per_ip: usize,
+        trusted_proxies: Vec<IpNet>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             counts: Mutex::new(HashMap::with_hasher(FxBuildHasher)),
-            max_remote_per_ip: (workers / 2).max(2),
+            max_remote_per_ip,
             max_loopback_per_ip: (workers * 4).max(32),
+            trusted_proxies,
         })
     }
 
     fn try_acquire(self: &Arc<Self>, raw_ip: IpAddr) -> Option<IpConnPermit> {
         let ip = raw_ip.to_canonical();
-        let limit = if ip.is_loopback() {
-            self.max_loopback_per_ip
-        } else {
-            self.max_remote_per_ip
+        if !ip.is_loopback()
+            && (self.max_remote_per_ip == 0
+                || self.trusted_proxies.iter().any(|net| net.contains(ip)))
+        {
+            return Some(IpConnPermit {
+                limiter: Arc::clone(self),
+                bucket: None,
+            });
+        }
+        let (bucket, limit) = match ip {
+            IpAddr::V4(v4) if v4.is_loopback() => (IpBucket::LoopbackV4, self.max_loopback_per_ip),
+            IpAddr::V4(v4) => (IpBucket::V4(v4.octets()), self.max_remote_per_ip),
+            IpAddr::V6(v6) if v6.is_loopback() => (IpBucket::LoopbackV6, self.max_loopback_per_ip),
+            IpAddr::V6(v6) => {
+                let mut prefix = [0u8; 8];
+                prefix.copy_from_slice(&v6.octets()[..8]);
+                (IpBucket::V6Prefix(prefix), self.max_remote_per_ip)
+            }
         };
         let mut guard = self.counts.lock().ok()?;
-        let entry = guard.entry(ip).or_insert(0);
+        let entry = guard.entry(bucket).or_insert(0);
         if *entry >= limit {
             return None;
         }
         *entry += 1;
         Some(IpConnPermit {
             limiter: Arc::clone(self),
-            ip,
+            bucket: Some(bucket),
         })
     }
 }
 
 impl Drop for IpConnPermit {
     fn drop(&mut self) {
+        let Some(bucket) = self.bucket else {
+            return;
+        };
         if let Ok(mut guard) = self.limiter.counts.lock()
-            && let Some(count) = guard.get_mut(&self.ip)
+            && let Some(count) = guard.get_mut(&bucket)
         {
             if *count <= 1 {
-                guard.remove(&self.ip);
+                guard.remove(&bucket);
             } else {
                 *count -= 1;
             }
         }
     }
+}
+
+fn send_503_nonblocking(mut stream: TcpStream) {
+    let _ = stream.set_nonblocking(true);
+    let _ = std::io::Write::write_all(
+        &mut stream,
+        b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 19\r\nRetry-After: 1\r\nConnection: close\r\n\r\nService Unavailable",
+    );
+}
+
+fn is_fatal_accept_error(err: &std::io::Error) -> bool {
+    if err.kind() == std::io::ErrorKind::InvalidInput {
+        return true;
+    }
+    #[cfg(unix)]
+    if matches!(err.raw_os_error(), Some(9 | 22)) {
+        // EBADF (9), EINVAL (22)
+        return true;
+    }
+    #[cfg(windows)]
+    if matches!(err.raw_os_error(), Some(10009 | 10022 | 10038)) {
+        // WSAEBADF, WSAEINVAL, WSAENOTSOCK
+        return true;
+    }
+    false
 }
 
 fn json_escape_str(s: &str) -> String {
@@ -228,10 +403,12 @@ pub(crate) fn serve_http_listener(
         SIGNAL_STOP.store(false, Ordering::Release);
         install_signal_handlers();
     }
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get().clamp(4, 16))
-        .unwrap_or(8);
-    let ip_limiter = IpConnLimiter::new(workers);
+    let cfg = HttpServerConfig::from_env();
+    let workers = cfg.workers;
+    let idle_timeout = cfg.idle_timeout;
+    let header_timeout = cfg.header_timeout;
+    let body_timeout = cfg.body_timeout;
+    let ip_limiter = IpConnLimiter::with_config(workers, cfg.max_conns_per_ip, cfg.trusted_proxies);
     let (tx, rx) = mpsc::sync_channel::<(TcpStream, IpConnPermit)>(workers * 8);
     let rx = Arc::new(Mutex::new(rx));
     std::thread::scope(|scope| {
@@ -261,7 +438,15 @@ pub(crate) fn serve_http_listener(
                             Err(_) => break,
                         }
                     };
-                    serve_connection_isolated(&mut worker_vm, &mod_worker, rid, stream);
+                    serve_connection_isolated(
+                        &mut worker_vm,
+                        &mod_worker,
+                        rid,
+                        stream,
+                        idle_timeout,
+                        header_timeout,
+                        body_timeout,
+                    );
                     drop(permit);
                     crate::vm::exec_map::flush_stdout();
                 }
@@ -288,23 +473,48 @@ pub(crate) fn serve_http_listener(
         } else {
             None
         };
+        let mut backoff_ms = 5u64;
         while !stop_flag.load(Ordering::Acquire) {
             match listener.accept() {
                 Ok((stream, peer_addr)) => {
+                    backoff_ms = 5;
                     if stop_flag.load(Ordering::Acquire) {
                         break;
                     }
+                    let _ = stream.set_nodelay(true);
                     let Some(permit) = ip_limiter.try_acquire(peer_addr.ip()) else {
+                        send_503_nonblocking(stream);
                         continue;
                     };
                     match tx.try_send((stream, permit)) {
                         Ok(()) => {}
-                        Err(mpsc::TrySendError::Full(_)) => continue,
+                        Err(mpsc::TrySendError::Full((stream, _permit))) => {
+                            send_503_nonblocking(stream);
+                            continue;
+                        }
                         Err(mpsc::TrySendError::Disconnected(_)) => break,
                     }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::Interrupted
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    continue;
+                }
+                Err(e) => {
+                    if stop_flag.load(Ordering::Acquire) || is_fatal_accept_error(&e) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(backoff_ms));
+                    backoff_ms = (backoff_ms * 2).min(50);
+                }
             }
         }
         drop(tx);
@@ -1541,9 +1751,17 @@ fn extract_header_pairs(obj: &Obj) -> Vec<(String, String)> {
     hdrs
 }
 
-fn serve_connection_isolated(vm: &mut Vm, module: &Module, rid: usize, stream: TcpStream) {
+fn serve_connection_isolated(
+    vm: &mut Vm,
+    module: &Module,
+    rid: usize,
+    stream: TcpStream,
+    idle_timeout: Duration,
+    header_timeout: Duration,
+    body_timeout: Duration,
+) {
     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        serve_connection(vm, module, rid, stream);
+        serve_connection(vm, module, rid, stream, idle_timeout, header_timeout, body_timeout);
     }))
     .is_err()
     {
@@ -1554,21 +1772,29 @@ fn serve_connection_isolated(vm: &mut Vm, module: &Module, rid: usize, stream: T
     }
 }
 
-fn serve_connection(vm: &mut Vm, module: &Module, rid: usize, stream: TcpStream) {
-    let _ = stream.set_read_timeout(Some(HTTP_HEADER_TIMEOUT));
+fn serve_connection(
+    vm: &mut Vm,
+    module: &Module,
+    rid: usize,
+    stream: TcpStream,
+    idle_timeout: Duration,
+    header_timeout: Duration,
+    body_timeout: Duration,
+) {
+    let _ = stream.set_read_timeout(Some(header_timeout));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
-    let Ok((mut reader, mut writer)) = deadline_reader_writer_pair(stream, HTTP_HEADER_TIMEOUT)
+    let Ok((mut reader, mut writer)) = deadline_reader_writer_pair(stream, header_timeout)
     else {
         return;
     };
     let mut req_count: usize = 0;
     loop {
         let idle = if req_count == 0 {
-            HTTP_HEADER_TIMEOUT
+            header_timeout
         } else {
-            HTTP_IDLE_TIMEOUT
+            idle_timeout
         };
-        match read_http_request_deadline(&mut reader, idle, HTTP_HEADER_TIMEOUT, HTTP_BODY_TIMEOUT)
+        match read_http_request_deadline(&mut reader, idle, header_timeout, body_timeout)
         {
             Ok(raw) => {
                 req_count += 1;
@@ -1863,20 +2089,35 @@ mod tests {
     #[test]
     fn ip_conn_limiter_enforces_remote_and_loopback_caps_and_releases() {
         let limiter = IpConnLimiter::new(4);
-        assert_eq!(limiter.max_remote_per_ip, 2);
+        assert_eq!(limiter.max_remote_per_ip, 4);
         assert_eq!(limiter.max_loopback_per_ip, 32);
 
         let remote = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10));
-        let p1 = limiter.try_acquire(remote).expect("1st remote");
-        let p2 = limiter.try_acquire(remote).expect("2nd remote");
-        assert!(limiter.try_acquire(remote).is_none(), "3rd remote blocked");
+        let mut remote_permits = Vec::new();
+        for _ in 0..limiter.max_remote_per_ip {
+            remote_permits.push(limiter.try_acquire(remote).expect("remote within cap"));
+        }
+        assert!(limiter.try_acquire(remote).is_none(), "remote cap reached");
 
         let mapped = IpAddr::V6(Ipv4Addr::new(203, 0, 113, 10).to_ipv6_mapped());
         assert!(limiter.try_acquire(mapped).is_none(), "IPv4-mapped IPv6 shares limit");
 
-        drop(p1);
-        let _p3 = limiter.try_acquire(remote).expect("slot freed after drop");
-        drop(p2);
+        drop(remote_permits.pop());
+        let _p_extra = limiter.try_acquire(remote).expect("slot freed after drop");
+        drop(remote_permits);
+        drop(_p_extra);
+
+        // IPv6 clients are grouped by /64 prefix to prevent trivial suffix rotation bypasses.
+        let v6_a = IpAddr::V6("2001:db8:abcd:1234::1".parse::<Ipv6Addr>().unwrap());
+        let v6_b = IpAddr::V6("2001:db8:abcd:1234:feed::9999".parse::<Ipv6Addr>().unwrap());
+        let v6_other_prefix = IpAddr::V6("2001:db8:abcd:1235::1".parse::<Ipv6Addr>().unwrap());
+        let mut v6_permits = Vec::new();
+        for _ in 0..limiter.max_remote_per_ip {
+            v6_permits.push(limiter.try_acquire(v6_a).expect("v6 /64 within cap"));
+        }
+        assert!(limiter.try_acquire(v6_b).is_none(), "same /64 shares cap");
+        assert!(limiter.try_acquire(v6_other_prefix).is_some(), "different /64 has own bucket");
+        drop(v6_permits);
 
         let loopback = IpAddr::V6(Ipv6Addr::LOCALHOST);
         let mut loop_permits = Vec::new();
@@ -1891,5 +2132,28 @@ mod tests {
         assert!(limiter.try_acquire(loopback).is_none(), "v6 loopback cap enforced");
         drop(loop_permits);
         assert!(limiter.try_acquire(loopback).is_some());
+
+        // Trusted proxies bypass per-IP remote caps.
+        let proxies = vec![
+            IpNet::parse("172.17.0.0/16").unwrap(),
+            IpNet::parse("fd00:1::/48").unwrap(),
+            IpNet::parse("10.0.0.5").unwrap(),
+        ];
+        assert!(proxies[0].contains("172.17.42.9".parse().unwrap()));
+        assert!(proxies[0].contains("::ffff:172.17.42.9".parse().unwrap()));
+        assert!(!proxies[0].contains("172.18.0.1".parse().unwrap()));
+        assert!(proxies[1].contains("fd00:1::beef".parse().unwrap()));
+        assert!(proxies[2].contains("10.0.0.5".parse().unwrap()));
+
+        let proxied_limiter = IpConnLimiter::with_config(4, 2, proxies);
+        let proxy_ip: IpAddr = "172.17.0.10".parse().unwrap();
+        let mut proxy_permits = Vec::new();
+        for _ in 0..20 {
+            proxy_permits.push(proxied_limiter.try_acquire(proxy_ip).expect("trusted proxy unrestricted"));
+        }
+        let untrusted_ip: IpAddr = "198.51.100.7".parse().unwrap();
+        let _u1 = proxied_limiter.try_acquire(untrusted_ip).unwrap();
+        let _u2 = proxied_limiter.try_acquire(untrusted_ip).unwrap();
+        assert!(proxied_limiter.try_acquire(untrusted_ip).is_none());
     }
 }

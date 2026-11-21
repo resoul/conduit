@@ -1,9 +1,27 @@
 use std::cell::RefCell;
-#[cfg(not(windows))]
+#[cfg(all(
+    not(windows),
+    not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    ))
+))]
 use std::fs::File;
-#[cfg(not(windows))]
+#[cfg(all(
+    not(windows),
+    not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    ))
+))]
 use std::io::Read;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use crate::native::b64_simd;
 use crate::vm::value::{Obj, SCHEMA_CRYPTO_ERROR, StructData};
@@ -216,27 +234,35 @@ unsafe fn sha256_compress_x86_64(h: &mut [u32; 8], blocks: &[[u8; 64]]) {
     }
 }
 
-#[inline]
-fn sha256_compress(h: &mut [u32; 8], blocks: &[[u8; 64]]) {
-    if blocks.is_empty() {
-        return;
-    }
+fn sha256_compress_kernel() -> fn(&mut [u32; 8], &[[u8; 64]]) {
     #[cfg(target_arch = "aarch64")]
     if std::arch::is_aarch64_feature_detected!("sha2") {
-        // SAFETY: sha2 feature verified at runtime.
-        unsafe { sha256_compress_aarch64(h, blocks) };
-        return;
+        fn aarch64_wrap(h: &mut [u32; 8], blocks: &[[u8; 64]]) {
+            // SAFETY: sha2 feature verified at runtime.
+            unsafe { sha256_compress_aarch64(h, blocks) };
+        }
+        return aarch64_wrap;
     }
     #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("sha")
         && std::arch::is_x86_feature_detected!("ssse3")
         && std::arch::is_x86_feature_detected!("sse4.1")
     {
-        // SAFETY: sha + ssse3 + sse4.1 features verified at runtime.
-        unsafe { sha256_compress_x86_64(h, blocks) };
+        fn x86_wrap(h: &mut [u32; 8], blocks: &[[u8; 64]]) {
+            // SAFETY: sha + ssse3 + sse4.1 features verified at runtime.
+            unsafe { sha256_compress_x86_64(h, blocks) };
+        }
+        return x86_wrap;
+    }
+    sha256_compress_scalar
+}
+
+#[inline]
+fn sha256_compress(h: &mut [u32; 8], blocks: &[[u8; 64]]) {
+    if blocks.is_empty() {
         return;
     }
-    sha256_compress_scalar(h, blocks);
+    sha256_compress_kernel()(h, blocks);
 }
 
 pub fn sha256_bytes(data: &[u8]) -> [u8; 32] {
@@ -580,8 +606,37 @@ fn os_fill_random(buf: &mut [u8], _cur_pid: u32) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(windows))]
-fn os_fill_random(buf: &mut [u8], cur_pid: u32) -> Result<(), String> {
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd"
+))]
+fn os_fill_random(buf: &mut [u8], _cur_pid: u32) -> Result<(), String> {
+    unsafe extern "C" {
+        fn getentropy(buf: *mut core::ffi::c_void, buflen: usize) -> i32;
+    }
+    for chunk in buf.chunks_mut(256) {
+        let rc = unsafe { getentropy(chunk.as_mut_ptr().cast(), chunk.len()) };
+        if rc != 0 {
+            return Err(format!("getentropy failed: {}", std::io::Error::last_os_error()));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(
+    not(windows),
+    not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    ))
+))]
+fn urandom_fill_random(buf: &mut [u8], cur_pid: u32) -> Result<(), String> {
     thread_local! {
         static URANDOM_FILE: RefCell<(Option<File>, u32)> = const { RefCell::new((None, 0)) };
     }
@@ -601,6 +656,46 @@ fn os_fill_random(buf: &mut [u8], cur_pid: u32) -> Result<(), String> {
             .read_exact(buf)
             .map_err(|e| format!("Failed to read /dev/urandom: {}", e))
     })
+}
+
+#[cfg(target_os = "linux")]
+fn os_fill_random(buf: &mut [u8], cur_pid: u32) -> Result<(), String> {
+    unsafe extern "C" {
+        fn getrandom(buf: *mut core::ffi::c_void, buflen: usize, flags: u32) -> isize;
+    }
+    let mut offset = 0usize;
+    while offset < buf.len() {
+        let rem = &mut buf[offset..];
+        let rc = unsafe { getrandom(rem.as_mut_ptr().cast(), rem.len(), 0) };
+        if rc > 0 {
+            offset += rc as usize;
+        } else {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            if err.raw_os_error() == Some(38) {
+                return urandom_fill_random(&mut buf[offset..], cur_pid);
+            }
+            return Err(format!("getrandom failed: {}", err));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(
+    not(windows),
+    not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "linux"
+    ))
+))]
+fn os_fill_random(buf: &mut [u8], cur_pid: u32) -> Result<(), String> {
+    urandom_fill_random(buf, cur_pid)
 }
 
 thread_local! {
@@ -706,6 +801,7 @@ fn sha256_finish_with_prefix(mut h: [u32; 8], prefix_bytes: u64, data: &[u8]) ->
 }
 
 pub fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32, out: &mut [u8]) {
+    let compress = sha256_compress_kernel();
     let mut k_block = [0u8; 64];
     if password.len() > 64 {
         let hashed = sha256_bytes(password);
@@ -720,9 +816,15 @@ pub fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32, out: &mut [u
         opad[i] ^= k_block[i];
     }
     let mut h_inner = sha256_init_state();
-    sha256_compress(&mut h_inner, std::slice::from_ref(&ipad));
+    compress(&mut h_inner, std::slice::from_ref(&ipad));
     let mut h_outer = sha256_init_state();
-    sha256_compress(&mut h_outer, std::slice::from_ref(&opad));
+    compress(&mut h_outer, std::slice::from_ref(&opad));
+
+    // Pre-padded 64-byte SHA-256 block for compressing a 32-byte digest after the 64-byte HMAC pad:
+    // total length = (64 + 32) * 8 = 768 bits = 0x0300.
+    let mut blk = [0u8; 64];
+    blk[32] = 0x80;
+    blk[62] = 0x03;
 
     let iters = iterations.max(1);
     for (index, chunk) in out.chunks_mut(32).enumerate() {
@@ -731,17 +833,71 @@ pub fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32, out: &mut [u
         salted.extend_from_slice(&(index as u32 + 1).to_be_bytes());
 
         let inner_h = sha256_finish_with_prefix(h_inner, 64, &salted);
-        let mut u = sha256_finish_with_prefix(h_outer, 64, &inner_h);
-        let mut t = u;
+        let u1 = sha256_finish_with_prefix(h_outer, 64, &inner_h);
+        let mut t_words = [0u32; 8];
+        for i in 0..8 {
+            t_words[i] = u32::from_be_bytes([u1[i * 4], u1[i * 4 + 1], u1[i * 4 + 2], u1[i * 4 + 3]]);
+        }
+        blk[..32].copy_from_slice(&u1);
+
         for _ in 1..iters {
-            let ih = sha256_finish_with_prefix(h_inner, 64, &u);
-            u = sha256_finish_with_prefix(h_outer, 64, &ih);
-            for (a, b) in t.iter_mut().zip(u) {
-                *a ^= b;
+            let mut st = h_inner;
+            compress(&mut st, std::slice::from_ref(&blk));
+            for (i, &w) in st.iter().enumerate() {
+                blk[i * 4..i * 4 + 4].copy_from_slice(&w.to_be_bytes());
             }
+            st = h_outer;
+            compress(&mut st, std::slice::from_ref(&blk));
+            for i in 0..8 {
+                t_words[i] ^= st[i];
+                blk[i * 4..i * 4 + 4].copy_from_slice(&st[i].to_be_bytes());
+            }
+        }
+
+        let mut t = [0u8; 32];
+        for (i, &w) in t_words.iter().enumerate() {
+            t[i * 4..i * 4 + 4].copy_from_slice(&w.to_be_bytes());
         }
         chunk.copy_from_slice(&t[..chunk.len()]);
     }
+}
+
+struct PasswordHashGate {
+    active: Mutex<usize>,
+    cv: Condvar,
+    max: usize,
+}
+
+struct PasswordHashPermit<'a>(&'a PasswordHashGate);
+
+impl Drop for PasswordHashPermit<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.0.active.lock() {
+            *guard = guard.saturating_sub(1);
+            self.0.cv.notify_one();
+        }
+    }
+}
+
+static PASSWORD_HASH_GATE: OnceLock<PasswordHashGate> = OnceLock::new();
+
+fn acquire_password_hash_permit() -> PasswordHashPermit<'static> {
+    let gate = PASSWORD_HASH_GATE.get_or_init(|| {
+        let max = std::thread::available_parallelism()
+            .map(|n| (n.get() / 2).clamp(2, 4))
+            .unwrap_or(2);
+        PasswordHashGate {
+            active: Mutex::new(0),
+            cv: Condvar::new(),
+            max,
+        }
+    });
+    let mut guard = gate.active.lock().unwrap_or_else(|e| e.into_inner());
+    while *guard >= gate.max {
+        guard = gate.cv.wait(guard).unwrap_or_else(|e| e.into_inner());
+    }
+    *guard += 1;
+    PasswordHashPermit(gate)
 }
 
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -761,7 +917,10 @@ pub fn hash_password(password: &str) -> Obj {
         return make_crypto_error("rng_failed", e);
     }
     let mut dk = [0u8; 32];
-    pbkdf2_sha256(password.as_bytes(), &salt, DEFAULT_PBKDF2_ITERATIONS, &mut dk);
+    {
+        let _permit = acquire_password_hash_permit();
+        pbkdf2_sha256(password.as_bytes(), &salt, DEFAULT_PBKDF2_ITERATIONS, &mut dk);
+    }
     Obj::str(format!(
         "pbkdf2-sha256${}${}${}",
         DEFAULT_PBKDF2_ITERATIONS,
@@ -790,14 +949,16 @@ fn parse_pbkdf2_hash(stored: &str) -> Option<(u32, Vec<u8>, Vec<u8>)> {
 }
 
 pub fn verify_password(password: &str, stored: &str) -> bool {
+    let _permit = acquire_password_hash_permit();
     if let Some((iters, salt, expected)) = parse_pbkdf2_hash(stored) {
         let mut dk = [0u8; 32];
         pbkdf2_sha256(password.as_bytes(), &salt, iters, &mut dk);
         constant_time_eq(&dk, &expected)
     } else {
-        // Burn constant-ish work even on malformed input to avoid timing leaks.
+        // Burn constant-cost PBKDF2 work on malformed input to prevent timing leaks.
         let mut dk = [0u8; 32];
-        pbkdf2_sha256(password.as_bytes(), &[0u8; 16], 1, &mut dk);
+        pbkdf2_sha256(password.as_bytes(), &[0u8; 16], DEFAULT_PBKDF2_ITERATIONS, &mut dk);
+        std::hint::black_box(&dk);
         false
     }
 }

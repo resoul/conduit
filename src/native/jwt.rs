@@ -1,5 +1,9 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+pub const MIN_JWT_SECRET_BYTES: usize = 32;
+pub const MAX_JWT_BYTES: usize = 16 * 1024;
 
 use crate::native::crypto::{constant_time_eq, hmac_sha256_bytes};
 use crate::native::json_decode::decode_json_with_plan;
@@ -435,6 +439,50 @@ fn skip_json_value_at(src: &str, mut pos: usize, depth: usize) -> Option<usize> 
     }
 }
 
+pub fn validate_jwt_json_object(json: &str) -> Result<(), String> {
+    let bytes = json.as_bytes();
+    let mut pos = skip_ws_bytes(bytes, 0);
+    if bytes.get(pos) != Some(&b'{') {
+        return Err("Expected JSON object".to_string());
+    }
+    pos = skip_ws_bytes(bytes, pos + 1);
+    if bytes.get(pos) == Some(&b'}') {
+        pos = skip_ws_bytes(bytes, pos + 1);
+        if pos != bytes.len() {
+            return Err("Trailing characters after JSON object".to_string());
+        }
+        return Ok(());
+    }
+    let mut seen = HashSet::new();
+    loop {
+        pos = skip_ws_bytes(bytes, pos);
+        let (k, after_key) = parse_json_str_at(json, pos)
+            .ok_or_else(|| "Malformed JSON object key".to_string())?;
+        if !seen.insert(k) {
+            return Err("Duplicate key in JWT JSON object".to_string());
+        }
+        pos = skip_ws_bytes(bytes, after_key);
+        if bytes.get(pos) != Some(&b':') {
+            return Err("Expected ':' in JSON object".to_string());
+        }
+        let val_start = skip_ws_bytes(bytes, pos + 1);
+        let val_end = skip_json_value_at(json, val_start, 0)
+            .ok_or_else(|| "Malformed JSON value".to_string())?;
+        pos = skip_ws_bytes(bytes, val_end);
+        match bytes.get(pos) {
+            Some(b',') => pos += 1,
+            Some(b'}') => {
+                let end = skip_ws_bytes(bytes, pos + 1);
+                if end != bytes.len() {
+                    return Err("Trailing characters after JSON object".to_string());
+                }
+                return Ok(());
+            }
+            _ => return Err("Malformed JSON object delimiter".to_string()),
+        }
+    }
+}
+
 pub fn json_obj_get_raw_span(json: &str, key: &str) -> Result<Option<(usize, usize)>, String> {
     let bytes = json.as_bytes();
     let mut pos = skip_ws_bytes(bytes, 0);
@@ -600,14 +648,18 @@ impl JwtAlg {
     }
 }
 
-fn warn_if_short_secret(secret: &str) {
-    static WARNED_SHORT_SECRET: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    if secret.len() < 32 && WARNED_SHORT_SECRET.set(()).is_ok() {
-        eprintln!(
-            "[cdt.jwt] WARNING: HMAC secret is {} bytes; recommend at least 32 random bytes",
-            secret.len()
-        );
+fn validate_hmac_secret(secret: &str) -> Result<(), Obj> {
+    if secret.len() < MIN_JWT_SECRET_BYTES {
+        return Err(make_jwt_error(
+            "weak_secret",
+            format!(
+                "JWT HMAC secret must be at least {} bytes (got {}); generate one with crypto.random_bytes_hex(32)",
+                MIN_JWT_SECRET_BYTES,
+                secret.len()
+            ),
+        ));
     }
+    Ok(())
 }
 
 pub fn jwt_sign(
@@ -617,7 +669,9 @@ pub fn jwt_sign(
     ttl_secs: Option<i64>,
     schemas: &[StructSchema],
 ) -> Obj {
-    warn_if_short_secret(secret);
+    if let Err(err) = validate_hmac_secret(secret) {
+        return err;
+    }
     let Some(alg) = JwtAlg::parse(alg_str) else {
         return make_jwt_error(
             "unsupported_alg",
@@ -654,6 +708,12 @@ pub fn jwt_sign(
 }
 
 fn split_jwt(token: &str) -> Result<(&str, &str, &str), Obj> {
+    if token.len() > MAX_JWT_BYTES {
+        return Err(make_jwt_error(
+            "too_large",
+            format!("JWT exceeds maximum size of {} bytes", MAX_JWT_BYTES),
+        ));
+    }
     let mut parts = token.split('.');
     let (Some(p0), Some(p1), Some(p2), None) =
         (parts.next(), parts.next(), parts.next(), parts.next())
@@ -674,7 +734,9 @@ pub fn jwt_verify(
     require_exp: bool,
     plan: &JsonDecodePlan,
 ) -> Obj {
-    warn_if_short_secret(secret);
+    if let Err(err) = validate_hmac_secret(secret) {
+        return err;
+    }
     let Some(alg) = JwtAlg::parse(expected_alg_str) else {
         return make_jwt_error(
             "unsupported_alg",
@@ -700,6 +762,18 @@ pub fn jwt_verify(
         Ok(s) => s,
         Err(e) => return make_jwt_error("malformed", format!("JWT header is not valid UTF-8: {}", e)),
     };
+    if let Err(e) = validate_jwt_json_object(&hdr_str) {
+        return make_jwt_error("malformed", format!("Invalid JWT header JSON: {}", e));
+    }
+    match json_obj_get_raw_field(&hdr_str, "typ") {
+        Ok(Some(_)) => {
+            if json_obj_get_string(&hdr_str, "typ").is_none() {
+                return make_jwt_error("malformed", "JWT header 'typ' field must be a string");
+            }
+        }
+        Ok(None) => {}
+        Err(e) => return make_jwt_error("malformed", e),
+    }
     let Some(hdr_alg) = json_obj_get_string(&hdr_str, "alg") else {
         return make_jwt_error("malformed", "JWT header missing string 'alg' field");
     };
@@ -728,6 +802,9 @@ pub fn jwt_verify(
         Ok(s) => s,
         Err(e) => return make_jwt_error("malformed", format!("JWT payload is not valid UTF-8: {}", e)),
     };
+    if let Err(e) = validate_jwt_json_object(&pay_str) {
+        return make_jwt_error("malformed", format!("Invalid JWT payload JSON: {}", e));
+    }
 
     let now = now_secs();
     match json_obj_get_i64(&pay_str, "exp") {
@@ -845,5 +922,49 @@ mod tests {
         assert_eq!(json_obj_get_i64(j, "exp").unwrap(), Some(1900000000));
         assert_eq!(json_obj_get_i64(j, "opt").unwrap(), None);
         assert_eq!(json_obj_get_i64(j, "missing").unwrap(), None);
+        assert!(validate_jwt_json_object(j).is_ok());
+        assert!(validate_jwt_json_object(r#"{"exp":9999999999,"exp":0}"#).is_err());
+        assert!(validate_jwt_json_object(r#"{"alg":"HS256","alg":"none"}"#).is_err());
+    }
+
+    #[test]
+    fn jwt_rejects_short_secrets_oversized_tokens_and_duplicate_keys() {
+        let plan = JsonDecodePlan::compile(
+            &crate::native::JsonType::Map(Box::new(crate::native::JsonType::String)),
+            &[],
+        );
+        let obj = Obj::Map(Arc::new(Default::default()));
+
+        let err_sign = jwt_sign("HS256", &obj, "too-short-secret", None, &[]);
+        let Obj::Record(sd) = err_sign else { panic!("expected JwtError") };
+        assert_eq!(sd.get_obj(0).format_obj(), "weak_secret");
+
+        let valid_secret = "0123456789abcdef0123456789abcdef";
+        let err_verify = jwt_verify("HS256", "a.b.c", "short", 0, false, &plan);
+        let Obj::Record(sd_v) = err_verify else { panic!("expected JwtError") };
+        assert_eq!(sd_v.get_obj(0).format_obj(), "weak_secret");
+
+        let huge_tok = format!("{}.{}.sig", "a".repeat(MAX_JWT_BYTES), "b");
+        let err_big = jwt_verify("HS256", &huge_tok, valid_secret, 0, false, &plan);
+        let Obj::Record(sd_big) = err_big else { panic!("expected JwtError") };
+        assert_eq!(sd_big.get_obj(0).format_obj(), "too_large");
+
+        // Signed token with duplicate "exp" key must be rejected as malformed even with valid HMAC.
+        let hdr = b64url_encode(br#"{"alg":"HS256","typ":"JWT"}"#);
+        let pay = b64url_encode(br#"{"sub":"u1","exp":9999999999,"exp":1}"#);
+        let input = format!("{hdr}.{pay}");
+        let sig = b64url_encode(&hmac_sha256_bytes(valid_secret.as_bytes(), input.as_bytes()));
+        let dup_tok = format!("{input}.{sig}");
+        let err_dup = jwt_verify("HS256", &dup_tok, valid_secret, 0, false, &plan);
+        let Obj::Record(sd_dup) = err_dup else { panic!("expected JwtError") };
+        assert_eq!(sd_dup.get_obj(0).format_obj(), "malformed");
+
+        // Signed token with non-string "typ" must be rejected as malformed.
+        let bad_typ_hdr = b64url_encode(br#"{"alg":"HS256","typ":123}"#);
+        let input2 = format!("{bad_typ_hdr}.{pay}");
+        let sig2 = b64url_encode(&hmac_sha256_bytes(valid_secret.as_bytes(), input2.as_bytes()));
+        let err_typ = jwt_verify("HS256", &format!("{input2}.{sig2}"), valid_secret, 0, false, &plan);
+        let Obj::Record(sd_typ) = err_typ else { panic!("expected JwtError") };
+        assert_eq!(sd_typ.get_obj(0).format_obj(), "malformed");
     }
 }

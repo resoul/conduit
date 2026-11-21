@@ -28,7 +28,9 @@ func main() -> Void | redis.RedisError {
 ## Connection URL Format
 
 * `redis://[:password@]host[:port][/db][?timeout_ms=5000]`
+* `rediss://[:password@]host[:port][/db][?tls_verify=full|ca|none&ca_file=/path/to/ca.pem]`
 * `redis://username:password@host:6379/1` (ACL `AUTH user pass` + `SELECT 1`)
+* Non-loopback connections using plaintext `redis://` or `tls_verify=none` emit a one-time warning per host; use `rediss://` (default `tls_verify=full`, or `tls_verify=ca&ca_file=...` for internal CAs) in non-local environments (Conduit 0.4.0 will enforce verified TLS by default for non-loopback hosts).
 
 ## Types
 

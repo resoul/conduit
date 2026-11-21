@@ -418,19 +418,37 @@ fn sql_col_type(ty: &JsonType, is_auto: bool, is_unique_or_pk: bool, dialect: Di
     (sql_ty, is_opt)
 }
 
+#[inline]
+pub fn quote_ident(ident: &str, dialect: Dialect) -> String {
+    match dialect {
+        Dialect::Postgres => format!("\"{}\"", ident.replace('"', "\"\"")),
+        Dialect::Mysql => format!("`{}`", ident.replace('`', "``")),
+    }
+}
+
+#[inline]
+pub fn quote_ident_str(ident: &str, dialect: &str) -> String {
+    match dialect {
+        "mysql" => quote_ident(ident, Dialect::Mysql),
+        _ => quote_ident(ident, Dialect::Postgres),
+    }
+}
+
 pub fn build_create_table_sqls(
     model: &crate::ir::DbModelMeta,
     schema: &StructSchema,
     dialect: Dialect,
 ) -> Vec<String> {
+    let q_table = quote_ident(&model.table_name, dialect);
     let mut col_defs = Vec::with_capacity(model.columns.len());
     let mut idx_sqls = Vec::new();
     for col in &model.columns {
         let Some(f) = schema.fields.iter().find(|f| f.name == col.field_name) else {
             continue;
         };
+        let q_col = quote_ident(&col.col_name, dialect);
         let (sql_ty, is_opt) = sql_col_type(&f.ty, col.is_auto, col.is_unique || col.is_pk, dialect);
-        let mut def = format!("{} {}", col.col_name, sql_ty);
+        let mut def = format!("{} {}", q_col, sql_ty);
         if col.is_pk {
             def.push_str(" PRIMARY KEY");
         }
@@ -445,27 +463,32 @@ pub fn build_create_table_sqls(
             def.push_str(d);
         }
         if let Some((ref_tbl, ref_col)) = &col.fk {
-            def.push_str(&format!(" REFERENCES {}({})", ref_tbl, ref_col));
+            def.push_str(&format!(
+                " REFERENCES {}({})",
+                quote_ident(ref_tbl, dialect),
+                quote_ident(ref_col, dialect)
+            ));
         }
         col_defs.push(def);
         if col.is_index {
+            let idx_name = quote_ident(&format!("idx_{}_{}", model.table_name, col.col_name), dialect);
             idx_sqls.push(format!(
-                "CREATE INDEX IF NOT EXISTS idx_{}_{} ON {} ({})",
-                model.table_name, col.col_name, model.table_name, col.col_name
+                "CREATE INDEX IF NOT EXISTS {} ON {} ({})",
+                idx_name, q_table, q_col
             ));
         }
     }
     let mut out = vec![format!(
         "CREATE TABLE IF NOT EXISTS {} ({})",
-        model.table_name,
+        q_table,
         col_defs.join(", ")
     )];
     out.extend(idx_sqls);
     out
 }
 
-pub fn build_drop_table_sql(model: &crate::ir::DbModelMeta) -> String {
-    format!("DROP TABLE IF EXISTS {}", model.table_name)
+pub fn build_drop_table_sql(model: &crate::ir::DbModelMeta, dialect: Dialect) -> String {
+    format!("DROP TABLE IF EXISTS {}", quote_ident(&model.table_name, dialect))
 }
 
 fn field_value_to_cell(
@@ -515,6 +538,7 @@ pub fn build_insert_and_cells(
     model: &crate::ir::DbModelMeta,
     schema: &StructSchema,
     rec: &StructData,
+    dialect: Dialect,
 ) -> Result<(String, Vec<Cell>), String> {
     let mut cols = Vec::new();
     let mut placeholders = Vec::new();
@@ -526,13 +550,13 @@ pub fn build_insert_and_cells(
         let Some(cell) = field_value_to_cell(schema, f, rec, col.is_auto, true, "insert")? else {
             continue;
         };
-        cols.push(col.col_name.clone());
+        cols.push(quote_ident(&col.col_name, dialect));
         placeholders.push("?");
         cells.push(cell);
     }
     let sql = format!(
         "INSERT INTO {} ({}) VALUES ({})",
-        model.table_name,
+        quote_ident(&model.table_name, dialect),
         cols.join(", "),
         placeholders.join(", ")
     );
@@ -543,6 +567,7 @@ pub fn build_insert_all_and_cells(
     model: &crate::ir::DbModelMeta,
     schema: &StructSchema,
     recs: &[&StructData],
+    dialect: Dialect,
 ) -> Result<Vec<(String, Vec<Cell>)>, String> {
     if recs.is_empty() {
         return Ok(Vec::new());
@@ -572,7 +597,11 @@ pub fn build_insert_all_and_cells(
             model.table_name
         ));
     }
-    let col_names: Vec<&str> = active_cols.iter().map(|(c, _)| c.col_name.as_str()).collect();
+    let col_names: Vec<String> = active_cols
+        .iter()
+        .map(|(c, _)| quote_ident(&c.col_name, dialect))
+        .collect();
+    let q_table = quote_ident(&model.table_name, dialect);
     let row_ph = format!("({})", vec!["?"; active_cols.len()].join(", "));
     let max_rows = (65_535 / active_cols.len()).max(1);
     let mut batches = Vec::with_capacity(recs.len().div_ceil(max_rows));
@@ -588,7 +617,7 @@ pub fn build_insert_all_and_cells(
         let values_list = vec![row_ph.as_str(); chunk.len()].join(", ");
         let sql = format!(
             "INSERT INTO {} ({}) VALUES {}",
-            model.table_name,
+            q_table,
             col_names.join(", "),
             values_list
         );
@@ -601,6 +630,7 @@ pub fn build_update_and_cells(
     model: &crate::ir::DbModelMeta,
     schema: &StructSchema,
     rec: &StructData,
+    dialect: Dialect,
 ) -> Result<(String, Vec<Cell>), String> {
     let pk = pk_column_name(model)?;
     let mut assignments = Vec::new();
@@ -616,7 +646,7 @@ pub fn build_update_and_cells(
         if col.col_name == pk {
             pk_cell = Some(cell);
         } else {
-            assignments.push(format!("{} = ?", col.col_name));
+            assignments.push(format!("{} = ?", quote_ident(&col.col_name, dialect)));
             cells.push(cell);
         }
     }
@@ -635,18 +665,22 @@ pub fn build_update_and_cells(
     cells.push(pk_val);
     let sql = format!(
         "UPDATE {} SET {} WHERE {} = ?",
-        model.table_name,
+        quote_ident(&model.table_name, dialect),
         assignments.join(", "),
-        pk
+        quote_ident(pk, dialect)
     );
     Ok((sql, cells))
 }
 
-pub fn build_count_sql(model: &crate::ir::DbModelMeta) -> String {
-    format!("SELECT COUNT(*) FROM {}", model.table_name)
+pub fn build_count_sql(model: &crate::ir::DbModelMeta, dialect: Dialect) -> String {
+    format!("SELECT COUNT(*) FROM {}", quote_ident(&model.table_name, dialect))
 }
 
-pub fn build_find_by_sql(model: &crate::ir::DbModelMeta, column: &str) -> Result<String, String> {
+pub fn build_find_by_sql(
+    model: &crate::ir::DbModelMeta,
+    column: &str,
+    dialect: Dialect,
+) -> Result<String, String> {
     let target_col = model
         .columns
         .iter()
@@ -657,12 +691,16 @@ pub fn build_find_by_sql(model: &crate::ir::DbModelMeta, column: &str) -> Result
                 column, model.table_name
             )
         })?;
-    let cols: Vec<&str> = model.columns.iter().map(|c| c.col_name.as_str()).collect();
+    let cols: Vec<String> = model
+        .columns
+        .iter()
+        .map(|c| quote_ident(&c.col_name, dialect))
+        .collect();
     Ok(format!(
         "SELECT {} FROM {} WHERE {} = ?",
         cols.join(", "),
-        model.table_name,
-        target_col.col_name
+        quote_ident(&model.table_name, dialect),
+        quote_ident(&target_col.col_name, dialect)
     ))
 }
 
@@ -675,9 +713,17 @@ pub fn extract_count_cell(qr: &QueryResult) -> Result<i64, String> {
     cell_to_int(cell)
 }
 
-pub fn build_select_all_sql(model: &crate::ir::DbModelMeta) -> String {
-    let cols: Vec<&str> = model.columns.iter().map(|c| c.col_name.as_str()).collect();
-    format!("SELECT {} FROM {}", cols.join(", "), model.table_name)
+pub fn build_select_all_sql(model: &crate::ir::DbModelMeta, dialect: Dialect) -> String {
+    let cols: Vec<String> = model
+        .columns
+        .iter()
+        .map(|c| quote_ident(&c.col_name, dialect))
+        .collect();
+    format!(
+        "SELECT {} FROM {}",
+        cols.join(", "),
+        quote_ident(&model.table_name, dialect)
+    )
 }
 
 pub fn pk_column_name(model: &crate::ir::DbModelMeta) -> Result<&str, String> {
@@ -693,20 +739,28 @@ pub fn pk_column_name(model: &crate::ir::DbModelMeta) -> Result<&str, String> {
     ))
 }
 
-pub fn build_find_sql(model: &crate::ir::DbModelMeta) -> Result<String, String> {
+pub fn build_find_sql(model: &crate::ir::DbModelMeta, dialect: Dialect) -> Result<String, String> {
     let pk = pk_column_name(model)?;
-    let cols: Vec<&str> = model.columns.iter().map(|c| c.col_name.as_str()).collect();
+    let cols: Vec<String> = model
+        .columns
+        .iter()
+        .map(|c| quote_ident(&c.col_name, dialect))
+        .collect();
     Ok(format!(
         "SELECT {} FROM {} WHERE {} = ? LIMIT 1",
         cols.join(", "),
-        model.table_name,
-        pk
+        quote_ident(&model.table_name, dialect),
+        quote_ident(pk, dialect)
     ))
 }
 
-pub fn build_delete_sql(model: &crate::ir::DbModelMeta) -> Result<String, String> {
+pub fn build_delete_sql(model: &crate::ir::DbModelMeta, dialect: Dialect) -> Result<String, String> {
     let pk = pk_column_name(model)?;
-    Ok(format!("DELETE FROM {} WHERE {} = ?", model.table_name, pk))
+    Ok(format!(
+        "DELETE FROM {} WHERE {} = ?",
+        quote_ident(&model.table_name, dialect),
+        quote_ident(pk, dialect)
+    ))
 }
 
 pub fn any_obj_to_cell(obj: &Obj) -> Result<Cell, String> {

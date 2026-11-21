@@ -44,7 +44,7 @@ test "auth_api login validation, JWT auth middleware, and rate limiting" {
     ))
     assert_eq(login_ok.status, 200)
     reply := json.decode<TokenReply>(login_ok.body)?
-    claims := jwt.verify<Claims>(reply.token, "dev-conduit-jwt-secret")?
+    claims := jwt.verify<Claims>(reply.token, "dev-conduit-jwt-secret-0123456789abcdef")?
     assert_eq(claims.sub, "alice@conduit.dev")
     assert_eq(claims.role, "admin")
 

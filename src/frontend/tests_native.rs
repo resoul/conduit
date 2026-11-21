@@ -1675,9 +1675,9 @@ fn cdt_db_model_schemas_ddl_and_bundle_e2e() {
         panic!("expected String, got {out:?}");
     };
     let s = s.as_str();
-    assert!(s.contains("CREATE TABLE IF NOT EXISTS users (id BIGSERIAL PRIMARY KEY, email TEXT NOT NULL UNIQUE, org_id BIGINT NOT NULL REFERENCES orgs(id), active BOOLEAN NOT NULL DEFAULT true, bio_text TEXT);"), "got:\n{s}");
-    assert!(s.contains("CREATE INDEX IF NOT EXISTS idx_users_email ON users (email)"));
-    assert!(s.contains("CREATE TABLE IF NOT EXISTS users (id BIGINT AUTO_INCREMENT PRIMARY KEY, email VARCHAR(255) NOT NULL UNIQUE,"));
+    assert!(s.contains(r#"CREATE TABLE IF NOT EXISTS "users" ("id" BIGSERIAL PRIMARY KEY, "email" TEXT NOT NULL UNIQUE, "org_id" BIGINT NOT NULL REFERENCES "orgs"("id"), "active" BOOLEAN NOT NULL DEFAULT true, "bio_text" TEXT);"#), "got:\n{s}");
+    assert!(s.contains(r#"CREATE INDEX IF NOT EXISTS "idx_users_email" ON "users" ("email")"#));
+    assert!(s.contains("CREATE TABLE IF NOT EXISTS `users` (`id` BIGINT AUTO_INCREMENT PRIMARY KEY, `email` VARCHAR(255) NOT NULL UNIQUE,"));
 }
 
 #[test]
@@ -2252,8 +2252,9 @@ fn cdt_db_extended_crud_sql_and_check_e2e() {
     rec.set_obj(0, Obj::str("updated@example.com"));
     rec.set_obj(1, Obj::boxed_int(42));
 
-    let (upd_sql, upd_cells) = build_update_and_cells(model, schema, &rec).unwrap();
-    assert_eq!(upd_sql, "UPDATE accounts SET email = ?, age = ? WHERE id = ?");
+    let (upd_sql, upd_cells) =
+        build_update_and_cells(model, schema, &rec, crate::native::db::Dialect::Postgres).unwrap();
+    assert_eq!(upd_sql, r#"UPDATE "accounts" SET "email" = ?, "age" = ? WHERE "id" = ?"#);
     assert_eq!(
         upd_cells,
         vec![
@@ -2263,13 +2264,16 @@ fn cdt_db_extended_crud_sql_and_check_e2e() {
         ]
     );
 
-    assert_eq!(build_count_sql(model), "SELECT COUNT(*) FROM accounts");
     assert_eq!(
-        build_find_by_sql(model, "email").unwrap(),
-        "SELECT id, email, age FROM accounts WHERE email = ?"
+        build_count_sql(model, crate::native::db::Dialect::Postgres),
+        r#"SELECT COUNT(*) FROM "accounts""#
+    );
+    assert_eq!(
+        build_find_by_sql(model, "email", crate::native::db::Dialect::Postgres).unwrap(),
+        r#"SELECT "id", "email", "age" FROM "accounts" WHERE "email" = ?"#
     );
     assert!(
-        build_find_by_sql(model, "email = '' OR 1=1").is_err(),
+        build_find_by_sql(model, "email = '' OR 1=1", crate::native::db::Dialect::Postgres).is_err(),
         "must reject non-model columns to prevent SQL injection"
     );
 
@@ -2295,7 +2299,7 @@ fn cdt_jwt_sign_verify_hs256_hs512_expiry_and_bundle_e2e() {
     }
 
     export func run() -> String | jwt.JwtError {
-        secret := "s3cr3t-hmac-key"
+        secret := "s3cr3t-hmac-key-0123456789abcdef"
         tok256 := jwt.sign(Claims(sub: "u42", role: "admin"), secret, 3600)?
         c256 := jwt.verify<Claims>(tok256, secret)?
         has_exp := c256.exp != nil && c256.iat != nil
@@ -2303,8 +2307,20 @@ fn cdt_jwt_sign_verify_hs256_hs512_expiry_and_bundle_e2e() {
         tok512 := jwt.sign_alg("HS512", Claims(sub: "u99", role: "ops"), secret, 120)?
         c512 := jwt.verify_alg<Claims>("HS512", tok512, secret)?
 
+        var weak_sign = ""
+        switch jwt.sign(Claims(sub: "u1", role: "user"), "short", 60) {
+            case jwt.JwtError(e): weak_sign = e.kind
+            case String(_): weak_sign = "unexpected"
+        }
+
+        var weak_verify = ""
+        switch jwt.verify<Claims>(tok256, "short") {
+            case jwt.JwtError(e): weak_verify = e.kind
+            case Claims(_): weak_verify = "unexpected"
+        }
+
         var bad_sig = ""
-        switch jwt.verify<Claims>(tok256, "wrong-secret") {
+        switch jwt.verify<Claims>(tok256, "wrong-secret-0123456789abcdef012") {
             case jwt.JwtError(e): bad_sig = e.kind
             case Claims(_): bad_sig = "unexpected"
         }
@@ -2365,7 +2381,7 @@ fn cdt_jwt_sign_verify_hs256_hs512_expiry_and_bundle_e2e() {
         s_lw := leeway_ok.sub
         s_uv := unverified.sub
         s_re := req_exp_ok.sub
-        return "{s1}:{r1}:{has_exp}|{s2}|{bad_sig}:{alg_mismatch}:{bad_none}|{exp_kind}:{s_lw}|{nbf_kind}|{miss_exp_kind}:{s_re}|{s_uv}"
+        return "{s1}:{r1}:{has_exp}|{s2}|{weak_sign}:{weak_verify}|{bad_sig}:{alg_mismatch}:{bad_none}|{exp_kind}:{s_lw}|{nbf_kind}|{miss_exp_kind}:{s_re}|{s_uv}"
     }
     "#;
     let module = compile_source(src).unwrap();
@@ -2380,7 +2396,7 @@ fn cdt_jwt_sign_verify_hs256_hs512_expiry_and_bundle_e2e() {
         let out = vm.call_obj(m, f, &[], &[]).unwrap();
         assert_eq!(
             out,
-            Obj::str("u42:admin:true|u99|invalid_signature:unsupported_alg:unsupported_alg|expired:old|not_before|missing_exp:u42|u99")
+            Obj::str("u42:admin:true|u99|weak_secret:weak_secret|invalid_signature:unsupported_alg:unsupported_alg|expired:old|not_before|missing_exp:u42|u99")
         );
     }
 }
@@ -3266,7 +3282,7 @@ export func dummy_exec(conn: db.Connection) -> [User] | db.DbError {
     .unwrap();
     assert_eq!(
         pg_sql,
-        "SELECT id, email FROM users WHERE active = ? AND (role = ? OR email ILIKE ?) AND 1 = 0 ORDER BY age DESC LIMIT 10 OFFSET 20"
+        r#"SELECT "id", "email" FROM "users" WHERE "active" = ? AND ("role" = ? OR "email" ILIKE ?) AND 1 = 0 ORDER BY "age" DESC LIMIT 10 OFFSET 20"#
     );
 
     let mysql_sql = build_query_sql(
@@ -3280,7 +3296,7 @@ export func dummy_exec(conn: db.Connection) -> [User] | db.DbError {
         "mysql",
     )
     .unwrap();
-    assert!(mysql_sql.contains("LOWER(email) LIKE LOWER(?)"), "{}", mysql_sql);
+    assert!(mysql_sql.contains("LOWER(`email`) LIKE LOWER(?)"), "{}", mysql_sql);
 
     assert!(
         build_query_sql(
@@ -3466,7 +3482,7 @@ export func use_pool_helpers(p: db.Pool) -> Int | db.DbError {
 
 #[test]
 fn cdt_db_prepared_url_flags_and_insert_all_e2e() {
-    use crate::native::db::{Cell, build_insert_all_and_cells};
+    use crate::native::db::{Cell, Dialect, build_insert_all_and_cells};
     use crate::native::mysql::parse_mysql_url;
     use crate::native::pg::parse_pg_url;
     use crate::vm::value::{Obj, StructData};
@@ -3517,11 +3533,11 @@ export func bulk(conn: db.Connection) -> Int | db.DbError {
     r2.set_scalar(1, 30);
     r2.set_obj(0, Obj::str("b@x.com"));
 
-    let batches = build_insert_all_and_cells(model, schema, &[&r1, &r2]).unwrap();
+    let batches = build_insert_all_and_cells(model, schema, &[&r1, &r2], Dialect::Postgres).unwrap();
     assert_eq!(batches.len(), 1);
     assert_eq!(
         batches[0].0,
-        "INSERT INTO accounts (email, age) VALUES (?, ?), (?, ?)"
+        r#"INSERT INTO "accounts" ("email", "age") VALUES (?, ?), (?, ?)"#
     );
     assert_eq!(
         batches[0].1,
@@ -3532,7 +3548,55 @@ export func bulk(conn: db.Connection) -> Int | db.DbError {
             Cell::Int(30),
         ]
     );
-    assert!(build_insert_all_and_cells(model, schema, &[]).unwrap().is_empty());
+    assert!(build_insert_all_and_cells(model, schema, &[], Dialect::Mysql).unwrap().is_empty());
+
+    // Reserved SQL keywords ("order", "user", "group") are safely quoted per dialect.
+    let kw_src = r#"
+    @db.table("order")
+    struct OrderRow {
+        id: Int @db.pk @db.auto = 0
+        user: String @db.index
+        group: Int = 1
+    }
+    func main() -> Void {}
+    "#;
+    let kw_mod = compile_source(kw_src).unwrap();
+    let kw_model = &kw_mod.db_models[0];
+    let kw_schema = kw_mod
+        .struct_schemas
+        .iter()
+        .find(|s| s.schema_id == kw_model.schema_id)
+        .unwrap();
+    let pg_ddl = crate::native::db::build_create_table_sqls(kw_model, kw_schema, Dialect::Postgres).join(";");
+    assert!(
+        pg_ddl.contains(r#"CREATE TABLE IF NOT EXISTS "order" ("id" BIGSERIAL PRIMARY KEY, "user" TEXT NOT NULL, "group" BIGINT NOT NULL)"#),
+        "got: {pg_ddl}"
+    );
+    assert!(pg_ddl.contains(r#"ON "order" ("user")"#), "got: {pg_ddl}");
+    let my_ddl = crate::native::db::build_create_table_sqls(kw_model, kw_schema, Dialect::Mysql).join(";");
+    assert!(
+        my_ddl.contains("CREATE TABLE IF NOT EXISTS `order` (`id` BIGINT AUTO_INCREMENT PRIMARY KEY, `user` TEXT NOT NULL, `group` BIGINT NOT NULL)"),
+        "got: {my_ddl}"
+    );
+    assert!(my_ddl.contains("ON `order` (`user`)"));
+    assert_eq!(
+        crate::native::db::build_find_by_sql(kw_model, "user", Dialect::Mysql).unwrap(),
+        "SELECT `id`, `user`, `group` FROM `order` WHERE `user` = ?"
+    );
+    assert_eq!(
+        crate::native::db_query::build_query_sql(
+            kw_model,
+            &["user".to_string()],
+            None,
+            &[("group".to_string(), crate::native::db_query::OrderDir::Asc)],
+            None,
+            None,
+            crate::native::db_query::QueryMode::All,
+            "postgres",
+        )
+        .unwrap(),
+        r#"SELECT "user" FROM "order" ORDER BY "group" ASC"#
+    );
 }
 
 #[test]

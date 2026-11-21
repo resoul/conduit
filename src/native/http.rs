@@ -15,8 +15,10 @@ use crate::vm::value::{
 };
 
 pub const MAX_LINE: usize = 8 * 1024;
+pub const MAX_HEADER_BYTES: usize = 64 * 1024;
 pub const MAX_HEADERS: usize = 100;
 pub const MAX_BODY: usize = 1024 * 1024;
+const BODY_INITIAL_CAP: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub enum RouteSeg {
@@ -696,28 +698,92 @@ pub fn is_valid_header_value(val: &str) -> bool {
     !val.bytes().any(|b| (b < b' ' && b != b'\t') || b == 127)
 }
 
-enum LineReadError {
-    TooLarge,
-    Io(io::Error),
+#[inline]
+fn find_crlf_crlf(buf: &[u8]) -> Option<usize> {
+    if buf.len() < 4 {
+        return None;
+    }
+    for i in 0..=buf.len() - 4 {
+        if &buf[i..i + 4] == b"\r\n\r\n" {
+            return Some(i + 4);
+        }
+    }
+    None
 }
 
-fn read_crlf_line_raw<R: BufRead>(reader: &mut R) -> Result<Option<Vec<u8>>, LineReadError> {
-    let mut buf = Vec::new();
-    let n = reader
-        .by_ref()
-        .take(MAX_LINE as u64 + 1)
-        .read_until(b'\n', &mut buf)
-        .map_err(LineReadError::Io)?;
-    if n == 0 {
-        return Ok(None);
+#[inline]
+fn has_bare_lf(buf: &[u8], base_prev_byte: Option<u8>) -> bool {
+    for (i, &b) in buf.iter().enumerate() {
+        if b == b'\n' {
+            let prev = if i == 0 { base_prev_byte } else { Some(buf[i - 1]) };
+            if prev != Some(b'\r') {
+                return true;
+            }
+        }
     }
-    if buf.len() > MAX_LINE {
-        return Err(LineReadError::TooLarge);
+    false
+}
+
+fn read_http_head<R: BufRead, M>(
+    reader: &mut R,
+    map_io_err: &M,
+) -> Result<Vec<u8>, ReadHttpError>
+where
+    M: Fn(&R, io::Error) -> ReadHttpError,
+{
+    let mut head = Vec::with_capacity(2048);
+    loop {
+        let prev_len = head.len();
+        let prev_byte = head.last().copied();
+        let (avail_len, take) = match reader.fill_buf() {
+            Ok(avail) => {
+                if avail.is_empty() {
+                    return Err(ReadHttpError::Closed);
+                }
+                let cap_left = MAX_HEADER_BYTES - prev_len;
+                if cap_left == 0 {
+                    return Err(ReadHttpError::TooLarge);
+                }
+                let take = avail.len().min(cap_left);
+                head.extend_from_slice(&avail[..take]);
+                (avail.len(), take)
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(map_io_err(reader, e)),
+        };
+
+        let search_from = prev_len.saturating_sub(3);
+        if let Some(rel_end) = find_crlf_crlf(&head[search_from..]) {
+            let end_in_head = search_from + rel_end;
+            if has_bare_lf(&head[prev_len..end_in_head], prev_byte) {
+                return Err(ReadHttpError::Bad("Bare LF in HTTP request".to_string()));
+            }
+            reader.consume(end_in_head - prev_len);
+            head.truncate(end_in_head);
+            return Ok(head);
+        }
+        if has_bare_lf(&head[prev_len..], prev_byte) {
+            return Err(ReadHttpError::Bad("Bare LF in HTTP request".to_string()));
+        }
+        reader.consume(take);
+        if head.len() >= MAX_HEADER_BYTES || (take < avail_len && head.len() >= MAX_HEADER_BYTES) {
+            return Err(ReadHttpError::TooLarge);
+        }
     }
-    while buf.last().is_some_and(|&b| b == b'\n' || b == b'\r') {
-        buf.pop();
+}
+
+#[inline]
+fn next_crlf_line<'a>(rem: &mut &'a [u8]) -> Option<&'a [u8]> {
+    for i in 0..rem.len().saturating_sub(1) {
+        if rem[i] == b'\r' && rem[i + 1] == b'\n' {
+            let line = &rem[..i];
+            *rem = &rem[i + 2..];
+            return Some(line);
+        }
     }
-    Ok(Some(buf))
+    let line = *rem;
+    *rem = &[];
+    Some(line)
 }
 
 #[inline]
@@ -742,24 +808,35 @@ where
     F: FnOnce(&mut R),
     M: Fn(&R, io::Error) -> ReadHttpError,
 {
-    let read_line = |r: &mut R| match read_crlf_line_raw(r) {
-        Ok(opt) => Ok(opt),
-        Err(LineReadError::TooLarge) => Err(ReadHttpError::TooLarge),
-        Err(LineReadError::Io(e)) => Err(map_io_err(r, e)),
-    };
-    let Some(req_line) = read_line(reader)? else {
-        return Err(ReadHttpError::Closed);
-    };
-    let req_line = std::str::from_utf8(&req_line)
+    let head = read_http_head(reader, &map_io_err)?;
+    let mut rem = &head[..head.len() - 4];
+    let req_line_bytes = next_crlf_line(&mut rem).unwrap_or(&[]);
+    if req_line_bytes.len() > MAX_LINE {
+        return Err(ReadHttpError::TooLarge);
+    }
+    if req_line_bytes.is_empty() {
+        return Err(ReadHttpError::Bad("Missing HTTP request line".to_string()));
+    }
+    if req_line_bytes.contains(&b'\r') {
+        return Err(ReadHttpError::Bad("Bare CR in HTTP request line".to_string()));
+    }
+    let req_line = std::str::from_utf8(req_line_bytes)
         .map_err(|_| ReadHttpError::Bad("Request line is not valid UTF-8".to_owned()))?;
-    let mut parts = req_line.split_whitespace();
-    let Some(method) = parts.next() else {
-        return Err(ReadHttpError::Bad("Missing HTTP method".to_string()));
+    let mut parts = req_line.split(' ');
+    let (Some(method), Some(target), Some(version), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(ReadHttpError::Bad("Malformed HTTP request line".to_string()));
     };
-    let Some(target) = parts.next() else {
-        return Err(ReadHttpError::Bad("Missing HTTP target".to_string()));
-    };
-    let version = parts.next().unwrap_or("HTTP/1.1");
+    if method.is_empty() || !method.bytes().all(is_http_tchar) {
+        return Err(ReadHttpError::Bad("Invalid HTTP method".to_string()));
+    }
+    if target.is_empty() || target.bytes().any(|b| b <= b' ' || b == 127) {
+        return Err(ReadHttpError::Bad("Invalid HTTP target".to_string()));
+    }
+    if !matches!(version, "HTTP/1.1" | "HTTP/1.0") {
+        return Err(ReadHttpError::Bad(format!("Unsupported HTTP version '{}'", version)));
+    }
     let (raw_path, raw_query) = match target.split_once('?') {
         Some((p, q)) => (p, q),
         None => (target, ""),
@@ -768,12 +845,18 @@ where
     let mut content_length: usize = 0;
     let mut saw_content_length = false;
     let mut conn_header: Option<String> = None;
-    loop {
-        let Some(line) = read_line(reader)? else {
-            return Err(ReadHttpError::Closed);
-        };
-        if line.is_empty() {
+    while !rem.is_empty() {
+        let Some(line) = next_crlf_line(&mut rem) else {
             break;
+        };
+        if line.len() > MAX_LINE {
+            return Err(ReadHttpError::TooLarge);
+        }
+        if line.is_empty() {
+            return Err(ReadHttpError::Bad("Unexpected empty header line".to_string()));
+        }
+        if line.contains(&b'\r') {
+            return Err(ReadHttpError::Bad("Bare CR in HTTP header".to_string()));
         }
         if headers.len() >= MAX_HEADERS {
             return Err(ReadHttpError::TooLarge);
@@ -810,7 +893,9 @@ where
             if val.is_empty() || !val.iter().all(u8::is_ascii_digit) {
                 return Err(ReadHttpError::Bad("Invalid Content-Length".to_string()));
             }
-            content_length = std::str::from_utf8(val).ok().and_then(|val| val.parse::<usize>().ok())
+            content_length = std::str::from_utf8(val)
+                .ok()
+                .and_then(|val| val.parse::<usize>().ok())
                 .ok_or(())
                 .map_err(|_| ReadHttpError::Bad("Invalid Content-Length".to_string()))?;
             if content_length > MAX_BODY {
@@ -823,11 +908,27 @@ where
     }
 
     on_headers_done(reader);
-    let mut body_bytes = vec![0u8; content_length];
-    if content_length > 0
-        && let Err(e) = reader.read_exact(&mut body_bytes)
-    {
-        return Err(map_io_err(reader, e));
+    let mut body_bytes = Vec::with_capacity(content_length.min(BODY_INITIAL_CAP));
+    if content_length > 0 {
+        let mut remaining = content_length;
+        let mut chunk = [0u8; 16 * 1024];
+        while remaining > 0 {
+            let want = remaining.min(chunk.len());
+            match reader.read(&mut chunk[..want]) {
+                Ok(0) => {
+                    return Err(map_io_err(
+                        reader,
+                        io::Error::new(io::ErrorKind::UnexpectedEof, "unexpected EOF in HTTP body"),
+                    ));
+                }
+                Ok(n) => {
+                    body_bytes.extend_from_slice(&chunk[..n]);
+                    remaining -= n;
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(map_io_err(reader, e)),
+            }
+        }
     }
 
     let keep_alive = if version == "HTTP/1.0" {
@@ -2192,5 +2293,74 @@ mod tests {
             assert_eq!(rec.schema_id, SCHEMA_HTTP_ERROR);
             assert_eq!(rec.get_obj(0).format_obj(), "blocked_addr", "url={url}");
         }
+    }
+
+    #[test]
+    fn strict_http_parser_rejects_malformed_requests_and_enforces_total_header_limit() {
+        // 1. Bare LF rejected
+        assert!(matches!(
+            read_http_request(&mut b"GET / HTTP/1.1\nHost: example.com\n\n".as_slice()),
+            Err(ReadHttpError::Bad(_))
+        ));
+        assert!(matches!(
+            read_http_request(&mut b"GET / HTTP/1.1\r\nHost: example.com\n\r\n".as_slice()),
+            Err(ReadHttpError::Bad(_))
+        ));
+
+        // 2. Bare CR inside header rejected
+        assert!(matches!(
+            read_http_request(&mut b"GET / HTTP/1.1\r\nHost: a\rb\r\n\r\n".as_slice()),
+            Err(ReadHttpError::Bad(_))
+        ));
+
+        // 3. Request line strict validation (missing version, extra whitespace, tab, wrong version, bad method)
+        for bad_line in [
+            b"GET /\r\nHost: a\r\n\r\n".as_slice(),
+            b"GET  / HTTP/1.1\r\nHost: a\r\n\r\n".as_slice(),
+            b"GET\t/\tHTTP/1.1\r\nHost: a\r\n\r\n".as_slice(),
+            b"GET / HTTP/1.1 extra\r\nHost: a\r\n\r\n".as_slice(),
+            b"GET / HTTP/2.0\r\nHost: a\r\n\r\n".as_slice(),
+            b"BAD@METHOD / HTTP/1.1\r\nHost: a\r\n\r\n".as_slice(),
+        ] {
+            assert!(
+                matches!(read_http_request(&mut &*bad_line), Err(ReadHttpError::Bad(_))),
+                "expected 400 for {:?}",
+                String::from_utf8_lossy(bad_line)
+            );
+        }
+
+        // 4. Total header block > MAX_HEADER_BYTES rejected as TooLarge
+        let mut huge = Vec::from(&b"GET / HTTP/1.1\r\n"[..]);
+        for i in 0..20 {
+            huge.extend_from_slice(format!("X-Pad-{i:02}: {}\r\n", "a".repeat(3500)).as_bytes());
+        }
+        huge.extend_from_slice(b"\r\n");
+        assert!(huge.len() > MAX_HEADER_BYTES);
+        assert!(matches!(
+            read_http_request(&mut huge.as_slice()),
+            Err(ReadHttpError::TooLarge)
+        ));
+
+        // 5. Pipelined requests + HTTP/1.0 no headers + >64 KiB body work cleanly on one BufReader
+        let mut pipelined = Vec::new();
+        pipelined.extend_from_slice(b"GET /one HTTP/1.0\r\n\r\n");
+        let big_body = vec![b'z'; 70_000];
+        pipelined.extend_from_slice(
+            format!("POST /two HTTP/1.1\r\nHost: example.com\r\nContent-Length: {}\r\n\r\n", big_body.len())
+                .as_bytes(),
+        );
+        pipelined.extend_from_slice(&big_body);
+        pipelined.extend_from_slice(b"GET /three HTTP/1.1\r\nHost: example.com\r\n\r\n");
+
+        let mut br = BufReader::new(Cursor::new(pipelined));
+        let r1 = read_http_request(&mut br).unwrap();
+        assert_eq!(r1.path, "/one");
+        assert!(!r1.keep_alive);
+        let r2 = read_http_request(&mut br).unwrap();
+        assert_eq!(r2.path, "/two");
+        assert_eq!(r2.body, big_body);
+        assert!(r2.keep_alive);
+        let r3 = read_http_request(&mut br).unwrap();
+        assert_eq!(r3.path, "/three");
     }
 }

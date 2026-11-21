@@ -6,8 +6,9 @@ import { User } from "./main"
 test "db_service generates PostgreSQL and MySQL DDL for User" {
     pg := db.ddl<User>("postgres")
     my := db.ddl<User>("mysql")
-    assert(pg.contains("CREATE TABLE IF NOT EXISTS users"))
+    assert(pg.contains("CREATE TABLE IF NOT EXISTS \"users\""))
     assert(pg.contains("BIGSERIAL PRIMARY KEY"))
+    assert(my.contains("CREATE TABLE IF NOT EXISTS `users`"))
     assert(my.contains("AUTO_INCREMENT PRIMARY KEY"))
 }
 

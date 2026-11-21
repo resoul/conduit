@@ -380,18 +380,20 @@ impl Vm {
                             }
                             out
                         }
-                        DB_DROP_TABLE => match conn.execute(&build_drop_table_sql(model), &[]) {
-                            Ok(_) => Obj::Empty,
-                            Err(e) => e.into_obj(),
-                        },
-                        DB_COUNT => match conn.query(&build_count_sql(model), &[]) {
+                        DB_DROP_TABLE => {
+                            match conn.execute(&build_drop_table_sql(model, conn.dialect()), &[]) {
+                                Ok(_) => Obj::Empty,
+                                Err(e) => e.into_obj(),
+                            }
+                        }
+                        DB_COUNT => match conn.query(&build_count_sql(model, conn.dialect()), &[]) {
                             Ok(qr) => match extract_count_cell(&qr) {
                                 Ok(n) => Obj::boxed_int(n),
                                 Err(msg) => make_db_error("decode_error", &msg, ""),
                             },
                             Err(e) => e.into_obj(),
                         },
-                        _ => match conn.query(&build_select_all_sql(model), &[]) {
+                        _ => match conn.query(&build_select_all_sql(model, conn.dialect()), &[]) {
                             Ok(qr) => match query_result_to_structs(qr, schema) {
                                 Ok(list) => list,
                                 Err(msg) => make_db_error("decode_error", &msg, ""),
@@ -422,7 +424,7 @@ impl Vm {
                             let Obj::Record(row_rec) = &arg_obj else {
                                 return Err(err_msg("Expected struct record in db.insert()"));
                             };
-                            match build_insert_and_cells(model, schema, row_rec) {
+                            match build_insert_and_cells(model, schema, row_rec, conn.dialect()) {
                                 Ok((sql, cells)) => match conn.execute(&sql, &cells) {
                                     Ok(n) => {
                                         let lid = conn.last_insert_id();
@@ -444,7 +446,7 @@ impl Vm {
                                 };
                                 recs.push(rec.as_ref());
                             }
-                            match build_insert_all_and_cells(model, schema, &recs) {
+                            match build_insert_all_and_cells(model, schema, &recs, conn.dialect()) {
                                 Ok(batches) => {
                                     let mut total = 0i64;
                                     let mut err_obj = None;
@@ -466,7 +468,7 @@ impl Vm {
                             let Obj::Record(row_rec) = &arg_obj else {
                                 return Err(err_msg("Expected struct record in db.update()"));
                             };
-                            match build_update_and_cells(model, schema, row_rec) {
+                            match build_update_and_cells(model, schema, row_rec, conn.dialect()) {
                                 Ok((sql, cells)) => match conn.execute(&sql, &cells) {
                                     Ok(n) => Obj::boxed_int(n as i64),
                                     Err(e) => e.into_obj(),
@@ -474,26 +476,28 @@ impl Vm {
                                 Err(msg) => make_db_error("query_error", &msg, ""),
                             }
                         }
-                        DB_FIND => match (build_find_sql(model), any_obj_to_cell(&arg_obj)) {
-                            (Ok(sql), Ok(cell)) => match conn.query(&sql, &[cell]) {
-                                Ok(qr) => {
-                                    if qr.rows.is_empty() {
-                                        Obj::Empty
-                                    } else {
-                                        match query_result_to_structs(qr, schema) {
-                                            Ok(Obj::List(ListStorage::Obj(items))) => {
-                                                items.first().cloned().unwrap_or(Obj::Empty)
+                        DB_FIND => {
+                            match (build_find_sql(model, conn.dialect()), any_obj_to_cell(&arg_obj)) {
+                                (Ok(sql), Ok(cell)) => match conn.query(&sql, &[cell]) {
+                                    Ok(qr) => {
+                                        if qr.rows.is_empty() {
+                                            Obj::Empty
+                                        } else {
+                                            match query_result_to_structs(qr, schema) {
+                                                Ok(Obj::List(ListStorage::Obj(items))) => {
+                                                    items.first().cloned().unwrap_or(Obj::Empty)
+                                                }
+                                                Ok(_) => Obj::Empty,
+                                                Err(msg) => make_db_error("decode_error", &msg, ""),
                                             }
-                                            Ok(_) => Obj::Empty,
-                                            Err(msg) => make_db_error("decode_error", &msg, ""),
                                         }
                                     }
-                                }
-                                Err(e) => e.into_obj(),
-                            },
-                            (Err(msg), _) | (_, Err(msg)) => make_db_error("query_error", &msg, ""),
-                        },
-                        _ => match (build_delete_sql(model), any_obj_to_cell(&arg_obj)) {
+                                    Err(e) => e.into_obj(),
+                                },
+                                (Err(msg), _) | (_, Err(msg)) => make_db_error("query_error", &msg, ""),
+                            }
+                        }
+                        _ => match (build_delete_sql(model, conn.dialect()), any_obj_to_cell(&arg_obj)) {
                             (Ok(sql), Ok(cell)) => match conn.execute(&sql, &[cell]) {
                                 Ok(n) => Obj::boxed_int(n as i64),
                                 Err(e) => e.into_obj(),
@@ -523,7 +527,10 @@ impl Vm {
                     .find(|s| s.schema_id == model.schema_id)
                     .ok_or_else(|| err_msg("Missing struct schema for db.find_by()"))?;
                 let res = match self.host.get_db_conn(id) {
-                    Some(conn) => match (build_find_by_sql(model, col_name), any_obj_to_cell(val_obj)) {
+                    Some(conn) => match (
+                        build_find_by_sql(model, col_name, conn.dialect()),
+                        any_obj_to_cell(val_obj),
+                    ) {
                         (Ok(sql), Ok(cell)) => match conn.query(&sql, &[cell]) {
                             Ok(qr) => match query_result_to_structs(qr, schema) {
                                 Ok(list) => list,

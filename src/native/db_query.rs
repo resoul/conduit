@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::ir::DbModelMeta;
-use crate::native::db::{Cell, any_obj_to_cell};
+use crate::native::db::{Cell, any_obj_to_cell, quote_ident_str};
 use crate::vm::value::{ListStorage, Obj};
 
 #[inline]
@@ -184,43 +184,43 @@ fn render_where_node(
             op,
             param_count,
         } => {
-            let resolved = resolve_model_column(model, col_name)?;
+            let resolved = quote_ident_str(resolve_model_column(model, col_name)?, dialect);
             match op {
                 WhereOp::Eq => {
-                    out.push_str(resolved);
+                    out.push_str(&resolved);
                     out.push_str(" = ?");
                 }
                 WhereOp::Ne => {
-                    out.push_str(resolved);
+                    out.push_str(&resolved);
                     out.push_str(" != ?");
                 }
                 WhereOp::Gt => {
-                    out.push_str(resolved);
+                    out.push_str(&resolved);
                     out.push_str(" > ?");
                 }
                 WhereOp::Ge => {
-                    out.push_str(resolved);
+                    out.push_str(&resolved);
                     out.push_str(" >= ?");
                 }
                 WhereOp::Lt => {
-                    out.push_str(resolved);
+                    out.push_str(&resolved);
                     out.push_str(" < ?");
                 }
                 WhereOp::Le => {
-                    out.push_str(resolved);
+                    out.push_str(&resolved);
                     out.push_str(" <= ?");
                 }
                 WhereOp::Like => {
-                    out.push_str(resolved);
+                    out.push_str(&resolved);
                     out.push_str(" LIKE ?");
                 }
                 WhereOp::ILike => {
                     if dialect == "mysql" {
                         out.push_str("LOWER(");
-                        out.push_str(resolved);
+                        out.push_str(&resolved);
                         out.push_str(") LIKE LOWER(?)");
                     } else {
-                        out.push_str(resolved);
+                        out.push_str(&resolved);
                         out.push_str(" ILIKE ?");
                     }
                 }
@@ -228,7 +228,7 @@ fn render_where_node(
                     if *param_count == 0 {
                         out.push_str("1 = 0");
                     } else {
-                        out.push_str(resolved);
+                        out.push_str(&resolved);
                         out.push_str(" IN (");
                         for i in 0..*param_count {
                             if i > 0 {
@@ -240,11 +240,11 @@ fn render_where_node(
                     }
                 }
                 WhereOp::IsNull => {
-                    out.push_str(resolved);
+                    out.push_str(&resolved);
                     out.push_str(" IS NULL");
                 }
                 WhereOp::IsNotNull => {
-                    out.push_str(resolved);
+                    out.push_str(&resolved);
                     out.push_str(" IS NOT NULL");
                 }
             }
@@ -305,18 +305,19 @@ pub fn build_query_sql(
     dialect: &str,
 ) -> Result<String, String> {
     let mut sql = String::new();
+    let q_table = quote_ident_str(&model.table_name, dialect);
     match mode {
         QueryMode::Count => {
             sql.push_str("SELECT COUNT(*) FROM ");
-            sql.push_str(&model.table_name);
+            sql.push_str(&q_table);
         }
         QueryMode::Exists => {
             sql.push_str("SELECT 1 FROM ");
-            sql.push_str(&model.table_name);
+            sql.push_str(&q_table);
         }
         QueryMode::Delete => {
             sql.push_str("DELETE FROM ");
-            sql.push_str(&model.table_name);
+            sql.push_str(&q_table);
         }
         QueryMode::All | QueryMode::First | QueryMode::Rows => {
             sql.push_str("SELECT ");
@@ -325,18 +326,18 @@ pub fn build_query_sql(
                     if i > 0 {
                         sql.push_str(", ");
                     }
-                    sql.push_str(&c.col_name);
+                    sql.push_str(&quote_ident_str(&c.col_name, dialect));
                 }
             } else {
                 for (i, col) in select_cols.iter().enumerate() {
                     if i > 0 {
                         sql.push_str(", ");
                     }
-                    sql.push_str(resolve_model_column(model, col)?);
+                    sql.push_str(&quote_ident_str(resolve_model_column(model, col)?, dialect));
                 }
             }
             sql.push_str(" FROM ");
-            sql.push_str(&model.table_name);
+            sql.push_str(&q_table);
         }
     }
 
@@ -351,7 +352,7 @@ pub fn build_query_sql(
             if i > 0 {
                 sql.push_str(", ");
             }
-            sql.push_str(resolve_model_column(model, col)?);
+            sql.push_str(&quote_ident_str(resolve_model_column(model, col)?, dialect));
             sql.push(' ');
             sql.push_str(dir.as_sql());
         }

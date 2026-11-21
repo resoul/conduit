@@ -197,12 +197,10 @@ conduit db rollback app.cdt --url postgres://conduit:secret@127.0.0.1:5432/app [
 
 Conduit includes a built-in zero-dependency TLS 1.2 / 1.3 client used by PostgreSQL, MySQL, Redis (`rediss://`), and HTTPS (`http.get` / `http.request`).
 
-- **PostgreSQL URL parameters:** `sslmode=disable|allow|prefer|require|verify-ca|verify-full` (default: `disable`), `sslrootcert=/path/to/ca.pem`. Note: `allow` is simplified to try TLS first (like `prefer`) and fall back to plaintext if the server refuses SSL (`'N'`). When TLS is active and the server advertises `SCRAM-SHA-256-PLUS`, `tls-server-end-point` channel binding is automatically negotiated.
-  With `sslmode=require` and no `sslrootcert`, Conduit encrypts the connection without
-  authenticating the server, leaving it open to man-in-the-middle attacks. Use
-  `sslmode=verify-full` to verify the certificate chain and hostname.
+- **PostgreSQL URL parameters:** `sslmode=disable|allow|prefer|require|verify-ca|verify-full` (current default: `disable`), `sslrootcert=/path/to/ca.pem`. Note: `allow` is simplified to try TLS first (like `prefer`) and fall back to plaintext if the server refuses SSL (`'N'`). When TLS is active and the server advertises `SCRAM-SHA-256-PLUS`, `tls-server-end-point` channel binding is automatically negotiated.
+  With `sslmode=disable`, `allow`, `prefer`, or `require` without `sslrootcert`, Conduit emits a one-time warning per host on non-loopback addresses (including RFC 1918 private networks and Docker hostnames such as `db`); **Conduit 0.4.0 will default non-loopback connections to `verify-full`**. Use `sslmode=verify-full` for verified TLS with SAN checks, `sslmode=verify-ca&sslrootcert=/path/to/ca.pem` for internal certificates without a hostname SAN, or explicit `sslmode=disable` only on a trusted network.
 - Prepared PostgreSQL queries request binary results for integers, booleans, double-precision floats, and UUIDs
   once the statement cache has the result column types. The connection preserves the usual Conduit result types.
-- **MySQL URL parameters:** `ssl-mode=disabled|preferred|required|verify_ca|verify_identity` (default: `disabled`), `sslrootcert=/path/to/ca.pem` (or `ssl-ca`). Enables `caching_sha2_password` full authentication over TLS.
-- **Redis URL parameters:** Use `rediss://...` with optional `tls_verify=full|ca|none` (default: `full`) and `ca_file=/path/to/ca.pem`.
+- **MySQL URL parameters:** `ssl-mode=disabled|preferred|required|verify_ca|verify_identity` (current default: `disabled`), `sslrootcert=/path/to/ca.pem` (or `ssl-ca`). Enables `caching_sha2_password` full authentication over TLS. Non-loopback connections with `disabled`, `preferred`, or `required` emit a migration warning toward `verify_identity` / `verify_ca` + `sslrootcert`.
+- **Redis URL parameters:** Use `rediss://...` with optional `tls_verify=full|ca|none` (default: `full`) and `ca_file=/path/to/ca.pem`. Non-loopback `redis://` plaintext or `tls_verify=none` connections emit a one-time warning per host.
 - **Supported algorithms & limits:** TLS 1.3 (`AES-128/256-GCM`, `ChaCha20-Poly1305`, `X25519`, `P-256`) and TLS 1.2 (`ECDHE` + `AEAD` with mandatory `extended_master_secret`). Legacy SSLv3 / TLS 1.0 / TLS 1.1, CBC, RC4, 3DES, static RSA/DHE, renegotiation, compression, and CRL/OCSP revocation checks are not supported.

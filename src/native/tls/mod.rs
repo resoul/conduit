@@ -296,7 +296,7 @@ pub fn connect(tcp: TcpStream, cfg: &TlsConfig) -> Result<TlsStream<TcpStream>, 
     res
 }
 
-fn is_loopback_host(host: &str) -> bool {
+pub(crate) fn is_loopback_host(host: &str) -> bool {
     let trimmed = host.trim_end_matches('.');
     let unbracketed = trimmed
         .strip_prefix('[')
@@ -306,6 +306,27 @@ fn is_loopback_host(host: &str) -> bool {
         || unbracketed
             .parse::<std::net::IpAddr>()
             .is_ok_and(|ip| ip.to_canonical().is_loopback())
+}
+
+/// Emits a once-per-process-and-host warning when a database driver connects to a non-loopback
+/// host without verified TLS. Intentionally does not exempt RFC1918 private IPs or Docker hostnames.
+pub(crate) fn warn_db_insecure_tls_once(driver: &str, host: &str, detail: &str, hint: &str) {
+    static WARNED_HOSTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(String, String)>>> =
+        std::sync::OnceLock::new();
+    if is_loopback_host(host) {
+        return;
+    }
+    let set = WARNED_HOSTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    let key = (driver.to_string(), host.trim_end_matches('.').to_ascii_lowercase());
+    let inserted = set
+        .lock()
+        .map(|mut g| g.len() < 1024 && g.insert(key))
+        .unwrap_or(false);
+    if inserted {
+        eprintln!(
+            "[{driver}] WARNING: connecting to non-loopback host '{host}' without verified TLS ({detail}). Add {hint} (Conduit 0.4.0 will require verified TLS by default for non-loopback hosts)."
+        );
+    }
 }
 
 fn warn_if_insecure_disable(cfg: &TlsConfig) {
@@ -962,6 +983,16 @@ mod tests {
                 got_large.extend_from_slice(&large_buf[..n]);
             }
             assert_eq!(got_large, expected, "large buf mismatch for {label}");
+        }
+    }
+
+    #[test]
+    fn loopback_host_check_excludes_rfc1918_and_docker_hostnames() {
+        for lb in ["localhost", "LOCALHOST.", "127.0.0.1", "127.0.1.9", "::1", "[::1]", "::ffff:127.0.0.1"] {
+            assert!(is_loopback_host(lb), "{lb} must be treated as loopback");
+        }
+        for remote in ["10.0.0.1", "172.17.0.2", "192.168.1.50", "db", "postgres.internal", "8.8.8.8", "fd00::1"] {
+            assert!(!is_loopback_host(remote), "{remote} must NOT be exempted as loopback");
         }
     }
 
