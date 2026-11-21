@@ -16,6 +16,7 @@ The `conduit` CLI provides tools for checking, compiling, executing, disassembli
 | `conduit fmt` | `<file_or_dir> [--check]` | Formats `.cdt` source files (or checks formatting with `--check`). |
 | `conduit routes` | `<file.cdt> [--router <name>]` | Prints the declarative HTTP router route table (`METHOD`, `PATH`, `HANDLER`, `BODY`, middleware). |
 | `conduit openapi` | `<file.cdt> [--router <name>] [--title <str>] [--version <str>] [--server <url>] [-o <file>]` | Generates an OpenAPI 3.0.3 JSON specification from declarative `router` and `@validation.*` schemas. |
+| `conduit env example` | `<file.cdt> [-o <file>]` | Generates a `.env.example` template from `config` and `@env` fields. |
 | `conduit check` | `<file.cdt>` | Performs static semantic analysis and type checking without running code. |
 | `conduit disasm` | `<file.cdt>` | Compiles the program and prints the disassembled register bytecode. |
 | `conduit bench` | `[--filter <pat>] [--strict]` | Runs the built-in VM benchmark suite and checks target performance gates. |

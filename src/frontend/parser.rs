@@ -190,7 +190,9 @@ impl Parser {
             TokenKind::Ident(kw) if kw == "config" => self.parse_config_item(is_exported),
             TokenKind::Ident(kw) if kw == "router" => self.parse_router_item(is_exported),
             TokenKind::Ident(kw) if kw == "schedule" => self.parse_schedule_item(is_exported),
+            TokenKind::Ident(kw) if kw == "app" => self.parse_app_item(is_exported),
             TokenKind::Ident(kw) if kw == "job" => self.parse_job_item(is_exported),
+            TokenKind::Ident(kw) if kw == "worker" => self.parse_worker_item(is_exported),
             TokenKind::Ident(kw) if kw == "migration" => self.parse_migration_item(),
             TokenKind::Ident(kw) if kw == "query" => self.parse_query_item(is_exported),
             TokenKind::Ident(kw) if matches!(kw.as_str(), "on" | "on_start" | "on_stop") => {
@@ -519,9 +521,7 @@ impl Parser {
         ))
     }
 
-    pub(super) fn parse_params_and_return_type(
-        &mut self,
-    ) -> Result<(Vec<Param>, Option<TypeExpr>), ParserError> {
+    pub(super) fn parse_param_list(&mut self) -> Result<Vec<Param>, ParserError> {
         self.expect(&TokenKind::LParen)?;
         let mut params = Vec::new();
         let mut seen_default = false;
@@ -550,6 +550,13 @@ impl Parser {
             }
         }
         self.expect(&TokenKind::RParen)?;
+        Ok(params)
+    }
+
+    pub(super) fn parse_params_and_return_type(
+        &mut self,
+    ) -> Result<(Vec<Param>, Option<TypeExpr>), ParserError> {
+        let params = self.parse_param_list()?;
         let return_type = if self.match_token(&TokenKind::Arrow) {
             Some(self.parse_type_expr()?)
         } else {
@@ -558,7 +565,7 @@ impl Parser {
         Ok((params, return_type))
     }
 
-    fn parse_type_params(&mut self) -> Result<Vec<String>, ParserError> {
+    pub(super) fn parse_type_params(&mut self) -> Result<Vec<String>, ParserError> {
         if !self.match_token(&TokenKind::Lt) {
             return Ok(Vec::new());
         }

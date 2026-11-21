@@ -70,3 +70,6 @@ conduit cron list app.cdt
 conduit cron run app.cdt cleanup_sessions
 conduit cron print app.cdt   # prints crontab lines to stdout
 ```
+
+> [!TIP]
+> To run a `schedule` alongside `config` validation, an `http` server, and unified `SIGINT`/`SIGTERM` shutdown, wire it inside an [`app`](app.md) block with `cdt.app`.

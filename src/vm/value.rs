@@ -256,6 +256,8 @@ pub const SCHEMA_DB_QUERY: u32 = 0xFFFF_0053;
 pub const SCHEMA_DB_POOL: u32 = 0xFFFF_0054;
 pub const SCHEMA_HTTP_CLIENT: u32 = 0xFFFF_0055;
 pub const SCHEMA_CHAN_HANDLE: u32 = 0xFFFF_0056;
+pub const SCHEMA_APP_ERROR: u32 = 0xFFFF_0057;
+pub const SCHEMA_APP_HANDLE: u32 = 0xFFFF_0058;
 
 #[inline]
 pub fn is_builtin_error_schema(schema_id: u32) -> bool {
@@ -283,6 +285,7 @@ pub fn is_builtin_error_schema(schema_id: u32) -> bool {
             | SCHEMA_LOCK_ERROR
             | SCHEMA_CACHE_ERROR
             | SCHEMA_REDIS_ERROR
+            | SCHEMA_APP_ERROR
     )
 }
 
@@ -834,12 +837,14 @@ impl Obj {
                 | SCHEMA_LOCK_ERROR
                 | SCHEMA_CACHE_ERROR
                 | SCHEMA_REDIS_ERROR
+                | SCHEMA_APP_ERROR
                     if rec.inline_objs.len() >= 2 =>
                 {
                     rec.inline_objs[1].format_obj()
                 }
                 SCHEMA_FS_ERROR if rec.obj_len >= 3 => rec.get_obj(2).format_obj(),
                 SCHEMA_CHAN_HANDLE => "<chan>".to_string(),
+                SCHEMA_APP_HANDLE => "<app>".to_string(),
                 _ if !rec.inline_objs.is_empty() && matches!(&rec.inline_objs[0], Obj::Str(_)) => {
                     rec.inline_objs[0].format_obj()
                 }

@@ -40,6 +40,7 @@ conduit env example app.cdt -o .env.example
 - Optional fields (`T?`) without a default become `empty` when unset or empty.
 - Required non-optional fields without a default return `env.EnvError`.
 - `@env` composes naturally with `@validation.*` rules via `validation.check(cfg)`.
+- Passing `config AppConfig` into a declarative [`app`](app.md) block loads and validates all fields fail-fast before any startup hooks, scheduler jobs, or HTTP listeners start.
 
 ```conduit
 import * as env from "cdt.env"

@@ -238,7 +238,11 @@ pub(crate) fn register_program_types(
             let router_ann = f
                 .annotations
                 .iter()
-                .find(|ann| ann.target.starts_with("router.") || ann.target.starts_with("schedule."))
+                .find(|ann| {
+                    ann.target.starts_with("router.")
+                        || ann.target.starts_with("schedule.")
+                        || ann.target.starts_with("app.")
+                })
                 .cloned();
             let db_anns: Vec<FieldAnnotation> = f
                 .annotations

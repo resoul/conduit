@@ -587,6 +587,25 @@ pub fn encode_bundle(module: &Module, main_fid: u32, main_ret_tag: u8) -> Result
             Ok(())
         })
     })?;
+    w.list(&module.apps, |w, a| {
+        w.str(&a.name);
+        match a.env_plan_idx {
+            Some(idx) => { w.u8(1); w.u16(idx); }
+            None => w.u8(0),
+        }
+        match &a.http_addr {
+            Some(addr) => { w.u8(1); w.str(addr); }
+            None => w.u8(0),
+        }
+        match a.schedule_idx {
+            Some(idx) => { w.u8(1); w.u16(idx); }
+            None => w.u8(0),
+        }
+        w.u64(a.shutdown_ms);
+        w.list(&a.on_start_funcs, |w, &fid| { w.u32(fid); Ok(()) })?;
+        w.list(&a.on_stop_funcs, |w, &fid| { w.u32(fid); Ok(()) })?;
+        Ok(())
+    })?;
     w.list(&module.http_query_plans, |w, qp| {
         w.u32(qp.schema_id);
         w.u16(qp.scalar_len);
@@ -811,6 +830,24 @@ pub fn decode_bundle(bytes: &[u8]) -> Result<(Module, u32, u8), String> {
             })
         })?;
         Ok(crate::ir::SchedulePlan { name, jobs })
+    })?;
+    module.apps = r.vec(|r| {
+        let name = r.str()?;
+        let env_plan_idx = if r.u8()? == 1 { Some(r.u16()?) } else { None };
+        let http_addr = if r.u8()? == 1 { Some(r.str()?) } else { None };
+        let schedule_idx = if r.u8()? == 1 { Some(r.u16()?) } else { None };
+        let shutdown_ms = r.u64()?;
+        let on_start_funcs = r.vec(Reader::u32)?;
+        let on_stop_funcs = r.vec(Reader::u32)?;
+        Ok(crate::ir::AppPlan {
+            name,
+            env_plan_idx,
+            http_addr,
+            schedule_idx,
+            shutdown_ms,
+            on_start_funcs,
+            on_stop_funcs,
+        })
     })?;
     module.http_query_plans = r.vec(|r| {
         Ok(crate::ir::HttpQueryPlan {

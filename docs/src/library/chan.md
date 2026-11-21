@@ -64,3 +64,39 @@ func sum_worker(ch: Chan<Int>, out: Chan<Int>) -> Void {
     out.send(total)
 }
 ```
+
+## Declarative `worker` Blocks
+
+Use `worker` to declare a typed channel consumer with built-in worker pools (`concurrency`), error retries (`retry`), and sleep delays (`backoff`)—without writing manual `spawn` loops:
+
+```conduit
+import * as chan from "cdt.chan"
+
+error JobError {
+    message: String
+}
+
+worker SendEmail(job: String, prefix: String = "[mail]") concurrency 4 retry 2 backoff 50ms -> Void | JobError {
+    if job == "bad" {
+        return JobError(message: "invalid recipient")
+    }
+    print("{prefix} sent {job}")
+}
+
+func main() -> Void {
+    jobs := chan.open<String>(16)
+    spawn {
+        jobs.send("alice@example.com")
+        jobs.send("bad")
+        jobs.close()
+    }
+
+    processed := SendEmail(jobs)
+    print("Succeeded: {processed}")
+}
+```
+
+* Syntax: `[export] worker Name[<T, ...>](msg: MsgType, extra...: ExtraType [= default]) [concurrency N] [retry R] [backoff D<ms|s|m|h>] [-> Void | ErrorType ...] { ... }`.
+* Inside the body, `msg` is each received value from the channel; you can use `?`, early `return`, and `defer` per item when returning `Void | Error`.
+* Calling `Name(ch, ...extra)` consumes `Chan<MsgType>` until `ch` is closed and drained across `concurrency` workers (default `1`) and returns `Int` (the count of successfully completed items).
+* If an item fails, it is retried up to `retry` times (default `0`), sleeping `backoff` between attempts. Permanently failing items are skipped and do not increment the returned count.

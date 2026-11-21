@@ -502,6 +502,49 @@ impl<'a> ModuleCompiler<'a> {
                 jobs,
             });
         }
+        for app in &self.checked.app_plans {
+            let env_plan_idx = app
+                .config_struct
+                .as_ref()
+                .and_then(|cfg_name| {
+                    let sid = self.checked.struct_by_name[cfg_name];
+                    let schema_id = self.checked.structs[sid].schema_id;
+                    self.checked
+                        .env_plans
+                        .iter()
+                        .position(|p| p.schema_id == schema_id)
+                        .map(|i| i as u16)
+                });
+            let schedule_idx = app
+                .schedule_name
+                .as_ref()
+                .and_then(|sname| {
+                    self.checked
+                        .cron_schedule_plans
+                        .iter()
+                        .position(|(n, _)| n == sname)
+                        .map(|i| i as u16)
+                });
+            let on_start_funcs = app
+                .on_start_handlers
+                .iter()
+                .map(|h| self.checked.func_by_name[h])
+                .collect();
+            let on_stop_funcs = app
+                .on_stop_handlers
+                .iter()
+                .map(|h| self.checked.func_by_name[h])
+                .collect();
+            self.module.apps.push(crate::ir::AppPlan {
+                name: app.name.clone(),
+                env_plan_idx,
+                http_addr: app.http_addr.clone(),
+                schedule_idx,
+                shutdown_ms: app.shutdown_ms,
+                on_start_funcs,
+                on_stop_funcs,
+            });
+        }
         self.module.populate_lifecycle_hooks();
         Ok(())
     }

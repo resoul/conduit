@@ -140,14 +140,15 @@ func main() -> Void {
 
 - **Forms**: Both block form (`spawn { ... }`) and single-expression form (`spawn send_email(id)`) are supported.
 - **Lexical captures**: Captured values are copied by value into the background VM (thread-safe shared primitives such as `cdt.cache`, `cdt.lock`, `cdt.db.Pool`, `cdt.http.Client`, and `cdt.http.Router` handles share underlying host state).
-- **Graceful draining**: Before a program exits or an `http.serve` server shuts down and runs `on stop` hooks, the runtime waits up to 5 seconds for active `spawn` tasks to finish.
+- **Graceful draining**: Before a program exits or an `http.serve` server shuts down and runs `on stop` hooks, the runtime waits up to 5 seconds for active `spawn` tasks to finish (or up to the configured `shutdown <duration>` inside a declarative [`app`](../library/app.md) block).
 - **Compile-time isolation**: Loop control (`break`, `continue`) cannot cross a `spawn` boundary, and `return` inside `spawn` returns from the spawned task (`Void`) rather than the enclosing function.
 
 ### Passing Data Between Threads
 
-Conduit threads do not share mutable local variables directly. You have two complementary tools for passing data between `spawn` threads and callers:
+Conduit threads do not share mutable local variables directly. You have three complementary tools for coordinating work between threads:
 
-1. **Channels (`cdt.chan` / `Chan<T>`)** — Go-style thread-safe FIFO queues for typed messaging with blocking `send`/`recv`, non-blocking `try_send`/`try_recv`, `recv_timeout(ms)`, and `for item in ch` iteration:
+1. **Declarative Worker Pools (`worker`)** — Top-level [`worker`](../library/chan.md#declarative-worker-blocks) declarations automatically spawn `concurrency` worker threads reading from `Chan<T>`, with built-in `retry` attempts and `backoff` delays.
+2. **Channels (`cdt.chan` / `Chan<T>`)** — Go-style thread-safe FIFO queues for typed messaging with blocking `send`/`recv`, non-blocking `try_send`/`try_recv`, `recv_timeout(ms)`, and `for item in ch` iteration:
 
 ```conduit
 import * as chan from "cdt.chan"
@@ -173,7 +174,7 @@ func main() -> Void {
 }
 ```
 
-2. **Shared In-Memory Cache (`cdt.cache` + `cdt.lock`)** — Ideal for shared counters, rate limits, and stateful key-value stores accessed concurrently across handlers and `spawn` tasks.
+3. **Shared In-Memory Cache (`cdt.cache` + `cdt.lock`)** — Ideal for shared counters, rate limits, and stateful key-value stores accessed concurrently across handlers and `spawn` tasks.
 
 ---
 

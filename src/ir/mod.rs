@@ -163,6 +163,24 @@ pub fn is_lifecycle_hook_name(name: &str) -> bool {
     is_on_start_hook_name(name) || is_on_stop_hook_name(name)
 }
 
+pub fn worker_step_display_name(name: &str) -> Option<&str> {
+    let raw = name
+        .strip_prefix("__cdt_worker_step_")
+        .or_else(|| name.split_once("___cdt_worker_step_").map(|(_, rest)| rest))?;
+    Some(raw.split_once('<').map_or(raw, |(base, _)| base))
+}
+
+#[derive(Debug, Clone)]
+pub struct AppPlan {
+    pub name: String,
+    pub env_plan_idx: Option<u16>,
+    pub http_addr: Option<String>,
+    pub schedule_idx: Option<u16>,
+    pub shutdown_ms: u64,
+    pub on_start_funcs: Vec<u32>,
+    pub on_stop_funcs: Vec<u32>,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct Module {
     pub functions: Vec<FunctionProto>,
@@ -180,6 +198,7 @@ pub struct Module {
     pub migrations: Vec<MigrationPlan>,
     pub db_models: Vec<DbModelMeta>,
     pub schedules: Vec<SchedulePlan>,
+    pub apps: Vec<AppPlan>,
     pub tests: Vec<TestSpec>,
     pub http_query_plans: Vec<HttpQueryPlan>,
     pub on_start_funcs: Vec<u32>,
@@ -1384,6 +1403,24 @@ impl Module {
                                 }
                                 _ => return Err(format!("Invalid chan aux {}", aux)),
                             },
+                            crate::vm::opcode::EXT_APP_OP => match aux {
+                                0 | 1 => {
+                                    check_o(a, &ctx)?;
+                                    check_o(c, &ctx)?;
+                                    if (b as usize) >= self.apps.len() {
+                                        return Err(format!("app_idx {} out of bounds", b));
+                                    }
+                                }
+                                2 => {
+                                    check_o(a, &ctx)?;
+                                    check_o(b, &ctx)?;
+                                }
+                                3 => {
+                                    check_s(a, &ctx)?;
+                                    check_o(b, &ctx)?;
+                                }
+                                _ => return Err(format!("Invalid app aux {}", aux)),
+                            },
                             _ => return Err(format!("Invalid ExtOp kind {}", kind)),
                         }
                     }
@@ -1403,6 +1440,32 @@ impl Module {
                     return Err(format!(
                         "Schedule '{}' job '{}' func_id out of bounds",
                         sched.name, job.name
+                    ));
+                }
+            }
+        }
+        for app in &self.apps {
+            if let Some(env_idx) = app.env_plan_idx
+                && (env_idx as usize) >= self.env_plans.len()
+            {
+                return Err(format!(
+                    "App '{}' env_plan_idx {} out of bounds",
+                    app.name, env_idx
+                ));
+            }
+            if let Some(sched_idx) = app.schedule_idx
+                && (sched_idx as usize) >= self.schedules.len()
+            {
+                return Err(format!(
+                    "App '{}' schedule_idx {} out of bounds",
+                    app.name, sched_idx
+                ));
+            }
+            for &fid in app.on_start_funcs.iter().chain(app.on_stop_funcs.iter()) {
+                if (fid as usize) >= self.functions.len() {
+                    return Err(format!(
+                        "App '{}' hook func_id {} out of bounds",
+                        app.name, fid
                     ));
                 }
             }

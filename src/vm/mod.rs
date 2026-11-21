@@ -1,4 +1,5 @@
 pub mod exec;
+pub(crate) mod exec_app;
 pub(crate) mod exec_cache;
 pub(crate) mod exec_chan;
 pub(crate) mod exec_cold;
@@ -144,6 +145,7 @@ pub(crate) struct VmHostState {
     pub(crate) db_pools: Vec<DbPoolSlot>,
     pub(crate) db_pool_free: Vec<usize>,
     pub(crate) cron_schedulers: Vec<Option<crate::native::cron::CronSchedulerState>>,
+    pub(crate) app_handles: Vec<Option<crate::vm::exec_app::AppHandleState>>,
     pub(crate) cached_http_req: Option<(Arc<StructData>, Arc<StructData>)>,
     pub(crate) spawn_tracker: Arc<SpawnTracker>,
     pub(crate) shared_module: Option<Arc<Module>>,

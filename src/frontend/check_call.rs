@@ -101,6 +101,7 @@ impl<'a> Checker<'a> {
             "cdt.cache" => self.check_cache_call(sym, type_args, args, named_args),
             "cdt.redis" => self.check_redis_call(sym, type_args, args, named_args),
             "cdt.chan" => self.check_chan_call(sym, type_args, args, named_args),
+            "cdt.app" => self.check_app_call(sym, type_args, args, named_args),
             other => Err(format!("Unknown native module '{}'", other)),
         }
     }
@@ -269,6 +270,20 @@ impl<'a> Checker<'a> {
                     return Ok(Type::List(Box::new(elem)));
                 }
                 "Chan" => return self.check_chan_call("open", type_args, args, named_args),
+                "__cdt_worker_ok" => {
+                    if !type_args.is_empty() || !named_args.is_empty() || args.len() != 1 {
+                        return Err("__cdt_worker_ok expects 1 argument".to_string());
+                    }
+                    self.check_expr(&mut args[0], None)?;
+                    return Ok(Type::Bool);
+                }
+                "__cdt_sleep_ms" => {
+                    if !type_args.is_empty() || !named_args.is_empty() || args.len() != 1 {
+                        return Err("__cdt_sleep_ms expects 1 Int argument".to_string());
+                    }
+                    self.expect_arg_ty(&mut args[0], &Type::Int, "backoff")?;
+                    return Ok(Type::Void);
+                }
                 "IndexError" | "KeyError" | "ParseError" => {
                     return self.check_prelude_error_ctor(name, type_args, args, named_args);
                 }

@@ -9,12 +9,12 @@ Conduit is designed with explicit control flow, strict types, and composable sta
 - **Zero External Dependencies**: Implemented purely using the Rust standard library (`std`) with no external crates.
 - **Register Bytecode VM**: Compiles `.cdt` programs to compact register bytecode (`Op`) with split scalar/object registers, copy-on-write (`Arc`) collections, and fused `|>` pipelines.
 - **Static Type System & Tagged Unions**: Catches type mismatches, unhandled error unions, and non-exhaustive `switch` cases at compile time with multi-error source-snippet diagnostics, scalar and payload `enum`s (tagged unions with named fields and default values), and distinct module-scoped type identities across imports.
-- **Generics, Collections, Closures, `spawn` & `defer`**: Supports user-defined generic structs and functions (`struct Box<T>`, `func find<T>`), safe indexing on `[T]` (`IndexError`), insertion-ordered `Map<K, V>` (`KeyError`), string interpolation (`"hello {x}"`), anonymous lexical closures, `|>` pipelines, concurrent `spawn` background tasks, and LIFO `defer` cleanup on function exit or `?` error propagation.
+- **Generics, Collections, Closures, `spawn`, `worker` & `defer`**: Supports user-defined generic structs and functions (`struct Box<T>`, `func find<T>`), safe indexing on `[T]` (`IndexError`), insertion-ordered `Map<K, V>` (`KeyError`), string interpolation (`"hello {x}"`), anonymous lexical closures, `|>` pipelines, concurrent `spawn` background tasks, declarative `worker` channel pools, and LIFO `defer` cleanup on function exit or `?` error propagation.
 - **TS-Style Modules & Tree-Shaking**: Supports `import { a, b } from "./mod"` and `import * as ns from "./mod"` with explicit `export` privacy and dead-code elimination of unreachable functions.
 - **Errors as Values**: Functions return explicit union types (`T | Error`), inspected via exhaustive `switch` or propagated via `?`—zero exceptions.
 - **Strict Numbers (`Int` & `Float`)**: 64-bit integers (`Int`) and IEEE 754 floats (`Float`) never mix implicitly; conversions (`.to_float()`, `.floor()`, `.ceil()`, `.round()`, `.to_string()`) are always explicit.
 - **Explicit Schema Validation**: Mark validators with `[#validator]`, attach `@rule` / `@module.rule(...)` annotations to fields, and execute recursive checks explicitly via `validation.check()`.
-- **Standard Library (`cdt.*`)**: Built-in host-native modules for HTTP (`cdt.http`), SQL databases (`cdt.db`), Redis (`cdt.redis`), JWT (`cdt.jwt`), channels (`cdt.chan`), in-memory/WAL cache (`cdt.cache`), mutex/RW/file locks (`cdt.lock`), cron scheduling (`cdt.cron`), JSON (`cdt.json`), schema validation (`cdt.validation`), time (`cdt.time`), environment config (`cdt.env`), CLI parsing & dispatch (`cdt.cli`), filesystem (`cdt.fs`), paths (`cdt.path`), processes (`cdt.process`), crypto (`cdt.crypto`), URLs (`cdt.url`), CSV (`cdt.csv`), math (`cdt.math`), and logging (`cdt.log`).
+- **Standard Library (`cdt.*`)**: Built-in host-native modules for unified app lifecycle (`cdt.app`), HTTP (`cdt.http`), SQL databases (`cdt.db`), Redis (`cdt.redis`), JWT (`cdt.jwt`), channels (`cdt.chan`), in-memory/WAL cache (`cdt.cache`), mutex/RW/file locks (`cdt.lock`), cron scheduling (`cdt.cron`), JSON (`cdt.json`), schema validation (`cdt.validation`), time (`cdt.time`), environment config (`cdt.env`), CLI parsing & dispatch (`cdt.cli`), filesystem (`cdt.fs`), paths (`cdt.path`), processes (`cdt.process`), crypto (`cdt.crypto`), URLs (`cdt.url`), CSV (`cdt.csv`), math (`cdt.math`), and logging (`cdt.log`).
 
 ## Standard Library
 
@@ -38,9 +38,10 @@ Conduit is designed with explicit control flow, strict types, and composable sta
 | `cdt.cron` | Zero-dependency declarative `schedule` blocks, 5-field UTC cron & interval scheduler (`cron.run<T>`, `cron.start<T>`) | [cdt.cron](docs/src/library/cron.md) |
 | `cdt.jwt` | Pure-Rust HS256 & HS512 JWT signing, constant-time verification (`jwt.sign`, `jwt.verify<T>`), and `exp`/`nbf`/`iat` validation | [cdt.jwt](docs/src/library/jwt.md) |
 | `cdt.lock` | Process-wide named mutexes, writer-fair RWLocks, and inter-process OS advisory file locks (`lock.with`, `lock.file`) | [cdt.lock](docs/src/library/lock.md) |
-| `cdt.chan` | Thread-safe bounded & unbounded typed FIFO channels (`Chan<T>`, `chan.open<T>`, `send`/`try_send`, `recv`/`recv_timeout`, `close`, and `for item in ch` iteration) | [cdt.chan](docs/src/library/chan.md) |
+| `cdt.chan` | Thread-safe bounded & unbounded typed FIFO channels (`Chan<T>`, `chan.open<T>`, `send`/`try_send`, `recv`/`recv_timeout`, `close`, `for item in ch`) and declarative `worker` pools (`concurrency`, `retry`, `backoff`) | [cdt.chan](docs/src/library/chan.md) |
 | `cdt.cache` | Thread-safe TTL + LRU in-memory stores, stampede-safe `get_or_set`, atomic `incr`, snapshots, and append-only WAL persistence | [cdt.cache](docs/src/library/cache.md) |
 | `cdt.redis` | Zero-dependency RESP2 TCP client (KV, JSON, Hash, List, Set, raw `cmd`) and Lua-verified distributed locks (`with_lock`) | [cdt.redis](docs/src/library/redis.md) |
+| `cdt.app` | Unified declarative `app` coordinator (`config`, `http`, `schedule`, `shutdown`, `on start`/`on stop`, `app.run<T>`, `app.start<T>`) | [cdt.app](docs/src/library/app.md) |
 
 ## Installation
 

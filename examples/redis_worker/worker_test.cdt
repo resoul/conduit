@@ -65,3 +65,34 @@ test "redis_worker channel worker pool processes payloads concurrently" {
     assert_eq(processed[1]?, "webhook->https://example.com/1(retries=1)")
     assert_eq(processed[2]?, "webhook->https://example.com/2(retries=2)")
 }
+
+error WorkerErr {
+    message: String
+}
+
+worker BatchCounter(n: Int, ok_out: Chan<Int>) concurrency 2 retry 1 backoff 1ms -> Void | WorkerErr {
+    if n < 0 {
+        return WorkerErr(message: "negative")
+    }
+    ok_out.send(n * 10)
+}
+
+test "redis_worker declarative worker counts successes and skips permanent errors" {
+    ch := Chan<Int>(8)
+    out := Chan<Int>(8)
+    spawn {
+        ch.send(1)
+        ch.send(-5)
+        ch.send(2)
+        ch.close()
+    }
+    succeeded := BatchCounter(ch, out)
+    out.close()
+
+    assert_eq(succeeded, 2)
+    var sum = 0
+    for v in out {
+        sum = sum + v
+    }
+    assert_eq(sum, 30)
+}

@@ -225,6 +225,7 @@ pub const EXT_CACHE_OP: u8 = 48;
 pub const EXT_REDIS_OP: u8 = 49;
 pub const EXT_SPAWN: u8 = 50;
 pub const EXT_CHAN_OP: u8 = 51;
+pub const EXT_APP_OP: u8 = 52;
 
 #[cfg(test)]
 mod tests {

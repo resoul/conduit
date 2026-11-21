@@ -54,7 +54,7 @@ use crate::vm::opcode::{
     EXT_MAP_GET, EXT_MAP_INDEX, EXT_MAP_KEYS, EXT_MAP_REMOVE, EXT_MAP_SET, EXT_MAP_VALUES,
     EXT_MATH_OP, EXT_PATH_OP, EXT_PIPELINE_REDUCE, EXT_PRINT_OBJ, EXT_PRINT_SCALAR, EXT_PROCESS_OP,
     EXT_REDIS_OP, EXT_SPAWN, EXT_STR_IS_EMPTY, EXT_STR_PRED, EXT_STR_SPLIT, EXT_STR_TO_FLOAT,
-    EXT_STR_TO_INT, EXT_TIME_OP, EXT_URL_OP,
+    EXT_STR_TO_INT, EXT_TIME_OP, EXT_URL_OP, EXT_APP_OP,
 };
 use crate::vm::value::{
     ListStorage, MapKey, MapVal, Obj, OrderedMap, SCHEMA_BOXED_BOOL, SCHEMA_BOXED_FLOAT,
@@ -364,6 +364,9 @@ impl Vm {
             }
             EXT_CRON_OP => {
                 self.exec_cron_op(module, s_base, o_base, aux, a, b, c)?;
+            }
+            EXT_APP_OP => {
+                self.exec_app_op(module, s_base, o_base, s_top, o_top, aux, a, b, c)?;
             }
             EXT_JWT_OP => {
                 self.exec_jwt_op(module, s_base, o_base, aux, a, b, c)?;

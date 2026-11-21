@@ -41,6 +41,7 @@
 - [cdt.chan](library/chan.md)
 - [cdt.cache](library/cache.md)
 - [cdt.redis](library/redis.md)
+- [cdt.app](library/app.md)
 
 # Practical Guides
 - [Working with Errors](guides/working-with-errors.md)

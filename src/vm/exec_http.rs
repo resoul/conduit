@@ -130,6 +130,125 @@ pub fn install_signal_handlers() {
 #[cfg(not(any(unix, windows)))]
 pub fn install_signal_handlers() {}
 
+fn wake_socket_addr(mut addr: std::net::SocketAddr) {
+    if addr.ip().is_unspecified() {
+        addr.set_ip(if addr.is_ipv4() {
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        } else {
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+        });
+    }
+    let _ = TcpStream::connect_timeout(&addr, Duration::from_millis(50));
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn serve_http_listener(
+    module: Arc<Module>,
+    routers: Vec<RouterState>,
+    http_clients: Vec<HttpClientState>,
+    db_pools: Vec<crate::vm::DbPoolSlot>,
+    db_pool_free: Vec<usize>,
+    spawn_tracker: Arc<crate::vm::SpawnTracker>,
+    script_args: Option<Vec<String>>,
+    rid: usize,
+    listener: TcpListener,
+    stop_flag: Arc<std::sync::atomic::AtomicBool>,
+    watch_signals: bool,
+) {
+    let bound_addr = listener.local_addr().ok();
+    if let Some(local) = bound_addr
+        && let Ok(mut guard) = routers[rid].listen_addr.lock()
+    {
+        *guard = Some(local);
+    }
+    stop_flag.store(false, Ordering::Release);
+    if watch_signals {
+        SIGNAL_STOP.store(false, Ordering::Release);
+        install_signal_handlers();
+    }
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get().clamp(4, 16))
+        .unwrap_or(8);
+    let (tx, rx) = mpsc::sync_channel::<TcpStream>(workers * 8);
+    let rx = Arc::new(Mutex::new(rx));
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let rx = Arc::clone(&rx);
+            let routers = routers.clone();
+            let http_clients = http_clients.clone();
+            let db_pools = db_pools.clone();
+            let db_pool_free = db_pool_free.clone();
+            let spawn_tracker = Arc::clone(&spawn_tracker);
+            let mod_worker = Arc::clone(&module);
+            let script_args = script_args.clone();
+            scope.spawn(move || {
+                let mut worker_vm = Vm::new();
+                worker_vm.script_args = script_args;
+                worker_vm.host.routers = routers;
+                worker_vm.host.http_clients = http_clients;
+                worker_vm.host.db_pools = db_pools;
+                worker_vm.host.db_pool_free = db_pool_free;
+                worker_vm.host.spawn_tracker = spawn_tracker;
+                worker_vm.host.shared_module = Some(Arc::clone(&mod_worker));
+                loop {
+                    let stream = {
+                        let Ok(guard) = rx.lock() else { break };
+                        match guard.recv() {
+                            Ok(s) => s,
+                            Err(_) => break,
+                        }
+                    };
+                    serve_connection_isolated(&mut worker_vm, &mod_worker, rid, stream);
+                    crate::vm::exec_map::flush_stdout();
+                }
+            });
+        }
+        let watch_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watcher = if watch_signals {
+            let watch_stop = Arc::clone(&stop_flag);
+            let watch_done_flag = Arc::clone(&watch_done);
+            Some(scope.spawn(move || {
+                while !watch_done_flag.load(Ordering::Acquire)
+                    && !watch_stop.load(Ordering::Acquire)
+                {
+                    if SIGNAL_STOP.load(Ordering::Acquire) {
+                        watch_stop.store(true, Ordering::Release);
+                        if let Some(wake_addr) = bound_addr {
+                            wake_socket_addr(wake_addr);
+                        }
+                        break;
+                    }
+                    std::thread::park_timeout(Duration::from_millis(50));
+                }
+            }))
+        } else {
+            None
+        };
+        while !stop_flag.load(Ordering::Acquire) {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    if stop_flag.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if tx.send(stream).is_err() {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        drop(tx);
+        if let Some(w) = watcher {
+            watch_done.store(true, Ordering::Release);
+            w.thread().unpark();
+        }
+    });
+    if let Ok(mut guard) = routers[rid].listen_addr.lock() {
+        *guard = None;
+    }
+}
+
 #[inline]
 fn set_matched_params_on_record(req: &mut StructData, params: MatchedParams) {
     let params = match params {
@@ -143,6 +262,15 @@ fn set_matched_params_on_record(req: &mut StructData, params: MatchedParams) {
 }
 
 impl Vm {
+    pub(crate) fn wake_router_listener(&self, rid: usize) {
+        if let Some(router) = self.host.routers.get(rid)
+            && let Ok(guard) = router.listen_addr.lock()
+            && let Some(addr) = *guard
+        {
+            wake_socket_addr(addr);
+        }
+    }
+
     fn invoke_http_fn_raw(
         &mut self,
         module: &Module,
@@ -1110,112 +1238,25 @@ impl Vm {
                         return Ok(());
                     }
                 };
-                let bound_addr = listener.local_addr().ok();
-                if let Some(local) = bound_addr
-                    && let Ok(mut guard) = self.host.routers[rid].listen_addr.lock()
-                {
-                    *guard = Some(local);
-                }
-                self.host.routers[rid].stop_flag.store(false, Ordering::Release);
-                SIGNAL_STOP.store(false, Ordering::Release);
-                install_signal_handlers();
                 let stop_flag = Arc::clone(&self.host.routers[rid].stop_flag);
                 let shared_mod = self
                     .host
                     .shared_module
                     .get_or_insert_with(|| Arc::new(module.clone()))
                     .clone();
-                let routers = self.host.routers.clone();
-                let http_clients = self.host.http_clients.clone();
-                let db_pools = self.host.db_pools.clone();
-                let db_pool_free = self.host.db_pool_free.clone();
-                let spawn_tracker = Arc::clone(&self.host.spawn_tracker);
-                let script_args = self.script_args.clone();
-                let workers = std::thread::available_parallelism()
-                    .map(|n| n.get().clamp(4, 16))
-                    .unwrap_or(8);
-                let (tx, rx) = mpsc::sync_channel::<TcpStream>(workers * 8);
-                let rx = Arc::new(Mutex::new(rx));
-                std::thread::scope(|scope| {
-                    for _ in 0..workers {
-                        let rx = Arc::clone(&rx);
-                        let routers = routers.clone();
-                        let http_clients = http_clients.clone();
-                        let db_pools = db_pools.clone();
-                        let db_pool_free = db_pool_free.clone();
-                        let spawn_tracker = Arc::clone(&spawn_tracker);
-                        let shared_mod = Arc::clone(&shared_mod);
-                        let script_args = script_args.clone();
-                        scope.spawn(move || {
-                            let mut worker_vm = Vm::new();
-                            worker_vm.script_args = script_args;
-                            worker_vm.host.routers = routers;
-                            worker_vm.host.http_clients = http_clients;
-                            worker_vm.host.db_pools = db_pools;
-                            worker_vm.host.db_pool_free = db_pool_free;
-                            worker_vm.host.spawn_tracker = spawn_tracker;
-                            worker_vm.host.shared_module = Some(shared_mod);
-                            loop {
-                                let stream = {
-                                    let Ok(guard) = rx.lock() else { break };
-                                    match guard.recv() {
-                                        Ok(s) => s,
-                                        Err(_) => break,
-                                    }
-                                };
-                                serve_connection_isolated(&mut worker_vm, module, rid, stream);
-                                crate::vm::exec_map::flush_stdout();
-                            }
-                        });
-                    }
-                    let watch_stop = Arc::clone(&stop_flag);
-                    let watch_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                    let watch_done_flag = Arc::clone(&watch_done);
-                    let watcher = scope.spawn(move || {
-                        while !watch_done_flag.load(Ordering::Acquire)
-                            && !watch_stop.load(Ordering::Acquire)
-                        {
-                            if SIGNAL_STOP.load(Ordering::Acquire) {
-                                watch_stop.store(true, Ordering::Release);
-                                if let Some(mut wake_addr) = bound_addr {
-                                    if wake_addr.ip().is_unspecified() {
-                                        wake_addr.set_ip(if wake_addr.is_ipv4() {
-                                            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
-                                        } else {
-                                            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
-                                        });
-                                    }
-                                    let _ = TcpStream::connect_timeout(
-                                        &wake_addr,
-                                        Duration::from_millis(50),
-                                    );
-                                }
-                                break;
-                            }
-                            std::thread::park_timeout(Duration::from_millis(50));
-                        }
-                    });
-                    while !stop_flag.load(Ordering::Acquire) {
-                        match listener.accept() {
-                            Ok((stream, _)) => {
-                                if stop_flag.load(Ordering::Acquire) {
-                                    break;
-                                }
-                                if tx.send(stream).is_err() {
-                                    break;
-                                }
-                            }
-                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                            Err(_) => break,
-                        }
-                    }
-                    drop(tx);
-                    watch_done.store(true, Ordering::Release);
-                    watcher.thread().unpark();
-                });
-                if let Ok(mut guard) = self.host.routers[rid].listen_addr.lock() {
-                    *guard = None;
-                }
+                serve_http_listener(
+                    shared_mod,
+                    self.host.routers.clone(),
+                    self.host.http_clients.clone(),
+                    self.host.db_pools.clone(),
+                    self.host.db_pool_free.clone(),
+                    Arc::clone(&self.host.spawn_tracker),
+                    self.script_args.clone(),
+                    rid,
+                    listener,
+                    stop_flag,
+                    true,
+                );
                 if self.host.spawn_tracker.active_count() > 0 {
                     self.host
                         .spawn_tracker

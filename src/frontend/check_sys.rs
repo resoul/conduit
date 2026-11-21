@@ -2576,3 +2576,194 @@ pub(crate) fn is_cron_handler_return(ty: &Type, checked: &CheckedProgram) -> boo
         _ => false,
     }
 }
+
+pub(crate) fn ensure_app_plan(
+    checked: &mut CheckedProgram,
+    app_name: &str,
+) -> Result<(), String> {
+    if checked.app_plans.iter().any(|p| p.name == app_name) {
+        return Ok(());
+    }
+    let sid = *checked
+        .struct_by_name
+        .get(app_name)
+        .ok_or_else(|| format!("Unknown app '{}' in cdt.app", app_name))?;
+    let anns: Vec<crate::frontend::ast::FieldAnnotation> = {
+        let st = &checked.structs[sid];
+        if st.fields.is_empty() {
+            return Err(format!("Type '{}' is not an 'app' declaration", app_name));
+        }
+        let mut collected = Vec::with_capacity(st.fields.len());
+        for f in &st.fields {
+            let Some(ann) = &f.router_ann else {
+                return Err(format!("Type '{}' is not an 'app' declaration", app_name));
+            };
+            if !ann.target.starts_with("app.") {
+                return Err(format!("Type '{}' is not an 'app' declaration", app_name));
+            }
+            collected.push(ann.clone());
+        }
+        collected
+    };
+
+    let mut config_struct: Option<String> = None;
+    let mut http_router: Option<String> = None;
+    let mut http_addr: Option<String> = None;
+    let mut schedule_name: Option<String> = None;
+    let mut shutdown_ms: u64 = 5_000;
+    let mut on_start_handlers = Vec::new();
+    let mut on_stop_handlers = Vec::new();
+
+    for ann in &anns {
+        match ann.target.as_str() {
+            "app.config" => {
+                let Some(Expr { kind: ExprKind::Ident(cfg_name), .. }) = ann.args.first() else {
+                    return Err(format!("Invalid config struct in app '{}'", app_name));
+                };
+                crate::frontend::check_native::ensure_env_load_plan(checked, cfg_name)?;
+                config_struct = Some(cfg_name.clone());
+            }
+            "app.http" => {
+                let Some(Expr { kind: ExprKind::Ident(router_name), .. }) = ann.args.first() else {
+                    return Err(format!("Invalid http router in app '{}'", app_name));
+                };
+                let Some(Expr { kind: ExprKind::String(addr), .. }) = ann.args.get(1) else {
+                    return Err(format!("Invalid http listen address in app '{}'", app_name));
+                };
+                if addr.trim().is_empty() {
+                    return Err(format!("Empty http listen address in app '{}'", app_name));
+                }
+                let req_ty = Type::Custom(TypeId::native("cdt.http", "Request"));
+                let resp_ty = Type::Custom(TypeId::native("cdt.http", "Response"));
+                ensure_http_router_plan(checked, router_name, &req_ty, &resp_ty)?;
+                http_router = Some(router_name.clone());
+                http_addr = Some(addr.clone());
+            }
+            "app.schedule" => {
+                let Some(Expr { kind: ExprKind::Ident(sched_name), .. }) = ann.args.first() else {
+                    return Err(format!("Invalid schedule in app '{}'", app_name));
+                };
+                ensure_cron_schedule_plan(checked, sched_name)?;
+                schedule_name = Some(sched_name.clone());
+            }
+            "app.shutdown" => {
+                let Some(Expr { kind: ExprKind::Int(ms), .. }) = ann.args.first() else {
+                    return Err(format!("Invalid shutdown duration in app '{}'", app_name));
+                };
+                shutdown_ms = (*ms).max(1) as u64;
+            }
+            "app.on_start" | "app.on_stop" => {
+                let is_start = ann.target == "app.on_start";
+                let hook_label = if is_start { "on start" } else { "on stop" };
+                let Some(Expr { kind: ExprKind::Ident(handler_name), .. }) = ann.args.first() else {
+                    return Err(format!("Invalid {} handler in app '{}'", hook_label, app_name));
+                };
+                let fid = *checked.func_by_name.get(handler_name).ok_or_else(|| {
+                    format!("Unknown {} handler '{}' in app '{}'", hook_label, handler_name, app_name)
+                })?;
+                let sig = &checked.funcs[fid as usize];
+                if !sig.params.is_empty() || !is_cron_handler_return(&sig.return_type, checked) {
+                    return Err(format!(
+                        "app '{}' {} handler '{}' must have signature () -> Void or () -> Void | Error",
+                        app_name, hook_label, handler_name
+                    ));
+                }
+                if is_start {
+                    on_start_handlers.push(handler_name.clone());
+                } else {
+                    on_stop_handlers.push(handler_name.clone());
+                }
+            }
+            _ => return Err(format!("Type '{}' is not an 'app' declaration", app_name)),
+        }
+    }
+
+    checked.app_plans.push(crate::frontend::check::AppPlanDecl {
+        name: app_name.to_string(),
+        config_struct,
+        http_router,
+        http_addr,
+        schedule_name,
+        shutdown_ms,
+        on_start_handlers,
+        on_stop_handlers,
+    });
+    Ok(())
+}
+
+impl<'a> Checker<'a> {
+    pub(crate) fn check_app_call(
+        &mut self,
+        sym: &str,
+        type_args: &[TypeExpr],
+        args: &mut [Expr],
+        named_args: &mut [NamedArg],
+    ) -> Result<Type, String> {
+        let app_err = Type::Custom(TypeId::native("cdt.app", "AppError"));
+        let app_ty = Type::Custom(TypeId::native("cdt.app", "App"));
+        match sym {
+            "AppError" => {
+                if !type_args.is_empty() {
+                    return Err("AppError does not accept type arguments".to_string());
+                }
+                check_fields_ctor(
+                    self,
+                    "AppError",
+                    &[("kind", Type::String), ("message", Type::String)],
+                    args,
+                    named_args,
+                    app_err,
+                )
+            }
+            "run" | "start" => {
+                if type_args.len() != 1 || !args.is_empty() || !named_args.is_empty() {
+                    return Err(format!(
+                        "app.{}<T>() expects 1 app type argument and 0 value arguments",
+                        sym
+                    ));
+                }
+                let target_ty = self.checked.resolve_type_mut(&type_args[0])?;
+                let Type::Custom(tid) = &target_ty else {
+                    return Err(format!("app.{}<T>() requires an app declaration, got {}", sym, target_ty));
+                };
+                if tid.module != ModuleId::Program {
+                    return Err(format!("app.{}<T>() requires a program app declaration, got {}", sym, target_ty));
+                }
+                ensure_app_plan(self.checked, &tid.name)?;
+                if sym == "run" {
+                    Ok(Type::union(vec![Type::Void, app_err]))
+                } else {
+                    Ok(Type::union(vec![app_ty, app_err]))
+                }
+            }
+            other => Err(format!("Unknown cdt.app symbol '{}'", other)),
+        }
+    }
+
+    pub(crate) fn check_app_method(
+        &mut self,
+        type_name: &str,
+        method: &str,
+        args: &mut [Expr],
+    ) -> Result<Type, String> {
+        if type_name != "App" {
+            return Err(format!("Unknown cdt.app method '.{}()' on {}", method, type_name));
+        }
+        let app_err = Type::Custom(TypeId::native("cdt.app", "AppError"));
+        match method {
+            "stop" => {
+                if !args.is_empty() {
+                    return Err("App.stop() takes 0 arguments".to_string());
+                }
+                Ok(Type::union(vec![Type::Void, app_err]))
+            }
+            "is_running" => {
+                if !args.is_empty() {
+                    return Err("App.is_running() takes 0 arguments".to_string());
+                }
+                Ok(Type::Bool)
+            }
+            _ => Err(format!("Unknown method '.{}()' on app.App", method)),
+        }
+    }
+}

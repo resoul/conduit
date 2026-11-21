@@ -182,6 +182,16 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                     });
                     return Ok(());
                 }
+                "__cdt_sleep_ms" => {
+                    let arg_reg = self.lower_scalar(&args[0])?;
+                    let dst_obj = self.alloc_temp_o();
+                    self.ops.push(Op::TimeOp {
+                        kind: crate::native::time::TimeOpKind::Sleep as u8,
+                        dst_obj,
+                        arg_reg,
+                    });
+                    return Ok(());
+                }
                 _ => {}
             }
         }
@@ -245,6 +255,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             "cdt.cache" => self.lower_cache_call(sym, args, named_args),
             "cdt.redis" => self.lower_redis_call(sym, args, named_args),
             "cdt.chan" => self.lower_chan_call(sym, args),
+            "cdt.app" => self.lower_app_call(sym, type_args, args, named_args),
             other => Err(format!("Unsupported native call '{}.{}'", other, sym)),
         }
     }
@@ -271,6 +282,27 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
         {
             let sym = sym.clone();
             return self.lower_native_scalar_call(mod_name, &sym, args, named_args);
+        }
+        if let ExprKind::Ident(fn_name) = &callee.kind
+            && self.lookup_local(fn_name).is_none()
+            && fn_name == "__cdt_worker_ok"
+        {
+            let dst_s = self.alloc_temp_s();
+            if args[0].ty == Type::Void {
+                self.lower_void_call(&args[0])?;
+                self.ops.push(Op::LoadBool { dst: dst_s, val: true });
+            } else if args[0].ty.is_obj() {
+                let res_o = self.lower_obj(&args[0])?;
+                self.ops.push(Op::IsTypeObj {
+                    dst_s,
+                    src_obj: res_o,
+                    expected_tag: crate::vm::value::SCHEMA_EMPTY_TAG,
+                });
+            } else {
+                let _ = self.lower_scalar(&args[0])?;
+                self.ops.push(Op::LoadBool { dst: dst_s, val: true });
+            }
+            return Ok(dst_s);
         }
         if let ExprKind::Ident(fn_name) = &callee.kind
             && self.lookup_local(fn_name).is_none()
@@ -446,7 +478,7 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 }
             }
             (Type::Custom(tid), _)
-                if matches!(&tid.module, ModuleId::Native(m) if m == "cdt.fs" || m == "cdt.http" || m == "cdt.db" || m == "cdt.cron" || m == "cdt.lock" || m == "cdt.redis") =>
+                if matches!(&tid.module, ModuleId::Native(m) if m == "cdt.fs" || m == "cdt.http" || m == "cdt.db" || m == "cdt.cron" || m == "cdt.app" || m == "cdt.lock" || m == "cdt.redis") =>
             {
                 self.lower_native_method_obj(tid, target, method, &[], args)?;
                 Ok(())
@@ -635,6 +667,11 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 if matches!(&tid.module, ModuleId::Native(m) if m == "cdt.cron") =>
             {
                 self.lower_cron_is_running(target)
+            }
+            (Type::Custom(tid), "is_running")
+                if matches!(&tid.module, ModuleId::Native(m) if m == "cdt.app") =>
+            {
+                self.lower_app_is_running(target)
             }
             (Type::Custom(tid), "is_held")
                 if matches!(&tid.module, ModuleId::Native(m) if m == "cdt.lock") =>

@@ -392,6 +392,7 @@ fn rewrite_items(items: &mut [Item], env: &RewriteEnv) -> Result<(), String> {
                             || ann.target.starts_with("cli.")
                             || ann.target.starts_with("router.")
                             || ann.target.starts_with("schedule.")
+                            || ann.target.starts_with("app.")
                         {
                             continue;
                         }

@@ -1,6 +1,6 @@
-# Conduit Redis Worker & Distributed Locks Demo (`cdt.redis` + `cdt.validation` + `cdt.lock`)
+# Conduit Redis Worker & Distributed Locks Demo (`cdt.redis` + `cdt.chan` + `cdt.validation` + `cdt.lock`)
 
-Demonstrates zero-dependency RESP2 TCP communication with Redis (`cdt.redis`), typed JSON payloads (`set_json` / `get_json<T>`), Lists/Sets/Hashes, Lua-verified distributed locks (`lock` / `extend` / `unlock` / `with_lock`), extended `@validation.uuid` & `@validation.one_of` checks, and `conduit test`.
+Demonstrates zero-dependency RESP2 TCP communication with Redis (`cdt.redis`), declarative `worker` channel pools and `cdt.chan` (`Chan<T>`) concurrency, typed JSON payloads (`set_json` / `get_json<T>`), tagged-union data `enum`s, Lists/Sets/Hashes, Lua-verified distributed locks (`lock` / `extend` / `unlock` / `with_lock`), extended `@validation.uuid` & `@validation.one_of` checks, and `conduit test`.
 
 ## Offline Checks & Tests
 

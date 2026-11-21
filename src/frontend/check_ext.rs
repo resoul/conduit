@@ -4,7 +4,7 @@ use crate::frontend::check_native::{check_fields_ctor, is_error_type, type_to_js
 use crate::frontend::types::{ModuleId, Type, TypeId};
 
 impl Checker<'_> {
-    fn expect_arg_ty(&mut self, arg: &mut Expr, expected: &Type, ctx: &str) -> Result<(), String> {
+    pub(crate) fn expect_arg_ty(&mut self, arg: &mut Expr, expected: &Type, ctx: &str) -> Result<(), String> {
         self.check_expr(arg, Some(expected))?;
         if !arg.ty.is_assignable_to(expected) {
             return Err(format!("{} expects {}, got {}", ctx, expected, arg.ty));

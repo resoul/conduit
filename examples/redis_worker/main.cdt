@@ -29,14 +29,16 @@ export func describe_payload(p: JobPayload) -> String {
     }
 }
 
+export worker PayloadWorker(p: JobPayload, results: chan.Chan<String>) {
+    results.send(describe_payload(p))
+}
+
 export func run_payload_workers(payloads: [JobPayload]) -> [String] {
     jobs := chan.open<JobPayload>(8)
     results := chan.open<String>(8)
 
     spawn {
-        for p in jobs {
-            results.send(describe_payload(p))
-        }
+        PayloadWorker(jobs, results)
         results.close()
     }
 

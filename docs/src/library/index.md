@@ -36,7 +36,8 @@ All standard libraries reside in the reserved `cdt.*` namespace.
 | [cdt.cron](cron.md) | `cdt.cron` | Zero-dependency declarative `schedule` and `job` blocks, 5-field UTC cron & fixed-interval runner (`run<T>`, `start<T>`, `run_once<T>`). |
 | [cdt.jwt](jwt.md) | `cdt.jwt` | Zero-dependency HS256/HS512 JWT signing (`sign`, `sign_alg`), verification (`verify<T>`, `verify_alg<T>`), and payload inspection. |
 | [cdt.lock](lock.md) | `cdt.lock` | Process-wide named mutexes (`with`, `try_with`), writer-fair `RwLock` (`read`, `write`), and OS advisory file locks (`file`, `file_try`, `file_shared`, `Guard`). |
-| [cdt.chan](chan.md) | `cdt.chan` | Thread-safe typed FIFO channels (`Chan<T>`, `chan.open<T>`, `send`/`try_send`, `recv`/`recv_timeout`, `close`, and `for item in ch` iteration). |
+| [cdt.chan](chan.md) | `cdt.chan` | Thread-safe typed FIFO channels (`Chan<T>`, `chan.open<T>`, `send`/`try_send`, `recv`/`recv_timeout`, `close`, `for item in ch`) and declarative `worker` pools (`concurrency`, `retry`, `backoff`). |
 | [cdt.cache](cache.md) | `cdt.cache` | Process-wide thread-safe TTL + LRU cache (`open`, `get_or_set`, `incr`) with atomic snapshots (`save`/`load`) and durable WAL (`open_file`/`compact`). |
 | [cdt.redis](redis.md) | `cdt.redis` | Zero-dependency RESP2 TCP client (`connect`, KV, JSON, Hash, List, Set, raw `cmd`) and Lua-verified distributed locks (`lock`, `unlock`, `extend`, `with_lock`). |
+| [cdt.app](app.md) | `cdt.app` | Unified service lifecycle coordinator (`app Name { config, http, schedule, shutdown, on start, on stop }`, `app.run<T>`, `app.start<T>`). |
 

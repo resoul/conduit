@@ -312,7 +312,15 @@
         },
         {
           "name": "keyword.other.dsl.block.conduit",
-          "match": "(?<!\\.)\\b(router|cli|schedule|config|job)\\b(?=\\s+[A-Z])"
+          "match": "(?<!\\.)\\b(router|cli|schedule|config|job|app)\\b(?=\\s+[A-Z])"
+        },
+        {
+          "name": "keyword.other.dsl.block.conduit",
+          "match": "(?<!\\.)\\b(worker)\\b(?=\\s+[A-Za-z_][A-Za-z0-9_]*(?:<[^>]+>)?\\s*\\()"
+        },
+        {
+          "name": "keyword.other.dsl.clause.conduit",
+          "match": "(?<!\\.)\\b(concurrency|retry|backoff|shutdown)\\b(?=\\s+[0-9])"
         },
         {
           "name": "keyword.other.dsl.block.conduit",

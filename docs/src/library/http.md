@@ -165,6 +165,9 @@ Shutdown sequence when `r.stop()` is called or `SIGINT` (`Ctrl+C`) / `SIGTERM` i
 4. Router `on_stop` hooks run, followed by top-level `on stop` hooks.
 5. If an `on_start` hook fails, `serve` returns `HttpError { kind: "startup_error", ... }` without binding the port; if an `on_stop` hook fails, `serve` returns `HttpError { kind: "shutdown_error", ... }`.
 
+> [!TIP]
+> To coordinate `config`, `http`, `schedule`, `shutdown`, and LIFO `on start`/`on stop` hooks in a single declaration, see [`cdt.app`](app.md).
+
 ## Declarative `router` DSL Example
 
 ```conduit

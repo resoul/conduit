@@ -25,14 +25,14 @@ enum JobTiming {
     Interval { every: Duration, next_at: Instant },
 }
 
-struct CompiledJob {
+pub(crate) struct CompiledJob {
     name: String,
     func_id: u32,
     timing: JobTiming,
     in_flight: Arc<AtomicBool>,
 }
 
-fn build_compiled_jobs(plan: &SchedulePlan) -> Result<Vec<CompiledJob>, String> {
+pub(crate) fn build_compiled_jobs(plan: &SchedulePlan) -> Result<Vec<CompiledJob>, String> {
     let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -65,6 +65,32 @@ fn build_compiled_jobs(plan: &SchedulePlan) -> Result<Vec<CompiledJob>, String> 
     Ok(out)
 }
 
+pub(crate) fn start_cron_scheduler(
+    module: Arc<Module>,
+    plan: &SchedulePlan,
+) -> Result<CronSchedulerState, String> {
+    let jobs = build_compiled_jobs(plan)?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let running = Arc::new(AtomicBool::new(true));
+    let stop_bg = Arc::clone(&stop);
+    let running_bg = Arc::clone(&running);
+    let handle = std::thread::spawn(move || {
+        scheduler_loop(module, jobs, stop_bg, running_bg);
+    });
+    Ok(CronSchedulerState {
+        stop,
+        running,
+        handle: Some(handle),
+    })
+}
+
+pub(crate) fn stop_cron_scheduler(mut st: CronSchedulerState) {
+    st.stop.store(true, Ordering::Release);
+    if let Some(h) = st.handle.take() {
+        let _ = h.join();
+    }
+}
+
 fn run_job_in_fresh_vm(module: &Module, job_name: &str, func_id: u32) -> Result<(), String> {
     let mut vm = Vm::new();
     match vm.call(module, func_id, &[], &[]) {
@@ -76,7 +102,7 @@ fn run_job_in_fresh_vm(module: &Module, job_name: &str, func_id: u32) -> Result<
     }
 }
 
-fn scheduler_loop(module: Arc<Module>, mut jobs: Vec<CompiledJob>, stop: Arc<AtomicBool>, running: Arc<AtomicBool>) {
+pub(crate) fn scheduler_loop(module: Arc<Module>, mut jobs: Vec<CompiledJob>, stop: Arc<AtomicBool>, running: Arc<AtomicBool>) {
     running.store(true, Ordering::Release);
     while !stop.load(Ordering::Acquire) {
         let now_unix = SystemTime::now()
@@ -184,22 +210,10 @@ impl Vm {
             }
             CRON_START => {
                 let plan = &module.schedules[b as usize];
-                match build_compiled_jobs(plan) {
-                    Ok(jobs) => {
-                        let stop = Arc::new(AtomicBool::new(false));
-                        let running = Arc::new(AtomicBool::new(true));
-                        let stop_bg = Arc::clone(&stop);
-                        let running_bg = Arc::clone(&running);
-                        let m = Arc::new(module.clone());
-                        let handle = std::thread::spawn(move || {
-                            scheduler_loop(m, jobs, stop_bg, running_bg);
-                        });
+                match start_cron_scheduler(Arc::new(module.clone()), plan) {
+                    Ok(state) => {
                         let id = self.host.cron_schedulers.len();
-                        self.host.cron_schedulers.push(Some(CronSchedulerState {
-                            stop,
-                            running,
-                            handle: Some(handle),
-                        }));
+                        self.host.cron_schedulers.push(Some(state));
                         self.objs[o_base + a as usize] = make_cron_scheduler(id as i64);
                     }
                     Err(msg) => {
@@ -226,11 +240,8 @@ impl Vm {
             }
             CRON_STOP => {
                 let id = self.extract_scheduler_id(&self.objs[o_base + b as usize])?;
-                if let Some(Some(mut st)) = self.host.cron_schedulers.get_mut(id).map(|slot| slot.take()) {
-                    st.stop.store(true, Ordering::Release);
-                    if let Some(h) = st.handle.take() {
-                        let _ = h.join();
-                    }
+                if let Some(Some(st)) = self.host.cron_schedulers.get_mut(id).map(|slot| slot.take()) {
+                    stop_cron_scheduler(st);
                 }
             }
             CRON_IS_RUNNING => {

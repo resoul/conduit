@@ -154,6 +154,11 @@ pub const NATIVE_MODULES: &[NativeModuleSpec] = &[
         fns: &["open"],
         types: &["Chan"],
     },
+    NativeModuleSpec {
+        name: "cdt.app",
+        fns: &["run", "start"],
+        types: &["App", "AppError"],
+    },
 ];
 
 pub fn find_native_module(path: &str) -> Option<&'static NativeModuleSpec> {
@@ -401,6 +406,7 @@ pub(crate) fn is_error_type(ty: &Type, checked: &CheckedProgram) -> bool {
             "cdt.lock" => name == "LockError",
             "cdt.cache" => name == "CacheError",
             "cdt.redis" => name == "RedisError",
+            "cdt.app" => name == "AppError",
             _ => false,
         },
         Type::Custom(TypeId {
@@ -538,6 +544,8 @@ pub(crate) fn native_member_field(tid: &TypeId, field: &str) -> Result<(Type, u1
         ("cdt.db", "DbError", "code") => Ok((Type::String, 2)),
         ("cdt.cron", "CronError", "kind") => Ok((Type::String, 0)),
         ("cdt.cron", "CronError", "message") => Ok((Type::String, 1)),
+        ("cdt.app", "AppError", "kind") => Ok((Type::String, 0)),
+        ("cdt.app", "AppError", "message") => Ok((Type::String, 1)),
         ("cdt.jwt", "JwtError", "kind") => Ok((Type::String, 0)),
         ("cdt.jwt", "JwtError", "message") => Ok((Type::String, 1)),
         ("cdt.lock", "LockError", "kind") => Ok((Type::String, 0)),
@@ -984,6 +992,12 @@ impl<'a> Checker<'a> {
                 }
                 self.check_cron_method(&tid.name, method, args)
             }
+            (ModuleId::Native(ref m), _, _) if m == "cdt.app" => {
+                if !type_args.is_empty() {
+                    return Err(format!("Method '.{}()' does not accept type arguments", method));
+                }
+                self.check_app_method(&tid.name, method, args)
+            }
             (ModuleId::Native(ref m), _, _) if m == "cdt.lock" => {
                 if !type_args.is_empty() {
                     return Err(format!("Method '.{}()' does not accept type arguments", method));
@@ -1104,61 +1118,74 @@ impl<'a> Checker<'a> {
                 if tid.module != ModuleId::Program {
                     return Err(format!("env.load<T>() requires a program struct, got {}", target_ty));
                 }
-                let sid = self.checked.struct_by_name[&tid.name];
-                let st = &self.checked.structs[sid];
-                let mut fields = Vec::with_capacity(st.fields.len());
-                for f in &st.fields {
-                    let env_name = f
-                        .env_name
-                        .clone()
-                        .unwrap_or_else(|| f.name.to_ascii_uppercase());
-                    let (is_optional, inner_ty) = match &f.ty {
-                        Type::Optional(inner) => (true, (**inner).clone()),
-                        other => (false, other.clone()),
-                    };
-                    let kind = match inner_ty {
-                        Type::String => crate::native::env::EnvFieldKind::String,
-                        Type::Int => crate::native::env::EnvFieldKind::Int,
-                        Type::Float => crate::native::env::EnvFieldKind::Float,
-                        Type::Bool => crate::native::env::EnvFieldKind::Bool,
-                        _ => {
-                            return Err(format!(
-                                "env.load<{}>: field '{}' has unsupported type {} (expected String, Int, Float, Bool, or optional)",
-                                tid.name, f.name, f.ty
-                            ));
-                        }
-                    };
-                    let default = match &f.default {
-                        Some(expr) => Some(expr_to_env_default(expr).ok_or_else(|| {
-                            format!(
-                                "env.load<{}>: default value for field '{}' must be a literal constant",
-                                tid.name, f.name
-                            )
-                        })?),
-                        None => None,
-                    };
-                    fields.push(crate::native::env::EnvFieldPlan {
-                        env_name,
-                        kind,
-                        is_optional,
-                        is_scalar: f.is_scalar,
-                        slot_idx: f.slot_idx,
-                        default,
-                    });
-                }
-                if !self.checked.env_plans.iter().any(|p| p.schema_id == st.schema_id) {
-                    self.checked.env_plans.push(crate::native::env::EnvLoadPlan {
-                        schema_id: st.schema_id,
-                        scalar_len: st.scalar_len,
-                        obj_len: st.obj_len,
-                        fields: fields.into_boxed_slice(),
-                    });
-                }
+                ensure_env_load_plan(self.checked, &tid.name)?;
                 Ok(Type::union(vec![target_ty, env_err]))
             }
             other => Err(format!("Unknown cdt.env symbol '{}'", other)),
         }
     }
+}
+
+pub(crate) fn ensure_env_load_plan(
+    checked: &mut CheckedProgram,
+    struct_name: &str,
+) -> Result<usize, String> {
+    let sid = *checked
+        .struct_by_name
+        .get(struct_name)
+        .ok_or_else(|| format!("Unknown config struct '{}'", struct_name))?;
+    let st = &checked.structs[sid];
+    if let Some(pos) = checked.env_plans.iter().position(|p| p.schema_id == st.schema_id) {
+        return Ok(pos);
+    }
+    let mut fields = Vec::with_capacity(st.fields.len());
+    for f in &st.fields {
+        let env_name = f
+            .env_name
+            .clone()
+            .unwrap_or_else(|| f.name.to_ascii_uppercase());
+        let (is_optional, inner_ty) = match &f.ty {
+            Type::Optional(inner) => (true, (**inner).clone()),
+            other => (false, other.clone()),
+        };
+        let kind = match inner_ty {
+            Type::String => crate::native::env::EnvFieldKind::String,
+            Type::Int => crate::native::env::EnvFieldKind::Int,
+            Type::Float => crate::native::env::EnvFieldKind::Float,
+            Type::Bool => crate::native::env::EnvFieldKind::Bool,
+            _ => {
+                return Err(format!(
+                    "env.load<{}>: field '{}' has unsupported type {} (expected String, Int, Float, Bool, or optional)",
+                    struct_name, f.name, f.ty
+                ));
+            }
+        };
+        let default = match &f.default {
+            Some(expr) => Some(expr_to_env_default(expr).ok_or_else(|| {
+                format!(
+                    "env.load<{}>: default value for field '{}' must be a literal constant",
+                    struct_name, f.name
+                )
+            })?),
+            None => None,
+        };
+        fields.push(crate::native::env::EnvFieldPlan {
+            env_name,
+            kind,
+            is_optional,
+            is_scalar: f.is_scalar,
+            slot_idx: f.slot_idx,
+            default,
+        });
+    }
+    let idx = checked.env_plans.len();
+    checked.env_plans.push(crate::native::env::EnvLoadPlan {
+        schema_id: st.schema_id,
+        scalar_len: st.scalar_len,
+        obj_len: st.obj_len,
+        fields: fields.into_boxed_slice(),
+    });
+    Ok(idx)
 }
 
 fn expr_to_env_default(expr: &Expr) -> Option<crate::native::env::EnvDefault> {

@@ -128,6 +128,37 @@ pub fn shake_unreachable_funcs(
             }
         }
     }
+    let mut app_validators: Vec<String> = Vec::new();
+    for plan in &checked.app_plans {
+        for h in &plan.on_start_handlers {
+            if reachable.insert(h.clone()) {
+                queue.push_back(h.clone());
+            }
+        }
+        for h in &plan.on_stop_handlers {
+            if reachable.insert(h.clone()) {
+                queue.push_back(h.clone());
+            }
+        }
+        if let Some(cfg_name) = &plan.config_struct {
+            let cfg_ty = crate::frontend::types::Type::Custom(
+                crate::frontend::types::TypeId::program(cfg_name),
+            );
+            let mut visited: HashSet<&str> = HashSet::new();
+            collect_validated_type_refs(
+                &cfg_ty,
+                checked,
+                &struct_fields,
+                &mut visited,
+                &mut app_validators,
+            );
+        }
+    }
+    for vname in app_validators {
+        if reachable.insert(vname.clone()) {
+            queue.push_back(vname);
+        }
+    }
     for item in &program.items {
         if let ItemKind::Migration { up, down, .. } = &item.kind {
             let mut up_scopes = vec![HashSet::from(["db".to_string()])];

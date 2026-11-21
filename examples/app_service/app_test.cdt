@@ -1,0 +1,118 @@
+import * as app from "cdt.app"
+import * as cache from "cdt.cache"
+import * as http from "cdt.http"
+import * as time from "cdt.time"
+import * as validation from "cdt.validation"
+import {
+    STATE_CACHE,
+    BillingApi,
+    BillingConfig,
+    BillingJobs,
+    cleanup_resources,
+    flush_metrics,
+    init_resources,
+    open_metrics,
+    record_lifecycle,
+} from "./main"
+
+app BillingHeadless {
+    config BillingConfig
+    schedule BillingJobs
+    shutdown 2s
+    on start => init_resources
+    on start => open_metrics
+    on stop  => flush_metrics
+    on stop  => cleanup_resources
+}
+
+config BrokenPortConfig {
+    port: Int @validation.min(1024) = 80
+}
+
+func unexpected_start() -> Void {
+    record_lifecycle("BAD_START")
+}
+
+app InvalidConfigApp {
+    config BrokenPortConfig
+    on start => unexpected_start
+}
+
+test "app_service headless lifecycle runs hooks in order, ticks cron, and stops in LIFO order" {
+    _d := cache.drop(STATE_CACHE)
+
+    svc := app.start<BillingHeadless>()?
+    assert(svc.is_running())
+
+    time.sleep(110)?
+    svc.stop()?
+    assert(!svc.is_running())
+
+    state := cache.open(STATE_CACHE)
+    assert_eq(state.get("status") ?? "", "stopped")
+    assert_eq(state.get("lifecycle") ?? "", "init,metrics_ready,cleanup,metrics_flushed")
+
+    raw_ticks := state.get("ticks") ?? "0"
+    var ticks = 0
+    switch raw_ticks.to_int() {
+        case Int(n):
+            ticks = n
+        case ParseError(_):
+            ticks = 0
+    }
+    assert(ticks >= 1)
+}
+
+test "app_service router dispatches health, stats, and typed invoice validation" {
+    _d := cache.drop(STATE_CACHE)
+    init_resources()
+
+    api := http.build<BillingApi>()
+    empty := Map<String, String>()
+
+    h_resp := api.dispatch(http.Request(method: "GET", path: "/health", body: "", headers: empty, query: empty, params: empty))
+    assert_eq(h_resp.status, 200)
+    assert(h_resp.body.contains("\"status\":\"ready\""))
+    assert(h_resp.body.contains("\"service\":\"billing-service\""))
+
+    inv_resp := api.dispatch(http.Request(
+        method: "POST",
+        path: "/invoices",
+        body: "{\"customer_id\":\"cust_42\",\"amount_cents\":1999}",
+        headers: empty,
+        query: empty,
+        params: empty,
+    ))
+    assert_eq(inv_resp.status, 202)
+    assert(inv_resp.body.contains("\"accepted\":true"))
+    assert(inv_resp.body.contains("\"total_queued\":1"))
+
+    bad_inv := api.dispatch(http.Request(
+        method: "POST",
+        path: "/invoices",
+        body: "{\"customer_id\":\"\",\"amount_cents\":0}",
+        headers: empty,
+        query: empty,
+        params: empty,
+    ))
+    assert_eq(bad_inv.status, 422)
+
+    s_resp := api.dispatch(http.Request(method: "GET", path: "/stats", body: "", headers: empty, query: empty, params: empty))
+    assert_eq(s_resp.status, 200)
+    assert(s_resp.body.contains("\"invoices_queued\":1"))
+}
+
+test "app_service fails fast with config_error before running startup hooks" {
+    _d := cache.drop(STATE_CACHE)
+
+    var err_kind = ""
+    switch app.run<InvalidConfigApp>() {
+        case app.AppError(e):
+            err_kind = e.kind
+        case _:
+    }
+    assert_eq(err_kind, "config_error")
+
+    state := cache.open(STATE_CACHE)
+    assert_eq(state.get("lifecycle") ?? "", "")
+}

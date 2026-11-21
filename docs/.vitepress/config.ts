@@ -24,6 +24,7 @@ const libraryItems = [
   { text: 'cdt.chan', link: '/library/chan' },
   { text: 'cdt.cache', link: '/library/cache' },
   { text: 'cdt.redis', link: '/library/redis' },
+  { text: 'cdt.app', link: '/library/app' },
 ]
 
 export default defineConfig({

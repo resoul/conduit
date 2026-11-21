@@ -1,0 +1,155 @@
+import * as app from "cdt.app"
+import * as cache from "cdt.cache"
+import * as cron from "cdt.cron"
+import * as env from "cdt.env"
+import * as http from "cdt.http"
+import * as log from "cdt.log"
+import * as time from "cdt.time"
+import * as validation from "cdt.validation"
+
+export const STATE_CACHE = "app_service_state"
+
+export config BillingConfig {
+    service_name: String @env("SERVICE_NAME") @validation.min_len(1) = "billing-service"
+    port: Int @env("PORT") @validation.range(1024, 65535) = 8080
+}
+
+export struct HealthReply {
+    status: String
+    service: String
+    ticks: Int
+}
+
+export struct StatsReply {
+    status: String
+    lifecycle: String
+    ticks: Int
+    invoices_queued: Int
+}
+
+export struct InvoiceRequest {
+    customer_id: String @validation.not_empty
+    amount_cents: Int @validation.min(1)
+}
+
+export struct InvoiceReply {
+    accepted: Bool
+    customer_id: String
+    total_queued: Int
+}
+
+export func record_lifecycle(step: String) -> Void {
+    state := cache.open(STATE_CACHE)
+    prev := state.get("lifecycle") ?? ""
+    var next = step
+    if prev != "" {
+        next = "{prev},{step}"
+    }
+    _s := state.set("lifecycle", next)
+}
+
+func read_counter(name: String) -> Int {
+    state := cache.open(STATE_CACHE)
+    raw := state.get(name) ?? "0"
+    switch raw.to_int() {
+        case Int(n):
+            return n
+        case ParseError(_):
+            return 0
+    }
+}
+
+func health(_req: http.Request) -> http.Response {
+    state := cache.open(STATE_CACHE)
+    status := state.get("status") ?? "starting"
+    service := state.get("service_name") ?? "billing-service"
+    return http.ok_json(HealthReply(
+        status: status,
+        service: service,
+        ticks: read_counter("ticks"),
+    ))
+}
+
+func stats(_req: http.Request) -> http.Response {
+    state := cache.open(STATE_CACHE)
+    return http.ok_json(StatsReply(
+        status: state.get("status") ?? "starting",
+        lifecycle: state.get("lifecycle") ?? "",
+        ticks: read_counter("ticks"),
+        invoices_queued: read_counter("invoices_queued"),
+    ))
+}
+
+func enqueue_invoice(_req: http.Request, body: InvoiceRequest) -> http.Response {
+    state := cache.open(STATE_CACHE)
+    var queued = 0
+    switch state.incr("invoices_queued", 1) {
+        case Int(n):
+            queued = n
+        case cache.CacheError(_):
+            queued = read_counter("invoices_queued")
+    }
+    spawn {
+        _s := time.sleep(20)
+        audit := cache.open(STATE_CACHE)
+        _w := audit.set("last_customer", body.customer_id)
+    }
+    return http.status_json(202, InvoiceReply(
+        accepted: true,
+        customer_id: body.customer_id,
+        total_queued: queued,
+    ))
+}
+
+export router BillingApi "Billing service HTTP API" {
+    get "/health" => health
+    get "/stats" => stats
+    post "/invoices" => enqueue_invoice
+}
+
+export func heartbeat_tick() -> Void {
+    state := cache.open(STATE_CACHE)
+    _n := state.incr("ticks", 1)
+}
+
+export schedule BillingJobs {
+    interval 40ms => heartbeat_tick
+}
+
+export func init_resources() -> Void {
+    state := cache.open(STATE_CACHE)
+    _s1 := state.set("status", "ready")
+    _s2 := state.set("service_name", "billing-service")
+    record_lifecycle("init")
+    log.info("BillingService initialized")
+}
+
+export func open_metrics() -> Void {
+    record_lifecycle("metrics_ready")
+}
+
+export func flush_metrics() -> Void {
+    record_lifecycle("metrics_flushed")
+}
+
+export func cleanup_resources() -> Void {
+    state := cache.open(STATE_CACHE)
+    _s := state.set("status", "stopped")
+    record_lifecycle("cleanup")
+    log.info("BillingService stopped cleanly")
+}
+
+app BillingService {
+    config BillingConfig
+    http BillingApi on "0.0.0.0:8080"
+    schedule BillingJobs
+    shutdown 5s
+    on start => init_resources
+    on start => open_metrics
+    on stop  => flush_metrics
+    on stop  => cleanup_resources
+}
+
+export func main() -> Void | app.AppError {
+    app.run<BillingService>()?
+}

@@ -3932,3 +3932,414 @@ fn cdt_chan_and_for_range_e2e_and_compile_errors() {
     "#;
     assert!(crate::frontend::compile_source(bad_iter).is_err());
 }
+
+#[test]
+fn cdt_chan_declarative_workers_e2e() {
+    let src = r#"
+        import * as cache from "cdt.cache"
+        import * as chan from "cdt.chan"
+        import * as time from "cdt.time"
+
+        error WorkErr {
+            message: String
+        }
+
+        worker ScaleWorker(n: Int, out: Chan<Int>, factor: Int = 2) {
+            out.send(n * factor)
+        }
+
+        worker PoolWorker(n: Int, out: Chan<Int>) concurrency 4 {
+            out.send(n + 100)
+        }
+
+        func fail_if_neg(n: Int) -> Int | WorkErr {
+            if n < 0 {
+                return WorkErr(message: "neg")
+            }
+            return n
+        }
+
+        worker RetryWorker(id: Int, out: Chan<Int>, defers: Chan<Int>) retry 2 backoff 5ms -> Void | WorkErr {
+            defer {
+                defers.send(id)
+            }
+            c := cache.open("worker_retry_e2e")
+            var attempt = 0
+            switch c.incr("k_{id}") {
+                case Int(v):
+                    attempt = v
+                case cache.CacheError(e):
+                    return WorkErr(message: e.message)
+            }
+            if id == 2 && attempt == 1 {
+                return WorkErr(message: "transient")
+            }
+            _v := fail_if_neg(id)?
+            out.send(id * 10 + attempt)
+        }
+
+        worker GenericTag<T>(item: T, out: Chan<String>, tag: String) concurrency 2 {
+            out.send("{tag}:{item}")
+        }
+
+        export func run_workers() -> String {
+            // 1. Sequential worker with extra param default
+            s_in := chan.open<Int>(8)
+            s_out := chan.open<Int>(8)
+            spawn {
+                s_in.send(1)
+                s_in.send(3)
+                s_in.close()
+            }
+            s_count := ScaleWorker(s_in, s_out)
+            s_out.close()
+            var s_sum = 0
+            for v in s_out {
+                s_sum = s_sum + v
+            }
+
+            // 2. Concurrent pool worker
+            p_in := chan.open<Int>(16)
+            p_out := chan.open<Int>(16)
+            spawn {
+                for i in 6 {
+                    p_in.send(i)
+                }
+                p_in.close()
+            }
+            p_count := PoolWorker(p_in, p_out)
+            p_out.close()
+            var p_sum = 0
+            for v in p_out {
+                p_sum = p_sum + v
+            }
+
+            // 3. Retry + backoff + ? + defer + permanent error skip
+            _dropped := cache.drop("worker_retry_e2e")
+            r_in := chan.open<Int>(8)
+            r_out := chan.open<Int>(8)
+            r_defers := chan.open<Int>(16)
+            t0 := time.monotonic()
+            r_in.send(1)
+            r_in.send(2)
+            r_in.send(-9)
+            r_in.close()
+            r_count := RetryWorker(r_in, r_out, r_defers)
+            var elapsed_ms = 0
+            switch time.elapsed(t0) {
+                case time.Duration(d):
+                    switch d.milliseconds() {
+                        case Int(ms):
+                            elapsed_ms = ms
+                        case time.TimeError(_):
+                    }
+                case time.TimeError(_):
+            }
+            r_out.close()
+            r_defers.close()
+            var r_out_sum = 0
+            for v in r_out {
+                r_out_sum = r_out_sum + v
+            }
+            var r_defer_count = 0
+            for _d in r_defers {
+                r_defer_count = r_defer_count + 1
+            }
+            assert(elapsed_ms >= 5)
+
+            // 4. Generic workers
+            gi := chan.open<Int>(4)
+            gi_out := chan.open<String>(4)
+            gi.send(7)
+            gi.send(8)
+            gi.close()
+            gi_n := GenericTag<Int>(gi, gi_out, "g")
+            gi_out.close()
+            var gi_count = 0
+            for _s in gi_out {
+                gi_count = gi_count + 1
+            }
+
+            gs := chan.open<String>(4)
+            gs_out := chan.open<String>(4)
+            gs.send("ok")
+            gs.close()
+            gs_n := GenericTag<String>(gs, gs_out, "s")
+            gs_out.close()
+            var gs_val = ""
+            for s in gs_out {
+                gs_val = s
+            }
+
+            return "{s_count}:{s_sum}|{p_count}:{p_sum}|{r_count}:{r_out_sum}:{r_defer_count}|{gi_n}:{gi_count}|{gs_n}:{gs_val}"
+        }
+    "#;
+
+    let module = crate::frontend::compile_source(src).expect("compile declarative workers");
+    let fid = module.func_id("run_workers").unwrap();
+    let res = Vm::new().call_obj(&module, fid, &[], &[]).unwrap();
+    // s: 2*(1+3)=8 (count 2)
+    // p: sum(100..105)=615 (count 6)
+    // r: id=1 attempt 1 => 11; id=2 retry succeeds attempt 2 => 22; total 33, count 2, defers=1(id=1)+2(id=2)+3(id=-9)=6
+    // g: 2:2 | 1:s:ok
+    assert_eq!(res, Obj::str("2:8|6:615|2:33:6|2:2|1:s:ok"));
+
+    // Cross-module exported worker
+    let mut modules = std::collections::HashMap::new();
+    modules.insert(
+        "./mod_worker",
+        r#"
+            import * as chan from "cdt.chan"
+            export worker DoubleWorker(x: Int, out: chan.Chan<Int>) concurrency 2 {
+                out.send(x * 2)
+            }
+        "#,
+    );
+    let mod_main = r#"
+        import { Chan } from "cdt.chan"
+        import { DoubleWorker } from "./mod_worker"
+
+        export func main() -> Int {
+            ch := Chan<Int>(4)
+            out := Chan<Int>(4)
+            ch.send(5)
+            ch.send(9)
+            ch.close()
+            n := DoubleWorker(ch, out)
+            out.close()
+            var sum = 0
+            for v in out {
+                sum = sum + v
+            }
+            return n * 100 + sum
+        }
+    "#;
+    let mod_compiled = crate::frontend::compile_with_modules(mod_main, &modules)
+        .expect("compile imported declarative worker");
+    let mf = mod_compiled.func_id("main").unwrap();
+    let mv = Vm::new().call(&mod_compiled, mf, &[], &[]).unwrap();
+    assert_eq!(mv, crate::vm::ExecResult::Scalar(228));
+
+    // Compile-time rejections
+    for bad in [
+        "worker Bad() {}",
+        "worker Bad(x: Int = 1) {}",
+        "worker Bad(x: Int) -> Int { return x }",
+        "worker Bad(x: Int) concurrency 0 {}",
+        "worker Bad(x: Int) retry -1 {}",
+        "worker Bad(x: Int) backoff 0ms {}",
+        "worker Bad(x: Int) backoff 5x {}",
+        "worker Bad(x: Int) retry 1 retry 2 {}",
+    ] {
+        assert!(
+            crate::frontend::compile_source(bad).is_err(),
+            "Expected failure for: {}",
+            bad
+        );
+    }
+}
+
+#[test]
+fn cdt_app_declarative_lifecycle_e2e() {
+    let src = r#"
+        import * as app from "cdt.app"
+        import * as cache from "cdt.cache"
+        import * as http from "cdt.http"
+        import * as time from "cdt.time"
+        import * as validation from "cdt.validation"
+
+        config OkCfg {
+            port: Int @validation.min(1024) = 8080
+        }
+
+        config MissingEnvCfg {
+            must_exist_var: String
+        }
+
+        config InvalidValCfg {
+            port: Int @validation.min(1024) = 80
+        }
+
+        error LifeErr {
+            message: String
+        }
+
+        func push_event(name: String) -> Void {
+            c := cache.open("app_life_e2e")
+            prev := c.get("log") ?? ""
+            var next = name
+            if prev != "" {
+                next = "{prev},{name}"
+            }
+            _ignored := c.set("log", next)
+        }
+
+        func start_first() -> Void {
+            push_event("start1")
+            spawn {
+                _s := time.sleep(70)
+                push_event("spawn_done")
+            }
+        }
+
+        func start_second() -> Void {
+            push_event("start2")
+        }
+
+        func stop_first() -> Void {
+            push_event("stop1")
+        }
+
+        func stop_second() -> Void {
+            push_event("stop2")
+        }
+
+        func cron_tick() -> Void {
+            c := cache.open("app_life_e2e")
+            _ignored := c.set("ticked", "yes")
+        }
+
+        schedule AppJobs {
+            interval 15ms => cron_tick
+        }
+
+        app HeadlessApp {
+            config OkCfg
+            schedule AppJobs
+            shutdown 2s
+            on start => start_first
+            on start => start_second
+            on stop => stop_first
+            on stop => stop_second
+        }
+
+        func never_called_start() -> Void {
+            push_event("BAD_START")
+        }
+
+        app MissingCfgApp {
+            config MissingEnvCfg
+            on start => never_called_start
+        }
+
+        app InvalidCfgApp {
+            config InvalidValCfg
+            on start => never_called_start
+        }
+
+        func failing_start() -> Void | LifeErr {
+            return LifeErr(message: "init_failed")
+        }
+
+        app FailingStartApp {
+            on start => failing_start
+        }
+
+        func ok_handler(_req: http.Request) -> http.Response {
+            return http.text("ok")
+        }
+
+        router Api {
+            get "/health" => ok_handler
+        }
+
+        app BadBindApp {
+            config OkCfg
+            http Api on "invalid_host:999999"
+            schedule AppJobs
+            shutdown 1s
+        }
+
+        export func run_app_tests() -> String {
+            _dropped := cache.drop("app_life_e2e")
+
+            // 1. Headless app: start, verify running, let cron tick, stop cleanly in LIFO order
+            h := app.start<HeadlessApp>()
+            var h_out = ""
+            switch h {
+                case app.App(a):
+                    r1 := a.is_running()
+                    _s := time.sleep(35)
+                    _st1 := a.stop()
+                    r2 := a.is_running()
+                    // Idempotent stop
+                    _st2 := a.stop()
+                    c := cache.open("app_life_e2e")
+                    log_str := c.get("log") ?? ""
+                    ticked := c.get("ticked") ?? "no"
+                    h_out = "{r1}:{r2}:{ticked}:{log_str}"
+                case app.AppError(e):
+                    h_out = "ERR:{e.kind}:{e.message}"
+            }
+
+            // 2. Fail-fast on missing env var
+            var missing_kind = ""
+            switch app.run<MissingCfgApp>() {
+                case app.AppError(e):
+                    missing_kind = e.kind
+                case _:
+            }
+
+            // 3. Fail-fast on validation failure
+            var val_kind = ""
+            switch app.run<InvalidCfgApp>() {
+                case app.AppError(e):
+                    val_kind = e.kind
+                case _:
+            }
+
+            // 4. Startup hook error propagation
+            var start_err_out = ""
+            switch app.run<FailingStartApp>() {
+                case app.AppError(e):
+                    start_err_out = "{e.kind}:{e.message}"
+                case _:
+            }
+
+            // 5. Invalid http bind error stops cleanly
+            var bind_kind = ""
+            switch app.run<BadBindApp>() {
+                case app.AppError(e):
+                    bind_kind = e.kind
+                case _:
+            }
+
+            return "{h_out}|{missing_kind}|{val_kind}|{start_err_out}|{bind_kind}"
+        }
+    "#;
+
+    let module = crate::frontend::compile_source(src).expect("compile declarative app");
+    assert_eq!(module.apps.len(), 5);
+    assert!(module.apps.iter().any(|a| a.name == "BadBindApp" && a.http_addr.as_deref() == Some("invalid_host:999999")));
+
+    // Bundle round-trip preserves AppPlan
+    let fid = module.func_id("run_app_tests").unwrap();
+    let bundled = crate::ir::bundle::encode_bundle(&module, fid, 0).expect("encode app bundle");
+    let (decoded, dfid, _) = crate::ir::bundle::decode_bundle(&bundled).expect("decode app bundle");
+    assert_eq!(decoded.apps.len(), module.apps.len());
+    assert_eq!(decoded.apps[0].shutdown_ms, module.apps[0].shutdown_ms);
+
+    let res = Vm::new().call_obj(&decoded, dfid, &[], &[]).unwrap();
+    assert_eq!(
+        res,
+        Obj::str("true:false:yes:start1,start2,spawn_done,stop2,stop1|config_error|config_error|startup_error:app on start hook failed: init_failed|bind_error")
+    );
+
+    // Compile-time rejections
+    for bad in [
+        r#"import * as app from "cdt.app"; struct S { x: Int }; func main() -> Void { _r := app.run<S>() }"#,
+        r#"import * as app from "cdt.app"; app A { config Missing }; func main() -> Void {}"#,
+        r#"import * as app from "cdt.app"; app A { http Missing on "127.0.0.1:8080" }; func main() -> Void {}"#,
+        r#"import * as app from "cdt.app"; app A { schedule Missing }; func main() -> Void {}"#,
+        r#"import * as app from "cdt.app"; func h(x: Int) -> Void {}; app A { on start => h }; func main() -> Void {}"#,
+        r#"import * as app from "cdt.app"; func h() -> Int { return 1 }; app A { on stop => h }; func main() -> Void {}"#,
+        r#"import * as app from "cdt.app"; struct C { a: Int = 1 }; app A { config C; config C }; func main() -> Void {}"#,
+        r#"import * as app from "cdt.app"; func f() -> Void {}; app A { shutdown 0s; on start => f }; func main() -> Void {}"#,
+    ] {
+        assert!(
+            crate::frontend::compile_source(bad).is_err(),
+            "Expected failure for: {}",
+            bad
+        );
+    }
+}

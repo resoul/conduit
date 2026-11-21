@@ -27,26 +27,26 @@ use crate::native::time::{TIME_ADD, TIME_DIFF, TIME_SUB, TimeOpKind};
 use crate::native::url::{URL_DECODE, URL_DECODE_QUERY, URL_ENCODE, URL_ENCODE_QUERY, URL_PARSE};
 use crate::native::validation::ValOpKind;
 use crate::vm::opcode::{
-    EXT_CLI_HELP, EXT_CLI_PARSE, EXT_CLI_PARSE_ARGS, EXT_CRYPTO_OP, EXT_ENV_ARGS, EXT_ENV_GET,
-    EXT_ENV_LOAD, EXT_ENV_REQUIRE, EXT_FS_BINARY, EXT_FS_UNARY, EXT_LIST_FIRST, EXT_LIST_LAST,
-    EXT_LIST_SORT, EXT_MAP_ENTRIES, EXT_MAP_GET, EXT_MAP_KEYS, EXT_MAP_REMOVE, EXT_MAP_VALUES,
-    EXT_PATH_OP, EXT_PROCESS_OP, EXT_STR_SPLIT, EXT_STR_TO_FLOAT, EXT_STR_TO_INT, EXT_TIME_OP,
-    EXT_URL_OP, EXT_CSV_OP, EXT_DB_OP, EXT_CRON_OP, EXT_MATH_OP, EXT_LOG_OP, EXT_HTTP_OP, Op,
+    EXT_APP_OP, EXT_CLI_HELP, EXT_CLI_PARSE, EXT_CLI_PARSE_ARGS, EXT_CRYPTO_OP, EXT_ENV_ARGS,
+    EXT_ENV_GET, EXT_ENV_LOAD, EXT_ENV_REQUIRE, EXT_FS_BINARY, EXT_FS_UNARY, EXT_LIST_FIRST,
+    EXT_LIST_LAST, EXT_LIST_SORT, EXT_MAP_ENTRIES, EXT_MAP_GET, EXT_MAP_KEYS, EXT_MAP_REMOVE,
+    EXT_MAP_VALUES, EXT_PATH_OP, EXT_PROCESS_OP, EXT_STR_SPLIT, EXT_STR_TO_FLOAT, EXT_STR_TO_INT,
+    EXT_TIME_OP, EXT_URL_OP, EXT_CSV_OP, EXT_DB_OP, EXT_CRON_OP, EXT_MATH_OP, EXT_LOG_OP,
+    EXT_HTTP_OP, Op,
 };
 use crate::vm::value::{
-    SCHEMA_BOXED_BOOL, SCHEMA_BOXED_FLOAT, SCHEMA_BOXED_INT, SCHEMA_CACHE_ERROR,
-    SCHEMA_CACHE_HANDLE, SCHEMA_CLI_ERROR, SCHEMA_CRON_ERROR, SCHEMA_CRON_SCHEDULER,
-    SCHEMA_CRYPTO_ERROR, SCHEMA_CSV_ERROR, SCHEMA_DB_CONN, SCHEMA_DB_ERROR, SCHEMA_DB_PARAM,
-    SCHEMA_DB_POOL,
-    SCHEMA_EMPTY_TAG, SCHEMA_ENV_ERROR, SCHEMA_FS_ERROR, SCHEMA_FS_READER, SCHEMA_FS_WRITER,
-    SCHEMA_HTTP_BINARY_RESPONSE, SCHEMA_HTTP_CLIENT, SCHEMA_HTTP_ERROR, SCHEMA_HTTP_REQUEST,
-    SCHEMA_HTTP_RESPONSE, SCHEMA_HTTP_ROUTER, SCHEMA_INDEX_ERROR, SCHEMA_JSON_DECODE_ERROR, SCHEMA_JSON_ENCODE_ERROR,
-    SCHEMA_JWT_ERROR, SCHEMA_KEY_ERROR, SCHEMA_LIST_TAG, SCHEMA_LOCK_ERROR, SCHEMA_LOCK_GUARD,
-    SCHEMA_MAP_TAG, SCHEMA_PARSE_ERROR, SCHEMA_PROCESS_ERROR, SCHEMA_PROCESS_OUTPUT,
-    SCHEMA_REDIS_CLIENT, SCHEMA_REDIS_ERROR, SCHEMA_REDIS_LOCK, SCHEMA_STR_TAG,
-    SCHEMA_TIME_DURATION, SCHEMA_TIME_ERROR, SCHEMA_TIME_INSTANT, SCHEMA_TIME_TIMESTAMP,
-    SCHEMA_URL, SCHEMA_URL_ERROR, SCHEMA_VALIDATION_ERROR, SCHEMA_VALIDATION_ISSUE,
-    SCHEMA_VALIDATION_VIOLATION,
+    SCHEMA_APP_ERROR, SCHEMA_APP_HANDLE, SCHEMA_BOXED_BOOL, SCHEMA_BOXED_FLOAT, SCHEMA_BOXED_INT,
+    SCHEMA_CACHE_ERROR, SCHEMA_CACHE_HANDLE, SCHEMA_CLI_ERROR, SCHEMA_CRON_ERROR,
+    SCHEMA_CRON_SCHEDULER, SCHEMA_CRYPTO_ERROR, SCHEMA_CSV_ERROR, SCHEMA_DB_CONN, SCHEMA_DB_ERROR,
+    SCHEMA_DB_PARAM, SCHEMA_DB_POOL, SCHEMA_EMPTY_TAG, SCHEMA_ENV_ERROR, SCHEMA_FS_ERROR,
+    SCHEMA_FS_READER, SCHEMA_FS_WRITER, SCHEMA_HTTP_BINARY_RESPONSE, SCHEMA_HTTP_CLIENT,
+    SCHEMA_HTTP_ERROR, SCHEMA_HTTP_REQUEST, SCHEMA_HTTP_RESPONSE, SCHEMA_HTTP_ROUTER,
+    SCHEMA_INDEX_ERROR, SCHEMA_JSON_DECODE_ERROR, SCHEMA_JSON_ENCODE_ERROR, SCHEMA_JWT_ERROR,
+    SCHEMA_KEY_ERROR, SCHEMA_LIST_TAG, SCHEMA_LOCK_ERROR, SCHEMA_LOCK_GUARD, SCHEMA_MAP_TAG,
+    SCHEMA_PARSE_ERROR, SCHEMA_PROCESS_ERROR, SCHEMA_PROCESS_OUTPUT, SCHEMA_REDIS_CLIENT,
+    SCHEMA_REDIS_ERROR, SCHEMA_REDIS_LOCK, SCHEMA_STR_TAG, SCHEMA_TIME_DURATION, SCHEMA_TIME_ERROR,
+    SCHEMA_TIME_INSTANT, SCHEMA_TIME_TIMESTAMP, SCHEMA_URL, SCHEMA_URL_ERROR,
+    SCHEMA_VALIDATION_ERROR, SCHEMA_VALIDATION_ISSUE, SCHEMA_VALIDATION_VIOLATION,
 };
 
 #[inline]
@@ -110,6 +110,8 @@ pub(crate) fn type_tag_for_switch(ty: &Type, checked: &CheckedProgram) -> Result
                 ("cdt.db", "Param") => Ok(SCHEMA_DB_PARAM),
                 ("cdt.cron", "CronError") => Ok(SCHEMA_CRON_ERROR),
                 ("cdt.cron", "Scheduler") => Ok(SCHEMA_CRON_SCHEDULER),
+                ("cdt.app", "AppError") => Ok(SCHEMA_APP_ERROR),
+                ("cdt.app", "App") => Ok(SCHEMA_APP_HANDLE),
                 ("cdt.jwt", "JwtError") => Ok(SCHEMA_JWT_ERROR),
                 ("cdt.lock", "LockError") => Ok(SCHEMA_LOCK_ERROR),
                 ("cdt.lock", "Guard") => Ok(SCHEMA_LOCK_GUARD),
@@ -1315,221 +1317,11 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 Ok(a)
             }
             "build" | "serve" => {
-                use crate::frontend::check::HttpRouterDeclKind;
                 let ty = self.mc.checked.resolve_type(&type_args[0])?;
                 let Type::Custom(tid) = ty else {
                     return Err(format!("http.{}<T>() requires a router type", sym));
                 };
-                let entries = self
-                    .mc
-                    .checked
-                    .http_router_plans
-                    .iter()
-                    .find(|(name, _)| name == &tid.name)
-                    .map(|(_, e)| e.clone())
-                    .ok_or_else(|| format!("Missing router plan for '{}'", tid.name))?;
-                let router_o = self.alloc_temp_o();
-                self.ops.push(Op::ExtOp {
-                    kind: EXT_HTTP_OP,
-                    aux: HTTP_ROUTER,
-                    a: router_o,
-                    b: 0,
-                    c: 0,
-                });
-                for entry in entries {
-                    match entry.kind {
-                        HttpRouterDeclKind::Static(url_prefix, dir_path) => {
-                            let p_idx = self.mc.intern_str(&url_prefix)?;
-                            let p_o = self.alloc_temp_o();
-                            self.ops.push(Op::LoadConstObj { dst_obj: p_o, idx: p_idx });
-                            let d_idx = self.mc.intern_str(&dir_path)?;
-                            let d_o = self.alloc_temp_o();
-                            self.ops.push(Op::LoadConstObj { dst_obj: d_o, idx: d_idx });
-                            self.ops.push(Op::ExtOp {
-                                kind: EXT_HTTP_OP,
-                                aux: HTTP_ROUTE_STATIC,
-                                a: router_o,
-                                b: p_o,
-                                c: d_o,
-                            });
-                            continue;
-                        }
-                        HttpRouterDeclKind::Cors(origin) => {
-                            let o_idx = self.mc.intern_str(&origin)?;
-                            let o_reg = self.alloc_temp_o();
-                            self.ops.push(Op::LoadConstObj { dst_obj: o_reg, idx: o_idx });
-                            self.ops.push(Op::ExtOp {
-                                kind: EXT_HTTP_OP,
-                                aux: HTTP_ROUTE_CORS,
-                                a: router_o,
-                                b: o_reg,
-                                c: 0,
-                            });
-                            continue;
-                        }
-                        _ => {}
-                    }
-                    let fid = *self
-                        .mc
-                        .checked
-                        .func_by_name
-                        .get(&entry.handler_name)
-                        .ok_or_else(|| format!("Unknown router handler '{}'", entry.handler_name))?;
-                    let handler_o = self.alloc_temp_o();
-                    self.ops.push(Op::LoadFuncObj {
-                        dst_obj: handler_o,
-                        func_id: fid as u16,
-                    });
-                    match entry.kind {
-                        HttpRouterDeclKind::Before => {
-                            self.ops.push(Op::ExtOp {
-                                kind: EXT_HTTP_OP,
-                                aux: HTTP_ROUTE_BEFORE,
-                                a: router_o,
-                                b: handler_o,
-                                c: 0,
-                            });
-                        }
-                        HttpRouterDeclKind::After => {
-                            self.ops.push(Op::ExtOp {
-                                kind: EXT_HTTP_OP,
-                                aux: HTTP_ROUTE_AFTER,
-                                a: router_o,
-                                b: handler_o,
-                                c: 0,
-                            });
-                        }
-                        HttpRouterDeclKind::OnStart => {
-                            self.ops.push(Op::ExtOp {
-                                kind: EXT_HTTP_OP,
-                                aux: HTTP_ROUTE_ON_START,
-                                a: router_o,
-                                b: handler_o,
-                                c: 0,
-                            });
-                        }
-                        HttpRouterDeclKind::OnStop => {
-                            self.ops.push(Op::ExtOp {
-                                kind: EXT_HTTP_OP,
-                                aux: HTTP_ROUTE_ON_STOP,
-                                a: router_o,
-                                b: handler_o,
-                                c: 0,
-                            });
-                        }
-                        HttpRouterDeclKind::GroupBefore(prefix) => {
-                            let p_idx = self.mc.intern_str(&prefix)?;
-                            let p_o = self.alloc_temp_o();
-                            self.ops.push(Op::LoadConstObj { dst_obj: p_o, idx: p_idx });
-                            self.ops.push(Op::ExtOp {
-                                kind: EXT_HTTP_OP,
-                                aux: HTTP_ROUTE_GROUP_BEFORE,
-                                a: router_o,
-                                b: p_o,
-                                c: handler_o,
-                            });
-                        }
-                        HttpRouterDeclKind::GroupAfter(prefix) => {
-                            let p_idx = self.mc.intern_str(&prefix)?;
-                            let p_o = self.alloc_temp_o();
-                            self.ops.push(Op::LoadConstObj { dst_obj: p_o, idx: p_idx });
-                            self.ops.push(Op::ExtOp {
-                                kind: EXT_HTTP_OP,
-                                aux: HTTP_ROUTE_GROUP_AFTER,
-                                a: router_o,
-                                b: p_o,
-                                c: handler_o,
-                            });
-                        }
-                        HttpRouterDeclKind::Static(_, _) | HttpRouterDeclKind::Cors(_) => {}
-                        HttpRouterDeclKind::Route(method, pat) => {
-                            let pat_idx = self.mc.intern_str(&pat)?;
-                            let pat_o = self.alloc_temp_o();
-                            self.ops.push(Op::LoadConstObj {
-                                dst_obj: pat_o,
-                                idx: pat_idx,
-                            });
-                            let aux = http_route_aux(&method);
-                            self.ops.push(Op::ExtOp {
-                                kind: EXT_HTTP_OP,
-                                aux,
-                                a: router_o,
-                                b: pat_o,
-                                c: handler_o,
-                            });
-                            if let Some(qname) = &entry.query_struct {
-                                let q_plan = build_http_query_plan(qname, self.mc.checked)?;
-                                let q_idx = self.mc.module.http_query_plans.len() as u16;
-                                self.mc.module.http_query_plans.push(q_plan);
-                                self.ops.push(Op::ExtOp {
-                                    kind: EXT_HTTP_OP,
-                                    aux: HTTP_ROUTE_TYPED_QUERY,
-                                    a: router_o,
-                                    b: 0,
-                                    c: q_idx,
-                                });
-                            }
-                            if let Some(body_name) = &entry.body_struct {
-                                let json_ty = if self.mc.checked.data_enums.contains_key(body_name) {
-                                    crate::frontend::check::type_to_json_type(
-                                        &Type::DataEnum(body_name.clone()),
-                                        self.mc.checked,
-                                    )
-                                    .ok_or_else(|| format!("Invalid router body type '{}'", body_name))?
-                                } else {
-                                    let sid = self.mc.checked.struct_by_name[body_name] as u32;
-                                    crate::native::JsonType::Struct(sid)
-                                };
-                                let plan_idx = self.mc.add_json_decode_plan(&json_ty)?;
-                                self.ops.push(Op::ExtOp {
-                                    kind: EXT_HTTP_OP,
-                                    aux: HTTP_ROUTE_TYPED_BODY,
-                                    a: router_o,
-                                    b: 0,
-                                    c: plan_idx,
-                                });
-                            }
-                            if let Some(guard_name) = &entry.guard_handler {
-                                let gfid = *self
-                                    .mc
-                                    .checked
-                                    .func_by_name
-                                    .get(guard_name)
-                                    .ok_or_else(|| format!("Unknown router guard '{}'", guard_name))?;
-                                let guard_o = self.alloc_temp_o();
-                                self.ops.push(Op::LoadFuncObj {
-                                    dst_obj: guard_o,
-                                    func_id: gfid as u16,
-                                });
-                                self.ops.push(Op::ExtOp {
-                                    kind: EXT_HTTP_OP,
-                                    aux: HTTP_ROUTE_GUARD,
-                                    a: router_o,
-                                    b: guard_o,
-                                    c: 0,
-                                });
-                            }
-                            if entry.auto_response {
-                                let sig = &self.mc.checked.funcs[fid as usize];
-                                let ret_kind: u16 = match &sig.return_type {
-                                    Type::Int => 1,
-                                    Type::Float => 2,
-                                    Type::Bool => 3,
-                                    Type::Void => 4,
-                                    Type::Optional(_) => 5,
-                                    _ => 0,
-                                };
-                                self.ops.push(Op::ExtOp {
-                                    kind: EXT_HTTP_OP,
-                                    aux: HTTP_ROUTE_AUTO_RESP,
-                                    a: router_o,
-                                    b: 0,
-                                    c: ret_kind,
-                                });
-                            }
-                        }
-                    }
-                }
+                let router_o = self.lower_build_router_for_name(&tid.name)?;
                 if sym == "build" {
                     Ok(router_o)
                 } else {
@@ -1971,6 +1763,11 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
             && m == "cdt.cron"
         {
             return self.lower_cron_method(&tid.name, target, method);
+        }
+        if let ModuleId::Native(m) = &tid.module
+            && m == "cdt.app"
+        {
+            return self.lower_app_method(&tid.name, target, method);
         }
         if let ModuleId::Native(m) = &tid.module
             && m == "cdt.lock"
@@ -3194,6 +2991,317 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
         let idx = self.mc.intern_empty()?;
         self.ops.push(Op::LoadConstObj { dst_obj: dst, idx });
         Ok(dst)
+    }
+
+    pub(crate) fn lower_build_router_for_name(&mut self, router_name: &str) -> Result<u16, String> {
+        use crate::frontend::check::HttpRouterDeclKind;
+        use crate::vm::exec_http::*;
+        let entries = self
+            .mc
+            .checked
+            .http_router_plans
+            .iter()
+            .find(|(name, _)| name == router_name)
+            .map(|(_, e)| e.clone())
+            .ok_or_else(|| format!("Missing router plan for '{}'", router_name))?;
+        let router_o = self.alloc_temp_o();
+        self.ops.push(Op::ExtOp {
+            kind: EXT_HTTP_OP,
+            aux: HTTP_ROUTER,
+            a: router_o,
+            b: 0,
+            c: 0,
+        });
+        for entry in entries {
+            match entry.kind {
+                HttpRouterDeclKind::Static(url_prefix, dir_path) => {
+                    let p_idx = self.mc.intern_str(&url_prefix)?;
+                    let p_o = self.alloc_temp_o();
+                    self.ops.push(Op::LoadConstObj { dst_obj: p_o, idx: p_idx });
+                    let d_idx = self.mc.intern_str(&dir_path)?;
+                    let d_o = self.alloc_temp_o();
+                    self.ops.push(Op::LoadConstObj { dst_obj: d_o, idx: d_idx });
+                    self.ops.push(Op::ExtOp {
+                        kind: EXT_HTTP_OP,
+                        aux: HTTP_ROUTE_STATIC,
+                        a: router_o,
+                        b: p_o,
+                        c: d_o,
+                    });
+                    continue;
+                }
+                HttpRouterDeclKind::Cors(origin) => {
+                    let o_idx = self.mc.intern_str(&origin)?;
+                    let o_reg = self.alloc_temp_o();
+                    self.ops.push(Op::LoadConstObj { dst_obj: o_reg, idx: o_idx });
+                    self.ops.push(Op::ExtOp {
+                        kind: EXT_HTTP_OP,
+                        aux: HTTP_ROUTE_CORS,
+                        a: router_o,
+                        b: o_reg,
+                        c: 0,
+                    });
+                    continue;
+                }
+                _ => {}
+            }
+            let fid = *self
+                .mc
+                .checked
+                .func_by_name
+                .get(&entry.handler_name)
+                .ok_or_else(|| format!("Unknown router handler '{}'", entry.handler_name))?;
+            let handler_o = self.alloc_temp_o();
+            self.ops.push(Op::LoadFuncObj {
+                dst_obj: handler_o,
+                func_id: fid as u16,
+            });
+            match entry.kind {
+                HttpRouterDeclKind::Before => {
+                    self.ops.push(Op::ExtOp {
+                        kind: EXT_HTTP_OP,
+                        aux: HTTP_ROUTE_BEFORE,
+                        a: router_o,
+                        b: handler_o,
+                        c: 0,
+                    });
+                }
+                HttpRouterDeclKind::After => {
+                    self.ops.push(Op::ExtOp {
+                        kind: EXT_HTTP_OP,
+                        aux: HTTP_ROUTE_AFTER,
+                        a: router_o,
+                        b: handler_o,
+                        c: 0,
+                    });
+                }
+                HttpRouterDeclKind::OnStart => {
+                    self.ops.push(Op::ExtOp {
+                        kind: EXT_HTTP_OP,
+                        aux: HTTP_ROUTE_ON_START,
+                        a: router_o,
+                        b: handler_o,
+                        c: 0,
+                    });
+                }
+                HttpRouterDeclKind::OnStop => {
+                    self.ops.push(Op::ExtOp {
+                        kind: EXT_HTTP_OP,
+                        aux: HTTP_ROUTE_ON_STOP,
+                        a: router_o,
+                        b: handler_o,
+                        c: 0,
+                    });
+                }
+                HttpRouterDeclKind::GroupBefore(prefix) => {
+                    let p_idx = self.mc.intern_str(&prefix)?;
+                    let p_o = self.alloc_temp_o();
+                    self.ops.push(Op::LoadConstObj { dst_obj: p_o, idx: p_idx });
+                    self.ops.push(Op::ExtOp {
+                        kind: EXT_HTTP_OP,
+                        aux: HTTP_ROUTE_GROUP_BEFORE,
+                        a: router_o,
+                        b: p_o,
+                        c: handler_o,
+                    });
+                }
+                HttpRouterDeclKind::GroupAfter(prefix) => {
+                    let p_idx = self.mc.intern_str(&prefix)?;
+                    let p_o = self.alloc_temp_o();
+                    self.ops.push(Op::LoadConstObj { dst_obj: p_o, idx: p_idx });
+                    self.ops.push(Op::ExtOp {
+                        kind: EXT_HTTP_OP,
+                        aux: HTTP_ROUTE_GROUP_AFTER,
+                        a: router_o,
+                        b: p_o,
+                        c: handler_o,
+                    });
+                }
+                HttpRouterDeclKind::Static(_, _) | HttpRouterDeclKind::Cors(_) => {}
+                HttpRouterDeclKind::Route(method, pat) => {
+                    let pat_idx = self.mc.intern_str(&pat)?;
+                    let pat_o = self.alloc_temp_o();
+                    self.ops.push(Op::LoadConstObj {
+                        dst_obj: pat_o,
+                        idx: pat_idx,
+                    });
+                    let aux = http_route_aux(&method);
+                    self.ops.push(Op::ExtOp {
+                        kind: EXT_HTTP_OP,
+                        aux,
+                        a: router_o,
+                        b: pat_o,
+                        c: handler_o,
+                    });
+                    if let Some(qname) = &entry.query_struct {
+                        let q_plan = build_http_query_plan(qname, self.mc.checked)?;
+                        let q_idx = self.mc.module.http_query_plans.len() as u16;
+                        self.mc.module.http_query_plans.push(q_plan);
+                        self.ops.push(Op::ExtOp {
+                            kind: EXT_HTTP_OP,
+                            aux: HTTP_ROUTE_TYPED_QUERY,
+                            a: router_o,
+                            b: 0,
+                            c: q_idx,
+                        });
+                    }
+                    if let Some(body_name) = &entry.body_struct {
+                        let json_ty = if self.mc.checked.data_enums.contains_key(body_name) {
+                            crate::frontend::check::type_to_json_type(
+                                &Type::DataEnum(body_name.clone()),
+                                self.mc.checked,
+                            )
+                            .ok_or_else(|| format!("Invalid router body type '{}'", body_name))?
+                        } else {
+                            let sid = self.mc.checked.struct_by_name[body_name] as u32;
+                            crate::native::JsonType::Struct(sid)
+                        };
+                        let plan_idx = self.mc.add_json_decode_plan(&json_ty)?;
+                        self.ops.push(Op::ExtOp {
+                            kind: EXT_HTTP_OP,
+                            aux: HTTP_ROUTE_TYPED_BODY,
+                            a: router_o,
+                            b: 0,
+                            c: plan_idx,
+                        });
+                    }
+                    if let Some(guard_name) = &entry.guard_handler {
+                        let gfid = *self
+                            .mc
+                            .checked
+                            .func_by_name
+                            .get(guard_name)
+                            .ok_or_else(|| format!("Unknown router guard '{}'", guard_name))?;
+                        let guard_o = self.alloc_temp_o();
+                        self.ops.push(Op::LoadFuncObj {
+                            dst_obj: guard_o,
+                            func_id: gfid as u16,
+                        });
+                        self.ops.push(Op::ExtOp {
+                            kind: EXT_HTTP_OP,
+                            aux: HTTP_ROUTE_GUARD,
+                            a: router_o,
+                            b: guard_o,
+                            c: 0,
+                        });
+                    }
+                    if entry.auto_response {
+                        let sig = &self.mc.checked.funcs[fid as usize];
+                        let ret_kind: u16 = match &sig.return_type {
+                            Type::Int => 1,
+                            Type::Float => 2,
+                            Type::Bool => 3,
+                            Type::Void => 4,
+                            Type::Optional(_) => 5,
+                            _ => 0,
+                        };
+                        self.ops.push(Op::ExtOp {
+                            kind: EXT_HTTP_OP,
+                            aux: HTTP_ROUTE_AUTO_RESP,
+                            a: router_o,
+                            b: 0,
+                            c: ret_kind,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(router_o)
+    }
+
+    fn resolve_app_idx(&self, te: &TypeExpr) -> Result<(u16, Option<String>), String> {
+        let target_ty = self.mc.resolve_type(te)?;
+        let Type::Custom(tid) = target_ty else {
+            return Err("Expected app type for cdt.app".to_string());
+        };
+        let (idx, decl) = self
+            .mc
+            .checked
+            .app_plans
+            .iter()
+            .enumerate()
+            .find(|(_, p)| p.name == tid.name)
+            .ok_or_else(|| format!("Unknown app '{}'", tid.name))?;
+        Ok((idx as u16, decl.http_router.clone()))
+    }
+
+    pub(crate) fn lower_app_call(
+        &mut self,
+        sym: &str,
+        type_args: &[TypeExpr],
+        args: &[Expr],
+        named_args: &[NamedArg],
+    ) -> Result<u16, String> {
+        use crate::vm::exec_app::*;
+        match sym {
+            "AppError" => self.lower_native_record(
+                SCHEMA_APP_ERROR,
+                &["kind", "message"],
+                args,
+                named_args,
+            ),
+            "run" | "start" => {
+                let (app_idx, http_router) = self.resolve_app_idx(&type_args[0])?;
+                let router_o = if let Some(rname) = http_router {
+                    self.lower_build_router_for_name(&rname)?
+                } else {
+                    let r = self.alloc_temp_o();
+                    let empty_idx = self.mc.intern_empty()?;
+                    self.ops.push(Op::LoadConstObj {
+                        dst_obj: r,
+                        idx: empty_idx,
+                    });
+                    r
+                };
+                let dst = self.alloc_temp_o();
+                let aux = if sym == "run" { APP_RUN } else { APP_START };
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_APP_OP,
+                    aux,
+                    a: dst,
+                    b: app_idx,
+                    c: router_o,
+                });
+                Ok(dst)
+            }
+            other => Err(format!("Unsupported cdt.app symbol '{}'", other)),
+        }
+    }
+
+    pub(crate) fn lower_app_method(
+        &mut self,
+        type_name: &str,
+        target: &Expr,
+        method: &str,
+    ) -> Result<u16, String> {
+        use crate::vm::exec_app::APP_STOP;
+        if type_name != "App" || method != "stop" {
+            return Err(format!("Unsupported app method '{}.{}()'", type_name, method));
+        }
+        let b = self.lower_obj(target)?;
+        let dst = self.alloc_temp_o();
+        self.ops.push(Op::ExtOp {
+            kind: EXT_APP_OP,
+            aux: APP_STOP,
+            a: dst,
+            b,
+            c: 0,
+        });
+        Ok(dst)
+    }
+
+    pub(crate) fn lower_app_is_running(&mut self, target: &Expr) -> Result<u16, String> {
+        use crate::vm::exec_app::APP_IS_RUNNING;
+        let b = self.lower_obj(target)?;
+        let a = self.alloc_temp_s();
+        self.ops.push(Op::ExtOp {
+            kind: EXT_APP_OP,
+            aux: APP_IS_RUNNING,
+            a,
+            b,
+            c: 0,
+        });
+        Ok(a)
     }
 }
 

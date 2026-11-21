@@ -54,6 +54,18 @@ pub struct CronScheduleEntry {
 }
 
 #[derive(Debug, Clone)]
+pub struct AppPlanDecl {
+    pub name: String,
+    pub config_struct: Option<String>,
+    pub http_router: Option<String>,
+    pub http_addr: Option<String>,
+    pub schedule_name: Option<String>,
+    pub shutdown_ms: u64,
+    pub on_start_handlers: Vec<String>,
+    pub on_stop_handlers: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct HttpRouterDeclEntry {
     pub kind: HttpRouterDeclKind,
     pub handler_name: String,
@@ -86,6 +98,7 @@ pub struct CheckedProgram {
     pub http_router_plans: Vec<(String, Vec<HttpRouterDeclEntry>)>,
     pub db_model_plans: Vec<crate::ir::DbModelMeta>,
     pub cron_schedule_plans: Vec<(String, Vec<CronScheduleEntry>)>,
+    pub app_plans: Vec<AppPlanDecl>,
     pub struct_abouts: HashMap<String, String>,
     pub validator_funcs: HashSet<String>,
     pub error_structs: HashSet<String>,
@@ -167,6 +180,7 @@ pub fn check_program_with_roots(
         http_router_plans: Vec::new(),
         db_model_plans: Vec::new(),
         cron_schedule_plans: Vec::new(),
+        app_plans: Vec::new(),
         struct_abouts: HashMap::new(),
         validator_funcs: HashSet::new(),
         error_structs: HashSet::new(),
@@ -220,6 +234,18 @@ pub fn check_program_with_roots(
                     format!(
                         "on start / on stop hook must return Void or Void | Error, got {}",
                         sig.return_type
+                    ),
+                ));
+            }
+            if let Some(wname) = crate::ir::worker_step_display_name(name)
+                && !crate::frontend::check_sys::is_cron_handler_return(&sig.return_type, &checked)
+            {
+                all_errors.push(format_check_err(
+                    item_span,
+                    source_file.as_deref(),
+                    format!(
+                        "worker '{}' must have return type Void or Void | Error, got {}",
+                        wname, sig.return_type
                     ),
                 ));
             }
@@ -371,6 +397,27 @@ pub fn check_program_with_roots(
         if let Err(e) = crate::frontend::check_sys::ensure_cron_schedule_plan(&mut checked, &sname) {
             let (sp, sf) = struct_locs
                 .get(&sname)
+                .cloned()
+                .unwrap_or((crate::frontend::lexer::Span::new(0, 0), None));
+            all_errors.push(format_check_err(sp, sf.as_deref(), e));
+        }
+    }
+    let app_names: Vec<String> = checked
+        .structs
+        .iter()
+        .filter(|s| {
+            s.fields.iter().any(|f| {
+                f.router_ann
+                    .as_ref()
+                    .is_some_and(|a| a.target.starts_with("app."))
+            })
+        })
+        .map(|s| s.name.clone())
+        .collect();
+    for aname in app_names {
+        if let Err(e) = crate::frontend::check_sys::ensure_app_plan(&mut checked, &aname) {
+            let (sp, sf) = struct_locs
+                .get(&aname)
                 .cloned()
                 .unwrap_or((crate::frontend::lexer::Span::new(0, 0), None));
             all_errors.push(format_check_err(sp, sf.as_deref(), e));

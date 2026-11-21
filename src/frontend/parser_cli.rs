@@ -1067,6 +1067,806 @@ impl Parser {
             false,
         ))
     }
+
+    pub(super) fn parse_app_item(&mut self, is_exported: bool) -> Result<Item, ParserError> {
+        let start_span = self.bump().span; // consume 'app'
+        let (name, _) = self.expect_ident()?;
+        let about = self.try_take_string();
+        self.expect(&TokenKind::LBrace)?;
+        let mut fields = Vec::new();
+        let mut idx = 0usize;
+        let mut seen_config = false;
+        let mut seen_http = false;
+        let mut seen_schedule = false;
+        let mut seen_shutdown = false;
+
+        while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
+            let tok = self.peek().clone();
+            let TokenKind::Ident(kw) = &tok.kind else {
+                return Err(ParserError {
+                    message: format!(
+                        "Expected app clause ('config', 'http', 'schedule', 'shutdown', 'on start', or 'on stop'), got '{:?}'",
+                        tok.kind
+                    ),
+                    span: tok.span,
+                });
+            };
+            let span = self.bump().span;
+            let ann = match kw.as_str() {
+                "config" => {
+                    if seen_config {
+                        return Err(ParserError {
+                            message: format!("Duplicate 'config' clause in app '{}'", name),
+                            span,
+                        });
+                    }
+                    seen_config = true;
+                    let (cfg_name, cspan) = self.expect_ident()?;
+                    FieldAnnotation {
+                        target: "app.config".to_string(),
+                        args: vec![ident_expr(cfg_name, cspan)],
+                        span,
+                    }
+                }
+                "http" => {
+                    if seen_http {
+                        return Err(ParserError {
+                            message: format!("Duplicate 'http' clause in app '{}'", name),
+                            span,
+                        });
+                    }
+                    seen_http = true;
+                    let (router_name, rspan) = self.expect_ident()?;
+                    let on_tok = self.peek().clone();
+                    match &on_tok.kind {
+                        TokenKind::Ident(s) if s == "on" => {
+                            self.bump();
+                        }
+                        _ => {
+                            return Err(ParserError {
+                                message: format!(
+                                    "Expected 'on' after router name '{}' in app '{}'",
+                                    router_name, name
+                                ),
+                                span: on_tok.span,
+                            });
+                        }
+                    }
+                    let aspan = self.peek().span;
+                    let Some(addr) = self.try_take_string() else {
+                        return Err(ParserError {
+                            message: format!(
+                                "Expected listen address string after 'on' in app '{}'",
+                                name
+                            ),
+                            span: aspan,
+                        });
+                    };
+                    FieldAnnotation {
+                        target: "app.http".to_string(),
+                        args: vec![ident_expr(router_name, rspan), str_expr(addr, aspan)],
+                        span,
+                    }
+                }
+                "schedule" => {
+                    if seen_schedule {
+                        return Err(ParserError {
+                            message: format!("Duplicate 'schedule' clause in app '{}'", name),
+                            span,
+                        });
+                    }
+                    seen_schedule = true;
+                    let (sched_name, sspan) = self.expect_ident()?;
+                    FieldAnnotation {
+                        target: "app.schedule".to_string(),
+                        args: vec![ident_expr(sched_name, sspan)],
+                        span,
+                    }
+                }
+                "shutdown" => {
+                    if seen_shutdown {
+                        return Err(ParserError {
+                            message: format!("Duplicate 'shutdown' clause in app '{}'", name),
+                            span,
+                        });
+                    }
+                    seen_shutdown = true;
+                    let dspan = self.peek().span;
+                    let ms = self.parse_positive_duration_ms(&format!("shutdown in app '{}'", name))?;
+                    FieldAnnotation {
+                        target: "app.shutdown".to_string(),
+                        args: vec![int_expr(ms, dspan)],
+                        span,
+                    }
+                }
+                "on" => {
+                    let (sub, sub_span) = self.expect_ident()?;
+                    let target = match sub.as_str() {
+                        "start" => "app.on_start",
+                        "stop" => "app.on_stop",
+                        other => {
+                            return Err(ParserError {
+                                message: format!(
+                                    "Expected 'start' or 'stop' after 'on' in app '{}', got '{}'",
+                                    name, other
+                                ),
+                                span: sub_span,
+                            });
+                        }
+                    };
+                    let _ = self.match_token(&TokenKind::FatArrow);
+                    let (handler_name, hspan) = self.expect_ident()?;
+                    FieldAnnotation {
+                        target: target.to_string(),
+                        args: vec![ident_expr(handler_name, hspan)],
+                        span,
+                    }
+                }
+                "on_start" | "on_stop" => {
+                    let target = if kw == "on_start" {
+                        "app.on_start"
+                    } else {
+                        "app.on_stop"
+                    };
+                    let _ = self.match_token(&TokenKind::FatArrow);
+                    let (handler_name, hspan) = self.expect_ident()?;
+                    FieldAnnotation {
+                        target: target.to_string(),
+                        args: vec![ident_expr(handler_name, hspan)],
+                        span,
+                    }
+                }
+                other => {
+                    return Err(ParserError {
+                        message: format!(
+                            "Unknown app clause '{}' in app '{}' (expected 'config', 'http', 'schedule', 'shutdown', 'on start', or 'on stop')",
+                            other, name
+                        ),
+                        span: tok.span,
+                    });
+                }
+            };
+            fields.push(FieldDef {
+                name: format!("__app_{}", idx),
+                json_name: None,
+                ty: TypeExpr::Named("Bool".to_string()),
+                annotations: vec![ann],
+                default: Some(Expr {
+                    kind: ExprKind::Bool(false),
+                    ty: crate::frontend::types::Type::Void,
+                    span,
+                }),
+                span,
+            });
+            idx += 1;
+        }
+        self.expect(&TokenKind::RBrace)?;
+
+        let mut item = Item::new_exported(
+            ItemKind::Struct {
+                name,
+                type_params: Vec::new(),
+                fields,
+            },
+            start_span,
+            is_exported,
+        );
+        item.doc = about;
+        Ok(item)
+    }
+
+    fn parse_positive_duration_ms(&mut self, ctx: &str) -> Result<i64, ParserError> {
+        let dspan = self.peek().span;
+        let TokenKind::Int(n) = self.peek().kind else {
+            return Err(ParserError {
+                message: format!(
+                    "Expected positive integer duration (e.g. 100ms, 5s, 1m) for {}",
+                    ctx
+                ),
+                span: dspan,
+            });
+        };
+        if n <= 0 {
+            return Err(ParserError {
+                message: format!("Expected positive integer duration for {}", ctx),
+                span: dspan,
+            });
+        }
+        self.bump();
+        let unit_tok = self.peek().clone();
+        let mult = match &unit_tok.kind {
+            TokenKind::Ident(u) if u == "ms" => {
+                self.bump();
+                1i64
+            }
+            TokenKind::Ident(u) if u == "s" => {
+                self.bump();
+                1_000i64
+            }
+            TokenKind::Ident(u) if u == "m" => {
+                self.bump();
+                60_000i64
+            }
+            TokenKind::Ident(u) if u == "h" => {
+                self.bump();
+                3_600_000i64
+            }
+            _ => {
+                return Err(ParserError {
+                    message: format!(
+                        "Expected duration unit ('ms', 's', 'm', or 'h') for {}",
+                        ctx
+                    ),
+                    span: unit_tok.span,
+                });
+            }
+        };
+        Ok(n.saturating_mul(mult))
+    }
+
+    pub(super) fn parse_worker_item(&mut self, is_exported: bool) -> Result<Item, ParserError> {
+        let start_span = self.bump().span; // consume 'worker'
+        let (name, _) = self.expect_ident()?;
+        let type_params = self.parse_type_params()?;
+        let params = self.parse_param_list()?;
+        if params.is_empty() {
+            return Err(ParserError {
+                message: format!(
+                    "Worker '{}' must declare at least a message parameter (e.g. 'worker {}(msg: T) {{ ... }}')",
+                    name, name
+                ),
+                span: start_span,
+            });
+        }
+        if params[0].default.is_some() {
+            return Err(ParserError {
+                message: format!(
+                    "Worker '{}' message parameter '{}' cannot have a default value",
+                    name, params[0].name
+                ),
+                span: params[0].span,
+            });
+        }
+
+        let mut return_type: Option<TypeExpr> = None;
+        let mut concurrency: Option<i64> = None;
+        let mut retry: Option<i64> = None;
+        let mut backoff_ms: Option<i64> = None;
+        while !self.check(&TokenKind::LBrace) && !self.check(&TokenKind::Eof) {
+            if self.match_token(&TokenKind::Arrow) {
+                let arrow_span = self.tokens[self.cursor - 1].span;
+                if return_type.is_some() {
+                    return Err(ParserError {
+                        message: format!("Duplicate return type '->' in worker '{}'", name),
+                        span: arrow_span,
+                    });
+                }
+                return_type = Some(self.parse_type_expr()?);
+                continue;
+            }
+            let tok = self.peek().clone();
+            let TokenKind::Ident(kw) = &tok.kind else {
+                return Err(ParserError {
+                    message: format!(
+                        "Unexpected '{:?}' in worker '{}' (expected 'concurrency', 'retry', 'backoff', '->', or '{{')",
+                        tok.kind, name
+                    ),
+                    span: tok.span,
+                });
+            };
+            self.bump();
+            match kw.as_str() {
+                "concurrency" => {
+                    if concurrency.is_some() {
+                        return Err(ParserError {
+                            message: format!("Duplicate 'concurrency' in worker '{}'", name),
+                            span: tok.span,
+                        });
+                    }
+                    let ntok = self.peek().clone();
+                    let TokenKind::Int(n) = ntok.kind else {
+                        return Err(ParserError {
+                            message: format!(
+                                "Expected positive integer after 'concurrency' in worker '{}'",
+                                name
+                            ),
+                            span: ntok.span,
+                        });
+                    };
+                    self.bump();
+                    if n < 1 {
+                        return Err(ParserError {
+                            message: format!(
+                                "Worker '{}' concurrency must be at least 1, got {}",
+                                name, n
+                            ),
+                            span: ntok.span,
+                        });
+                    }
+                    concurrency = Some(n);
+                }
+                "retry" => {
+                    if retry.is_some() {
+                        return Err(ParserError {
+                            message: format!("Duplicate 'retry' in worker '{}'", name),
+                            span: tok.span,
+                        });
+                    }
+                    let ntok = self.peek().clone();
+                    let TokenKind::Int(n) = ntok.kind else {
+                        return Err(ParserError {
+                            message: format!(
+                                "Expected non-negative integer after 'retry' in worker '{}'",
+                                name
+                            ),
+                            span: ntok.span,
+                        });
+                    };
+                    self.bump();
+                    if n < 0 {
+                        return Err(ParserError {
+                            message: format!(
+                                "Worker '{}' retry count must be >= 0, got {}",
+                                name, n
+                            ),
+                            span: ntok.span,
+                        });
+                    }
+                    retry = Some(n);
+                }
+                "backoff" => {
+                    if backoff_ms.is_some() {
+                        return Err(ParserError {
+                            message: format!("Duplicate 'backoff' in worker '{}'", name),
+                            span: tok.span,
+                        });
+                    }
+                    backoff_ms = Some(
+                        self.parse_positive_duration_ms(&format!("backoff in worker '{}'", name))?,
+                    );
+                }
+                other => {
+                    return Err(ParserError {
+                        message: format!(
+                            "Unexpected '{}' in worker '{}' (expected 'concurrency', 'retry', 'backoff', '->', or '{{')",
+                            other, name
+                        ),
+                        span: tok.span,
+                    });
+                }
+            }
+        }
+
+        let body = self.parse_block()?;
+        let step_name = format!("__cdt_worker_step_{}", name);
+        let step_params: Vec<Param> = params
+            .iter()
+            .map(|p| Param {
+                name: p.name.clone(),
+                ty: p.ty.clone(),
+                default: None,
+                span: p.span,
+            })
+            .collect();
+        self.pending_items.push(Item::new_exported(
+            ItemKind::Func {
+                name: step_name.clone(),
+                type_params: type_params.clone(),
+                params: step_params,
+                return_type,
+                body,
+                is_validator: false,
+            },
+            start_span,
+            false,
+        ));
+
+        let msg_ty = params[0].ty.clone();
+        let mut runner_params = Vec::with_capacity(params.len());
+        runner_params.push(Param {
+            name: "__cdt_ch".to_string(),
+            ty: TypeExpr::Generic {
+                name: "Chan".to_string(),
+                type_args: vec![msg_ty],
+            },
+            default: None,
+            span: params[0].span,
+        });
+        runner_params.extend(params.into_iter().skip(1));
+
+        let runner_body = build_worker_runner_body(
+            &step_name,
+            &type_params,
+            &runner_params[1..],
+            concurrency.unwrap_or(1),
+            retry.unwrap_or(0),
+            backoff_ms.unwrap_or(0),
+            start_span,
+        );
+
+        Ok(Item::new_exported(
+            ItemKind::Func {
+                name,
+                type_params,
+                params: runner_params,
+                return_type: Some(TypeExpr::Named("Int".to_string())),
+                body: runner_body,
+                is_validator: false,
+            },
+            start_span,
+            is_exported,
+        ))
+    }
+}
+
+fn ident_expr(name: String, span: Span) -> Expr {
+    Expr::new(ExprKind::Ident(name), span)
+}
+
+fn int_expr(val: i64, span: Span) -> Expr {
+    Expr::new(ExprKind::Int(val), span)
+}
+
+fn bin_expr(op: BinaryOp, left: Expr, right: Expr, span: Span) -> Expr {
+    Expr::new(
+        ExprKind::Binary {
+            op,
+            left: Box::new(left),
+            right: Box::new(right),
+        },
+        span,
+    )
+}
+
+fn call_expr(callee: Expr, type_args: Vec<TypeExpr>, args: Vec<Expr>, span: Span) -> Expr {
+    Expr::new(
+        ExprKind::Call {
+            callee: Box::new(callee),
+            type_args,
+            args,
+            named_args: Vec::new(),
+        },
+        span,
+    )
+}
+
+fn method_call(target: &str, method: &str, args: Vec<Expr>, span: Span) -> Expr {
+    let member = Expr::new(
+        ExprKind::Member {
+            target: Box::new(ident_expr(target.to_string(), span)),
+            field: method.to_string(),
+        },
+        span,
+    );
+    call_expr(member, Vec::new(), args, span)
+}
+
+fn build_worker_step_stmts(
+    step_name: &str,
+    type_params: &[String],
+    extra_params: &[Param],
+    retry: i64,
+    backoff_ms: i64,
+    span: Span,
+) -> Vec<Stmt> {
+    let step_type_args: Vec<TypeExpr> = type_params
+        .iter()
+        .map(|tp| TypeExpr::Named(tp.clone()))
+        .collect();
+    let mut step_args = Vec::with_capacity(1 + extra_params.len());
+    step_args.push(ident_expr("__cdt_msg".to_string(), span));
+    for p in extra_params {
+        step_args.push(ident_expr(p.name.clone(), p.span));
+    }
+    let step_call = call_expr(
+        ident_expr(step_name.to_string(), span),
+        step_type_args,
+        step_args,
+        span,
+    );
+    let ok_call = call_expr(
+        ident_expr("__cdt_worker_ok".to_string(), span),
+        Vec::new(),
+        vec![step_call],
+        span,
+    );
+    let inc_count = Stmt::new(
+        StmtKind::Assign {
+            target: ident_expr("__cdt_count".to_string(), span),
+            value: bin_expr(
+                BinaryOp::Add,
+                ident_expr("__cdt_count".to_string(), span),
+                int_expr(1, span),
+                span,
+            ),
+        },
+        span,
+    );
+
+    if retry == 0 {
+        return vec![Stmt::new(
+            StmtKind::If {
+                condition: ok_call,
+                then_block: Block {
+                    stmts: vec![inc_count],
+                    span,
+                },
+                else_block: None,
+            },
+            span,
+        )];
+    }
+
+    let mut loop_stmts = Vec::new();
+    if backoff_ms > 0 {
+        loop_stmts.push(Stmt::new(
+            StmtKind::If {
+                condition: bin_expr(
+                    BinaryOp::Gt,
+                    ident_expr("__cdt_attempt".to_string(), span),
+                    int_expr(0, span),
+                    span,
+                ),
+                then_block: Block {
+                    stmts: vec![Stmt::new(
+                        StmtKind::Expr(call_expr(
+                            ident_expr("__cdt_sleep_ms".to_string(), span),
+                            Vec::new(),
+                            vec![int_expr(backoff_ms, span)],
+                            span,
+                        )),
+                        span,
+                    )],
+                    span,
+                },
+                else_block: None,
+            },
+            span,
+        ));
+    }
+    loop_stmts.push(Stmt::new(
+        StmtKind::If {
+            condition: ok_call,
+            then_block: Block {
+                stmts: vec![
+                    Stmt::new(
+                        StmtKind::Assign {
+                            target: ident_expr("__cdt_ok".to_string(), span),
+                            value: Expr::new(ExprKind::Bool(true), span),
+                        },
+                        span,
+                    ),
+                    inc_count,
+                ],
+                span,
+            },
+            else_block: Some(Block {
+                stmts: vec![Stmt::new(
+                    StmtKind::Assign {
+                        target: ident_expr("__cdt_attempt".to_string(), span),
+                        value: bin_expr(
+                            BinaryOp::Add,
+                            ident_expr("__cdt_attempt".to_string(), span),
+                            int_expr(1, span),
+                            span,
+                        ),
+                    },
+                    span,
+                )],
+                span,
+            }),
+        },
+        span,
+    ));
+
+    vec![
+        Stmt::new(
+            StmtKind::VarDecl {
+                name: "__cdt_attempt".to_string(),
+                ty: None,
+                init: Some(int_expr(0, span)),
+            },
+            span,
+        ),
+        Stmt::new(
+            StmtKind::VarDecl {
+                name: "__cdt_ok".to_string(),
+                ty: None,
+                init: Some(Expr::new(ExprKind::Bool(false), span)),
+            },
+            span,
+        ),
+        Stmt::new(
+            StmtKind::While {
+                condition: bin_expr(
+                    BinaryOp::And,
+                    bin_expr(
+                        BinaryOp::LtEq,
+                        ident_expr("__cdt_attempt".to_string(), span),
+                        int_expr(retry, span),
+                        span,
+                    ),
+                    Expr::new(
+                        ExprKind::Unary {
+                            op: UnaryOp::Not,
+                            expr: Box::new(ident_expr("__cdt_ok".to_string(), span)),
+                        },
+                        span,
+                    ),
+                    span,
+                ),
+                body: Block {
+                    stmts: loop_stmts,
+                    span,
+                },
+            },
+            span,
+        ),
+    ]
+}
+
+fn build_worker_runner_body(
+    step_name: &str,
+    type_params: &[String],
+    extra_params: &[Param],
+    concurrency: i64,
+    retry: i64,
+    backoff_ms: i64,
+    span: Span,
+) -> Block {
+    let per_msg_stmts =
+        build_worker_step_stmts(step_name, type_params, extra_params, retry, backoff_ms, span);
+    let init_count = Stmt::new(
+        StmtKind::VarDecl {
+            name: "__cdt_count".to_string(),
+            ty: None,
+            init: Some(int_expr(0, span)),
+        },
+        span,
+    );
+    let msg_loop = Stmt::new(
+        StmtKind::ForIn {
+            pattern: Pattern::new(PatternKind::Ident("__cdt_msg".to_string()), span),
+            iterable: ident_expr("__cdt_ch".to_string(), span),
+            body: Block {
+                stmts: per_msg_stmts,
+                span,
+            },
+        },
+        span,
+    );
+
+    if concurrency <= 1 {
+        return Block {
+            stmts: vec![
+                init_count,
+                msg_loop,
+                Stmt::new(
+                    StmtKind::Return(Some(ident_expr("__cdt_count".to_string(), span))),
+                    span,
+                ),
+            ],
+            span,
+        };
+    }
+
+    let done_chan = Stmt::new(
+        StmtKind::Define {
+            name: "__cdt_done".to_string(),
+            value: call_expr(
+                ident_expr("Chan".to_string(), span),
+                vec![TypeExpr::Named("Int".to_string())],
+                vec![int_expr(concurrency, span)],
+                span,
+            ),
+        },
+        span,
+    );
+    let send_count = Stmt::new(
+        StmtKind::Expr(method_call(
+            "__cdt_done",
+            "send",
+            vec![ident_expr("__cdt_count".to_string(), span)],
+            span,
+        )),
+        span,
+    );
+    let spawn_workers = Stmt::new(
+        StmtKind::ForIn {
+            pattern: Pattern::new(PatternKind::Ident("__cdt_w".to_string()), span),
+            iterable: int_expr(concurrency, span),
+            body: Block {
+                stmts: vec![Stmt::new(
+                    StmtKind::Spawn(Block {
+                        stmts: vec![init_count, msg_loop, send_count],
+                        span,
+                    }),
+                    span,
+                )],
+                span,
+            },
+        },
+        span,
+    );
+    let init_total = Stmt::new(
+        StmtKind::VarDecl {
+            name: "__cdt_total".to_string(),
+            ty: None,
+            init: Some(int_expr(0, span)),
+        },
+        span,
+    );
+    let join_workers = Stmt::new(
+        StmtKind::ForIn {
+            pattern: Pattern::new(PatternKind::Ident("__cdt_w".to_string()), span),
+            iterable: int_expr(concurrency, span),
+            body: Block {
+                stmts: vec![Stmt::new(
+                    StmtKind::Switch {
+                        expr: method_call("__cdt_done", "recv", Vec::new(), span),
+                        cases: vec![
+                            SwitchCase {
+                                pattern: Pattern::new(
+                                    PatternKind::Type {
+                                        name: "Int".to_string(),
+                                        binding: "__cdt_c".to_string(),
+                                    },
+                                    span,
+                                ),
+                                body: Block {
+                                    stmts: vec![Stmt::new(
+                                        StmtKind::Assign {
+                                            target: ident_expr("__cdt_total".to_string(), span),
+                                            value: bin_expr(
+                                                BinaryOp::Add,
+                                                ident_expr("__cdt_total".to_string(), span),
+                                                ident_expr("__cdt_c".to_string(), span),
+                                                span,
+                                            ),
+                                        },
+                                        span,
+                                    )],
+                                    span,
+                                },
+                                span,
+                            },
+                            SwitchCase {
+                                pattern: Pattern::new(PatternKind::Nil, span),
+                                body: Block {
+                                    stmts: Vec::new(),
+                                    span,
+                                },
+                                span,
+                            },
+                        ],
+                    },
+                    span,
+                )],
+                span,
+            },
+        },
+        span,
+    );
+    let close_done = Stmt::new(
+        StmtKind::Expr(method_call("__cdt_done", "close", Vec::new(), span)),
+        span,
+    );
+    let ret_total = Stmt::new(
+        StmtKind::Return(Some(ident_expr("__cdt_total".to_string(), span))),
+        span,
+    );
+
+    Block {
+        stmts: vec![
+            done_chan,
+            spawn_workers,
+            init_total,
+            join_workers,
+            close_done,
+            ret_total,
+        ],
+        span,
+    }
 }
 
 fn join_route_prefix(prefix: &str, pat: &str) -> String {

@@ -7,6 +7,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Added
+
+* **Unified Declarative `app` Lifecycle (`cdt.app`, `app`)**:
+  * Added top-level `app Name { config, http <Router> on "<addr>", schedule, shutdown <duration>, on start, on stop }` declarations (`src/frontend/parser_cli.rs`, `src/frontend/check_sys.rs`, `src/frontend/reachability.rs`, `src/ir/{mod,bundle,lower_native}.rs`) coordinating validated configuration loading, HTTP serving, background `cron` scheduling, OS signal handling (`SIGINT`/`SIGTERM`), active `spawn` / `worker` task draining (`shutdown`, default `5s`), and ordered startup / reverse-order (`LIFO`) shutdown hooks.
+  * Added `cdt.app` runtime coordinator (`src/vm/exec_app.rs`) exposing `app.run<T>() -> Void | AppError`, `app.start<T>() -> App | AppError`, `App` (`.stop()`, `.is_running()`), and `AppError { kind, message }` (`"config_error"`, `"startup_error"`, `"bind_error"`, `"schedule_error"`, `"shutdown_error"`), plus LSP docs, TextMate/VitePress syntax highlighting, `docs/src/library/app.md`, and `examples/app_service/`.
+* **Declarative Channel `worker` Pools (`worker`, `cdt.chan`)**:
+  * Added top-level `[export] worker Name[<T, ...>](msg: MsgType, ...) [concurrency N] [retry R] [backoff D<ms|s|m|h>] [-> Void | Error] { ... }` declarations (`src/frontend/{parser_cli,check,check_sys,monomorph_reg,reachability}.rs`, `src/ir/{lower,lower_call,lower_native}.rs`) that consume `Chan<MsgType>` across `concurrency` worker threads with per-item retries, `backoff` sleeps, `?` / `defer` support, returning the completed item count (`Int`).
+  * Updated LSP docs, TextMate/VitePress highlighting, `docs/src/library/chan.md`, and `examples/redis_worker/`.
+* **Typed Channels (`cdt.chan` / `Chan<T>`), Background Tasks (`spawn`), Process Pipelines (`process.pipe`), Lifecycle Hooks & Range Loops**:
+  * Added Go-style bounded and unbounded typed channels (`cdt.chan` / `Chan<T>`, `chan.open<T>`, `.send`, `.try_send`, `.recv`, `.try_recv`, `.recv_timeout`, `.close`, `.len`, `.cap`, `.is_empty`, `.is_closed`, `for item in ch`) in `src/native/chan.rs` and `src/vm/exec_chan.rs`.
+  * Added `spawn { ... }` / `spawn expr` background tasks with thread-safe handle sharing and graceful task draining, `process.pipe(cmds)` multi-stage subprocess pipelines (`src/native/process.rs`), router/top-level `on start` / `on stop` lifecycle hooks (`src/vm/exec_http.rs`), Go-style integer range loops (`for i in N`, `for in N`, `for range N`), and empty list constructors (`[T]()`, `List<T>()`).
+
 ### Security
 
 * Discard caller-supplied HTTP headers for the rest of a redirect chain when the scheme, host, or port changes. This includes `http.Client` defaults, authentication headers, cookies, and custom headers.
@@ -18,6 +30,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Changed
 
+* Made `:=` variable bindings immutable by default (`var` required for mutable bindings).
+* Removed `panic = "abort"`, isolated `spawn` and HTTP worker panics via `catch_unwind`, and documented VM `// SAFETY:` invariants.
+* Optimized `ForRangeStep` modular arithmetic kernel, allocation-free `Cache.set`, lazy `req.params` / HTTP leaf dispatch, and `SwitchScalarTag` jump threading (`src/vm/exec.rs`, `src/vm/pipeline*.rs`, `src/native/cache.rs`).
 * Use the VM's record-map fast path for eligible `NewRecord` instructions emitted by the compiler. On macOS arm64, the median of three release runs of `collections.map_records` on 4,096 records fell from 161.1 µs to 97.7 µs.
 
 ## [0.3.4] - 2026-11-21

@@ -8,7 +8,7 @@
                 name: 'Conduit',
                 aliases: ['cdt'],
                 keywords: {
-                    keyword: 'func return if else guard while for in break continue switch case var const enum struct type error export import from as cli group cmd flag opt arg rest router before after static cors migration up down schedule every interval test',
+                    keyword: 'func return if else guard while for in break continue switch case var const enum struct type error export import from as cli group cmd flag opt arg rest router before after static cors migration up down schedule every interval worker concurrency retry backoff app shutdown test',
                     type: 'Int Float Bool String Void Map IndexError KeyError ParseError CliError EnvError FsError Reader Writer ProcessError Output CryptoError UrlError Url CsvError HttpError Request Response BinaryResponse Router DbError Connection Param CronError Scheduler Issue Violation ValidationError DecodeError EncodeError Duration Instant Timestamp TimeError',
                     literal: 'true false nil',
                     built_in: 'print map filter reduce assert assert_eq assert_ne fail'
