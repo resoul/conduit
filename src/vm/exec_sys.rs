@@ -2,10 +2,10 @@ use std::sync::Arc;
 
 use crate::native::crypto::{
     CRYPTO_B64_DEC, CRYPTO_B64_ENC, CRYPTO_CONST_TIME_EQ, CRYPTO_HASH_PASSWORD, CRYPTO_HEX_DEC,
-    CRYPTO_HEX_ENC, CRYPTO_HMAC_SHA256, CRYPTO_RAND_HEX, CRYPTO_RAND_INT, CRYPTO_SHA256,
-    CRYPTO_UUID_V4, CRYPTO_VERIFY_PASSWORD, constant_time_eq, decode_base64, decode_hex,
-    encode_base64, encode_hex, hash_password, hmac_sha256_bytes, random_bytes_hex, random_int,
-    sha256_bytes, uuid_v4, verify_password,
+    CRYPTO_HEX_ENC, CRYPTO_HMAC_SHA256, CRYPTO_PASSWORD_NEEDS_REHASH, CRYPTO_RAND_HEX,
+    CRYPTO_RAND_INT, CRYPTO_SHA256, CRYPTO_UUID_V4, CRYPTO_VERIFY_PASSWORD, constant_time_eq,
+    decode_base64, decode_hex, encode_base64, encode_hex, hash_password, hmac_sha256_bytes,
+    password_needs_rehash, random_bytes_hex, random_int, sha256_bytes, uuid_v4, verify_password,
 };
 use crate::native::path::{
     PATH_BASENAME, PATH_DIRNAME, PATH_EXT, PATH_IS_ABS, PATH_JOIN, PATH_JOIN_ALL, PATH_NORMALIZE,
@@ -213,6 +213,10 @@ impl Vm {
                 let s2 = self.sys_str(o_base, c, "crypto.constant_time_eq()")?;
                 self.scalars[s_base + a as usize] =
                     u64::from(constant_time_eq(s1.as_bytes(), s2.as_bytes()));
+            }
+            CRYPTO_PASSWORD_NEEDS_REHASH => {
+                let stored = self.sys_str(o_base, b, "crypto.password_needs_rehash()")?;
+                self.scalars[s_base + a as usize] = u64::from(password_needs_rehash(&stored));
             }
             _ => return Err(err_msg("Unknown crypto sub-op")),
         }

@@ -1173,10 +1173,10 @@ fn tls_server_end_point_hash(der: &[u8]) -> Vec<u8> {
     if let Ok(cert) = parse_x509(der) {
         match cert.sig_alg {
             SigAlg::RsaPkcs1(RsaHashAlg::Sha384)
-            | SigAlg::RsaPss(RsaHashAlg::Sha384)
+            | SigAlg::RsaPss { hash: RsaHashAlg::Sha384, .. }
             | SigAlg::EcdsaSha384 => return sha384_bytes(der).to_vec(),
             SigAlg::RsaPkcs1(RsaHashAlg::Sha512)
-            | SigAlg::RsaPss(RsaHashAlg::Sha512)
+            | SigAlg::RsaPss { hash: RsaHashAlg::Sha512, .. }
             | SigAlg::EcdsaSha512 => return sha512_bytes(der).to_vec(),
             _ => {}
         }

@@ -54,11 +54,18 @@ impl Vm {
                 };
                 let plan_idx = packed.get_scalar(0) as usize;
                 let leeway_secs = packed.get_scalar(1) as i64;
+                let require_exp = packed.scalar_len >= 3 && packed.get_scalar(2) != 0;
                 let Some(plan) = module.json_plans.get(plan_idx) else {
                     return Err(err_msg("JSON decode plan out of bounds in jwt.verify()"));
                 };
-                self.objs[o_base + a as usize] =
-                    jwt_verify(alg.as_str(), token.as_str(), secret.as_str(), leeway_secs, plan);
+                self.objs[o_base + a as usize] = jwt_verify(
+                    alg.as_str(),
+                    token.as_str(),
+                    secret.as_str(),
+                    leeway_secs,
+                    require_exp,
+                    plan,
+                );
             }
             JWT_DECODE_UNVERIFIED => {
                 let token = self.sys_str(o_base, b, "jwt.decode_unverified()")?;

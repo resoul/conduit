@@ -116,8 +116,19 @@ impl RsaPublicKey {
         em == expected
     }
 
-    /// Verify RSASSA-PSS signature over `digest` (salt_len == digest_len by default).
+    /// Verify RSASSA-PSS signature over `digest` requiring `salt_len == alg.digest_len()` (RFC 8446 §4.2.3).
     pub fn verify_pss(&self, alg: RsaHashAlg, digest: &[u8], sig: &[u8]) -> bool {
+        self.verify_pss_with_salt_len(alg, alg.digest_len(), digest, sig)
+    }
+
+    /// Verify RSASSA-PSS signature over `digest` with an explicit expected `salt_len`.
+    pub fn verify_pss_with_salt_len(
+        &self,
+        alg: RsaHashAlg,
+        expected_salt_len: usize,
+        digest: &[u8],
+        sig: &[u8],
+    ) -> bool {
         if digest.len() != alg.digest_len() || sig.len() != self.mod_bytes {
             return false;
         }
@@ -140,7 +151,7 @@ impl RsaPublicKey {
         };
 
         let h_len = alg.digest_len();
-        if em_len < h_len + 2 {
+        if em_len < h_len + expected_salt_len + 2 {
             return false;
         }
         if em[em_len - 1] != 0xbc {
@@ -175,9 +186,8 @@ impl RsaPublicKey {
             return false;
         }
         let salt = &db[one_pos + 1..];
-        // TLS 1.3 requires salt_len == h_len; X.509 typically uses salt_len == h_len (or 0..=h_len)
-        if salt.len() != h_len && !salt.is_empty() {
-            // Allow standard PSS salt lengths up to db_len
+        if salt.len() != expected_salt_len {
+            return false;
         }
 
         let mut m_prime = Vec::with_capacity(8 + h_len + salt.len());

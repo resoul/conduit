@@ -128,9 +128,16 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                     self.load_int_into(r, 0)?;
                     r
                 };
+                let req_exp_s = if let Some(re) = args.get(idx + 3) {
+                    self.lower_scalar(re)?
+                } else {
+                    let r = self.alloc_temp_s();
+                    self.ops.push(Op::LoadBool { dst: r, val: false });
+                    r
+                };
                 let packed = self.pack_record(
                     SCHEMA_JWT_ERROR,
-                    &[plan_s, leeway_s],
+                    &[plan_s, leeway_s, req_exp_s],
                     &[alg_o, token_o, secret_o],
                 )?;
                 let dst = self.alloc_temp_o();

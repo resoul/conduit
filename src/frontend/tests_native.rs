@@ -968,7 +968,9 @@ fn cdt_path_process_and_crypto_e2e() {
             u := crypto.uuid_v4()
             rh := crypto.random_bytes_hex(8)?
             ri := crypto.random_int(10, 20)?
-            return h + "|" + hm + "|" + b64 + "|" + b64d + "|" + hx + "|" + hxd + "|" + u.len().to_string() + "|" + rh.len().to_string() + "|" + (ri >= 10 && ri < 20).to_string()
+            needs_old := crypto.password_needs_rehash("pbkdf2-sha256$1000$00112233445566778899aabbccddeeff$00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
+            needs_bad := crypto.password_needs_rehash("invalid")
+            return h + "|" + hm + "|" + b64 + "|" + b64d + "|" + hx + "|" + hxd + "|" + u.len().to_string() + "|" + rh.len().to_string() + "|" + (ri >= 10 && ri < 20).to_string() + "|" + needs_old.to_string() + ":" + needs_bad.to_string()
         }
     "#;
 
@@ -1010,7 +1012,7 @@ fn cdt_path_process_and_crypto_e2e() {
     assert_eq!(
         vm.call_obj(&module, f_cryp, &[], &[]).unwrap(),
         Obj::str(
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad|f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8|SGVsbG8sIENvbmR1aXQh|Hello, Conduit!|415a|AZ|36|16|true"
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad|f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8|SGVsbG8sIENvbmR1aXQh|Hello, Conduit!|415a|AZ|36|16|true|true:true"
         )
     );
 }
@@ -1455,6 +1457,34 @@ fn cdt_http_client_loopback_e2e() {
     };
     assert_eq!(rec_to.schema_id, crate::vm::value::SCHEMA_HTTP_ERROR);
     assert_eq!(rec_to.get_obj(0), &Obj::str("invalid_timeout"));
+}
+
+#[test]
+fn cdt_http_client_deny_private_addrs_e2e() {
+    let src = r#"
+        import * as http from "cdt.http"
+
+        export func run() -> String {
+            c := http.client("http://127.0.0.1:8080").deny_private_addrs()
+            defer c.close()
+            var k1 = ""
+            switch c.get("/secret") {
+                case http.HttpError(e): k1 = e.kind
+                case http.Response(_): k1 = "unexpected"
+            }
+            var k2 = ""
+            switch c.get("http://169.254.169.254/latest/meta-data/") {
+                case http.HttpError(e): k2 = e.kind
+                case http.Response(_): k2 = "unexpected"
+            }
+            return "{k1}:{k2}"
+        }
+    "#;
+    let module = crate::frontend::compile_source(src).unwrap();
+    let fid = module.func_id("run").unwrap();
+    let mut vm = Vm::new();
+    let res = vm.call_obj(&module, fid, &[], &[]).unwrap();
+    assert_eq!(res, Obj::str("blocked_addr:blocked_addr"));
 }
 
 #[test]
@@ -2319,6 +2349,14 @@ fn cdt_jwt_sign_verify_hs256_hs512_expiry_and_bundle_e2e() {
             case Claims(_): nbf_kind = "unexpected"
         }
 
+        no_exp_tok := jwt.sign(Claims(sub: "noexp", role: "user"), secret)?
+        var miss_exp_kind = ""
+        switch jwt.verify<Claims>(no_exp_tok, secret, 0, true) {
+            case jwt.JwtError(e): miss_exp_kind = e.kind
+            case Claims(_): miss_exp_kind = "unexpected"
+        }
+        req_exp_ok := jwt.verify<Claims>(tok256, secret, 0, true)?
+
         unverified := jwt.decode_unverified<Claims>(tok512)?
 
         s1 := c256.sub
@@ -2326,7 +2364,8 @@ fn cdt_jwt_sign_verify_hs256_hs512_expiry_and_bundle_e2e() {
         s2 := c512.sub
         s_lw := leeway_ok.sub
         s_uv := unverified.sub
-        return "{s1}:{r1}:{has_exp}|{s2}|{bad_sig}:{alg_mismatch}:{bad_none}|{exp_kind}:{s_lw}|{nbf_kind}|{s_uv}"
+        s_re := req_exp_ok.sub
+        return "{s1}:{r1}:{has_exp}|{s2}|{bad_sig}:{alg_mismatch}:{bad_none}|{exp_kind}:{s_lw}|{nbf_kind}|{miss_exp_kind}:{s_re}|{s_uv}"
     }
     "#;
     let module = compile_source(src).unwrap();
@@ -2341,7 +2380,7 @@ fn cdt_jwt_sign_verify_hs256_hs512_expiry_and_bundle_e2e() {
         let out = vm.call_obj(m, f, &[], &[]).unwrap();
         assert_eq!(
             out,
-            Obj::str("u42:admin:true|u99|invalid_signature:unsupported_alg:unsupported_alg|expired:old|not_before|u99")
+            Obj::str("u42:admin:true|u99|invalid_signature:unsupported_alg:unsupported_alg|expired:old|not_before|missing_exp:u42|u99")
         );
     }
 }

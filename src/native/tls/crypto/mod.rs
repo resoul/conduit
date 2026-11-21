@@ -75,6 +75,17 @@ impl<T: Zeroize> Zeroize for Vec<T> {
     }
 }
 
+/// Zeroizes all allocated bytes of a `Vec<u8>` including spare capacity.
+#[inline]
+pub fn zeroize_vec_full(v: &mut Vec<u8>) {
+    let cap = v.capacity();
+    if cap > 0 {
+        v.resize(cap, 0);
+        v.as_mut_slice().zeroize();
+    }
+    v.clear();
+}
+
 /// Wrapper that automatically zeroizes its inner value on Drop.
 #[derive(Clone)]
 pub struct Zeroizing<T: Zeroize>(T);

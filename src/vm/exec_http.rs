@@ -8,7 +8,7 @@ use crate::ir::Module;
 use crate::native::http::{
     HttpClientState, MatchedParams, ReadHttpError, RouteEntry, RouterState,
     deadline_reader_writer_pair, header_key, http_client_bytes_request,
-    http_client_pooled_request, http_client_request, http_client_request_with_timeout,
+    http_client_pooled_request_with_options, http_client_request, http_client_request_with_timeout,
     lookup_route, make_http_client_obj, make_http_error, make_response_obj,
     make_response_with_body_obj, make_router_obj, read_http_request_deadline,
     resolve_client_url, route_prefix_matches, try_serve_static, write_error_response,
@@ -148,6 +148,7 @@ pub const HTTP_CLIENT_CLOSE: u8 = 48;
 pub const HTTP_CLIENT_POOL_STATS: u8 = 49;
 pub const HTTP_ROUTE_ON_START: u8 = 50;
 pub const HTTP_ROUTE_ON_STOP: u8 = 51;
+pub const HTTP_CLIENT_DENY_PRIVATE: u8 = 52;
 
 pub static SIGNAL_STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -1119,6 +1120,15 @@ impl Vm {
                 self.host.http_clients.push(next);
                 self.objs[o_base + a as usize] = make_http_client_obj(new_cid);
             }
+            HTTP_CLIENT_DENY_PRIVATE => {
+                let cid = self.extract_client_id(&self.objs[o_base + b as usize])?;
+                let deny = self.scalars[s_base + c as usize] != 0;
+                let mut next = self.host.http_clients[cid].clone();
+                next.deny_private_addrs = deny;
+                let new_cid = self.host.http_clients.len();
+                self.host.http_clients.push(next);
+                self.objs[o_base + a as usize] = make_http_client_obj(new_cid);
+            }
             HTTP_CLIENT_REQUEST => {
                 let cid = self.extract_client_id(&self.objs[o_base + b as usize])?;
                 let Obj::Record(packed) = &self.objs[o_base + c as usize] else {
@@ -1153,14 +1163,16 @@ impl Vm {
                 }
                 let full_url = resolve_client_url(&self.host.http_clients[cid].base_url, &path);
                 let timeout_ms = self.host.http_clients[cid].timeout_ms;
+                let deny_private = self.host.http_clients[cid].deny_private_addrs;
                 let pool = Arc::clone(&self.host.http_clients[cid].pool);
-                let resp = http_client_pooled_request(
+                let resp = http_client_pooled_request_with_options(
                     &method,
                     &full_url,
                     &body,
                     &hdrs,
                     timeout_ms,
                     &pool,
+                    deny_private,
                 );
                 self.objs[o_base + a as usize] = resp;
             }
@@ -1191,14 +1203,16 @@ impl Vm {
                     hdrs.push(("Accept".to_string(), "application/json".to_string()));
                 }
                 let timeout_ms = self.host.http_clients[cid].timeout_ms;
+                let deny_private = self.host.http_clients[cid].deny_private_addrs;
                 let pool = Arc::clone(&self.host.http_clients[cid].pool);
-                let resp = http_client_pooled_request(
+                let resp = http_client_pooled_request_with_options(
                     "GET",
                     &full_url,
                     "",
                     &hdrs,
                     timeout_ms,
                     &pool,
+                    deny_private,
                 );
                 let out = match &resp {
                     Obj::Record(rec) if rec.schema_id == SCHEMA_HTTP_RESPONSE => {
@@ -1239,8 +1253,17 @@ impl Vm {
                         }
                         let full_url = resolve_client_url(&self.host.http_clients[cid].base_url, &path);
                         let timeout_ms = self.host.http_clients[cid].timeout_ms;
+                        let deny_private = self.host.http_clients[cid].deny_private_addrs;
                         let pool = Arc::clone(&self.host.http_clients[cid].pool);
-                        http_client_pooled_request("POST", &full_url, &body, &hdrs, timeout_ms, &pool)
+                        http_client_pooled_request_with_options(
+                            "POST",
+                            &full_url,
+                            &body,
+                            &hdrs,
+                            timeout_ms,
+                            &pool,
+                            deny_private,
+                        )
                     }
                     Err(e) => make_http_error("encode_error", &e.message),
                 };

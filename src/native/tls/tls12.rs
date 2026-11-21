@@ -10,7 +10,7 @@ use crate::native::tls::crypto::hmac_hkdf::Hmac;
 use crate::native::tls::crypto::p256::ecdsa_p256_verify_der;
 use crate::native::tls::crypto::p384::ecdsa_p384_verify_der;
 use crate::native::tls::crypto::rsa::{RsaHashAlg, RsaPublicKey};
-use crate::native::tls::crypto::sha2::{Digest, Sha256, Sha384, Sha512};
+use crate::native::tls::crypto::sha2::{Digest, Sha256, Sha384};
 use crate::native::tls::error::TlsError;
 use crate::native::tls::handshake::{
     CipherSuite, HT_CERTIFICATE, HT_CERTIFICATE_REQUEST, HT_CLIENT_KEY_EXCHANGE, HT_FINISHED,
@@ -203,10 +203,12 @@ fn make_tls12_cipher_state(suite: CipherSuite, key: &[u8], iv: &[u8]) -> CipherS
     if suite.is_chacha() {
         let mut k32 = [0u8; 32];
         k32.copy_from_slice(key);
+        let aead = ChaCha20Poly1305::new(k32);
+        k32.zeroize();
         let mut iv12 = [0u8; 12];
         iv12.copy_from_slice(iv);
         CipherState::Tls12 {
-            cipher: AeadCipher::ChaCha20Poly1305(ChaCha20Poly1305::new(k32)),
+            cipher: AeadCipher::ChaCha20Poly1305(aead),
             implicit_iv: [0; 4],
             seq: 0,
             is_chacha: true,
@@ -342,6 +344,5 @@ fn parse_and_verify_ske(
             "TLS 1.2 ServerKeyExchange signature verification failed".to_string(),
         ));
     }
-    let _ = Sha512::new(); // keep Sha512 import clean if needed
     Ok((group, server_pub))
 }

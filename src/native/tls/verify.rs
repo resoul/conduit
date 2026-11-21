@@ -65,6 +65,7 @@ pub fn verify_server_cert(
     let mut sig_checks_left = MAX_SIG_CHECKS;
     if !build_and_verify_path(
         leaf,
+        leaf,
         &parsed,
         roots,
         &mut visited,
@@ -82,6 +83,7 @@ pub fn verify_server_cert(
 
 #[allow(clippy::too_many_arguments)]
 fn build_and_verify_path<'a>(
+    leaf: &X509Cert<'a>,
     current: &X509Cert<'a>,
     intermediates: &[X509Cert<'a>],
     roots: &RootStore,
@@ -114,7 +116,7 @@ fn build_and_verify_path<'a>(
         *sig_checks_left -= 1;
         if verify_signature(current, &root).is_ok() {
             if let Some(nc) = &root.name_constraints {
-                check_name_constraints_on_leaf(nc, intermediates[0].san.as_slice())?;
+                check_name_constraints_on_leaf(nc, leaf.san.as_slice())?;
             }
             return Ok(true);
         }
@@ -141,11 +143,12 @@ fn build_and_verify_path<'a>(
             continue;
         }
         if let Some(nc) = &cand.name_constraints {
-            check_name_constraints_on_leaf(nc, intermediates[0].san.as_slice())?;
+            check_name_constraints_on_leaf(nc, leaf.san.as_slice())?;
         }
         visited[idx] = true;
         path_indices.push(idx);
         if build_and_verify_path(
+            leaf,
             cand,
             intermediates,
             roots,
@@ -216,11 +219,18 @@ fn check_name_constraints_on_leaf(nc: &NameConstraints, san: &[SanEntry]) -> Res
 }
 
 fn dns_matches_constraint(dns: &str, constraint: &str) -> bool {
-    let c = constraint.trim_start_matches('.');
-    if dns == c {
+    let d = dns.trim_end_matches('.').to_ascii_lowercase();
+    let c = constraint
+        .trim_start_matches('.')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if d.is_empty() || c.is_empty() {
+        return false;
+    }
+    if d == c {
         return true;
     }
-    dns.ends_with(&format!(".{c}"))
+    d.ends_with(&format!(".{c}"))
 }
 
 pub fn verify_signature(child: &X509Cert<'_>, issuer: &X509Cert<'_>) -> Result<(), TlsError> {
@@ -248,14 +258,14 @@ pub fn verify_signature(child: &X509Cert<'_>, issuer: &X509Cert<'_>) -> Result<(
             let digest = alg.hash(child.tbs_raw);
             rsa.verify_pkcs1_v15(*alg, &digest, child.signature)
         }
-        (SigAlg::RsaPss(alg), SubjectPublicKey::Rsa { n, e }) => {
+        (SigAlg::RsaPss { hash, salt_len }, SubjectPublicKey::Rsa { n, e }) => {
             let Some(rsa) = RsaPublicKey::from_components(n, e) else {
                 return Err(TlsError::CertificateError(
-                    "invalid or too-small RSA public key (< 2048 bits)".to_string(),
+                    "invalid or <2048-bit RSA public key".to_string(),
                 ));
             };
-            let digest = alg.hash(child.tbs_raw);
-            rsa.verify_pss(*alg, &digest, child.signature)
+            let digest = hash.hash(child.tbs_raw);
+            rsa.verify_pss_with_salt_len(*hash, *salt_len, &digest, child.signature)
         }
         (SigAlg::EcdsaSha256, SubjectPublicKey::EcP256(pub_bytes)) => {
             let mut h = Sha256::new();
@@ -424,6 +434,10 @@ WXzLvyx+jgyLFnWKSF7Qj3o=
         assert!(!dns_wildcard_match("*.com", "example.com"));
         assert!(!dns_wildcard_match("foo*.example.com", "foobar.example.com"));
         assert!(dns_wildcard_match("db.internal", "db.internal"));
+
+        assert!(dns_matches_constraint("EVIL.example.com", "example.com"));
+        assert!(dns_matches_constraint("api.EXAMPLE.com.", ".example.com."));
+        assert!(!dns_matches_constraint("badexample.com", "example.com"));
     }
 
     #[test]

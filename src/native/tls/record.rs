@@ -2,7 +2,7 @@
 
 use std::io::{self, Read, Write};
 
-use crate::native::tls::crypto::Zeroize;
+use crate::native::tls::crypto::{Zeroize, zeroize_vec_full};
 use crate::native::tls::crypto::chacha_poly::ChaCha20Poly1305;
 use crate::native::tls::crypto::gcm::AesGcm;
 use crate::native::tls::error::{AlertDescription, TlsError};
@@ -15,6 +15,8 @@ pub const CT_APPLICATION_DATA: u8 = 23;
 pub const MAX_PLAINTEXT: usize = 16_384;
 pub const MAX_CIPHERTEXT_TLS13: usize = MAX_PLAINTEXT + 256;
 pub const MAX_CIPHERTEXT_TLS12: usize = MAX_PLAINTEXT + 2048;
+/// Fixed pre-allocated receive buffer larger than any single TLS 1.2/1.3 record (18,437 B).
+const RX_BUF_CAP: usize = 24 * 1024;
 /// Rekey before reaching AES-GCM 2^24.5 safety limit.
 pub const TLS13_REKEY_SEQ_LIMIT: u64 = 1 << 23;
 
@@ -86,13 +88,21 @@ impl CipherState {
 pub struct RecordLayer {
     pub read_state: CipherState,
     pub write_state: CipherState,
-    /// Raw incoming socket buffer for partial record assembly (especially in non-blocking probes).
+    /// Number of unencrypted ChangeCipherSpec records still allowed during TLS 1.3 handshake.
+    tls13_ccs_remaining: u8,
+    /// Fixed-length incoming socket buffer for zero-fill-free reads and in-place decryption.
     rx_buf: Vec<u8>,
     rx_pos: usize,
-    /// Reusable decrypted payload buffer.
-    pt_buf: Vec<u8>,
+    rx_end: usize,
     /// Reusable outgoing record buffer.
     tx_buf: Vec<u8>,
+}
+
+impl Drop for RecordLayer {
+    fn drop(&mut self) {
+        zeroize_vec_full(&mut self.rx_buf);
+        zeroize_vec_full(&mut self.tx_buf);
+    }
 }
 
 impl Default for RecordLayer {
@@ -106,21 +116,39 @@ impl RecordLayer {
         Self {
             read_state: CipherState::Plain,
             write_state: CipherState::Plain,
-            rx_buf: Vec::with_capacity(MAX_CIPHERTEXT_TLS13 + 5),
+            tls13_ccs_remaining: 0,
+            rx_buf: vec![0u8; RX_BUF_CAP],
             rx_pos: 0,
-            pt_buf: Vec::with_capacity(MAX_PLAINTEXT + 1),
+            rx_end: 0,
             tx_buf: Vec::with_capacity(MAX_CIPHERTEXT_TLS13 + 5),
         }
     }
 
-    fn compact_rx(&mut self) {
-        if self.rx_pos > 0 {
-            if self.rx_pos >= self.rx_buf.len() {
-                self.rx_buf.clear();
-            } else {
-                self.rx_buf.copy_within(self.rx_pos.., 0);
-                self.rx_buf.truncate(self.rx_buf.len() - self.rx_pos);
-            }
+    pub fn set_tls13_ccs_budget(&mut self, count: u8) {
+        self.tls13_ccs_remaining = count;
+    }
+
+    pub fn consume_plain_ccs(&mut self, payload: &[u8]) -> bool {
+        if self.tls13_ccs_remaining > 0 && payload == [1] {
+            self.tls13_ccs_remaining -= 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn compact_if_needed(&mut self, needed_record_total: Option<usize>) {
+        if self.rx_pos == self.rx_end {
+            self.rx_pos = 0;
+            self.rx_end = 0;
+            return;
+        }
+        if self.rx_pos > 0
+            && (self.rx_buf.len() - self.rx_end < 4096
+                || needed_record_total.is_some_and(|total| self.rx_pos + total > self.rx_buf.len()))
+        {
+            self.rx_buf.copy_within(self.rx_pos..self.rx_end, 0);
+            self.rx_end -= self.rx_pos;
             self.rx_pos = 0;
         }
     }
@@ -128,7 +156,9 @@ impl RecordLayer {
     /// Blocking read of one complete TLS record. Returns `(content_type, plaintext_slice)`.
     pub fn read_record(&mut self, stream: &mut impl Read) -> Result<(u8, &[u8]), TlsError> {
         loop {
-            if self.rx_buf.len() - self.rx_pos >= 5 {
+            let avail = self.rx_end - self.rx_pos;
+            let mut needed_total = None;
+            if avail >= 5 {
                 let hdr = &self.rx_buf[self.rx_pos..self.rx_pos + 5];
                 let ct = hdr[0];
                 let rec_len = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
@@ -142,25 +172,17 @@ impl RecordLayer {
                         description: AlertDescription::RecordOverflow,
                     });
                 }
-                if self.rx_buf.len() - self.rx_pos >= 5 + rec_len {
+                let total = 5 + rec_len;
+                if avail >= total {
                     return self.decrypt_buffered_record(ct, rec_len);
                 }
+                needed_total = Some(total);
             }
-            self.compact_rx();
-            let old_len = self.rx_buf.len();
-            self.rx_buf.resize(old_len + 8192, 0);
-            match stream.read(&mut self.rx_buf[old_len..]) {
-                Ok(0) => {
-                    self.rx_buf.truncate(old_len);
-                    return Err(TlsError::UnexpectedEof);
-                }
-                Ok(n) => {
-                    self.rx_buf.truncate(old_len + n);
-                }
-                Err(e) => {
-                    self.rx_buf.truncate(old_len);
-                    return Err(TlsError::from(e));
-                }
+            self.compact_if_needed(needed_total);
+            match stream.read(&mut self.rx_buf[self.rx_end..]) {
+                Ok(0) => return Err(TlsError::UnexpectedEof),
+                Ok(n) => self.rx_end += n,
+                Err(e) => return Err(TlsError::from(e)),
             }
         }
     }
@@ -172,7 +194,9 @@ impl RecordLayer {
         stream: &mut impl Read,
     ) -> Result<Option<(u8, &[u8])>, TlsError> {
         loop {
-            if self.rx_buf.len() - self.rx_pos >= 5 {
+            let avail = self.rx_end - self.rx_pos;
+            let mut needed_total = None;
+            if avail >= 5 {
                 let hdr = &self.rx_buf[self.rx_pos..self.rx_pos + 5];
                 let ct = hdr[0];
                 let rec_len = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
@@ -183,29 +207,18 @@ impl RecordLayer {
                 if rec_len > max_len {
                     return Err(TlsError::ProtocolError("record overflow".to_string()));
                 }
-                if self.rx_buf.len() - self.rx_pos >= 5 + rec_len {
+                let total = 5 + rec_len;
+                if avail >= total {
                     return self.decrypt_buffered_record(ct, rec_len).map(Some);
                 }
+                needed_total = Some(total);
             }
-            self.compact_rx();
-            let old_len = self.rx_buf.len();
-            self.rx_buf.resize(old_len + 4096, 0);
-            match stream.read(&mut self.rx_buf[old_len..]) {
-                Ok(0) => {
-                    self.rx_buf.truncate(old_len);
-                    return Err(TlsError::UnexpectedEof);
-                }
-                Ok(n) => {
-                    self.rx_buf.truncate(old_len + n);
-                }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    self.rx_buf.truncate(old_len);
-                    return Ok(None);
-                }
-                Err(e) => {
-                    self.rx_buf.truncate(old_len);
-                    return Err(TlsError::from(e));
-                }
+            self.compact_if_needed(needed_total);
+            match stream.read(&mut self.rx_buf[self.rx_end..]) {
+                Ok(0) => return Err(TlsError::UnexpectedEof),
+                Ok(n) => self.rx_end += n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+                Err(e) => return Err(TlsError::from(e)),
             }
         }
     }
@@ -218,22 +231,16 @@ impl RecordLayer {
         self.rx_pos = payload_end;
 
         match &mut self.read_state {
-            CipherState::Plain => {
-                self.pt_buf.clear();
-                self.pt_buf.extend_from_slice(&self.rx_buf[payload_start..payload_end]);
-                Ok((ct, &self.pt_buf))
-            }
+            CipherState::Plain => Ok((ct, &self.rx_buf[payload_start..payload_end])),
             CipherState::Tls13 { cipher, iv, seq } => {
-                // Allow unencrypted ChangeCipherSpec during TLS 1.3 handshake (RFC 8446 §5)
-                if ct == CT_CHANGE_CIPHER_SPEC && rec_len == 1 && self.rx_buf[payload_start] == 1 {
-                    self.pt_buf.clear();
-                    self.pt_buf.push(1);
-                    return Ok((CT_CHANGE_CIPHER_SPEC, &self.pt_buf));
-                }
-                if ct == CT_ALERT && rec_len == 2 {
-                    self.pt_buf.clear();
-                    self.pt_buf.extend_from_slice(&self.rx_buf[payload_start..payload_end]);
-                    return Ok((CT_ALERT, &self.pt_buf));
+                // Allow at most one unencrypted ChangeCipherSpec during TLS 1.3 handshake (RFC 8446 §5)
+                if ct == CT_CHANGE_CIPHER_SPEC
+                    && self.tls13_ccs_remaining > 0
+                    && rec_len == 1
+                    && self.rx_buf[payload_start] == 1
+                {
+                    self.tls13_ccs_remaining -= 1;
+                    return Ok((CT_CHANGE_CIPHER_SPEC, &self.rx_buf[payload_start..payload_end]));
                 }
                 if ct != CT_APPLICATION_DATA {
                     return Err(TlsError::ProtocolError(format!(
@@ -250,15 +257,13 @@ impl RecordLayer {
                 *seq = next_seq;
 
                 let ct_len = rec_len - 16;
-                self.pt_buf.clear();
-                self.pt_buf
-                    .extend_from_slice(&self.rx_buf[payload_start..payload_start + ct_len]);
                 let tag: [u8; 16] = self.rx_buf[payload_start + ct_len..payload_end]
                     .try_into()
                     .unwrap();
+                let pt_slice = &mut self.rx_buf[payload_start..payload_start + ct_len];
 
-                if !cipher.open_in_place(&nonce, &hdr, &mut self.pt_buf, &tag) {
-                    self.pt_buf.zeroize();
+                if !cipher.open_in_place(&nonce, &hdr, pt_slice, &tag) {
+                    pt_slice.zeroize();
                     return Err(TlsError::RemoteAlert {
                         level: 2,
                         description: AlertDescription::BadRecordMac,
@@ -266,16 +271,19 @@ impl RecordLayer {
                 }
 
                 // Strip trailing zero padding and read inner content type
-                while self.pt_buf.last() == Some(&0) {
-                    self.pt_buf.pop();
+                let mut end = payload_start + ct_len;
+                while end > payload_start && self.rx_buf[end - 1] == 0 {
+                    end -= 1;
                 }
-                let Some(inner_ct) = self.pt_buf.pop() else {
+                if end == payload_start {
                     return Err(TlsError::ProtocolError("empty TLSInnerPlaintext".to_string()));
-                };
-                if self.pt_buf.len() > MAX_PLAINTEXT {
+                }
+                end -= 1;
+                let inner_ct = self.rx_buf[end];
+                if end - payload_start > MAX_PLAINTEXT {
                     return Err(TlsError::ProtocolError("decrypted TLS 1.3 plaintext > 16 KiB".to_string()));
                 }
-                Ok((inner_ct, &self.pt_buf))
+                Ok((inner_ct, &self.rx_buf[payload_start..end]))
             }
             CipherState::Tls12 {
                 cipher,
@@ -284,11 +292,6 @@ impl RecordLayer {
                 is_chacha,
                 chacha_iv,
             } => {
-                if ct == CT_ALERT && rec_len == 2 {
-                    self.pt_buf.clear();
-                    self.pt_buf.extend_from_slice(&self.rx_buf[payload_start..payload_end]);
-                    return Ok((CT_ALERT, &self.pt_buf));
-                }
                 let next_seq = seq
                     .checked_add(1)
                     .ok_or(TlsError::CryptoError("TLS 1.2 read sequence overflow"))?;
@@ -305,20 +308,18 @@ impl RecordLayer {
                     }
                     let nonce = make_tls13_nonce(chacha_iv, cur_seq);
                     let aad = make_tls12_aad(cur_seq, ct, pt_len);
-                    self.pt_buf.clear();
-                    self.pt_buf
-                        .extend_from_slice(&self.rx_buf[payload_start..payload_start + pt_len]);
                     let tag: [u8; 16] = self.rx_buf[payload_start + pt_len..payload_end]
                         .try_into()
                         .unwrap();
-                    if !cipher.open_in_place(&nonce, &aad, &mut self.pt_buf, &tag) {
-                        self.pt_buf.zeroize();
+                    let pt_slice = &mut self.rx_buf[payload_start..payload_start + pt_len];
+                    if !cipher.open_in_place(&nonce, &aad, pt_slice, &tag) {
+                        pt_slice.zeroize();
                         return Err(TlsError::RemoteAlert {
                             level: 2,
                             description: AlertDescription::BadRecordMac,
                         });
                     }
-                    Ok((ct, &self.pt_buf))
+                    Ok((ct, &self.rx_buf[payload_start..payload_start + pt_len]))
                 } else {
                     if rec_len < 24 {
                         return Err(TlsError::DecodeError("TLS 1.2 AES-GCM ciphertext too short"));
@@ -331,21 +332,19 @@ impl RecordLayer {
                     nonce[..4].copy_from_slice(implicit_iv);
                     nonce[4..12].copy_from_slice(&self.rx_buf[payload_start..payload_start + 8]);
                     let aad = make_tls12_aad(cur_seq, ct, pt_len);
-                    self.pt_buf.clear();
-                    self.pt_buf.extend_from_slice(
-                        &self.rx_buf[payload_start + 8..payload_start + 8 + pt_len],
-                    );
-                    let tag: [u8; 16] = self.rx_buf[payload_start + 8 + pt_len..payload_end]
+                    let pt_start = payload_start + 8;
+                    let tag: [u8; 16] = self.rx_buf[pt_start + pt_len..payload_end]
                         .try_into()
                         .unwrap();
-                    if !cipher.open_in_place(&nonce, &aad, &mut self.pt_buf, &tag) {
-                        self.pt_buf.zeroize();
+                    let pt_slice = &mut self.rx_buf[pt_start..pt_start + pt_len];
+                    if !cipher.open_in_place(&nonce, &aad, pt_slice, &tag) {
+                        pt_slice.zeroize();
                         return Err(TlsError::RemoteAlert {
                             level: 2,
                             description: AlertDescription::BadRecordMac,
                         });
                     }
-                    Ok((ct, &self.pt_buf))
+                    Ok((ct, &self.rx_buf[pt_start..pt_start + pt_len]))
                 }
             }
         }

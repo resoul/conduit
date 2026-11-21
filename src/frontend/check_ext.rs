@@ -114,10 +114,10 @@ impl Checker<'_> {
                 }
                 let has_alg = sym == "verify_alg";
                 let min_args = if has_alg { 3 } else { 2 };
-                let max_args = min_args + 1;
+                let max_args = min_args + 2;
                 if !(min_args..=max_args).contains(&args.len()) {
                     return Err(format!(
-                        "jwt.{} expects {} or {} arguments",
+                        "jwt.{} expects {} to {} arguments",
                         sym, min_args, max_args
                     ));
                 }
@@ -137,11 +137,18 @@ impl Checker<'_> {
                     &Type::String,
                     &format!("jwt.{} secret", sym),
                 )?;
-                if args.len() == max_args {
+                if args.len() > min_args {
                     self.expect_arg_ty(
                         &mut args[idx_tok + 2],
                         &Type::Int,
                         &format!("jwt.{} leeway_secs", sym),
+                    )?;
+                }
+                if args.len() == max_args {
+                    self.expect_arg_ty(
+                        &mut args[idx_tok + 3],
+                        &Type::Bool,
+                        &format!("jwt.{} require_exp", sym),
                     )?;
                 }
                 Ok(Type::union(vec![target_ty, jwt_err]))

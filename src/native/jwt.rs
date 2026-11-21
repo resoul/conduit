@@ -600,6 +600,16 @@ impl JwtAlg {
     }
 }
 
+fn warn_if_short_secret(secret: &str) {
+    static WARNED_SHORT_SECRET: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if secret.len() < 32 && WARNED_SHORT_SECRET.set(()).is_ok() {
+        eprintln!(
+            "[cdt.jwt] WARNING: HMAC secret is {} bytes; recommend at least 32 random bytes",
+            secret.len()
+        );
+    }
+}
+
 pub fn jwt_sign(
     alg_str: &str,
     claims_obj: &Obj,
@@ -607,6 +617,7 @@ pub fn jwt_sign(
     ttl_secs: Option<i64>,
     schemas: &[StructSchema],
 ) -> Obj {
+    warn_if_short_secret(secret);
     let Some(alg) = JwtAlg::parse(alg_str) else {
         return make_jwt_error(
             "unsupported_alg",
@@ -660,8 +671,10 @@ pub fn jwt_verify(
     token: &str,
     secret: &str,
     leeway_secs: i64,
+    require_exp: bool,
     plan: &JsonDecodePlan,
 ) -> Obj {
+    warn_if_short_secret(secret);
     let Some(alg) = JwtAlg::parse(expected_alg_str) else {
         return make_jwt_error(
             "unsupported_alg",
@@ -723,7 +736,11 @@ pub fn jwt_verify(
                 return make_jwt_error("expired", "JWT token has expired");
             }
         }
-        Ok(None) => {}
+        Ok(None) => {
+            if require_exp {
+                return make_jwt_error("missing_exp", "JWT token is missing required 'exp' claim");
+            }
+        }
         Err(e) => return make_jwt_error("malformed", e),
     }
     match json_obj_get_i64(&pay_str, "nbf") {

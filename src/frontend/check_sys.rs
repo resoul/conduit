@@ -201,6 +201,22 @@ impl Checker<'_> {
                     Ok(Type::String)
                 }
             }
+            "password_needs_rehash" => {
+                if !type_args.is_empty() || !named_args.is_empty() || args.len() != 1 {
+                    return Err(
+                        "crypto.password_needs_rehash(encoded) expects 1 String argument"
+                            .to_string(),
+                    );
+                }
+                self.check_expr(&mut args[0], Some(&Type::String))?;
+                if args[0].ty != Type::String {
+                    return Err(format!(
+                        "crypto.password_needs_rehash expects String, got {}",
+                        args[0].ty
+                    ));
+                }
+                Ok(Type::Bool)
+            }
             "verify_password" | "constant_time_eq" => {
                 if !type_args.is_empty() || !named_args.is_empty() || args.len() != 2 {
                     return Err(format!("crypto.{}(a, b) expects 2 String arguments", sym));
@@ -962,6 +978,24 @@ impl Checker<'_> {
                 self.check_expr(&mut args[0], Some(&Type::Int))?;
                 if args[0].ty != Type::Int {
                     return Err(format!("Client.timeout_ms() expects Int, got {}", args[0].ty));
+                }
+                Ok(client_ty)
+            }
+            ("Client", "deny_private_addrs") => {
+                if args.len() > 1 {
+                    return Err(
+                        "Client.deny_private_addrs(enabled?: Bool) expects 0 or 1 argument"
+                            .to_string(),
+                    );
+                }
+                if let Some(arg) = args.get_mut(0) {
+                    self.check_expr(arg, Some(&Type::Bool))?;
+                    if arg.ty != Type::Bool {
+                        return Err(format!(
+                            "Client.deny_private_addrs() expects Bool, got {}",
+                            arg.ty
+                        ));
+                    }
                 }
                 Ok(client_ty)
             }

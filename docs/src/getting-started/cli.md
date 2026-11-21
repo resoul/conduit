@@ -67,7 +67,7 @@ conduit build main.cdt -o my_app
 ./my_app
 ```
 
-Resolves all relative module imports, performs tree-shaking and type-checking ahead of time, and emits a self-contained executable with embedded bytecode (`CDTB0001`). Runtime arguments passed to `./my_app` are forwarded directly to `env.args()` and `cdt.cli`.
+Resolves all relative module imports, performs tree-shaking and type-checking ahead of time, and emits a self-contained executable with SHA-256-verified embedded bytecode (`CDTB0002`). Runtime arguments passed to `./my_app` are forwarded directly to `env.args()` and `cdt.cli`.
 
 ### Watching & Auto-Reloading in Development
 

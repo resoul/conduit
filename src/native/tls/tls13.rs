@@ -120,7 +120,9 @@ pub fn make_tls13_cipher_state(suite: CipherSuite, traffic_secret: &[u8]) -> Cip
     let cipher = if suite.is_chacha() {
         let mut k32 = [0u8; 32];
         k32.copy_from_slice(&key);
-        AeadCipher::ChaCha20Poly1305(ChaCha20Poly1305::new(k32))
+        let aead = ChaCha20Poly1305::new(k32);
+        k32.zeroize();
+        AeadCipher::ChaCha20Poly1305(aead)
     } else {
         AeadCipher::AesGcm(Box::new(AesGcm::new(&key).expect("valid AES key length")))
     };
@@ -193,6 +195,7 @@ pub fn finish_tls13_handshake<S: Read + Write>(
 
     record.read_state = make_tls13_cipher_state(suite, &server_hs_secret);
     record.write_state = make_tls13_cipher_state(suite, &client_hs_secret);
+    record.set_tls13_ccs_budget(1);
 
     // 1. EncryptedExtensions
     let (mt, raw) = read_next_handshake(stream, &mut record, &mut hs_reader)?;
@@ -297,6 +300,7 @@ pub fn finish_tls13_handshake<S: Read + Write>(
     // Switch to application traffic keys
     record.read_state = make_tls13_cipher_state(suite, &server_app_secret);
     record.write_state = make_tls13_cipher_state(suite, &client_app_secret);
+    record.set_tls13_ccs_budget(0);
 
     Ok(HandshakeOutcome {
         record,
@@ -321,7 +325,17 @@ pub fn read_next_handshake<S: Read>(
         }
         let (ct, payload) = record.read_record(stream)?;
         match ct {
-            CT_CHANGE_CIPHER_SPEC => continue,
+            CT_CHANGE_CIPHER_SPEC => {
+                let valid_ccs = payload == [1];
+                if matches!(record.read_state, CipherState::Plain)
+                    && (!valid_ccs || !record.consume_plain_ccs(&[1]))
+                {
+                    return Err(TlsError::ProtocolError(
+                        "unexpected ChangeCipherSpec during handshake".to_string(),
+                    ));
+                }
+                continue;
+            }
             CT_HANDSHAKE => hs_reader.push_bytes(payload)?,
             CT_ALERT => {
                 if payload.len() >= 2 {
@@ -483,6 +497,7 @@ pub fn connect_tls_handshake<S: Read + Write>(
         // Send dummy ChangeCipherSpec for middlebox compatibility
         record.write_plain_with_legacy_ver(stream, CT_CHANGE_CIPHER_SPEC, 0x0303, &[1])?;
         record.write_plain_with_legacy_ver(stream, CT_HANDSHAKE, 0x0303, &ch2)?;
+        record.set_tls13_ccs_budget(1);
 
         let (mt2, raw_sh2) = read_next_handshake(stream, &mut record, &mut hs_reader)?;
         if mt2 != HT_SERVER_HELLO {

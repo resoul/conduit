@@ -70,6 +70,7 @@ If a pooled request fails while sending the request or parsing the response, the
 | `bearer` | `c.bearer(token: String) -> Client` | Sets `Authorization: Bearer <token>` on the client. |
 | `timeout_ms` | `c.timeout_ms(ms: Int) -> Client` | Sets request timeout in milliseconds. |
 | `base_url` | `c.base_url(url: String) -> Client` | Updates the client's `base_url`. |
+| `deny_private_addrs` | `c.deny_private_addrs(enabled?: Bool) -> Client` | Blocks loopback, private RFC 1918, CGNAT, link-local/metadata (`169.254.169.254`), and internal IPv6 addresses across URLs, DNS answers, and redirects (`"blocked_addr"`). Default `true` when called without arguments. |
 | `get` | `c.get(path: String) -> Response \| HttpError` | Pooled `GET` against `base_url + path` (or full URL). |
 | `delete` | `c.delete(path: String) -> Response \| HttpError` | Pooled `DELETE` request. |
 | `post` | `c.post(path: String, body: String) -> Response \| HttpError` | Pooled `POST` request with string `body`. |

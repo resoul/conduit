@@ -20,6 +20,7 @@ pub const CRYPTO_RAND_INT: u8 = 8;
 pub const CRYPTO_HASH_PASSWORD: u8 = 9;
 pub const CRYPTO_VERIFY_PASSWORD: u8 = 10;
 pub const CRYPTO_CONST_TIME_EQ: u8 = 11;
+pub const CRYPTO_PASSWORD_NEEDS_REHASH: u8 = 12;
 
 pub const MAX_PBKDF2_ITERATIONS: u32 = 10_000_000;
 const DEFAULT_PBKDF2_ITERATIONS: u32 = 600_000;
@@ -769,13 +770,14 @@ pub fn hash_password(password: &str) -> Obj {
     ))
 }
 
-pub fn verify_password(password: &str, stored: &str) -> bool {
+fn parse_pbkdf2_hash(stored: &str) -> Option<(u32, Vec<u8>, Vec<u8>)> {
     let mut parts = stored.split('$');
-    let valid_parts = match (parts.next(), parts.next(), parts.next(), parts.next(), parts.next()) {
+    match (parts.next(), parts.next(), parts.next(), parts.next(), parts.next()) {
         (Some("pbkdf2-sha256"), Some(iter_s), Some(salt_hex), Some(hash_hex), None) => {
             if let Ok(iters) = iter_s.parse::<u32>()
                 && (1..=MAX_PBKDF2_ITERATIONS).contains(&iters)
-                && let (Some(salt), Some(expected)) = (decode_hex_bytes(salt_hex), decode_hex_bytes(hash_hex))
+                && let (Some(salt), Some(expected)) =
+                    (decode_hex_bytes(salt_hex), decode_hex_bytes(hash_hex))
                 && expected.len() == 32
             {
                 Some((iters, salt, expected))
@@ -784,8 +786,11 @@ pub fn verify_password(password: &str, stored: &str) -> bool {
             }
         }
         _ => None,
-    };
-    if let Some((iters, salt, expected)) = valid_parts {
+    }
+}
+
+pub fn verify_password(password: &str, stored: &str) -> bool {
+    if let Some((iters, salt, expected)) = parse_pbkdf2_hash(stored) {
         let mut dk = [0u8; 32];
         pbkdf2_sha256(password.as_bytes(), &salt, iters, &mut dk);
         constant_time_eq(&dk, &expected)
@@ -795,6 +800,13 @@ pub fn verify_password(password: &str, stored: &str) -> bool {
         pbkdf2_sha256(password.as_bytes(), &[0u8; 16], 1, &mut dk);
         false
     }
+}
+
+pub fn password_needs_rehash(stored: &str) -> bool {
+    let Some((iters, salt, _expected)) = parse_pbkdf2_hash(stored) else {
+        return true;
+    };
+    salt.len() < 16 || iters < DEFAULT_PBKDF2_ITERATIONS
 }
 
 fn decode_hex_bytes(s: &str) -> Option<Vec<u8>> {
@@ -843,6 +855,21 @@ mod tests {
         assert!(verify_password("s3cr3t!", h.as_str()));
         assert!(!verify_password("wrong", h.as_str()));
         assert!(!verify_password("s3cr3t!", "bad$format"));
+        assert!(!password_needs_rehash(h.as_str()));
+        assert!(password_needs_rehash("bad$format"));
+        let weak = format!(
+            "pbkdf2-sha256$1000${}${}",
+            encode_hex(&[1u8; 16]),
+            encode_hex(&[2u8; 32])
+        );
+        assert!(password_needs_rehash(&weak));
+        let short_salt = format!(
+            "pbkdf2-sha256${}${}${}",
+            DEFAULT_PBKDF2_ITERATIONS,
+            encode_hex(&[1u8; 8]),
+            encode_hex(&[2u8; 32])
+        );
+        assert!(password_needs_rehash(&short_salt));
     }
 
     #[test]

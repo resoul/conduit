@@ -14,6 +14,7 @@ const OID_SHA1_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x
 const OID_SHA256_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b];
 const OID_SHA384_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0c];
 const OID_SHA512_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0d];
+const OID_MGF1: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x08];
 const OID_RSA_PSS: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a];
 
 const OID_SHA256: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
@@ -45,7 +46,7 @@ const OID_EKU_ANY: &[u8] = &[0x55, 0x1d, 0x25, 0x00];
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SigAlg {
     RsaPkcs1(RsaHashAlg),
-    RsaPss(RsaHashAlg),
+    RsaPss { hash: RsaHashAlg, salt_len: usize },
     EcdsaSha256,
     EcdsaSha384,
     EcdsaSha512,
@@ -289,7 +290,13 @@ fn parse_algorithm_id(reader: &mut DerReader<'_>) -> Result<SigAlg, TlsError> {
             if seq.is_empty() {
                 SigAlg::Unsupported
             } else {
-                parse_pss_params(&mut seq)?
+                let pss = parse_pss_params(&mut seq)?;
+                if !seq.is_empty() {
+                    return Err(TlsError::CertificateError(
+                        "trailing data in RSASSA-PSS AlgorithmIdentifier".to_string(),
+                    ));
+                }
+                pss
             }
         }
         _ => SigAlg::Unsupported,
@@ -297,29 +304,111 @@ fn parse_algorithm_id(reader: &mut DerReader<'_>) -> Result<SigAlg, TlsError> {
     Ok(alg)
 }
 
-fn parse_pss_params(reader: &mut DerReader<'_>) -> Result<SigAlg, TlsError> {
-    let mut params = reader.read_sequence()?;
-    let mut hash_alg = RsaHashAlg::Sha256; // RFC 4055 default is SHA-1, but we require explicit SHA-2
-    let mut saw_explicit_hash = false;
-    while !params.is_empty() {
-        let tlv = params.read_tlv()?;
-        if tlv.tag == 0xa0 {
-            let mut inner = tlv.reader()?;
-            let mut alg_seq = inner.read_sequence()?;
-            let oid = alg_seq.read_oid()?;
-            hash_alg = match oid {
-                OID_SHA256 => RsaHashAlg::Sha256,
-                OID_SHA384 => RsaHashAlg::Sha384,
-                OID_SHA512 => RsaHashAlg::Sha512,
-                _ => return Ok(SigAlg::WeakMd5OrSha1),
-            };
-            saw_explicit_hash = true;
+fn parse_sha2_alg_id(reader: &mut DerReader<'_>) -> Result<Option<RsaHashAlg>, TlsError> {
+    let mut alg_seq = reader.read_sequence()?;
+    let oid = alg_seq.read_oid()?;
+    if !alg_seq.is_empty() {
+        alg_seq.read_tag(TAG_NULL)?;
+        if !alg_seq.is_empty() {
+            return Err(TlsError::CertificateError(
+                "trailing parameters in PSS HashAlgorithm".to_string(),
+            ));
         }
     }
-    if !saw_explicit_hash {
+    Ok(match oid {
+        OID_SHA256 => Some(RsaHashAlg::Sha256),
+        OID_SHA384 => Some(RsaHashAlg::Sha384),
+        OID_SHA512 => Some(RsaHashAlg::Sha512),
+        _ => None,
+    })
+}
+
+pub(crate) fn parse_pss_params(reader: &mut DerReader<'_>) -> Result<SigAlg, TlsError> {
+    let mut params = reader.read_sequence()?;
+    let mut hash_alg: Option<RsaHashAlg> = None;
+    let mut mgf_hash: Option<RsaHashAlg> = None;
+    let mut saw_mgf = false;
+    let mut salt_len: usize = 20; // RFC 4055 default saltLength
+    let mut expected_min_tag: u8 = 0xa0;
+
+    while !params.is_empty() {
+        let tlv = params.read_tlv()?;
+        if !matches!(tlv.tag, 0xa0..=0xa3) || tlv.tag < expected_min_tag {
+            return Err(TlsError::CertificateError(
+                "invalid or out-of-order RSASSA-PSS-params field".to_string(),
+            ));
+        }
+        expected_min_tag = tlv.tag + 1;
+        let mut inner = tlv.reader()?;
+        match tlv.tag {
+            0xa0 => {
+                let Some(h) = parse_sha2_alg_id(&mut inner)? else {
+                    return Ok(SigAlg::WeakMd5OrSha1);
+                };
+                hash_alg = Some(h);
+            }
+            0xa1 => {
+                saw_mgf = true;
+                let mut mgf_seq = inner.read_sequence()?;
+                let mgf_oid = mgf_seq.read_oid()?;
+                if mgf_oid != OID_MGF1 {
+                    return Ok(SigAlg::Unsupported);
+                }
+                let Some(h) = parse_sha2_alg_id(&mut mgf_seq)? else {
+                    return Ok(SigAlg::WeakMd5OrSha1);
+                };
+                if !mgf_seq.is_empty() {
+                    return Err(TlsError::CertificateError(
+                        "trailing data in MGF1 AlgorithmIdentifier".to_string(),
+                    ));
+                }
+                mgf_hash = Some(h);
+            }
+            0xa2 => {
+                let int_bytes = inner.read_positive_integer_be()?;
+                if int_bytes.len() > 2 {
+                    return Err(TlsError::CertificateError("invalid PSS saltLength".to_string()));
+                }
+                let mut v = 0usize;
+                for &b in int_bytes {
+                    v = (v << 8) | (b as usize);
+                }
+                if v > 512 {
+                    return Err(TlsError::CertificateError("PSS saltLength exceeds 512".to_string()));
+                }
+                salt_len = v;
+            }
+            0xa3 => {
+                let int_bytes = inner.read_positive_integer_be()?;
+                if int_bytes != [1] {
+                    return Err(TlsError::CertificateError(
+                        "unsupported PSS trailerField".to_string(),
+                    ));
+                }
+            }
+            _ => unreachable!(),
+        }
+        if !inner.is_empty() {
+            return Err(TlsError::CertificateError(
+                "trailing data in RSASSA-PSS-params field".to_string(),
+            ));
+        }
+    }
+
+    let Some(hash) = hash_alg else {
+        // RFC 4055 default hash is SHA-1, which we reject
+        return Ok(SigAlg::WeakMd5OrSha1);
+    };
+    if !saw_mgf {
+        // RFC 4055 default maskGenAlgorithm is mgf1SHA1, which is weak / mismatched
         return Ok(SigAlg::WeakMd5OrSha1);
     }
-    Ok(SigAlg::RsaPss(hash_alg))
+    if mgf_hash != Some(hash) {
+        return Err(TlsError::CertificateError(
+            "RSASSA-PSS MGF1 hash does not match hashAlgorithm".to_string(),
+        ));
+    }
+    Ok(SigAlg::RsaPss { hash, salt_len })
 }
 
 fn parse_spki(reader: &mut DerReader<'_>) -> Result<SubjectPublicKey, TlsError> {
@@ -556,4 +645,71 @@ fn civil_to_unix(year: i64, month: i64, day: i64, hour: i64, min: i64, sec: i64)
 #[allow(dead_code)]
 fn _keep_tag_ia5_used() -> u8 {
     TAG_IA5_STRING
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wrap_tlv(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        assert!(body.len() < 128);
+        out.push(body.len() as u8);
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn alg_id(oid: &[u8]) -> Vec<u8> {
+        let mut body = wrap_tlv(0x06, oid);
+        body.extend_from_slice(&[0x05, 0x00]); // NULL
+        wrap_tlv(0x30, &body)
+    }
+
+    fn mgf1(hash_oid: &[u8]) -> Vec<u8> {
+        let mut body = wrap_tlv(0x06, OID_MGF1);
+        body.extend_from_slice(&alg_id(hash_oid));
+        wrap_tlv(0x30, &body)
+    }
+
+    #[test]
+    fn parse_pss_params_validates_hash_mgf_salt_and_trailer() {
+        // Valid SHA-256 + MGF1-SHA256 + saltLength 32 + trailerField 1
+        let mut valid_body = Vec::new();
+        valid_body.extend_from_slice(&wrap_tlv(0xa0, &alg_id(OID_SHA256)));
+        valid_body.extend_from_slice(&wrap_tlv(0xa1, &mgf1(OID_SHA256)));
+        valid_body.extend_from_slice(&wrap_tlv(0xa2, &wrap_tlv(0x02, &[32])));
+        valid_body.extend_from_slice(&wrap_tlv(0xa3, &wrap_tlv(0x02, &[1])));
+        let valid = wrap_tlv(0x30, &valid_body);
+        assert_eq!(
+            parse_pss_params(&mut DerReader::new(&valid)).unwrap(),
+            SigAlg::RsaPss {
+                hash: RsaHashAlg::Sha256,
+                salt_len: 32,
+            }
+        );
+
+        // Missing MGF1 (defaults to SHA-1) rejected as weak
+        let mut no_mgf_body = Vec::new();
+        no_mgf_body.extend_from_slice(&wrap_tlv(0xa0, &alg_id(OID_SHA256)));
+        let no_mgf = wrap_tlv(0x30, &no_mgf_body);
+        assert_eq!(
+            parse_pss_params(&mut DerReader::new(&no_mgf)).unwrap(),
+            SigAlg::WeakMd5OrSha1
+        );
+
+        // Mismatched MGF1 hash (SHA-256 + MGF1-SHA384) rejected
+        let mut mismatch_body = Vec::new();
+        mismatch_body.extend_from_slice(&wrap_tlv(0xa0, &alg_id(OID_SHA256)));
+        mismatch_body.extend_from_slice(&wrap_tlv(0xa1, &mgf1(OID_SHA384)));
+        let mismatch = wrap_tlv(0x30, &mismatch_body);
+        assert!(parse_pss_params(&mut DerReader::new(&mismatch)).is_err());
+
+        // Invalid trailerField != 1 rejected
+        let mut bad_trailer_body = Vec::new();
+        bad_trailer_body.extend_from_slice(&wrap_tlv(0xa0, &alg_id(OID_SHA256)));
+        bad_trailer_body.extend_from_slice(&wrap_tlv(0xa1, &mgf1(OID_SHA256)));
+        bad_trailer_body.extend_from_slice(&wrap_tlv(0xa3, &wrap_tlv(0x02, &[2])));
+        let bad_trailer = wrap_tlv(0x30, &bad_trailer_body);
+        assert!(parse_pss_params(&mut DerReader::new(&bad_trailer)).is_err());
+    }
 }

@@ -6,8 +6,8 @@ use crate::ir::lower::FnLowerer;
 use crate::ir::{FunctionProto, RecordDesc};
 use crate::native::crypto::{
     CRYPTO_B64_DEC, CRYPTO_B64_ENC, CRYPTO_CONST_TIME_EQ, CRYPTO_HASH_PASSWORD, CRYPTO_HEX_DEC,
-    CRYPTO_HEX_ENC, CRYPTO_HMAC_SHA256, CRYPTO_RAND_HEX, CRYPTO_RAND_INT, CRYPTO_SHA256,
-    CRYPTO_UUID_V4, CRYPTO_VERIFY_PASSWORD,
+    CRYPTO_HEX_ENC, CRYPTO_HMAC_SHA256, CRYPTO_PASSWORD_NEEDS_REHASH, CRYPTO_RAND_HEX,
+    CRYPTO_RAND_INT, CRYPTO_SHA256, CRYPTO_UUID_V4, CRYPTO_VERIFY_PASSWORD,
 };
 use crate::native::fs::{
     FS_APPEND_TEXT, FS_COPY, FS_EACH_LINE, FS_EXISTS, FS_IS_DIR, FS_IS_FILE, FS_LIST_DIR,
@@ -977,6 +977,18 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                 });
                 Ok(a)
             }
+            "password_needs_rehash" => {
+                let b = self.lower_obj(&args[0])?;
+                let a = self.alloc_temp_s();
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_CRYPTO_OP,
+                    aux: CRYPTO_PASSWORD_NEEDS_REHASH,
+                    a,
+                    b,
+                    c: 0,
+                });
+                Ok(a)
+            }
             "verify_password" | "constant_time_eq" => {
                 let b = self.lower_obj(&args[0])?;
                 let c = self.lower_obj(&args[1])?;
@@ -1527,6 +1539,24 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                     a: dst_o,
                     b: router_o,
                     c: ms_s,
+                });
+                Ok(dst_o)
+            }
+            ("Client", "deny_private_addrs") => {
+                let flag_s = if let Some(arg) = args.first() {
+                    self.lower_scalar(arg)?
+                } else {
+                    let r = self.alloc_temp_s();
+                    self.ops.push(Op::LoadBool { dst: r, val: true });
+                    r
+                };
+                let dst_o = self.alloc_temp_o();
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_HTTP_OP,
+                    aux: HTTP_CLIENT_DENY_PRIVATE,
+                    a: dst_o,
+                    b: router_o,
+                    c: flag_s,
                 });
                 Ok(dst_o)
             }

@@ -119,6 +119,25 @@ impl BigUint {
         res
     }
 
+    /// Subtracts `other` from `self` in place assuming `self >= other`.
+    fn sub_assign(&mut self, other: &Self) {
+        let mut borrow = 0u128;
+        for (i, limb) in self.limbs.iter_mut().enumerate() {
+            let a = *limb as u128;
+            let b = other.limbs.get(i).copied().unwrap_or(0) as u128;
+            let sub = b + borrow;
+            if a >= sub {
+                *limb = (a - sub) as u64;
+                borrow = 0;
+            } else {
+                *limb = ((1u128 << 64) + a - sub) as u64;
+                borrow = 1;
+            }
+        }
+        debug_assert_eq!(borrow, 0);
+        self.trim();
+    }
+
     /// Returns `self - other` assuming `self >= other`.
     pub fn sub_checked(&self, other: &Self) -> Option<Self> {
         if self.cmp_val(other) == Ordering::Less {
@@ -179,7 +198,9 @@ impl BigUint {
             return self.clone();
         }
         let bits = self.bit_len();
-        let mut rem = Self::zero();
+        let mut rem = Self {
+            limbs: Vec::with_capacity(modulus.limbs.len() + 1),
+        };
         for i in (0..bits).rev() {
             rem.shl1();
             if self.bit(i) {
@@ -189,10 +210,8 @@ impl BigUint {
                     rem.limbs[0] |= 1;
                 }
             }
-            if rem.cmp_val(modulus) != Ordering::Less
-                && let Some(diff) = rem.sub_checked(modulus)
-            {
-                rem = diff;
+            if rem.cmp_val(modulus) != Ordering::Less {
+                rem.sub_assign(modulus);
             }
         }
         rem
@@ -222,7 +241,7 @@ impl BigUint {
 
     /// Public-exponent modular exponentiation (uses Montgomery multiplication for odd moduli).
     pub fn mod_pow(&self, exp: &Self, m: &Self) -> Self {
-        if m.is_zero() {
+        if m.is_zero() || (m.limbs.len() == 1 && m.limbs[0] == 1) {
             return Self::zero();
         }
         if !m.is_even() {
@@ -243,39 +262,46 @@ impl BigUint {
     }
 
     fn mod_pow_montgomery(&self, exp: &Self, m: &Self) -> Self {
+        const STACK_MONT_LIMBS: usize = 64; // Up to 4096-bit RSA without heap allocations
         let k = m.limbs.len();
-        let n = &m.limbs;
-        let n0_inv = mont_n0_inv(n[0]);
-
-        // Compute R^2 mod m where R = 2^(64*k)
-        let mut r2 = Self::zero();
-        r2.limbs = vec![0u64; 2 * k + 1];
-        r2.limbs[2 * k] = 1;
-        let r2_mod = r2.rem(m);
-
         let base_mod = self.rem(m);
-        let mut base_limbs = vec![0u64; k];
-        base_limbs[..base_mod.limbs.len()].copy_from_slice(&base_mod.limbs);
-        let mut r2_limbs = vec![0u64; k];
-        r2_limbs[..r2_mod.limbs.len()].copy_from_slice(&r2_mod.limbs);
-
-        let base_mont = mont_mul(&base_limbs, &r2_limbs, n, n0_inv);
-        let mut one_limbs = vec![0u64; k];
-        one_limbs[0] = 1;
-        let mut acc_mont = mont_mul(&one_limbs, &r2_limbs, n, n0_inv);
-
-        let bits = exp.bit_len();
-        for i in (0..bits).rev() {
-            acc_mont = mont_mul(&acc_mont, &acc_mont, n, n0_inv);
-            if exp.bit(i) {
-                acc_mont = mont_mul(&acc_mont, &base_mont, n, n0_inv);
-            }
+        if k <= STACK_MONT_LIMBS {
+            let mut r1 = [0u64; STACK_MONT_LIMBS];
+            let mut r2 = [0u64; STACK_MONT_LIMBS];
+            let mut base_mont = [0u64; STACK_MONT_LIMBS];
+            let mut acc = [0u64; STACK_MONT_LIMBS];
+            let mut tmp = [0u64; STACK_MONT_LIMBS];
+            let mut scratch = [0u64; STACK_MONT_LIMBS + 2];
+            mod_pow_montgomery_bufs(
+                &base_mod,
+                exp,
+                m,
+                &mut r1[..k],
+                &mut r2[..k],
+                &mut base_mont[..k],
+                &mut acc[..k],
+                &mut tmp[..k],
+                &mut scratch[..k + 2],
+            )
+        } else {
+            let mut r1 = vec![0u64; k];
+            let mut r2 = vec![0u64; k];
+            let mut base_mont = vec![0u64; k];
+            let mut acc = vec![0u64; k];
+            let mut tmp = vec![0u64; k];
+            let mut scratch = vec![0u64; k + 2];
+            mod_pow_montgomery_bufs(
+                &base_mod,
+                exp,
+                m,
+                &mut r1,
+                &mut r2,
+                &mut base_mont,
+                &mut acc,
+                &mut tmp,
+                &mut scratch,
+            )
         }
-
-        let res_limbs = mont_mul(&acc_mont, &one_limbs, n, n0_inv);
-        let mut res = Self { limbs: res_limbs };
-        res.trim();
-        res
     }
 
     /// Modular inverse for prime modulus `p > 2` via Fermat's Little Theorem: `a^(p-2) mod p`.
@@ -289,6 +315,83 @@ impl BigUint {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn mod_pow_montgomery_bufs(
+    base_mod: &BigUint,
+    exp: &BigUint,
+    m: &BigUint,
+    r1: &mut [u64],
+    r2: &mut [u64],
+    base_mont: &mut [u64],
+    acc: &mut [u64],
+    tmp: &mut [u64],
+    scratch: &mut [u64],
+) -> BigUint {
+    if base_mod.is_zero() {
+        return if exp.is_zero() {
+            BigUint::one()
+        } else {
+            BigUint::zero()
+        };
+    }
+
+    let k = m.limbs.len();
+    let n = &m.limbs;
+    let n0_inv = mont_n0_inv(n[0]);
+
+    // Compute R mod m (R = 2^(64*k)) via allocation-free doublings from 2^(m_bits - 1) < m.
+    r1.fill(0);
+    let m_bits = m.bit_len();
+    r1[(m_bits - 1) / 64] = 1u64 << ((m_bits - 1) % 64);
+    for _ in (m_bits - 1)..(64 * k) {
+        double_mod(r1, n);
+    }
+
+    // Compute R^2 mod m: tmp = 2^64 * R mod m, then raise tmp to k in Montgomery domain.
+    tmp.copy_from_slice(r1);
+    for _ in 0..64 {
+        double_mod(tmp, n);
+    }
+    r2.copy_from_slice(tmp);
+    if k > 1 {
+        let top = (usize::BITS - 1 - k.leading_zeros()) as usize;
+        for bit in (0..top).rev() {
+            mont_mul_with_scratch(r2, r2, n, n0_inv, scratch, acc);
+            r2.copy_from_slice(acc);
+            if (k >> bit) & 1 != 0 {
+                mont_mul_with_scratch(r2, tmp, n, n0_inv, scratch, acc);
+                r2.copy_from_slice(acc);
+            }
+        }
+    }
+
+    tmp.fill(0);
+    tmp[..base_mod.limbs.len()].copy_from_slice(&base_mod.limbs);
+    mont_mul_with_scratch(tmp, r2, n, n0_inv, scratch, base_mont);
+
+    // Initialize acc = 1 * R mod m = R mod m.
+    acc.copy_from_slice(r1);
+    let mut acc_ref: &mut [u64] = acc;
+    let mut tmp_ref: &mut [u64] = tmp;
+
+    let bits = exp.bit_len();
+    for i in (0..bits).rev() {
+        mont_mul_with_scratch(acc_ref, acc_ref, n, n0_inv, scratch, tmp_ref);
+        std::mem::swap(&mut acc_ref, &mut tmp_ref);
+        if exp.bit(i) {
+            mont_mul_with_scratch(acc_ref, base_mont, n, n0_inv, scratch, tmp_ref);
+            std::mem::swap(&mut acc_ref, &mut tmp_ref);
+        }
+    }
+
+    mont_reduce_with_scratch(acc_ref, n, n0_inv, scratch, tmp_ref);
+    let mut res = BigUint {
+        limbs: tmp_ref.to_vec(),
+    };
+    res.trim();
+    res
+}
+
 /// Computes `-n0^-1 mod 2^64` for odd `n0` using Newton's method.
 #[inline]
 fn mont_n0_inv(n0: u64) -> u64 {
@@ -299,10 +402,83 @@ fn mont_n0_inv(n0: u64) -> u64 {
     x.wrapping_neg()
 }
 
-/// Montgomery multiplication `a * b * R^-1 mod n` (SOS/CIOS), `a.len() == b.len() == n.len() == k`.
-fn mont_mul(a: &[u64], b: &[u64], n: &[u64], n0_inv: u64) -> Vec<u64> {
+/// Doubles `buf` modulo `n` in place assuming `buf < n`.
+#[inline]
+fn double_mod(buf: &mut [u64], n: &[u64]) {
+    let mut carry = 0u64;
+    for w in buf.iter_mut() {
+        let next = *w >> 63;
+        *w = (*w << 1) | carry;
+        carry = next;
+    }
+    let mut ge = carry != 0;
+    if !ge {
+        ge = true;
+        for j in (0..n.len()).rev() {
+            if buf[j] != n[j] {
+                ge = buf[j] > n[j];
+                break;
+            }
+        }
+    }
+    if ge {
+        let mut borrow = 0u128;
+        for j in 0..n.len() {
+            let sub = (n[j] as u128) + borrow;
+            let bj = buf[j] as u128;
+            if bj >= sub {
+                buf[j] = (bj - sub) as u64;
+                borrow = 0;
+            } else {
+                buf[j] = ((1u128 << 64) + bj - sub) as u64;
+                borrow = 1;
+            }
+        }
+    }
+}
+
+#[inline]
+fn mont_cond_sub(t: &mut [u64], n: &[u64], out: &mut [u64]) {
     let k = n.len();
-    let mut t = vec![0u64; k + 2];
+    let mut ge = t[k] > 0;
+    if !ge {
+        ge = true;
+        for j in (0..k).rev() {
+            if t[j] != n[j] {
+                ge = t[j] > n[j];
+                break;
+            }
+        }
+    }
+    if ge {
+        let mut borrow = 0u128;
+        for j in 0..k {
+            let sub = (n[j] as u128) + borrow;
+            let tj = t[j] as u128;
+            if tj >= sub {
+                out[j] = (tj - sub) as u64;
+                borrow = 0;
+            } else {
+                out[j] = ((1u128 << 64) + tj - sub) as u64;
+                borrow = 1;
+            }
+        }
+    } else {
+        out.copy_from_slice(&t[..k]);
+    }
+}
+
+/// Montgomery multiplication `a * b * R^-1 mod n` (CIOS) writing the `k`-limb result into `out`.
+fn mont_mul_with_scratch(
+    a: &[u64],
+    b: &[u64],
+    n: &[u64],
+    n0_inv: u64,
+    t: &mut [u64],
+    out: &mut [u64],
+) {
+    let k = n.len();
+    t.fill(0);
     for &ai in a {
         let mut carry = 0u128;
         for j in 0..k {
@@ -326,39 +502,54 @@ fn mont_mul(a: &[u64], b: &[u64], n: &[u64], n0_inv: u64) -> Vec<u64> {
         t[k] = t[k + 1] + ((s2 >> 64) as u64);
         t[k + 1] = 0;
     }
+    mont_cond_sub(t, n, out);
+}
 
-    // Final conditional subtraction if t >= n
-    let mut ge = t[k] > 0;
-    if !ge {
-        ge = true;
-        for j in (0..k).rev() {
-            if t[j] != n[j] {
-                ge = t[j] > n[j];
-                break;
-            }
+/// Montgomery reduction `a * R^-1 mod n` writing the `k`-limb result into `out`.
+fn mont_reduce_with_scratch(
+    a: &[u64],
+    n: &[u64],
+    n0_inv: u64,
+    t: &mut [u64],
+    out: &mut [u64],
+) {
+    let k = n.len();
+    t[..k].copy_from_slice(a);
+    t[k] = 0;
+    t[k + 1] = 0;
+    for _ in 0..k {
+        let m = t[0].wrapping_mul(n0_inv);
+        let mut carry = ((m as u128) * (n[0] as u128) + (t[0] as u128)) >> 64;
+        for j in 1..k {
+            let p = (m as u128) * (n[j] as u128) + (t[j] as u128) + carry;
+            t[j - 1] = p as u64;
+            carry = p >> 64;
         }
+        let s = (t[k] as u128) + carry;
+        t[k - 1] = s as u64;
+        t[k] = (s >> 64) as u64;
     }
-    if ge {
-        let mut borrow = 0u128;
-        for j in 0..k {
-            let sub = (n[j] as u128) + borrow;
-            let tj = t[j] as u128;
-            if tj >= sub {
-                t[j] = (tj - sub) as u64;
-                borrow = 0;
-            } else {
-                t[j] = ((1u128 << 64) + tj - sub) as u64;
-                borrow = 1;
-            }
-        }
-    }
-    t.truncate(k);
-    t
+    mont_cond_sub(t, n, out);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mod_pow_naive(base: &BigUint, exp: &BigUint, m: &BigUint) -> BigUint {
+        let mut b = base.rem(m);
+        let mut res = BigUint::one().rem(m);
+        let bits = exp.bit_len();
+        for i in 0..bits {
+            if exp.bit(i) {
+                res = res.mod_mul(&b, m);
+            }
+            if i + 1 < bits {
+                b = b.mod_mul(&b, m);
+            }
+        }
+        res
+    }
 
     #[test]
     fn bigint_basic_arithmetic() {
@@ -374,5 +565,53 @@ mod tests {
         let p = g.mod_pow(&e, &m);
         // Verified against Python pow(5, 123456789, 1000000007) == 372224738
         assert_eq!(p, BigUint::from_u64(372_224_738));
+    }
+
+    #[test]
+    fn bigint_montgomery_mod_pow_edge_and_large_moduli() {
+        // Edge cases: m = 1, exp = 0, base = 0
+        let one = BigUint::one();
+        let zero = BigUint::zero();
+        let seven = BigUint::from_u64(7);
+        assert_eq!(seven.mod_pow(&BigUint::from_u64(5), &one), zero);
+        assert_eq!(zero.mod_pow(&zero, &seven), one);
+        assert_eq!(zero.mod_pow(&BigUint::from_u64(5), &seven), zero);
+        assert_eq!(seven.mod_pow(&zero, &BigUint::from_u64(13)), one);
+
+        // k = 6 (P-384 prime p): Fermat's Little Theorem and modular inverse
+        let p384_p_bytes = [
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xfe, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
+        ];
+        let p384_p = BigUint::from_be_bytes(&p384_p_bytes);
+        let p384_p_minus_1 = p384_p.sub_checked(&one).unwrap();
+        let val = BigUint::from_be_bytes(&[0xab; 47]);
+        assert_eq!(val.mod_pow(&p384_p_minus_1, &p384_p), one);
+        let inv = val.mod_inv_prime(&p384_p).unwrap();
+        assert_eq!(val.mod_mul(&inv, &p384_p), one);
+
+        // k = 32 (2048-bit odd modulus, stack Montgomery path) with e = 65537 vs naive mod_pow
+        let mut m2048_bytes = vec![0x81u8; 256];
+        m2048_bytes[255] = 0x5d;
+        let m2048 = BigUint::from_be_bytes(&m2048_bytes);
+        let e65537 = BigUint::from_u64(65537);
+        let base2048 = BigUint::from_be_bytes(&[0x3c; 255]);
+        assert_eq!(
+            base2048.mod_pow(&e65537, &m2048),
+            mod_pow_naive(&base2048, &e65537, &m2048)
+        );
+
+        // k = 65 (> STACK_MONT_LIMBS heap fallback path)
+        let mut m_heap_bytes = vec![0x93u8; 520];
+        m_heap_bytes[519] = 0x7b;
+        let m_heap = BigUint::from_be_bytes(&m_heap_bytes);
+        let e17 = BigUint::from_u64(17);
+        let base_heap = BigUint::from_be_bytes(&[0x55; 519]);
+        assert_eq!(
+            base_heap.mod_pow(&e17, &m_heap),
+            mod_pow_naive(&base_heap, &e17, &m_heap)
+        );
     }
 }

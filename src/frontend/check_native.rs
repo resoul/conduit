@@ -71,7 +71,7 @@ pub const NATIVE_MODULES: &[NativeModuleSpec] = &[
         fns: &[
             "sha256", "hmac_sha256", "base64_encode", "base64_decode", "hex_encode", "hex_decode",
             "uuid_v4", "random_bytes_hex", "random_int", "hash_password", "verify_password",
-            "constant_time_eq",
+            "constant_time_eq", "password_needs_rehash",
         ],
         types: &["CryptoError"],
     },

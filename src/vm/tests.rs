@@ -728,6 +728,17 @@ func main() -> String {
     let bundled = crate::ir::bundle::encode_bundle(&module, main_fid, crate::ir::bundle::RET_OBJ).unwrap();
     let (decoded, dec_fid, dec_tag) = crate::ir::bundle::decode_bundle(&bundled).unwrap();
     assert_eq!((dec_fid, dec_tag), (main_fid, crate::ir::bundle::RET_OBJ));
+    let mut tampered = bundled.clone();
+    let flip_idx = tampered.len() / 2;
+    tampered[flip_idx] ^= 0x01;
+    assert!(
+        crate::ir::bundle::decode_bundle(&tampered)
+            .unwrap_err()
+            .contains("checksum mismatch")
+    );
+    let mut extended = bundled.clone();
+    extended.push(0);
+    assert!(crate::ir::bundle::decode_bundle(&extended).is_err());
     let mut vm = Vm::new();
     let out = vm.call_obj(&decoded, dec_fid, &[], &[]).unwrap();
     assert_eq!(out, Obj::str("Ada:2:localhost"));

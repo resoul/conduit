@@ -82,6 +82,16 @@ impl Fe {
     }
 
     #[inline]
+    fn cswap(&mut self, other: &mut Self, cond: u32) {
+        let mask = 0u32.wrapping_sub(cond & 1);
+        for i in 0..8 {
+            let diff = mask & (self.0[i] ^ other.0[i]);
+            self.0[i] ^= diff;
+            other.0[i] ^= diff;
+        }
+    }
+
+    #[inline]
     fn add(self, rhs: Self) -> Self {
         let (sum, carry) = add_raw(&self.0, &rhs.0);
         let (reduced, borrow) = sub_raw(&sum, &P_U32);
@@ -257,6 +267,12 @@ impl JacobianPoint {
         z: Fe::ZERO,
     };
 
+    fn cswap(&mut self, other: &mut Self, cond: u32) {
+        self.x.cswap(&mut other.x, cond);
+        self.y.cswap(&mut other.y, cond);
+        self.z.cswap(&mut other.z, cond);
+    }
+
     fn cmov(&mut self, other: &Self, cond: u32) {
         self.x.cmov(&other.x, cond);
         self.y.cmov(&other.y, cond);
@@ -274,16 +290,18 @@ impl JacobianPoint {
             let p = t1.mul(t2);
             p.add(p).add(p) // 3 * (X - Z^2) * (X + Z^2)
         };
-        let x3 = alpha.sq().sub(beta.add(beta).add(beta).add(beta).add(beta).add(beta).add(beta).add(beta)); // - 8*beta
+        let b2 = beta.add(beta);
+        let b4 = b2.add(b2);
+        let b8 = b4.add(b4);
+        let x3 = alpha.sq().sub(b8);
         let z3 = self.y.add(self.z).sq().sub(gamma).sub(delta);
-        let four_beta = beta.add(beta).add(beta).add(beta);
         let eight_gamma2 = {
             let g2 = gamma.sq();
-            let g4 = g2.add(g2);
-            let g8 = g4.add(g4);
-            g8.add(g8) // wait: 8*gamma^2! g4 is 2*g2, g8 is 4*g2, so g8.add(g8) = 8*g2!
+            let two_g2 = g2.add(g2);
+            let four_g2 = two_g2.add(two_g2);
+            four_g2.add(four_g2)
         };
-        let y3 = alpha.mul(four_beta.sub(x3)).sub(eight_gamma2);
+        let y3 = alpha.mul(b4.sub(x3)).sub(eight_gamma2);
 
         let mut out = Self {
             x: x3,
@@ -295,8 +313,8 @@ impl JacobianPoint {
         out
     }
 
-    /// Constant-time Jacobian addition handling infinity and P == Q.
-    fn add_ct(&self, other: &Self) -> Self {
+    /// Constant-time Jacobian addition taking a precomputed `2 * self` (`dbl`).
+    fn add_ct_with_dbl(&self, other: &Self, dbl: &Self) -> Self {
         let z1z1 = self.z.sq();
         let z2z2 = other.z.sq();
         let u1 = self.x.mul(z2z2);
@@ -325,16 +343,85 @@ impl JacobianPoint {
         let h_zero = h.is_zero_ct();
         let r_zero = r.is_zero_ct();
 
-        let dbl = self.double();
         // If P == Q (h == 0 && r == 0 && neither inf), use doubled point
         let same = h_zero & r_zero & (self_inf ^ 1) & (other_inf ^ 1);
-        out.cmov(&dbl, same);
+        out.cmov(dbl, same);
         // If P == -Q (h == 0 && r != 0 && neither inf), infinity
         let neg = h_zero & (r_zero ^ 1) & (self_inf ^ 1) & (other_inf ^ 1);
         out.cmov(&Self::INFINITY, neg);
         out.cmov(other, self_inf);
         out.cmov(self, other_inf);
         out
+    }
+
+    /// Variable-time Jacobian addition for public inputs (ECDSA verification).
+    fn add_public(&self, other: &Self) -> Self {
+        if self.z == Fe::ZERO {
+            return *other;
+        }
+        if other.z == Fe::ZERO {
+            return *self;
+        }
+        let z1z1 = self.z.sq();
+        let z2z2 = other.z.sq();
+        let u1 = self.x.mul(z2z2);
+        let u2 = other.x.mul(z1z1);
+        let s1 = self.y.mul(other.z).mul(z2z2);
+        let s2 = other.y.mul(self.z).mul(z1z1);
+
+        let h = u2.sub(u1);
+        let r = s2.sub(s1);
+        if h == Fe::ZERO {
+            if r == Fe::ZERO {
+                return self.double();
+            }
+            return Self::INFINITY;
+        }
+        let hh = h.sq();
+        let hhh = hh.mul(h);
+        let v = u1.mul(hh);
+        let x3 = r.sq().sub(hhh).sub(v.add(v));
+        let y3 = r.mul(v.sub(x3)).sub(s1.mul(hhh));
+        let z3 = self.z.mul(other.z).mul(h);
+        Self {
+            x: x3,
+            y: y3,
+            z: z3,
+        }
+    }
+
+    /// Variable-time mixed Jacobian + affine (`z2 == 1`) addition for public inputs.
+    fn add_affine(&self, ax: Fe, ay: Fe) -> Self {
+        if self.z == Fe::ZERO {
+            return Self {
+                x: ax,
+                y: ay,
+                z: Fe::ONE,
+            };
+        }
+        let z1z1 = self.z.sq();
+        let u2 = ax.mul(z1z1);
+        let s2 = ay.mul(self.z).mul(z1z1);
+
+        let h = u2.sub(self.x);
+        let r = s2.sub(self.y);
+        if h == Fe::ZERO {
+            if r == Fe::ZERO {
+                return self.double();
+            }
+            return Self::INFINITY;
+        }
+        let hh = h.sq();
+        let hhh = hh.mul(h);
+        let v = self.x.mul(hh);
+        let x3 = r.sq().sub(hhh).sub(v.add(v));
+        let y3 = r.mul(v.sub(x3)).sub(self.y.mul(hhh));
+        let z3 = self.z.mul(h);
+        Self {
+            x: x3,
+            y: y3,
+            z: z3,
+        }
     }
 }
 
@@ -360,22 +447,54 @@ fn scalar_mul_ct(scalar: &[u8; 32], x: Fe, y: Fe) -> JacobianPoint {
     let base = JacobianPoint { x, y, z: Fe::ONE };
     let mut r0 = JacobianPoint::INFINITY;
     let mut r1 = base;
+    let mut prev = 0u32;
     for byte in scalar {
         for bit in (0..8).rev() {
             let b = ((*byte >> bit) & 1) as u32;
-            // Constant-time Montgomery ladder in Jacobian coordinates:
-            // if b == 0: r1 = r0 + r1; r0 = 2*r0
-            // if b == 1: r0 = r0 + r1; r1 = 2*r1
-            let sum = r0.add_ct(&r1);
-            let dbl0 = r0.double();
-            let dbl1 = r1.double();
-            r0.cmov(&dbl0, b ^ 1);
-            r0.cmov(&sum, b);
-            r1.cmov(&sum, b ^ 1);
-            r1.cmov(&dbl1, b);
+            let swap = b ^ prev;
+            r0.cswap(&mut r1, swap);
+            prev = b;
+            // After cswap: always compute r1 = r0 + r1; r0 = 2*r0
+            let dbl = r0.double();
+            r1 = r0.add_ct_with_dbl(&r1, &dbl);
+            r0 = dbl;
         }
     }
+    r0.cswap(&mut r1, prev);
     r0
+}
+
+fn scalar_mul_shamir(
+    u1: &[u8; 32],
+    gx: Fe,
+    gy: Fe,
+    u2: &[u8; 32],
+    qx: Fe,
+    qy: Fe,
+) -> JacobianPoint {
+    let g = JacobianPoint {
+        x: gx,
+        y: gy,
+        z: Fe::ONE,
+    };
+    let g_plus_q = g.add_affine(qx, qy);
+    let mut acc = JacobianPoint::INFINITY;
+    for byte_idx in 0..32 {
+        let b1 = u1[byte_idx];
+        let b2 = u2[byte_idx];
+        for bit in (0..8).rev() {
+            if acc.z != Fe::ZERO {
+                acc = acc.double();
+            }
+            match (((b1 >> bit) & 1) != 0, ((b2 >> bit) & 1) != 0) {
+                (true, true) => acc = acc.add_public(&g_plus_q),
+                (true, false) => acc = acc.add_affine(gx, gy),
+                (false, true) => acc = acc.add_affine(qx, qy),
+                (false, false) => {}
+            }
+        }
+    }
+    acc
 }
 
 /// Compute P-256 public key (uncompressed 65 bytes: `0x04 || x || y`) from 32-byte scalar.
@@ -465,9 +584,14 @@ pub fn ecdsa_p256_verify_rs(
     let gx = Fe::from_be_bytes(&GX_BE).unwrap();
     let gy = Fe::from_be_bytes(&GY_BE).unwrap();
 
-    let p1 = scalar_mul_ct(&u1.try_into().unwrap(), gx, gy);
-    let p2 = scalar_mul_ct(&u2.try_into().unwrap(), qx, qy);
-    let sum = p1.add_ct(&p2);
+    let sum = scalar_mul_shamir(
+        &u1.try_into().unwrap(),
+        gx,
+        gy,
+        &u2.try_into().unwrap(),
+        qx,
+        qy,
+    );
     if sum.z.is_zero_ct() == 1 {
         return false;
     }
@@ -548,5 +672,40 @@ mod tests {
 
         // r >= n fails
         assert!(!ecdsa_p256_verify_rs(&pubkey, &digest, &N_BE, &s));
+    }
+
+    #[test]
+    fn p256_scalar_mul_edge_cases() {
+        let gx = Fe::from_be_bytes(&GX_BE).unwrap();
+        let gy = Fe::from_be_bytes(&GY_BE).unwrap();
+        let to_affine = |pt: JacobianPoint| {
+            let z_inv = pt.z.inv();
+            let z_inv2 = z_inv.sq();
+            let z_inv3 = z_inv2.mul(z_inv);
+            (pt.x.mul(z_inv2).to_be_bytes(), pt.y.mul(z_inv3).to_be_bytes())
+        };
+
+        let mut s1 = [0u8; 32];
+        s1[31] = 1;
+        assert_eq!(to_affine(scalar_mul_ct(&s1, gx, gy)), (GX_BE, GY_BE));
+
+        let mut s2 = [0u8; 32];
+        s2[31] = 2;
+        let p2_ct = to_affine(scalar_mul_ct(&s2, gx, gy));
+        let p2_dbl = to_affine(JacobianPoint { x: gx, y: gy, z: Fe::ONE }.double());
+        assert_eq!(p2_ct, p2_dbl);
+
+        let mut s3 = [0u8; 32];
+        s3[31] = 3;
+        let p3_ct = to_affine(scalar_mul_ct(&s3, gx, gy));
+        let p2_jac = JacobianPoint { x: gx, y: gy, z: Fe::ONE }.double();
+        let p3_add = to_affine(p2_jac.add_affine(gx, gy));
+        assert_eq!(p3_ct, p3_add);
+
+        let mut n_minus_1 = N_BE;
+        n_minus_1[31] -= 1;
+        let (rx, ry) = to_affine(scalar_mul_ct(&n_minus_1, gx, gy));
+        assert_eq!(rx, GX_BE);
+        assert_eq!(ry, Fe::ZERO.sub(gy).to_be_bytes());
     }
 }

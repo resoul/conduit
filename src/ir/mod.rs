@@ -1032,8 +1032,12 @@ impl Module {
                                 }
                             }
                             crate::vm::opcode::EXT_CRYPTO_OP => match aux {
-                                0 | 2..=5 | 9 => {
-                                    check_o(a, &ctx)?;
+                                0 | 2..=5 | 9 | 12 => {
+                                    if aux == 12 {
+                                        check_s(a, &ctx)?;
+                                    } else {
+                                        check_o(a, &ctx)?;
+                                    }
                                     check_o(b, &ctx)?;
                                 }
                                 1 => {
@@ -1187,7 +1191,7 @@ impl Module {
                                     check_o(b, &ctx)?;
                                     check_o(c, &ctx)?;
                                 }
-                                43 => {
+                                43 | 52 => {
                                     check_o(a, &ctx)?;
                                     check_o(b, &ctx)?;
                                     check_s(c, &ctx)?;
@@ -1475,6 +1479,11 @@ impl Module {
                 return Err(format!("Test '{}' func_id out of bounds", test.name));
             }
         }
+        for &fid in self.on_start_funcs.iter().chain(self.on_stop_funcs.iter()) {
+            if (fid as usize) >= self.functions.len() {
+                return Err(format!("Module lifecycle hook func_id {} out of bounds", fid));
+            }
+        }
         Ok(())
     }
 
@@ -1571,5 +1580,15 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn validates_module_lifecycle_hook_bounds() {
+        let mut module = Module::new();
+        module.on_start_funcs.push(99);
+        assert!(module.validate().unwrap_err().contains("lifecycle hook"));
+        module.on_start_funcs.clear();
+        module.on_stop_funcs.push(42);
+        assert!(module.validate().unwrap_err().contains("lifecycle hook"));
     }
 }

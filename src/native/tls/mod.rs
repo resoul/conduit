@@ -16,9 +16,12 @@ use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
+use crate::native::tls::crypto::{Zeroize, zeroize_vec_full};
 use crate::native::tls::error::{AlertDescription, TlsError};
 use crate::native::tls::handshake::{HT_KEY_UPDATE, HT_NEW_SESSION_TICKET, HandshakeReader, wrap_handshake};
 use crate::native::tls::record::{CT_ALERT, CT_APPLICATION_DATA, CT_HANDSHAKE, RecordLayer};
+
+const MAX_TLS13_KEY_UPDATES: u32 = 32;
 use crate::native::tls::roots::RootSource;
 use crate::native::tls::tls13::{
     Tls13Secrets, connect_tls_handshake, derive_next_app_secret, make_tls13_cipher_state,
@@ -70,6 +73,13 @@ pub struct TlsStream<S: Read + Write> {
     alpn: Option<Vec<u8>>,
     leaf_cert_der: Option<Vec<u8>>,
     tls13_secrets: Option<Tls13Secrets>,
+    peer_key_updates: u32,
+}
+
+impl<S: Read + Write> Drop for TlsStream<S> {
+    fn drop(&mut self) {
+        zeroize_vec_full(&mut self.app_buf);
+    }
 }
 
 impl<S: Read + Write> TlsStream<S> {
@@ -99,6 +109,12 @@ impl<S: Read + Write> TlsStream<S> {
                 HT_KEY_UPDATE => {
                     if raw.len() != 5 {
                         return Err(TlsError::DecodeError("invalid KeyUpdate length"));
+                    }
+                    self.peer_key_updates = self.peer_key_updates.saturating_add(1);
+                    if self.peer_key_updates > MAX_TLS13_KEY_UPDATES {
+                        return Err(TlsError::ProtocolError(
+                            "excessive TLS 1.3 KeyUpdate messages".to_string(),
+                        ));
                     }
                     let req = raw[4];
                     if req > 1 {
@@ -160,7 +176,7 @@ impl<S: Read + Write> Read for TlsStream<S> {
                 buf[..n].copy_from_slice(&self.app_buf[self.app_pos..self.app_pos + n]);
                 self.app_pos += n;
                 if self.app_pos == self.app_buf.len() {
-                    self.app_buf.clear();
+                    self.app_buf.zeroize();
                     self.app_pos = 0;
                 }
                 return Ok(n);
@@ -176,9 +192,14 @@ impl<S: Read + Write> Read for TlsStream<S> {
             match ct {
                 CT_APPLICATION_DATA => {
                     if !payload.is_empty() {
-                        self.app_buf.clear();
-                        self.app_pos = 0;
-                        self.app_buf.extend_from_slice(payload);
+                        let n = payload.len().min(buf.len());
+                        buf[..n].copy_from_slice(&payload[..n]);
+                        if n < payload.len() {
+                            self.app_buf.clear();
+                            self.app_pos = 0;
+                            self.app_buf.extend_from_slice(&payload[n..]);
+                        }
+                        return Ok(n);
                     }
                 }
                 CT_HANDSHAKE => {
@@ -275,7 +296,33 @@ pub fn connect(tcp: TcpStream, cfg: &TlsConfig) -> Result<TlsStream<TcpStream>, 
     res
 }
 
+fn is_loopback_host(host: &str) -> bool {
+    let trimmed = host.trim_end_matches('.');
+    let unbracketed = trimmed
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(trimmed);
+    unbracketed.eq_ignore_ascii_case("localhost")
+        || unbracketed
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.to_canonical().is_loopback())
+}
+
+fn warn_if_insecure_disable(cfg: &TlsConfig) {
+    static WARNED_DISABLE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if cfg.verify == VerifyMode::Disable
+        && !is_loopback_host(&cfg.server_name)
+        && WARNED_DISABLE.set(()).is_ok()
+    {
+        eprintln!(
+            "[cdt.tls] WARNING: TLS certificate verification is disabled for non-loopback host '{}'",
+            cfg.server_name
+        );
+    }
+}
+
 pub fn connect_stream<S: Read + Write>(mut stream: S, cfg: &TlsConfig) -> Result<TlsStream<S>, TlsError> {
+    warn_if_insecure_disable(cfg);
     let allow_tls12 = cfg.min_version == TlsVersion::Tls12;
     let outcome = connect_tls_handshake(&mut stream, cfg, allow_tls12)?;
     Ok(TlsStream {
@@ -288,6 +335,7 @@ pub fn connect_stream<S: Read + Write>(mut stream: S, cfg: &TlsConfig) -> Result
         alpn: outcome.alpn,
         leaf_cert_der: outcome.leaf_cert_der,
         tls13_secrets: outcome.tls13_secrets,
+        peer_key_updates: 0,
     })
 }
 
@@ -500,6 +548,7 @@ mod tests {
             alpn: None,
             leaf_cert_der: None,
             tls13_secrets: None,
+            peer_key_updates: 0,
         };
         tls_eof.record.read_state = CipherState::Tls13 {
             cipher: cipher.clone(),
@@ -527,14 +576,124 @@ mod tests {
             alpn: None,
             leaf_cert_der: None,
             tls13_secrets: None,
+            peer_key_updates: 0,
         };
         tls_mac.record.read_state = CipherState::Tls13 {
-            cipher,
+            cipher: cipher.clone(),
             iv,
             seq: 0,
         };
         let err_mac = tls_mac.read(&mut buf).unwrap_err();
         assert_eq!(err_mac.kind(), io::ErrorKind::InvalidData);
+
+        // 3. Forged plaintext close_notify alert rejected in both TLS 1.3 and TLS 1.2 encrypted states
+        let forged_close_notify = [CT_ALERT, 0x03, 0x03, 0x00, 0x02, 0x01, 0x00];
+        let mut tls13_forged = TlsStream {
+            inner: MockPipe {
+                rx: Cursor::new(forged_close_notify.to_vec()),
+                tx: Vec::new(),
+            },
+            record: RecordLayer::new(),
+            hs_reader: HandshakeReader::new(),
+            app_buf: Vec::new(),
+            app_pos: 0,
+            eof_clean: false,
+            alpn: None,
+            leaf_cert_der: None,
+            tls13_secrets: None,
+            peer_key_updates: 0,
+        };
+        tls13_forged.record.read_state = CipherState::Tls13 {
+            cipher: cipher.clone(),
+            iv,
+            seq: 0,
+        };
+        assert_eq!(
+            tls13_forged.read(&mut buf).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let mut tls12_forged = TlsStream {
+            inner: MockPipe {
+                rx: Cursor::new(forged_close_notify.to_vec()),
+                tx: Vec::new(),
+            },
+            record: RecordLayer::new(),
+            hs_reader: HandshakeReader::new(),
+            app_buf: Vec::new(),
+            app_pos: 0,
+            eof_clean: false,
+            alpn: None,
+            leaf_cert_der: None,
+            tls13_secrets: None,
+            peer_key_updates: 0,
+        };
+        tls12_forged.record.read_state = CipherState::Tls12 {
+            cipher: cipher.clone(),
+            implicit_iv: [0x22; 4],
+            seq: 0,
+            is_chacha: false,
+            chacha_iv: [0; 12],
+        };
+        assert_eq!(
+            tls12_forged.read(&mut buf).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        // 4. Unencrypted TLS 1.3 ChangeCipherSpec limited by budget
+        let ccs_rec = [
+            crate::native::tls::record::CT_CHANGE_CIPHER_SPEC,
+            0x03,
+            0x03,
+            0x00,
+            0x01,
+            0x01,
+        ];
+        let mut tls13_ccs_zero = RecordLayer::new();
+        tls13_ccs_zero.read_state = CipherState::Tls13 {
+            cipher: cipher.clone(),
+            iv,
+            seq: 0,
+        };
+        let mut cur_zero = Cursor::new(ccs_rec);
+        assert!(tls13_ccs_zero.read_record(&mut cur_zero).is_err());
+
+        let mut tls13_ccs_one = RecordLayer::new();
+        tls13_ccs_one.read_state = CipherState::Tls13 {
+            cipher,
+            iv,
+            seq: 0,
+        };
+        tls13_ccs_one.set_tls13_ccs_budget(1);
+        let two_ccs = [ccs_rec.as_slice(), ccs_rec.as_slice()].concat();
+        let mut cur_two = Cursor::new(two_ccs);
+        assert_eq!(
+            tls13_ccs_one.read_record(&mut cur_two).unwrap().0,
+            crate::native::tls::record::CT_CHANGE_CIPHER_SPEC
+        );
+        assert!(tls13_ccs_one.read_record(&mut cur_two).is_err());
+
+        // 5. KeyUpdate flooding rejected after MAX_TLS13_KEY_UPDATES
+        let mut tls_ku = TlsStream {
+            inner: MockPipe {
+                rx: Cursor::new(Vec::new()),
+                tx: Vec::new(),
+            },
+            record: RecordLayer::new(),
+            hs_reader: HandshakeReader::new(),
+            app_buf: Vec::new(),
+            app_pos: 0,
+            eof_clean: false,
+            alpn: None,
+            leaf_cert_der: None,
+            tls13_secrets: None,
+            peer_key_updates: 0,
+        };
+        let single_ku = wrap_handshake(HT_KEY_UPDATE, &[0]);
+        for _ in 0..MAX_TLS13_KEY_UPDATES {
+            tls_ku.handle_post_handshake_bytes(&single_ku).unwrap();
+        }
+        assert!(tls_ku.handle_post_handshake_bytes(&single_ku).is_err());
     }
 
     #[test]
@@ -665,6 +824,145 @@ mod tests {
             let _ = child.wait();
         }
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn record_layer_in_place_roundtrip_and_chunked_streaming() {
+        use crate::native::tls::crypto::chacha_poly::ChaCha20Poly1305;
+        use crate::native::tls::crypto::gcm::AesGcm;
+        use crate::native::tls::record::{AeadCipher, CipherState, MAX_PLAINTEXT};
+
+        struct OneByteReader {
+            data: Vec<u8>,
+            pos: usize,
+        }
+        impl Read for OneByteReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.pos >= self.data.len() || buf.is_empty() {
+                    return Ok(0);
+                }
+                buf[0] = self.data[self.pos];
+                self.pos += 1;
+                Ok(1)
+            }
+        }
+        impl Write for OneByteReader {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let key16 = [0x42u8; 16];
+        let key32 = [0x24u8; 32];
+        let iv12 = [0x11u8; 12];
+        let imp4 = [0x33u8; 4];
+
+        let aes_state = CipherState::Tls13 {
+            cipher: AeadCipher::AesGcm(Box::new(AesGcm::new(&key16).unwrap())),
+            iv: iv12,
+            seq: 0,
+        };
+        let cc_state = CipherState::Tls13 {
+            cipher: AeadCipher::ChaCha20Poly1305(ChaCha20Poly1305::new(key32)),
+            iv: iv12,
+            seq: 0,
+        };
+        let tls12_aes_state = CipherState::Tls12 {
+            cipher: AeadCipher::AesGcm(Box::new(AesGcm::new(&key16).unwrap())),
+            implicit_iv: imp4,
+            seq: 0,
+            is_chacha: false,
+            chacha_iv: [0; 12],
+        };
+        let tls12_cc_state = CipherState::Tls12 {
+            cipher: AeadCipher::ChaCha20Poly1305(ChaCha20Poly1305::new(key32)),
+            implicit_iv: [0; 4],
+            seq: 0,
+            is_chacha: true,
+            chacha_iv: iv12,
+        };
+
+        let payloads: Vec<Vec<u8>> = vec![
+            b"hello world".to_vec(),
+            vec![0xabu8; 4097],
+            vec![0x5cu8; MAX_PLAINTEXT],
+            b"tail".to_vec(),
+        ];
+
+        for (label, state) in [
+            ("tls13-aes", aes_state),
+            ("tls13-chacha", cc_state),
+            ("tls12-aes", tls12_aes_state),
+            ("tls12-chacha", tls12_cc_state),
+        ] {
+            let mut tx = RecordLayer::new();
+            tx.write_state = state.clone();
+            let mut wire = Vec::new();
+            for p in &payloads {
+                tx.write_record(&mut wire, CT_APPLICATION_DATA, p).unwrap();
+            }
+            tx.write_record(&mut wire, CT_ALERT, &[1, 0]).unwrap();
+
+            // 1. 1-byte chunked reader + 7-byte caller buffer (exercises spill into app_buf & compaction)
+            let mut tls_small = TlsStream {
+                inner: OneByteReader {
+                    data: wire.clone(),
+                    pos: 0,
+                },
+                record: RecordLayer::new(),
+                hs_reader: HandshakeReader::new(),
+                app_buf: Vec::new(),
+                app_pos: 0,
+                eof_clean: false,
+                alpn: None,
+                leaf_cert_der: None,
+                tls13_secrets: None,
+                peer_key_updates: 0,
+            };
+            tls_small.record.read_state = state.clone();
+            let mut got_small = Vec::new();
+            let mut small_buf = [0u8; 7];
+            loop {
+                let n = tls_small.read(&mut small_buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                got_small.extend_from_slice(&small_buf[..n]);
+            }
+            let expected: Vec<u8> = payloads.iter().flatten().copied().collect();
+            assert_eq!(got_small, expected, "small buf mismatch for {label}");
+
+            // 2. Full buffer read (pipelined records, exercises direct copy into caller buffer)
+            let mut tls_large = TlsStream {
+                inner: MockPipe {
+                    rx: Cursor::new(wire),
+                    tx: Vec::new(),
+                },
+                record: RecordLayer::new(),
+                hs_reader: HandshakeReader::new(),
+                app_buf: Vec::new(),
+                app_pos: 0,
+                eof_clean: false,
+                alpn: None,
+                leaf_cert_der: None,
+                tls13_secrets: None,
+                peer_key_updates: 0,
+            };
+            tls_large.record.read_state = state;
+            let mut got_large = Vec::new();
+            let mut large_buf = vec![0u8; 32 * 1024];
+            loop {
+                let n = tls_large.read(&mut large_buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                got_large.extend_from_slice(&large_buf[..n]);
+            }
+            assert_eq!(got_large, expected, "large buf mismatch for {label}");
+        }
     }
 
     #[test]

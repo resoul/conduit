@@ -1323,6 +1323,7 @@ struct PoolKey {
     is_https: bool,
     host: String,
     port: u16,
+    deny_private_addrs: bool,
 }
 
 struct PooledConn {
@@ -1401,6 +1402,7 @@ pub struct HttpClientState {
     pub base_url: String,
     pub default_headers: Vec<(String, String)>,
     pub timeout_ms: i64,
+    pub deny_private_addrs: bool,
     pub pool: Arc<HttpConnPool>,
 }
 
@@ -1410,6 +1412,7 @@ impl HttpClientState {
             base_url,
             default_headers: Vec::new(),
             timeout_ms: 30_000,
+            deny_private_addrs: false,
             pool: Arc::new(HttpConnPool::new()),
         }
     }
@@ -1448,7 +1451,62 @@ pub fn resolve_client_url(base_url: &str, path: &str) -> String {
     }
 }
 
-fn open_http_transport(parsed: &ParsedUrl, timeout: Duration) -> Result<Transport, Obj> {
+pub fn is_private_or_special_ip(ip: std::net::IpAddr) -> bool {
+    match ip.to_canonical() {
+        std::net::IpAddr::V4(v4) => {
+            let [a, b, _, _] = v4.octets();
+            v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || (a == 100 && (64..=127).contains(&b)) // RFC 6598 CGNAT 100.64.0.0/10
+                || (a == 198 && (b == 18 || b == 19)) // RFC 2544 benchmarking 198.18.0.0/15
+                || a >= 240 // Reserved 240.0.0.0/4
+        }
+        std::net::IpAddr::V6(v6) => {
+            let segs = v6.segments();
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || v6.is_unique_local() // fc00::/7
+                || v6.is_unicast_link_local() // fe80::/10
+                || (segs[0] & 0xffc0) == 0xfec0 // deprecated site-local fec0::/10
+                || (segs[0] == 0x2001 && segs[1] == 0x0db8) // documentation 2001:db8::/32
+        }
+    }
+}
+
+fn check_target_host_allowed(parsed: &ParsedUrl, deny_private_addrs: bool) -> Result<(), Obj> {
+    if !deny_private_addrs {
+        return Ok(());
+    }
+    let clean = parsed.host.trim_end_matches('.');
+    if clean.eq_ignore_ascii_case("localhost") {
+        return Err(make_http_error(
+            "blocked_addr",
+            format!("refusing connection to restricted host '{}'", parsed.host),
+        ));
+    }
+    if let Ok(ip) = clean.parse::<std::net::IpAddr>()
+        && is_private_or_special_ip(ip)
+    {
+        return Err(make_http_error(
+            "blocked_addr",
+            format!("refusing connection to private or restricted address {}", ip),
+        ));
+    }
+    Ok(())
+}
+
+fn open_http_transport(
+    parsed: &ParsedUrl,
+    timeout: Duration,
+    deny_private_addrs: bool,
+) -> Result<Transport, Obj> {
+    check_target_host_allowed(parsed, deny_private_addrs)?;
     let addr_str = format!("{}:{}", parsed.host, parsed.port);
     let addrs: Vec<_> = match addr_str.to_socket_addrs() {
         Ok(it) => it.collect(),
@@ -1456,6 +1514,20 @@ fn open_http_transport(parsed: &ParsedUrl, timeout: Duration) -> Result<Transpor
     };
     if addrs.is_empty() {
         return Err(make_http_error("dns_error", format!("no addresses resolved for {}", addr_str)));
+    }
+    if deny_private_addrs {
+        for addr in &addrs {
+            if is_private_or_special_ip(addr.ip()) {
+                return Err(make_http_error(
+                    "blocked_addr",
+                    format!(
+                        "refusing connection to private or restricted address {} (resolved from {})",
+                        addr.ip(),
+                        parsed.host
+                    ),
+                ));
+            }
+        }
     }
 
     let connect_timeout = timeout.min(Duration::from_secs(10));
@@ -1590,13 +1662,16 @@ fn tcp_http_request_once(
     headers: &[(String, String)],
     timeout: Duration,
     pool: Option<&HttpConnPool>,
+    deny_private_addrs: bool,
 ) -> Result<RawHttpResponse, Obj> {
+    check_target_host_allowed(parsed, deny_private_addrs)?;
     let want_keep_alive = pool.is_some();
     let req = build_http_request_bytes(method, parsed, body, headers, want_keep_alive)?;
     let pool_key = PoolKey {
         is_https: parsed.is_https,
         host: parsed.host.to_ascii_lowercase(),
         port: parsed.port,
+        deny_private_addrs,
     };
 
     if let Some(p) = pool
@@ -1617,7 +1692,7 @@ fn tcp_http_request_once(
         }
     }
 
-    let transport = open_http_transport(parsed, timeout)?;
+    let transport = open_http_transport(parsed, timeout, deny_private_addrs)?;
     let mut reader = BufReader::new(transport);
     let (resp, can_ka) = send_http_request(&mut reader, method, &req)?;
     if let Some(p) = pool
@@ -1635,6 +1710,7 @@ fn http_client_request_raw(
     headers: &[(String, String)],
     timeout_ms: i64,
     pool: Option<&HttpConnPool>,
+    deny_private_addrs: bool,
 ) -> Result<RawHttpResponse, Obj> {
     if timeout_ms <= 0 {
         return Err(make_http_error("invalid_timeout", "timeout_ms must be > 0"));
@@ -1656,8 +1732,15 @@ fn http_client_request_raw(
     let mut cur_headers = Cow::Borrowed(headers);
 
     for hop in 0..=MAX_REDIRECTS {
-        let resp =
-            tcp_http_request_once(&cur_method, &parsed, cur_body, &cur_headers, timeout, pool)?;
+        let resp = tcp_http_request_once(
+            &cur_method,
+            &parsed,
+            cur_body,
+            &cur_headers,
+            timeout,
+            pool,
+            deny_private_addrs,
+        )?;
         if matches!(resp.status, 301..=303 | 307 | 308)
             && let Some((_, loc)) = resp.headers.iter().find(|(k, _)| k == "location")
         {
@@ -1710,7 +1793,30 @@ pub fn http_client_request_with_timeout(
     headers: &[(String, String)],
     timeout_ms: i64,
 ) -> Obj {
-    match http_client_request_raw(method, url, body.as_bytes(), headers, timeout_ms, None) {
+    match http_client_request_raw(method, url, body.as_bytes(), headers, timeout_ms, None, false) {
+        Ok(resp) => build_response_obj(resp.status, &resp.body, resp.headers),
+        Err(err_obj) => err_obj,
+    }
+}
+
+pub fn http_client_pooled_request_with_options(
+    method: &str,
+    url: &str,
+    body: &str,
+    headers: &[(String, String)],
+    timeout_ms: i64,
+    pool: &HttpConnPool,
+    deny_private_addrs: bool,
+) -> Obj {
+    match http_client_request_raw(
+        method,
+        url,
+        body.as_bytes(),
+        headers,
+        timeout_ms,
+        Some(pool),
+        deny_private_addrs,
+    ) {
         Ok(resp) => build_response_obj(resp.status, &resp.body, resp.headers),
         Err(err_obj) => err_obj,
     }
@@ -1724,10 +1830,7 @@ pub fn http_client_pooled_request(
     timeout_ms: i64,
     pool: &HttpConnPool,
 ) -> Obj {
-    match http_client_request_raw(method, url, body.as_bytes(), headers, timeout_ms, Some(pool)) {
-        Ok(resp) => build_response_obj(resp.status, &resp.body, resp.headers),
-        Err(err_obj) => err_obj,
-    }
+    http_client_pooled_request_with_options(method, url, body, headers, timeout_ms, pool, false)
 }
 
 pub fn http_client_bytes_request(
@@ -1737,7 +1840,7 @@ pub fn http_client_bytes_request(
     headers: &[(String, String)],
     timeout_ms: i64,
 ) -> Obj {
-    match http_client_request_raw(method, url, body, headers, timeout_ms, None) {
+    match http_client_request_raw(method, url, body, headers, timeout_ms, None, false) {
         Ok(resp) => build_binary_response_obj(resp.status, resp.body, resp.headers),
         Err(err_obj) => err_obj,
     }
@@ -1887,13 +1990,21 @@ mod tests {
 
     impl Read for DripReader {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            let _ = self.state.next_read_timeout()?;
+            let rem = self.state.next_read_timeout()?;
             if self.idx >= self.chunks.len() {
                 return Ok(0);
             }
             let (delay_ms, chunk) = self.chunks[self.idx];
             if delay_ms > 0 {
-                std::thread::sleep(Duration::from_millis(delay_ms));
+                let delay = Duration::from_millis(delay_ms);
+                if delay > rem {
+                    std::thread::sleep(rem);
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "simulated socket read timeout",
+                    ));
+                }
+                std::thread::sleep(delay);
             }
             let n = chunk.len().min(buf.len());
             buf[..n].copy_from_slice(&chunk[..n]);
@@ -2010,9 +2121,10 @@ mod tests {
 
         let slow_body = DripReader::new(
             vec![
-                (0, b"POST / HTTP/1.1\r\nContent-Length: 4\r\n\r\n"),
+                (0, b"POST / HTTP/1.1\r\nContent-Length: 6\r\n\r\n"),
                 (20, b"ab"),
                 (20, b"cd"),
+                (20, b"ef"),
             ],
             Duration::from_millis(500),
         );
@@ -2026,5 +2138,59 @@ mod tests {
             ),
             Err(ReadHttpError::Timeout)
         ));
+    }
+
+    #[test]
+    fn deny_private_addrs_blocks_loopback_private_cgnat_metadata_and_ipv6() {
+        use std::net::IpAddr;
+
+        for blocked in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.5.4",
+            "192.168.1.10",
+            "169.254.169.254",
+            "100.64.0.1",
+            "198.18.0.1",
+            "0.0.0.0",
+            "240.0.0.1",
+            "::1",
+            "::",
+            "fe80::1",
+            "fc00::1",
+            "fd12:3456:789a::1",
+            "::ffff:127.0.0.1",
+            "::ffff:169.254.169.254",
+            "2001:db8::1",
+        ] {
+            let ip: IpAddr = blocked.parse().unwrap();
+            assert!(is_private_or_special_ip(ip), "{blocked} must be blocked");
+        }
+
+        for public in ["93.184.216.34", "1.1.1.1", "8.8.8.8", "2606:4700:4700::1111"] {
+            let ip: IpAddr = public.parse().unwrap();
+            assert!(!is_private_or_special_ip(ip), "{public} must be allowed");
+        }
+
+        let pool = HttpConnPool::new();
+        for url in [
+            "http://127.0.0.1:8080/secret",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://localhost:8080/",
+            "http://[::ffff:10.0.0.1]/admin",
+        ] {
+            let err_obj = http_client_pooled_request_with_options(
+                "GET",
+                url,
+                "",
+                &[],
+                1000,
+                &pool,
+                true,
+            );
+            let Obj::Record(rec) = err_obj else { panic!("expected HttpError for {url}") };
+            assert_eq!(rec.schema_id, SCHEMA_HTTP_ERROR);
+            assert_eq!(rec.get_obj(0).format_obj(), "blocked_addr", "url={url}");
+        }
     }
 }

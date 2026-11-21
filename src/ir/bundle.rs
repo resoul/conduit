@@ -16,7 +16,7 @@ use crate::native::{JsonDecodePlan, JsonType, StructFieldDef, StructSchema};
 use crate::vm::opcode::Op;
 use crate::vm::value::{Obj, SCHEMA_BOXED_BOOL, SCHEMA_BOXED_FLOAT, SCHEMA_BOXED_INT};
 
-pub const BUNDLE_MAGIC: &[u8; 8] = b"CDTB0001";
+pub const BUNDLE_MAGIC: &[u8; 8] = b"CDTB0002";
 
 pub const RET_VOID: u8 = 0;
 pub const RET_INT: u8 = 1;
@@ -628,14 +628,25 @@ pub fn encode_bundle(module: &Module, main_fid: u32, main_ret_tag: u8) -> Result
         })
     })?;
 
+    let digest = crate::native::crypto::sha256_bytes(&w.0);
+    w.0.extend_from_slice(&digest);
     Ok(w.0)
 }
 
 pub fn decode_bundle(bytes: &[u8]) -> Result<(Module, u32, u8), String> {
-    let mut r = Reader::new(bytes);
-    if r.take(8)? != BUNDLE_MAGIC {
+    if bytes.len() < 40 {
+        return Err("Invalid or truncated bundle".to_string());
+    }
+    if &bytes[..8] != BUNDLE_MAGIC {
         return Err("Invalid bundle magic header".to_string());
     }
+    let (payload, checksum) = bytes.split_at(bytes.len() - 32);
+    let expected = crate::native::crypto::sha256_bytes(payload);
+    if !crate::native::crypto::constant_time_eq(&expected, checksum) {
+        return Err("Bundle SHA-256 checksum mismatch (corrupted or tampered bundle)".to_string());
+    }
+    let mut r = Reader::new(payload);
+    let _ = r.take(8)?;
     let main_fid = r.u32()?;
     let main_ret_tag = r.u8()?;
 
@@ -881,6 +892,9 @@ pub fn decode_bundle(bytes: &[u8]) -> Result<(Module, u32, u8), String> {
         })
     })?;
 
+    if r.pos != payload.len() {
+        return Err("Unexpected trailing bytes in bundle".to_string());
+    }
     module.validate()?;
     if (main_fid as usize) >= module.functions.len() {
         return Err(format!("Invalid main_fid {} in bundle", main_fid));
