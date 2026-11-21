@@ -195,6 +195,7 @@ pub(crate) unsafe fn build_record_into_reg(
 
 // Keep the arithmetic kernels that meet the range and float benchmark gates.
 #[cold]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn finish_range_kernel(
     body: &[Op],
     scalars: &mut [u64],
@@ -392,6 +393,7 @@ impl Vm {
     }
 
     #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn exec_call_callable(
         &mut self,
         module: &Module,
