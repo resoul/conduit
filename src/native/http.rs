@@ -559,7 +559,122 @@ pub enum ReadHttpError {
     Closed,
     Bad(String),
     TooLarge,
+    Timeout,
     Io(io::Error),
+}
+
+pub trait DeadlineSource {
+    fn set_idle(&mut self, idle_timeout: Duration, header_timeout: Duration);
+    fn arm_deadline(&mut self, timeout: Duration);
+    fn has_deadline(&self) -> bool;
+}
+
+pub struct DeadlineState {
+    deadline: Option<Instant>,
+    arm_on_first_byte: Option<Duration>,
+    idle_timeout: Duration,
+}
+
+impl DeadlineState {
+    pub fn new(idle_timeout: Duration) -> Self {
+        Self {
+            deadline: None,
+            arm_on_first_byte: None,
+            idle_timeout,
+        }
+    }
+
+    pub fn set_idle(&mut self, idle_timeout: Duration, header_timeout: Duration) {
+        self.deadline = None;
+        self.idle_timeout = idle_timeout;
+        self.arm_on_first_byte = Some(header_timeout);
+    }
+
+    pub fn arm_deadline(&mut self, timeout: Duration) {
+        self.arm_on_first_byte = None;
+        self.deadline = Some(Instant::now() + timeout);
+    }
+
+    #[inline]
+    pub fn has_deadline(&self) -> bool {
+        self.deadline.is_some()
+    }
+
+    #[inline]
+    pub fn next_read_timeout(&self) -> io::Result<Duration> {
+        if let Some(dl) = self.deadline {
+            let rem = dl.saturating_duration_since(Instant::now());
+            if rem.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "HTTP request deadline exceeded",
+                ));
+            }
+            Ok(rem.max(Duration::from_millis(1)))
+        } else {
+            Ok(self.idle_timeout.max(Duration::from_millis(1)))
+        }
+    }
+
+    #[inline]
+    pub fn on_read_ok(&mut self, bytes_read: usize) {
+        if bytes_read > 0
+            && let Some(phase_dur) = self.arm_on_first_byte.take()
+            && self.deadline.is_none()
+        {
+            self.deadline = Some(Instant::now() + phase_dur);
+        }
+    }
+}
+
+pub struct TcpDeadlineStream {
+    inner: TcpStream,
+    state: DeadlineState,
+    last_timeout_ms: Option<u64>,
+}
+
+impl TcpDeadlineStream {
+    pub fn new(inner: TcpStream, initial_idle: Duration) -> Self {
+        Self {
+            inner,
+            state: DeadlineState::new(initial_idle),
+            last_timeout_ms: None,
+        }
+    }
+
+    fn apply_timeout(&mut self, dur: Duration) {
+        let ms = dur.as_millis().clamp(1, u64::MAX as u128) as u64;
+        if self.last_timeout_ms != Some(ms) {
+            let _ = self.inner.set_read_timeout(Some(Duration::from_millis(ms)));
+            self.last_timeout_ms = Some(ms);
+        }
+    }
+}
+
+impl DeadlineSource for TcpDeadlineStream {
+    fn set_idle(&mut self, idle_timeout: Duration, header_timeout: Duration) {
+        self.state.set_idle(idle_timeout, header_timeout);
+        self.apply_timeout(idle_timeout);
+    }
+
+    fn arm_deadline(&mut self, timeout: Duration) {
+        self.state.arm_deadline(timeout);
+        self.apply_timeout(timeout);
+    }
+
+    fn has_deadline(&self) -> bool {
+        self.state.has_deadline()
+    }
+}
+
+impl Read for TcpDeadlineStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let timeout = self.state.next_read_timeout()?;
+        self.apply_timeout(timeout);
+        let n = self.inner.read(buf)?;
+        self.state.on_read_ok(n);
+        Ok(n)
+    }
 }
 
 fn is_http_tchar(b: u8) -> bool {
@@ -571,18 +686,33 @@ fn is_http_tchar(b: u8) -> bool {
         )
 }
 
-fn read_crlf_line<R: BufRead>(reader: &mut R) -> Result<Option<Vec<u8>>, ReadHttpError> {
+#[inline]
+pub fn is_valid_header_name(name: &str) -> bool {
+    !name.is_empty() && name.bytes().all(is_http_tchar)
+}
+
+#[inline]
+pub fn is_valid_header_value(val: &str) -> bool {
+    !val.bytes().any(|b| (b < b' ' && b != b'\t') || b == 127)
+}
+
+enum LineReadError {
+    TooLarge,
+    Io(io::Error),
+}
+
+fn read_crlf_line_raw<R: BufRead>(reader: &mut R) -> Result<Option<Vec<u8>>, LineReadError> {
     let mut buf = Vec::new();
     let n = reader
         .by_ref()
         .take(MAX_LINE as u64 + 1)
         .read_until(b'\n', &mut buf)
-        .map_err(ReadHttpError::Io)?;
+        .map_err(LineReadError::Io)?;
     if n == 0 {
         return Ok(None);
     }
     if buf.len() > MAX_LINE {
-        return Err(ReadHttpError::TooLarge);
+        return Err(LineReadError::TooLarge);
     }
     while buf.last().is_some_and(|&b| b == b'\n' || b == b'\r') {
         buf.pop();
@@ -590,8 +720,34 @@ fn read_crlf_line<R: BufRead>(reader: &mut R) -> Result<Option<Vec<u8>>, ReadHtt
     Ok(Some(buf))
 }
 
-pub fn read_http_request<R: BufRead>(reader: &mut R) -> Result<RawHttpRequest, ReadHttpError> {
-    let Some(req_line) = read_crlf_line(reader)? else {
+#[inline]
+fn map_deadline_io_err<R: DeadlineSource>(source: &R, err: io::Error) -> ReadHttpError {
+    if matches!(err.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock) {
+        if source.has_deadline() {
+            ReadHttpError::Timeout
+        } else {
+            ReadHttpError::Closed
+        }
+    } else {
+        ReadHttpError::Io(err)
+    }
+}
+
+fn read_http_request_inner<R: BufRead, F, M>(
+    reader: &mut R,
+    on_headers_done: F,
+    map_io_err: M,
+) -> Result<RawHttpRequest, ReadHttpError>
+where
+    F: FnOnce(&mut R),
+    M: Fn(&R, io::Error) -> ReadHttpError,
+{
+    let read_line = |r: &mut R| match read_crlf_line_raw(r) {
+        Ok(opt) => Ok(opt),
+        Err(LineReadError::TooLarge) => Err(ReadHttpError::TooLarge),
+        Err(LineReadError::Io(e)) => Err(map_io_err(r, e)),
+    };
+    let Some(req_line) = read_line(reader)? else {
         return Err(ReadHttpError::Closed);
     };
     let req_line = std::str::from_utf8(&req_line)
@@ -613,7 +769,7 @@ pub fn read_http_request<R: BufRead>(reader: &mut R) -> Result<RawHttpRequest, R
     let mut saw_content_length = false;
     let mut conn_header: Option<String> = None;
     loop {
-        let Some(line) = read_crlf_line(reader)? else {
+        let Some(line) = read_line(reader)? else {
             return Err(ReadHttpError::Closed);
         };
         if line.is_empty() {
@@ -666,9 +822,12 @@ pub fn read_http_request<R: BufRead>(reader: &mut R) -> Result<RawHttpRequest, R
         headers.push((lname, val.to_vec()));
     }
 
+    on_headers_done(reader);
     let mut body_bytes = vec![0u8; content_length];
-    if content_length > 0 {
-        reader.read_exact(&mut body_bytes).map_err(ReadHttpError::Io)?;
+    if content_length > 0
+        && let Err(e) = reader.read_exact(&mut body_bytes)
+    {
+        return Err(map_io_err(reader, e));
     }
 
     let keep_alive = if version == "HTTP/1.0" {
@@ -687,6 +846,28 @@ pub fn read_http_request<R: BufRead>(reader: &mut R) -> Result<RawHttpRequest, R
     })
 }
 
+pub fn read_http_request<R: BufRead>(reader: &mut R) -> Result<RawHttpRequest, ReadHttpError> {
+    read_http_request_inner(reader, |_| {}, |_, e| ReadHttpError::Io(e))
+}
+
+pub fn read_http_request_deadline<R: Read + DeadlineSource>(
+    reader: &mut BufReader<R>,
+    idle_timeout: Duration,
+    header_timeout: Duration,
+    body_timeout: Duration,
+) -> Result<RawHttpRequest, ReadHttpError> {
+    if reader.buffer().is_empty() {
+        reader.get_mut().set_idle(idle_timeout, header_timeout);
+    } else {
+        reader.get_mut().arm_deadline(header_timeout);
+    }
+    read_http_request_inner(
+        reader,
+        |r| r.get_mut().arm_deadline(body_timeout),
+        |r, e| map_deadline_io_err(r.get_ref(), e),
+    )
+}
+
 pub fn reason_phrase(status: i64) -> &'static str {
     match status {
         200 => "OK",
@@ -699,8 +880,10 @@ pub fn reason_phrase(status: i64) -> &'static str {
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        408 => "Request Timeout",
         413 => "Payload Too Large",
         500 => "Internal Server Error",
+        503 => "Service Unavailable",
         _ => "OK",
     }
 }
@@ -713,6 +896,31 @@ pub fn write_http_response_ext<W: Write>(
     keep_alive: bool,
     head_only: bool,
 ) -> io::Result<()> {
+    if !(100..=999).contains(&status) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid HTTP status code",
+        ));
+    }
+    if let Some(map) = headers {
+        for (k, v) in map.entries.iter() {
+            if let (MapKey::Str(ks), MapVal::Obj(Obj::Str(vs))) = (k, v) {
+                let k_str = ks.as_str();
+                if k_str.eq_ignore_ascii_case("content-length")
+                    || k_str.eq_ignore_ascii_case("connection")
+                    || k_str.eq_ignore_ascii_case("transfer-encoding")
+                {
+                    continue;
+                }
+                if !is_valid_header_name(k_str) || !is_valid_header_value(vs.as_str()) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "invalid HTTP response header",
+                    ));
+                }
+            }
+        }
+    }
     write!(
         writer,
         "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: {}\r\n",
@@ -727,6 +935,7 @@ pub fn write_http_response_ext<W: Write>(
                 let k_str = ks.as_str();
                 if k_str.eq_ignore_ascii_case("content-length")
                     || k_str.eq_ignore_ascii_case("connection")
+                    || k_str.eq_ignore_ascii_case("transfer-encoding")
                 {
                     continue;
                 }
@@ -748,6 +957,17 @@ pub fn write_error_response(stream: &mut BufWriter<TcpStream>, status: i64, body
 pub fn reader_writer_pair(stream: TcpStream) -> io::Result<(BufReader<TcpStream>, BufWriter<TcpStream>)> {
     let writer_stream = stream.try_clone()?;
     Ok((BufReader::new(stream), BufWriter::new(writer_stream)))
+}
+
+pub fn deadline_reader_writer_pair(
+    stream: TcpStream,
+    initial_idle: Duration,
+) -> io::Result<(BufReader<TcpDeadlineStream>, BufWriter<TcpStream>)> {
+    let writer_stream = stream.try_clone()?;
+    Ok((
+        BufReader::new(TcpDeadlineStream::new(stream, initial_idle)),
+        BufWriter::new(writer_stream),
+    ))
 }
 
 const MAX_CLIENT_BODY: usize = 16 * 1024 * 1024;
@@ -1333,8 +1553,11 @@ fn build_http_request_bytes(
         req.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
     }
     for (k, v) in headers {
-        if k.contains(['\r', '\n']) || v.contains(['\r', '\n']) {
-            return Err(make_http_error("invalid_header", "header name or value contains CR/LF"));
+        if !is_valid_header_name(k) || !is_valid_header_value(v) {
+            return Err(make_http_error(
+                "invalid_header",
+                "invalid HTTP header name or value",
+            ));
         }
         req.extend_from_slice(format!("{}: {}\r\n", k, v).as_bytes());
     }
@@ -1630,5 +1853,178 @@ mod tests {
         let (resp4, ka4) = parse_http_response_raw(&mut r4, "GET", false).unwrap();
         assert_eq!(resp4.body, b"hello");
         assert!(!ka4);
+    }
+
+    struct DripReader {
+        chunks: Vec<(u64, &'static [u8])>,
+        idx: usize,
+        state: DeadlineState,
+    }
+
+    impl DripReader {
+        fn new(chunks: Vec<(u64, &'static [u8])>, initial_idle: Duration) -> Self {
+            Self {
+                chunks,
+                idx: 0,
+                state: DeadlineState::new(initial_idle),
+            }
+        }
+    }
+
+    impl DeadlineSource for DripReader {
+        fn set_idle(&mut self, idle_timeout: Duration, header_timeout: Duration) {
+            self.state.set_idle(idle_timeout, header_timeout);
+        }
+
+        fn arm_deadline(&mut self, timeout: Duration) {
+            self.state.arm_deadline(timeout);
+        }
+
+        fn has_deadline(&self) -> bool {
+            self.state.has_deadline()
+        }
+    }
+
+    impl Read for DripReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let _ = self.state.next_read_timeout()?;
+            if self.idx >= self.chunks.len() {
+                return Ok(0);
+            }
+            let (delay_ms, chunk) = self.chunks[self.idx];
+            if delay_ms > 0 {
+                std::thread::sleep(Duration::from_millis(delay_ms));
+            }
+            let n = chunk.len().min(buf.len());
+            buf[..n].copy_from_slice(&chunk[..n]);
+            if n == chunk.len() {
+                self.idx += 1;
+            } else {
+                self.chunks[self.idx].1 = &chunk[n..];
+            }
+            self.state.on_read_ok(n);
+            Ok(n)
+        }
+    }
+
+    struct IdleTimeoutReader {
+        state: DeadlineState,
+    }
+
+    impl DeadlineSource for IdleTimeoutReader {
+        fn set_idle(&mut self, idle_timeout: Duration, header_timeout: Duration) {
+            self.state.set_idle(idle_timeout, header_timeout);
+        }
+
+        fn arm_deadline(&mut self, timeout: Duration) {
+            self.state.arm_deadline(timeout);
+        }
+
+        fn has_deadline(&self) -> bool {
+            self.state.has_deadline()
+        }
+    }
+
+    impl Read for IdleTimeoutReader {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::TimedOut, "idle timeout"))
+        }
+    }
+
+    #[test]
+    fn response_writer_rejects_crlf_nul_and_bad_header_names() {
+        for bad_val in ["ok\r\nSet-Cookie: admin=1", "ok\nX-Test: 1", "ok\0nul", "bad\x07ctrl"] {
+            let mut hdrs = OrderedMap::new();
+            hdrs.set(MapKey::Str(header_key("Location")), MapVal::Obj(Obj::str(bad_val)));
+            let mut wire = Vec::new();
+            let err = write_http_response_ext(&mut wire, 302, "", Some(&hdrs), true, false)
+                .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            assert!(wire.is_empty(), "must not write partial bytes on rejected value");
+        }
+
+        for bad_name in ["", "Bad Name", "X:Inject", "X\r\n"] {
+            let mut hdrs = OrderedMap::new();
+            hdrs.set(MapKey::Str(header_key(bad_name)), MapVal::Obj(Obj::str("val")));
+            let mut wire = Vec::new();
+            let err = write_http_response_ext(&mut wire, 200, "ok", Some(&hdrs), true, false)
+                .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            assert!(wire.is_empty(), "must not write partial bytes on rejected name");
+        }
+
+        let mut ok_hdrs = OrderedMap::new();
+        ok_hdrs.set(MapKey::Str(header_key("Transfer-Encoding")), MapVal::Obj(Obj::str("chunked")));
+        ok_hdrs.set(MapKey::Str(header_key("X-Custom")), MapVal::Obj(Obj::str("tab\tok")));
+        let mut wire = Vec::new();
+        write_http_response_ext(&mut wire, 200, "ok", Some(&ok_hdrs), true, false).unwrap();
+        let text = String::from_utf8(wire).unwrap();
+        assert!(!text.contains("Transfer-Encoding"));
+        assert!(text.contains("X-Custom: tab\tok\r\n"));
+    }
+
+    #[test]
+    fn client_request_builder_rejects_invalid_headers() {
+        let parsed = parse_http_url("http://example.com/test").unwrap();
+        let bad_val = [("X-Test".to_string(), "ok\0bad".to_string())];
+        assert!(build_http_request_bytes("GET", &parsed, &[], &bad_val, false).is_err());
+
+        let bad_name = [("Bad Header".to_string(), "ok".to_string())];
+        assert!(build_http_request_bytes("GET", &parsed, &[], &bad_name, false).is_err());
+    }
+
+    #[test]
+    fn read_http_request_deadline_enforces_header_body_and_idle_timeouts() {
+        let mut idle = BufReader::new(IdleTimeoutReader {
+            state: DeadlineState::new(Duration::from_millis(50)),
+        });
+        assert!(matches!(
+            read_http_request_deadline(
+                &mut idle,
+                Duration::from_millis(50),
+                Duration::from_millis(100),
+                Duration::from_millis(100),
+            ),
+            Err(ReadHttpError::Closed)
+        ));
+
+        let slow_headers = DripReader::new(
+            vec![
+                (0, b"GET / HTTP/1.1\r\n"),
+                (20, b"Host: a\r\n"),
+                (20, b"X-Slow: 1\r\n"),
+                (20, b"\r\n"),
+            ],
+            Duration::from_millis(500),
+        );
+        let mut slow_hdr_reader = BufReader::new(slow_headers);
+        assert!(matches!(
+            read_http_request_deadline(
+                &mut slow_hdr_reader,
+                Duration::from_millis(500),
+                Duration::from_millis(30),
+                Duration::from_millis(500),
+            ),
+            Err(ReadHttpError::Timeout)
+        ));
+
+        let slow_body = DripReader::new(
+            vec![
+                (0, b"POST / HTTP/1.1\r\nContent-Length: 4\r\n\r\n"),
+                (20, b"ab"),
+                (20, b"cd"),
+            ],
+            Duration::from_millis(500),
+        );
+        let mut slow_body_reader = BufReader::new(slow_body);
+        assert!(matches!(
+            read_http_request_deadline(
+                &mut slow_body_reader,
+                Duration::from_millis(500),
+                Duration::from_millis(500),
+                Duration::from_millis(25),
+            ),
+            Err(ReadHttpError::Timeout)
+        ));
     }
 }

@@ -4,7 +4,30 @@ use std::sync::{Arc, LazyLock, OnceLock};
 
 use crate::vm::string::VmString;
 
-/// Fast non-cryptographic 64-bit hasher for internal maps.
+/// Fast non-cryptographic 64-bit hasher seeded once per process for internal maps.
+fn init_fx_hash_seed() -> u64 {
+    let mut bytes = [0u8; 8];
+    if crate::native::crypto::fill_random_bytes(&mut bytes).is_ok() {
+        let v = u64::from_ne_bytes(bytes);
+        if v != 0 {
+            return v;
+        }
+    }
+    let stack_addr = (&raw const bytes) as usize as u64;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9e37_79b9_7f4a_7c15);
+    (stack_addr.rotate_left(17) ^ nanos) | 1
+}
+
+static FX_HASH_SEED: OnceLock<u64> = OnceLock::new();
+
+#[inline]
+pub fn fx_hash_seed() -> u64 {
+    *FX_HASH_SEED.get_or_init(init_fx_hash_seed)
+}
+
 #[derive(Clone, Default)]
 pub struct FxBuildHasher;
 
@@ -17,7 +40,7 @@ impl BuildHasher for FxBuildHasher {
 
     #[inline]
     fn build_hasher(&self) -> FxHasher {
-        FxHasher { hash: 0 }
+        FxHasher { hash: fx_hash_seed() }
     }
 }
 
@@ -893,7 +916,7 @@ impl PartialEq for Obj {
 
 #[cfg(test)]
 mod layout_tests {
-    use super::Obj;
+    use super::*;
 
     #[test]
     fn obj_size_is_16_bytes() {
@@ -902,5 +925,21 @@ mod layout_tests {
             "Obj size was {} bytes",
             std::mem::size_of::<Obj>()
         );
+    }
+
+    #[test]
+    fn fx_hasher_uses_nonzero_seed_and_ordered_map_keeps_order() {
+        let seed = fx_hash_seed();
+        assert_ne!(seed, 0);
+        let h1 = FxBuildHasher.hash_one("alpha");
+        let h2 = FxBuildHasher.hash_one("alpha");
+        assert_eq!(h1, h2);
+
+        let mut map = OrderedMap::new();
+        for i in 0..16 {
+            map.set(MapKey::Str(Arc::new(VmString::from(format!("k{i}")))), MapVal::Scalar(i as u64));
+        }
+        assert_eq!(map.entries().len(), 16);
+        assert_eq!(map.get_str("k12"), Some(&MapVal::Scalar(12)));
     }
 }

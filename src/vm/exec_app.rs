@@ -289,7 +289,11 @@ impl Vm {
 
                 let cron_state = if let Some(sched_idx) = plan.schedule_idx {
                     let sched = &module.schedules[sched_idx as usize];
-                    match start_cron_scheduler(Arc::clone(&shared_mod), sched) {
+                    match start_cron_scheduler(
+                        Arc::clone(&shared_mod),
+                        sched,
+                        Some(Arc::clone(&self.host.spawn_tracker)),
+                    ) {
                         Ok(st) => Some(st),
                         Err(msg) => {
                             self.objs[o_base + a as usize] =

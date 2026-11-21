@@ -4259,12 +4259,16 @@ fn cdt_app_declarative_lifecycle_e2e() {
             switch h {
                 case app.App(a):
                     r1 := a.is_running()
-                    _s := time.sleep(35)
+                    c := cache.open("app_life_e2e")
+                    var wait_i = 0
+                    while wait_i < 200 && (c.get("ticked") ?? "no") != "yes" {
+                        _s := time.sleep(10)
+                        wait_i = wait_i + 1
+                    }
                     _st1 := a.stop()
                     r2 := a.is_running()
                     // Idempotent stop
                     _st2 := a.stop()
-                    c := cache.open("app_life_e2e")
                     log_str := c.get("log") ?? ""
                     ticked := c.get("ticked") ?? "no"
                     h_out = "{r1}:{r2}:{ticked}:{log_str}"

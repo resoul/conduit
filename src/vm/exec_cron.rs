@@ -11,7 +11,7 @@ use crate::native::cron::{
 use crate::native::validation::is_err_or_nil_obj;
 use crate::vm::exec_cold::err_msg;
 use crate::vm::value::{Obj, SCHEMA_CRON_SCHEDULER};
-use crate::vm::{ExecResult, RuntimeError, Vm};
+use crate::vm::{ExecResult, RuntimeError, SpawnTracker, Vm};
 
 pub const CRON_RUN: u8 = 0;
 pub const CRON_START: u8 = 1;
@@ -68,6 +68,7 @@ pub(crate) fn build_compiled_jobs(plan: &SchedulePlan) -> Result<Vec<CompiledJob
 pub(crate) fn start_cron_scheduler(
     module: Arc<Module>,
     plan: &SchedulePlan,
+    spawn_tracker: Option<Arc<SpawnTracker>>,
 ) -> Result<CronSchedulerState, String> {
     let jobs = build_compiled_jobs(plan)?;
     let stop = Arc::new(AtomicBool::new(false));
@@ -75,7 +76,7 @@ pub(crate) fn start_cron_scheduler(
     let stop_bg = Arc::clone(&stop);
     let running_bg = Arc::clone(&running);
     let handle = std::thread::spawn(move || {
-        scheduler_loop(module, jobs, stop_bg, running_bg);
+        scheduler_loop(module, jobs, stop_bg, running_bg, spawn_tracker);
     });
     Ok(CronSchedulerState {
         stop,
@@ -102,7 +103,27 @@ fn run_job_in_fresh_vm(module: &Module, job_name: &str, func_id: u32) -> Result<
     }
 }
 
-pub(crate) fn scheduler_loop(module: Arc<Module>, mut jobs: Vec<CompiledJob>, stop: Arc<AtomicBool>, running: Arc<AtomicBool>) {
+struct CronJobGuard {
+    flag: Arc<AtomicBool>,
+    tracker: Option<Arc<SpawnTracker>>,
+}
+
+impl Drop for CronJobGuard {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
+        if let Some(tracker) = &self.tracker {
+            tracker.on_finish();
+        }
+    }
+}
+
+pub(crate) fn scheduler_loop(
+    module: Arc<Module>,
+    mut jobs: Vec<CompiledJob>,
+    stop: Arc<AtomicBool>,
+    running: Arc<AtomicBool>,
+    spawn_tracker: Option<Arc<SpawnTracker>>,
+) {
     running.store(true, Ordering::Release);
     while !stop.load(Ordering::Acquire) {
         let now_unix = SystemTime::now()
@@ -148,11 +169,19 @@ pub(crate) fn scheduler_loop(module: Arc<Module>, mut jobs: Vec<CompiledJob>, st
                 let jname = job.name.clone();
                 let fid = job.func_id;
                 let flag = Arc::clone(&job.in_flight);
+                let tracker = spawn_tracker.clone();
+                if let Some(ref t) = tracker {
+                    t.on_spawn();
+                }
                 std::thread::spawn(move || {
-                    if let Err(msg) = run_job_in_fresh_vm(&m, &jname, fid) {
-                        eprintln!("[cdt.cron] {}", msg);
+                    let _guard = CronJobGuard { flag, tracker };
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run_job_in_fresh_vm(&m, &jname, fid)
+                    })) {
+                        Ok(Ok(())) => {}
+                        Ok(Err(msg)) => eprintln!("[cdt.cron] {}", msg),
+                        Err(_) => eprintln!("[cdt.cron] job '{}' panicked", jname),
                     }
-                    flag.store(false, Ordering::Release);
                 });
             }
         }
@@ -200,7 +229,13 @@ impl Vm {
                     Ok(jobs) => {
                         let stop = Arc::new(AtomicBool::new(false));
                         let running = Arc::new(AtomicBool::new(true));
-                        scheduler_loop(Arc::new(module.clone()), jobs, stop, running);
+                        scheduler_loop(
+                            Arc::new(module.clone()),
+                            jobs,
+                            stop,
+                            running,
+                            Some(Arc::clone(&self.host.spawn_tracker)),
+                        );
                         self.objs[o_base + a as usize] = Obj::Empty;
                     }
                     Err(msg) => {
@@ -210,7 +245,11 @@ impl Vm {
             }
             CRON_START => {
                 let plan = &module.schedules[b as usize];
-                match start_cron_scheduler(Arc::new(module.clone()), plan) {
+                match start_cron_scheduler(
+                    Arc::new(module.clone()),
+                    plan,
+                    Some(Arc::clone(&self.host.spawn_tracker)),
+                ) {
                     Ok(state) => {
                         let id = self.host.cron_schedulers.len();
                         self.host.cron_schedulers.push(Some(state));

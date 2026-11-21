@@ -552,7 +552,7 @@ pub fn decode_base64(s: &str) -> Obj {
 // ── OS CSPRNG / UUID v4 ──────────────────────────────────────────────────────
 
 #[cfg(windows)]
-fn os_fill_random(buf: &mut [u8]) -> Result<(), String> {
+fn os_fill_random(buf: &mut [u8], _cur_pid: u32) -> Result<(), String> {
     #[link(name = "bcrypt")]
     unsafe extern "system" {
         fn BCryptGenRandom(
@@ -580,19 +580,21 @@ fn os_fill_random(buf: &mut [u8]) -> Result<(), String> {
 }
 
 #[cfg(not(windows))]
-fn os_fill_random(buf: &mut [u8]) -> Result<(), String> {
+fn os_fill_random(buf: &mut [u8], cur_pid: u32) -> Result<(), String> {
     thread_local! {
-        static URANDOM_FILE: RefCell<Option<File>> = const { RefCell::new(None) };
+        static URANDOM_FILE: RefCell<(Option<File>, u32)> = const { RefCell::new((None, 0)) };
     }
     URANDOM_FILE.with(|cell| {
         let mut guard = cell.borrow_mut();
-        if guard.is_none() {
-            *guard = Some(
+        if guard.0.is_none() || guard.1 != cur_pid {
+            guard.0 = Some(
                 File::open("/dev/urandom")
                     .map_err(|e| format!("Failed to open /dev/urandom: {}", e))?,
             );
+            guard.1 = cur_pid;
         }
         guard
+            .0
             .as_mut()
             .unwrap()
             .read_exact(buf)
@@ -601,23 +603,26 @@ fn os_fill_random(buf: &mut [u8]) -> Result<(), String> {
 }
 
 thread_local! {
-    static RNG_BUF: RefCell<([u8; 4096], usize)> = const { RefCell::new(([0u8; 4096], 4096)) };
+    static RNG_BUF: RefCell<([u8; 4096], usize, u32)> = const { RefCell::new(([0u8; 4096], 4096, 0)) };
 }
 
 pub fn fill_random_bytes(buf: &mut [u8]) -> Result<(), String> {
     if buf.is_empty() {
         return Ok(());
     }
+    let cur_pid = std::process::id();
     if buf.len() > 256 {
-        return os_fill_random(buf);
+        return os_fill_random(buf, cur_pid);
     }
     RNG_BUF.with(|cell| {
-        let (pool, pos) = &mut *cell.borrow_mut();
-        if *pos + buf.len() > pool.len() {
-            os_fill_random(pool)?;
+        let (pool, pos, cached_pid) = &mut *cell.borrow_mut();
+        if *cached_pid != cur_pid || *pos + buf.len() > pool.len() {
+            os_fill_random(pool, cur_pid)?;
             *pos = 0;
+            *cached_pid = cur_pid;
         }
         buf.copy_from_slice(&pool[*pos..*pos + buf.len()]);
+        pool[*pos..*pos + buf.len()].fill(0);
         *pos += buf.len();
         Ok(())
     })
@@ -838,5 +843,28 @@ mod tests {
         assert!(verify_password("s3cr3t!", h.as_str()));
         assert!(!verify_password("wrong", h.as_str()));
         assert!(!verify_password("s3cr3t!", "bad$format"));
+    }
+
+    #[test]
+    fn rng_pool_resets_on_pid_mismatch_and_zeroes_consumed_bytes() {
+        let mut out = [0u8; 32];
+        fill_random_bytes(&mut out).unwrap();
+        RNG_BUF.with(|cell| {
+            let (pool, pos, pid) = &mut *cell.borrow_mut();
+            assert!(*pos >= 32);
+            assert!(pool[*pos - 32..*pos].iter().all(|&b| b == 0));
+            assert_eq!(*pid, std::process::id());
+            *pid = 0;
+            *pos = 16;
+            pool[16..48].fill(0xAA);
+        });
+        let mut after_fork = [0xAAu8; 32];
+        fill_random_bytes(&mut after_fork).unwrap();
+        RNG_BUF.with(|cell| {
+            let (_, pos, pid) = *cell.borrow();
+            assert_eq!(pos, 32);
+            assert_eq!(pid, std::process::id());
+        });
+        assert_ne!(after_fork, [0xAAu8; 32]);
     }
 }

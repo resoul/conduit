@@ -1,4 +1,5 @@
-use std::net::{TcpListener, TcpStream};
+use std::collections::HashMap;
+use std::net::{IpAddr, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex, mpsc};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -6,18 +7,78 @@ use std::time::Duration;
 use crate::ir::Module;
 use crate::native::http::{
     HttpClientState, MatchedParams, ReadHttpError, RouteEntry, RouterState,
-    header_key, http_client_bytes_request, http_client_pooled_request, http_client_request,
-    http_client_request_with_timeout, lookup_route, make_http_client_obj, make_http_error,
-    make_response_obj, make_response_with_body_obj, make_router_obj,
-    read_http_request, reader_writer_pair, resolve_client_url, route_prefix_matches,
-    try_serve_static, write_error_response, write_http_response_ext,
+    deadline_reader_writer_pair, header_key, http_client_bytes_request,
+    http_client_pooled_request, http_client_request, http_client_request_with_timeout,
+    lookup_route, make_http_client_obj, make_http_error, make_response_obj,
+    make_response_with_body_obj, make_router_obj, read_http_request_deadline,
+    resolve_client_url, route_prefix_matches, try_serve_static, write_error_response,
+    write_http_response_ext,
 };
 use crate::vm::exec_cold::err_msg;
 use crate::vm::value::{
-    ListStorage, MapKey, MapVal, Obj, OrderedMap, SCHEMA_HTTP_CLIENT, SCHEMA_HTTP_REQUEST,
-    SCHEMA_HTTP_RESPONSE, SCHEMA_HTTP_ROUTER, StructData,
+    FxBuildHasher, ListStorage, MapKey, MapVal, Obj, OrderedMap, SCHEMA_HTTP_CLIENT,
+    SCHEMA_HTTP_REQUEST, SCHEMA_HTTP_RESPONSE, SCHEMA_HTTP_ROUTER, StructData,
 };
 use crate::vm::{ExecResult, RuntimeError, Vm};
+
+const HTTP_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+const HTTP_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
+const HTTP_BODY_TIMEOUT: Duration = Duration::from_secs(30);
+const HTTP_MAX_KEEPALIVE_REQUESTS: usize = 100;
+
+struct IpConnLimiter {
+    counts: Mutex<HashMap<IpAddr, usize, FxBuildHasher>>,
+    max_remote_per_ip: usize,
+    max_loopback_per_ip: usize,
+}
+
+struct IpConnPermit {
+    limiter: Arc<IpConnLimiter>,
+    ip: IpAddr,
+}
+
+impl IpConnLimiter {
+    fn new(workers: usize) -> Arc<Self> {
+        Arc::new(Self {
+            counts: Mutex::new(HashMap::with_hasher(FxBuildHasher)),
+            max_remote_per_ip: (workers / 2).max(2),
+            max_loopback_per_ip: (workers * 4).max(32),
+        })
+    }
+
+    fn try_acquire(self: &Arc<Self>, raw_ip: IpAddr) -> Option<IpConnPermit> {
+        let ip = raw_ip.to_canonical();
+        let limit = if ip.is_loopback() {
+            self.max_loopback_per_ip
+        } else {
+            self.max_remote_per_ip
+        };
+        let mut guard = self.counts.lock().ok()?;
+        let entry = guard.entry(ip).or_insert(0);
+        if *entry >= limit {
+            return None;
+        }
+        *entry += 1;
+        Some(IpConnPermit {
+            limiter: Arc::clone(self),
+            ip,
+        })
+    }
+}
+
+impl Drop for IpConnPermit {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.limiter.counts.lock()
+            && let Some(count) = guard.get_mut(&self.ip)
+        {
+            if *count <= 1 {
+                guard.remove(&self.ip);
+            } else {
+                *count -= 1;
+            }
+        }
+    }
+}
 
 fn json_escape_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -169,7 +230,8 @@ pub(crate) fn serve_http_listener(
     let workers = std::thread::available_parallelism()
         .map(|n| n.get().clamp(4, 16))
         .unwrap_or(8);
-    let (tx, rx) = mpsc::sync_channel::<TcpStream>(workers * 8);
+    let ip_limiter = IpConnLimiter::new(workers);
+    let (tx, rx) = mpsc::sync_channel::<(TcpStream, IpConnPermit)>(workers * 8);
     let rx = Arc::new(Mutex::new(rx));
     std::thread::scope(|scope| {
         for _ in 0..workers {
@@ -191,14 +253,15 @@ pub(crate) fn serve_http_listener(
                 worker_vm.host.spawn_tracker = spawn_tracker;
                 worker_vm.host.shared_module = Some(Arc::clone(&mod_worker));
                 loop {
-                    let stream = {
+                    let (stream, permit) = {
                         let Ok(guard) = rx.lock() else { break };
                         match guard.recv() {
-                            Ok(s) => s,
+                            Ok(conn) => conn,
                             Err(_) => break,
                         }
                     };
                     serve_connection_isolated(&mut worker_vm, &mod_worker, rid, stream);
+                    drop(permit);
                     crate::vm::exec_map::flush_stdout();
                 }
             });
@@ -226,12 +289,17 @@ pub(crate) fn serve_http_listener(
         };
         while !stop_flag.load(Ordering::Acquire) {
             match listener.accept() {
-                Ok((stream, _)) => {
+                Ok((stream, peer_addr)) => {
                     if stop_flag.load(Ordering::Acquire) {
                         break;
                     }
-                    if tx.send(stream).is_err() {
-                        break;
+                    let Some(permit) = ip_limiter.try_acquire(peer_addr.ip()) else {
+                        continue;
+                    };
+                    match tx.try_send((stream, permit)) {
+                        Ok(()) => {}
+                        Err(mpsc::TrySendError::Full(_)) => continue,
+                        Err(mpsc::TrySendError::Disconnected(_)) => break,
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -1464,22 +1532,25 @@ fn serve_connection_isolated(vm: &mut Vm, module: &Module, rid: usize, stream: T
 }
 
 fn serve_connection(vm: &mut Vm, module: &Module, rid: usize, stream: TcpStream) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
+    let _ = stream.set_read_timeout(Some(HTTP_HEADER_TIMEOUT));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
-    let Ok((mut reader, mut writer)) = reader_writer_pair(stream) else {
+    let Ok((mut reader, mut writer)) = deadline_reader_writer_pair(stream, HTTP_HEADER_TIMEOUT)
+    else {
         return;
     };
-    let mut first_req = true;
+    let mut req_count: usize = 0;
     loop {
-        if !first_req {
-            // Keep-alive idle timeout to prevent slowloris / connection exhaustion
-            let _ = reader.get_ref().set_read_timeout(Some(Duration::from_secs(5)));
-        }
-        first_req = false;
-        match read_http_request(&mut reader) {
+        let idle = if req_count == 0 {
+            HTTP_HEADER_TIMEOUT
+        } else {
+            HTTP_IDLE_TIMEOUT
+        };
+        match read_http_request_deadline(&mut reader, idle, HTTP_HEADER_TIMEOUT, HTTP_BODY_TIMEOUT)
+        {
             Ok(raw) => {
+                req_count += 1;
                 let head_only = raw.method.eq_ignore_ascii_case("HEAD");
-                let keep_alive = raw.keep_alive;
+                let keep_alive = raw.keep_alive && req_count < HTTP_MAX_KEEPALIVE_REQUESTS;
                 let req_obj = raw.into_request_obj();
                 match vm.dispatch_router_request(module, 0, 0, rid, req_obj) {
                     Ok(resp_obj) => {
@@ -1487,16 +1558,17 @@ fn serve_connection(vm: &mut Vm, module: &Module, rid: usize, stream: TcpStream)
                             write_error_response(&mut writer, 500, "Internal Server Error");
                             break;
                         };
-                        if write_http_response_ext(
+                        if let Err(err) = write_http_response_ext(
                             &mut writer,
                             status,
                             body,
                             headers,
                             keep_alive,
                             head_only,
-                        )
-                        .is_err()
-                        {
+                        ) {
+                            if err.kind() == std::io::ErrorKind::InvalidInput {
+                                write_error_response(&mut writer, 500, "Internal Server Error");
+                            }
                             break;
                         }
                     }
@@ -1510,6 +1582,10 @@ fn serve_connection(vm: &mut Vm, module: &Module, rid: usize, stream: TcpStream)
                 }
             }
             Err(ReadHttpError::Closed) => break,
+            Err(ReadHttpError::Timeout) => {
+                write_error_response(&mut writer, 408, "Request Timeout");
+                break;
+            }
             Err(ReadHttpError::TooLarge) => {
                 write_error_response(&mut writer, 413, "Payload Too Large");
                 break;
@@ -1753,5 +1829,44 @@ fn convert_auto_http_response(
                 )),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn ip_conn_limiter_enforces_remote_and_loopback_caps_and_releases() {
+        let limiter = IpConnLimiter::new(4);
+        assert_eq!(limiter.max_remote_per_ip, 2);
+        assert_eq!(limiter.max_loopback_per_ip, 32);
+
+        let remote = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10));
+        let p1 = limiter.try_acquire(remote).expect("1st remote");
+        let p2 = limiter.try_acquire(remote).expect("2nd remote");
+        assert!(limiter.try_acquire(remote).is_none(), "3rd remote blocked");
+
+        let mapped = IpAddr::V6(Ipv4Addr::new(203, 0, 113, 10).to_ipv6_mapped());
+        assert!(limiter.try_acquire(mapped).is_none(), "IPv4-mapped IPv6 shares limit");
+
+        drop(p1);
+        let _p3 = limiter.try_acquire(remote).expect("slot freed after drop");
+        drop(p2);
+
+        let loopback = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        let mut loop_permits = Vec::new();
+        for _ in 0..limiter.max_loopback_per_ip {
+            loop_permits.push(limiter.try_acquire(loopback).expect("loopback within cap"));
+        }
+        let v4_mapped_loopback = IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped());
+        assert!(
+            limiter.try_acquire(v4_mapped_loopback).is_some(),
+            "separate loopback IPv4 has own bucket"
+        );
+        assert!(limiter.try_acquire(loopback).is_none(), "v6 loopback cap enforced");
+        drop(loop_permits);
+        assert!(limiter.try_acquire(loopback).is_some());
     }
 }

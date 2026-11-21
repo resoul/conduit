@@ -44,11 +44,15 @@ test "app_service headless lifecycle runs hooks in order, ticks cron, and stops 
     svc := app.start<BillingHeadless>()?
     assert(svc.is_running())
 
-    time.sleep(110)?
+    state := cache.open(STATE_CACHE)
+    var wait_ticks = 0
+    while wait_ticks < 200 && (state.get("ticks") ?? "0") == "0" {
+        time.sleep(10)?
+        wait_ticks = wait_ticks + 1
+    }
     svc.stop()?
     assert(!svc.is_running())
 
-    state := cache.open(STATE_CACHE)
     assert_eq(state.get("status") ?? "", "stopped")
     assert_eq(state.get("lifecycle") ?? "", "init,metrics_ready,cleanup,metrics_flushed")
 
