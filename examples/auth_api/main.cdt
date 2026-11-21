@@ -1,10 +1,13 @@
 import * as cache from "cdt.cache"
 import * as cron from "cdt.cron"
+import * as crypto from "cdt.crypto"
 import * as env from "cdt.env"
 import * as fs from "cdt.fs"
 import * as http from "cdt.http"
+import * as json from "cdt.json"
 import * as jwt from "cdt.jwt"
 import * as lock from "cdt.lock"
+import * as log from "cdt.log"
 import * as path from "cdt.path"
 import * as process from "cdt.process"
 import * as time from "cdt.time"
@@ -13,7 +16,13 @@ import * as validation from "cdt.validation"
 export struct LoginRequest {
     email: String @validation.email
     password: String @validation.min_len(6)
-    role: String? @validation.one_of("admin", "member") = nil
+}
+
+export config AuthConfig {
+    jwt_secret: String @env("JWT_SECRET") @validation.min_len(32)
+    email: String @env("AUTH_EMAIL") @validation.email
+    password_hash: String @env("AUTH_PASSWORD_HASH") @validation.not_empty
+    role: String @env("AUTH_ROLE") @validation.one_of("admin", "member") = "member"
 }
 
 export struct Claims {
@@ -45,10 +54,6 @@ export struct NoteReply {
 
 export struct ErrReply {
     code: String
-}
-
-func jwt_secret() -> String {
-    return env.get("JWT_SECRET") ?? "dev-conduit-jwt-secret-0123456789abcdef"
 }
 
 func active_work_dir() -> String {
@@ -84,7 +89,9 @@ func require_jwt(req: http.Request) -> Claims | http.Response {
     if tok.is_empty() {
         return http.status_json(401, ErrReply(code: "missing_bearer_token"))
     }
-    switch jwt.verify<Claims>(tok, jwt_secret()) {
+    cfg := cache.open("auth_api_state")
+    secret := cfg.get("jwt_secret") ?? ""
+    switch jwt.verify<Claims>(tok, secret, 0, true) {
         case Claims(claims):
             return claims
         case jwt.JwtError(_):
@@ -104,10 +111,17 @@ func login_handler(_req: http.Request, body: LoginRequest) -> http.Response {
             return http.status_json(500, ErrReply(code: e.message))
     }
 
-    role := body.role ?? "member"
-    switch jwt.sign(Claims(sub: body.email, role: role), jwt_secret(), 3600) {
+    cfg := cache.open("auth_api_state")
+    email := cfg.get("email") ?? ""
+    hash := cfg.get("password_hash") ?? ""
+    password_ok := crypto.verify_password(body.password, hash)
+    if !password_ok || body.email != email {
+        return http.status_json(401, ErrReply(code: "invalid_credentials"))
+    }
+    role := cfg.get("role") ?? "member"
+    secret := cfg.get("jwt_secret") ?? ""
+    switch jwt.sign(Claims(sub: email, role: role), secret, 3600) {
         case String(tok):
-            email := body.email
             spawn {
                 tel := cache.open("auth_api_telemetry")
                 _s := tel.set("last_user", email)
@@ -221,8 +235,12 @@ export func build_auth_router() -> http.Router {
     return http.build<AuthApi>()
 }
 
-export func setup_state(work_dir: String, limit: Int) -> Void | cache.CacheError {
+export func setup_state(work_dir: String, limit: Int, auth: AuthConfig) -> Void | cache.CacheError {
     cfg := cache.open("auth_api_state")
+    cfg.set("jwt_secret", auth.jwt_secret)?
+    cfg.set("email", auth.email)?
+    cfg.set("password_hash", auth.password_hash)?
+    cfg.set("role", auth.role)?
     cfg.set("dir", work_dir)?
     limit_str := limit.to_string()
     cfg.set("rate_limit", limit_str)?
@@ -232,7 +250,7 @@ export func setup_state(work_dir: String, limit: Int) -> Void | cache.CacheError
     return
 }
 
-export func run_self_test() -> Void | fs.FsError | cache.CacheError | jwt.JwtError {
+export func run_self_test() -> Void | fs.FsError | cache.CacheError | crypto.CryptoError | json.DecodeError {
     pid := process.pid()
     dir := path.join("/tmp", "conduit_auth_api_self_{pid}")
     let_clean := fs.remove(dir)
@@ -241,7 +259,9 @@ export func run_self_test() -> Void | fs.FsError | cache.CacheError | jwt.JwtErr
         case Void:
     }
     fs.mkdir_all(dir)?
-    setup_state(dir, 5)?
+    secret := crypto.random_bytes_hex(32)?
+    hash := crypto.hash_password("hunter2")?
+    setup_state(dir, 5, AuthConfig(jwt_secret: secret, email: "ada@conduit.dev", password_hash: hash))?
 
     r := build_auth_router()
     empty := Map<String, String>()
@@ -265,16 +285,16 @@ export func run_self_test() -> Void | fs.FsError | cache.CacheError | jwt.JwtErr
     r_login := r.dispatch(http.Request(
         method: "POST",
         path: "/auth/login",
-        body: "{\"email\":\"ada@conduit.dev\",\"password\":\"hunter2\",\"role\":\"admin\"}",
+        body: "{\"email\":\"ada@conduit.dev\",\"password\":\"hunter2\"}",
         headers: empty,
         query: empty,
         params: empty,
     ))
     print("POST /auth/login (valid): status={r_login.status}")
 
-    // 4. Re-issue / verify JWT and hit /api/me + /api/notes
-    tok := jwt.sign(Claims(sub: "ada@conduit.dev", role: "admin"), jwt_secret(), 3600)?
-    auth_h := Map.from([("Authorization", "Bearer {tok}")])
+    // 4. Use the token returned by login on both protected routes
+    reply := json.decode<TokenReply>(r_login.body)?
+    auth_h := Map.from([("Authorization", "Bearer {reply.token}")])
 
     r_me := r.dispatch(http.Request(method: "GET", path: "/api/me", body: "", headers: auth_h, query: empty, params: empty))
     print("GET /api/me (authed): status={r_me.status} body={r_me.body}")
@@ -311,7 +331,12 @@ export func run_self_test() -> Void | fs.FsError | cache.CacheError | jwt.JwtErr
     return
 }
 
-export func main() -> Void | fs.FsError | cache.CacheError | jwt.JwtError | http.HttpError {
+func load_live_auth() -> AuthConfig | env.EnvError | validation.ValidationError {
+    auth := env.load<AuthConfig>()?
+    return validation.check(auth)?
+}
+
+export func main() -> Void | fs.FsError | cache.CacheError | crypto.CryptoError | json.DecodeError | http.HttpError {
     args := env.args()
     var i = 0
     while i < args.len() {
@@ -319,7 +344,20 @@ export func main() -> Void | fs.FsError | cache.CacheError | jwt.JwtError | http
             case String(arg):
                 if arg == "serve" {
                     addr := env.get("BIND_ADDR") ?? "127.0.0.1:8080"
-                    setup_state("/tmp/conduit_auth_api_live", 100)?
+                    switch load_live_auth() {
+                        case AuthConfig(auth):
+                            setup_state("/tmp/conduit_auth_api_live", 100, auth)?
+                        case env.EnvError(e):
+                            log.warn("Missing or invalid environment variable: {e.name}")
+                            process.exit(1)
+                            return
+                        case validation.ValidationError(e):
+                            for issue in e.issues {
+                                log.warn("Invalid auth configuration: {issue.path} {issue.message}")
+                            }
+                            process.exit(1)
+                            return
+                    }
                     print("AuthApi listening on http://{addr}")
                     http.serve<AuthApi>(addr)?
                     return

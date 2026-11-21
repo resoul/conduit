@@ -330,6 +330,28 @@ fn cli_check_pretty_multi_error_and_imported_file_diagnostics() {
 }
 
 #[test]
+fn auth_api_serve_requires_a_strong_configured_jwt_secret() {
+    let main = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/auth_api/main.cdt");
+    for secret in [None, Some(""), Some("short")] {
+        let mut cmd = Command::new(conduit_bin());
+        cmd.arg("run").arg(&main).args(["--", "serve"])
+            .env("AUTH_EMAIL", "alice@conduit.dev")
+            .env("AUTH_PASSWORD_HASH", "unused-in-this-test")
+            .env_remove("AUTH_ROLE")
+            .env_remove("JWT_SECRET")
+            .env("BIND_ADDR", "invalid-bind-address");
+        if let Some(secret) = secret {
+            cmd.env("JWT_SECRET", secret);
+        }
+        let out = cmd.output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{stderr}");
+        assert!(stderr.to_ascii_lowercase().contains("jwt_secret"), "{stderr}");
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("listening"));
+    }
+}
+
+#[test]
 fn cli_routes_and_openapi_commands() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let auth_main = manifest_dir.join("examples/auth_api/main.cdt");
@@ -389,7 +411,10 @@ fn cli_routes_and_openapi_commands() {
     assert!(spec.contains("LoginRequest"), "{spec}");
     assert!(spec.contains(r#""format": "email""#), "{spec}");
     assert!(spec.contains(r#""minLength": 6"#), "{spec}");
-    assert!(spec.contains(r#""enum""#), "{spec}");
+    let (_, login_schema) = spec.split_once(r#""LoginRequest": {"#).unwrap();
+    let (login_fields, _) = login_schema.split_once(r#""required""#).unwrap();
+    assert!(login_fields.contains(r#""password""#), "{login_fields}");
+    assert!(!login_fields.contains(r#""role""#), "{login_fields}");
     assert!(spec.contains("TokenReply"), "{spec}");
     assert!(spec.contains("ValidationErrorResponse"), "{spec}");
 

@@ -24,7 +24,19 @@ conduit test .
 
 # Run offline self-test (exercises login, JWT middleware, rate limit, WAL, snapshot & file lock)
 conduit run main.cdt
-
-# Or start the live HTTP server
-conduit run main.cdt -- serve
 ```
+
+## Run the live server
+
+The example serves one configured account. Set these variables in the server environment before running `conduit run main.cdt -- serve`.
+
+| Variable | Value |
+| --- | --- |
+| `JWT_SECRET` | A persistent, randomly generated signing key of at least 32 characters. Generate one with `openssl rand -hex 32` and store it in your secret manager. |
+| `AUTH_EMAIL` | Email of the account allowed to log in. |
+| `AUTH_PASSWORD_HASH` | Encoded password hash for the account. Generate it with `crypto.hash_password(password)` and preserve the complete value, including the dollar signs. |
+| `AUTH_ROLE` | Optional. Defaults to `member` and also accepts `admin`. |
+
+When upgrading a running example, rotate `JWT_SECRET` to invalidate tokens issued by the previous login handler.
+
+Send `email` and `password` to `POST /auth/login`. A successful login returns a one-hour bearer token carrying the configured role. Unknown accounts and incorrect passwords both receive HTTP 401. The offline self-test generates its own signing key and password hash.

@@ -10,8 +10,9 @@ use crate::native::tls::{TlsConfig, TlsVersion, Transport, VerifyMode};
 
 use crate::vm::string::VmString;
 use crate::vm::value::{
-    MapKey, MapVal, Obj, OrderedMap, SCHEMA_HTTP_BINARY_RESPONSE, SCHEMA_HTTP_CLIENT,
-    SCHEMA_HTTP_ERROR, SCHEMA_HTTP_REQUEST, SCHEMA_HTTP_RESPONSE, SCHEMA_HTTP_ROUTER, StructData,
+    FxBuildHasher, MapKey, MapVal, Obj, OrderedMap, SCHEMA_HTTP_BINARY_RESPONSE,
+    SCHEMA_HTTP_CLIENT, SCHEMA_HTTP_ERROR, SCHEMA_HTTP_REQUEST, SCHEMA_HTTP_RESPONSE,
+    SCHEMA_HTTP_ROUTER, StructData,
 };
 
 pub const MAX_LINE: usize = 8 * 1024;
@@ -87,6 +88,7 @@ pub struct RouterServerOptions {
 #[derive(Debug, Default, Clone)]
 pub struct RouterState {
     pub routes: Vec<RouteEntry>,
+    pub(crate) route_index: Arc<RouteIndex>,
     pub before: Vec<(Option<Box<str>>, Obj)>,
     pub after: Vec<(Option<Box<str>>, Obj)>,
     pub on_start: Vec<Obj>,
@@ -96,6 +98,22 @@ pub struct RouterState {
     pub server_opts: RouterServerOptions,
     pub stop_flag: Arc<AtomicBool>,
     pub listen_addr: Arc<std::sync::Mutex<Option<std::net::SocketAddr>>>,
+}
+
+impl RouterState {
+    pub fn push_route(&mut self, entry: RouteEntry) {
+        let route_idx = self.routes.len();
+        Arc::make_mut(&mut self.route_index).insert(route_idx, &entry);
+        self.routes.push(entry);
+    }
+
+    pub fn lookup_route(&self, method: &str, path: &str) -> Result<(&RouteEntry, MatchedParams), u16> {
+        if self.route_index.indexed_len == self.routes.len() {
+            self.route_index.lookup(&self.routes, method, path)
+        } else {
+            lookup_route(&self.routes, method, path)
+        }
+    }
 }
 
 #[inline]
@@ -120,13 +138,42 @@ pub fn content_type_for_path(path: &std::path::Path) -> &'static str {
         "webp" => "image/webp",
         "ico" => "image/x-icon",
         "txt" | "md" => "text/plain; charset=utf-8",
+        "woff" => "font/woff",
         "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
         "wasm" => "application/wasm",
         _ => "application/octet-stream",
     }
 }
 
-pub fn try_serve_static(statics: &[(Box<str>, Box<str>)], method: &str, path: &str) -> Option<Obj> {
+pub enum StaticFileBody {
+    HeadOnly { len: u64 },
+    File { file: std::fs::File, len: u64 },
+}
+
+pub struct ResolvedStaticFile {
+    pub content_type: &'static str,
+    pub body: StaticFileBody,
+}
+
+impl ResolvedStaticFile {
+    pub fn len(&self) -> u64 {
+        match &self.body {
+            StaticFileBody::HeadOnly { len } | StaticFileBody::File { len, .. } => *len,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+pub fn resolve_static_file(
+    statics: &[(Box<str>, Box<str>)],
+    method: &str,
+    path: &str,
+) -> Option<ResolvedStaticFile> {
     if method != "GET" && method != "HEAD" {
         return None;
     }
@@ -136,21 +183,68 @@ pub fn try_serve_static(statics: &[(Box<str>, Box<str>)], method: &str, path: &s
         }
         let p = url_prefix.trim_end_matches('/');
         let rel = path.strip_prefix(p).unwrap_or("").trim_start_matches('/');
-        if rel.is_empty() || rel.contains('\0') || rel.split('/').any(|seg| seg == ".." || seg == ".") {
+        if rel.is_empty()
+            || rel.contains('\0')
+            || rel.split(['/', '\\']).any(|seg| seg == ".." || seg == ".")
+        {
             return None;
         }
-        let base_dir = std::fs::canonicalize(dir_path.as_ref()).ok()?;
+        let Ok(base_dir) = std::fs::canonicalize(dir_path.as_ref()) else {
+            continue;
+        };
         let candidate = base_dir.join(rel);
-        let canon = std::fs::canonicalize(&candidate).ok()?;
-        if !canon.starts_with(&base_dir) || !canon.is_file() {
+        let Ok(canon) = std::fs::canonicalize(&candidate) else {
+            continue;
+        };
+        if !canon.starts_with(&base_dir) {
             return None;
         }
-        let bytes = std::fs::read(&canon).ok()?;
-        let body = String::from_utf8_lossy(&bytes).into_owned();
-        let ct = content_type_for_path(&canon);
-        return Some(make_response_obj(200, body, Some(ct)));
+        let content_type = content_type_for_path(&canon);
+        if method == "HEAD" {
+            let Ok(meta) = std::fs::metadata(&canon) else {
+                continue;
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            return Some(ResolvedStaticFile {
+                content_type,
+                body: StaticFileBody::HeadOnly { len: meta.len() },
+            });
+        }
+        let Ok(file) = std::fs::File::open(&canon) else {
+            continue;
+        };
+        let Ok(meta) = file.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        return Some(ResolvedStaticFile {
+            content_type,
+            body: StaticFileBody::File {
+                file,
+                len: meta.len(),
+            },
+        });
     }
     None
+}
+
+pub fn try_serve_static(statics: &[(Box<str>, Box<str>)], method: &str, path: &str) -> Option<Obj> {
+    let resolved = resolve_static_file(statics, method, path)?;
+    match resolved.body {
+        StaticFileBody::HeadOnly { .. } => {
+            Some(make_response_obj(200, "", Some(resolved.content_type)))
+        }
+        StaticFileBody::File { mut file, len } => {
+            let mut bytes = Vec::with_capacity((len as usize).min(MAX_BODY));
+            file.read_to_end(&mut bytes).ok()?;
+            let body = String::from_utf8_lossy(&bytes).into_owned();
+            Some(make_response_obj(200, body, Some(resolved.content_type)))
+        }
+    }
 }
 
 pub fn parse_pattern(pattern: &str) -> Vec<RouteSeg> {
@@ -349,6 +443,373 @@ pub fn lookup_route<'a>(
     }
 
     Err(404)
+}
+
+const METHOD_IDX_ANY: usize = 7;
+const METHOD_MASK_ANY: u16 = 1 << 7;
+const METHOD_MASK_OTHER: u16 = 1 << 8;
+const METHOD_MASK_ALL: u16 = 0x01FF;
+
+#[inline]
+fn classify_method(method: &str) -> Option<usize> {
+    match method {
+        "GET" => Some(0),
+        "POST" => Some(1),
+        "PUT" => Some(2),
+        "DELETE" => Some(3),
+        "PATCH" => Some(4),
+        "HEAD" => Some(5),
+        "OPTIONS" => Some(6),
+        "*" => Some(METHOD_IDX_ANY),
+        _ => {
+            if method.eq_ignore_ascii_case("GET") {
+                Some(0)
+            } else if method.eq_ignore_ascii_case("POST") {
+                Some(1)
+            } else if method.eq_ignore_ascii_case("PUT") {
+                Some(2)
+            } else if method.eq_ignore_ascii_case("DELETE") {
+                Some(3)
+            } else if method.eq_ignore_ascii_case("PATCH") {
+                Some(4)
+            } else if method.eq_ignore_ascii_case("HEAD") {
+                Some(5)
+            } else if method.eq_ignore_ascii_case("OPTIONS") {
+                Some(6)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+#[inline]
+fn method_mask_for_route(route_method: &str) -> u16 {
+    match classify_method(route_method) {
+        Some(METHOD_IDX_ANY) => METHOD_MASK_ALL,
+        Some(idx) => 1u16 << idx,
+        None => METHOD_MASK_OTHER,
+    }
+}
+
+#[inline]
+fn method_mask_for_request(req_method: &str) -> u16 {
+    match classify_method(req_method) {
+        Some(METHOD_IDX_ANY) => METHOD_MASK_ANY,
+        Some(idx) => (1u16 << idx) | METHOD_MASK_ANY,
+        None => METHOD_MASK_OTHER | METHOD_MASK_ANY,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StaticPathBucket {
+    first_by_method: [u32; 8],
+    other_methods: Vec<(Box<str>, u32)>,
+}
+
+impl Default for StaticPathBucket {
+    fn default() -> Self {
+        Self {
+            first_by_method: [u32::MAX; 8],
+            other_methods: Vec::new(),
+        }
+    }
+}
+
+impl StaticPathBucket {
+    fn insert(&mut self, route_idx: usize, method: &str) {
+        let idx = route_idx as u32;
+        if let Some(m_idx) = classify_method(method) {
+            if self.first_by_method[m_idx] == u32::MAX {
+                self.first_by_method[m_idx] = idx;
+            }
+        } else if !self
+            .other_methods
+            .iter()
+            .any(|(m, _)| m.eq_ignore_ascii_case(method))
+        {
+            self.other_methods.push((method.into(), idx));
+        }
+    }
+
+    #[inline]
+    fn best_for_method(&self, req_method: &str) -> Option<usize> {
+        let any_idx = self.first_by_method[METHOD_IDX_ANY];
+        let best = match classify_method(req_method) {
+            Some(METHOD_IDX_ANY) => any_idx,
+            Some(idx) => self.first_by_method[idx].min(any_idx),
+            None => {
+                let mut best = any_idx;
+                for (m, idx) in &self.other_methods {
+                    if m.eq_ignore_ascii_case(req_method) {
+                        best = best.min(*idx);
+                        break;
+                    }
+                }
+                best
+            }
+        };
+        (best != u32::MAX).then_some(best as usize)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DynamicTrieNode {
+    min_route_idx: usize,
+    method_mask: u16,
+    literals: HashMap<Box<str>, DynamicTrieNode, FxBuildHasher>,
+    param: Option<Box<DynamicTrieNode>>,
+    terminal_routes: Vec<usize>,
+    wildcard_routes: Vec<usize>,
+}
+
+impl Default for DynamicTrieNode {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DynamicTrieNode {
+    fn new() -> Self {
+        Self {
+            min_route_idx: usize::MAX,
+            method_mask: 0,
+            literals: HashMap::with_hasher(FxBuildHasher),
+            param: None,
+            terminal_routes: Vec::new(),
+            wildcard_routes: Vec::new(),
+        }
+    }
+
+    fn insert(&mut self, route_idx: usize, entry: &RouteEntry) {
+        let mask = method_mask_for_route(&entry.method);
+        let mut node = self;
+        for seg in &entry.segments {
+            node.min_route_idx = node.min_route_idx.min(route_idx);
+            node.method_mask |= mask;
+            match seg {
+                RouteSeg::Lit(lit) => {
+                    node = node
+                        .literals
+                        .entry(lit.clone())
+                        .or_default();
+                }
+                RouteSeg::Param(_) => {
+                    node = node
+                        .param
+                        .get_or_insert_with(|| Box::new(DynamicTrieNode::new()));
+                }
+                RouteSeg::Wildcard(_) => {
+                    node.wildcard_routes.push(route_idx);
+                    return;
+                }
+            }
+        }
+        node.min_route_idx = node.min_route_idx.min(route_idx);
+        node.method_mask |= mask;
+        node.terminal_routes.push(route_idx);
+    }
+
+    fn search_best(
+        &self,
+        routes: &[RouteEntry],
+        method: &str,
+        req_mask: u16,
+        path_segs: &[&str],
+        depth: usize,
+        best_idx: &mut usize,
+    ) {
+        if self.min_route_idx >= *best_idx || (self.method_mask & req_mask) == 0 {
+            return;
+        }
+        for &idx in &self.wildcard_routes {
+            if idx >= *best_idx {
+                break;
+            }
+            if route_matches_method(&routes[idx].method, method) {
+                *best_idx = idx;
+                break;
+            }
+        }
+        if depth == path_segs.len() {
+            for &idx in &self.terminal_routes {
+                if idx >= *best_idx {
+                    break;
+                }
+                if route_matches_method(&routes[idx].method, method) {
+                    *best_idx = idx;
+                    break;
+                }
+            }
+            return;
+        }
+        let seg = path_segs[depth];
+        let lit_child = self.literals.get(seg);
+        let param_child = if seg.is_empty() {
+            None
+        } else {
+            self.param.as_deref()
+        };
+        match (lit_child, param_child) {
+            (Some(lc), Some(pc)) => {
+                if lc.min_route_idx <= pc.min_route_idx {
+                    lc.search_best(routes, method, req_mask, path_segs, depth + 1, best_idx);
+                    pc.search_best(routes, method, req_mask, path_segs, depth + 1, best_idx);
+                } else {
+                    pc.search_best(routes, method, req_mask, path_segs, depth + 1, best_idx);
+                    lc.search_best(routes, method, req_mask, path_segs, depth + 1, best_idx);
+                }
+            }
+            (Some(child), None) | (None, Some(child)) => {
+                child.search_best(routes, method, req_mask, path_segs, depth + 1, best_idx);
+            }
+            (None, None) => {}
+        }
+    }
+
+    fn matches_any_method(&self, path_segs: &[&str], depth: usize) -> bool {
+        if !self.wildcard_routes.is_empty() {
+            return true;
+        }
+        if depth == path_segs.len() {
+            return !self.terminal_routes.is_empty();
+        }
+        let seg = path_segs[depth];
+        if let Some(lc) = self.literals.get(seg)
+            && lc.matches_any_method(path_segs, depth + 1)
+        {
+            return true;
+        }
+        if !seg.is_empty()
+            && let Some(pc) = self.param.as_deref()
+            && pc.matches_any_method(path_segs, depth + 1)
+        {
+            return true;
+        }
+        false
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RouteIndex {
+    pub(crate) indexed_len: usize,
+    static_by_path: HashMap<Box<str>, StaticPathBucket, FxBuildHasher>,
+    dynamic_root: DynamicTrieNode,
+}
+
+impl Default for RouteIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RouteIndex {
+    pub fn new() -> Self {
+        Self {
+            indexed_len: 0,
+            static_by_path: HashMap::with_hasher(FxBuildHasher),
+            dynamic_root: DynamicTrieNode::new(),
+        }
+    }
+
+    pub fn from_routes(routes: &[RouteEntry]) -> Self {
+        let mut index = Self::new();
+        for (idx, entry) in routes.iter().enumerate() {
+            index.insert(idx, entry);
+        }
+        index
+    }
+
+    pub fn insert(&mut self, route_idx: usize, entry: &RouteEntry) {
+        debug_assert_eq!(route_idx, self.indexed_len);
+        self.indexed_len = self.indexed_len.max(route_idx + 1);
+        if entry.is_static {
+            self.static_by_path
+                .entry(entry.trimmed_pattern.clone())
+                .or_default()
+                .insert(route_idx, &entry.method);
+        } else {
+            self.dynamic_root.insert(route_idx, entry);
+        }
+    }
+
+    pub fn lookup<'a>(
+        &self,
+        routes: &'a [RouteEntry],
+        method: &str,
+        path: &str,
+    ) -> Result<(&'a RouteEntry, MatchedParams), u16> {
+        let trimmed = path.trim_matches('/');
+        let static_bucket = self.static_by_path.get(trimmed);
+        let mut best_idx = static_bucket
+            .and_then(|b| b.best_for_method(method))
+            .unwrap_or(usize::MAX);
+
+        let mut segs = PathSegCache::new(trimmed);
+        let req_mask = method_mask_for_request(method);
+        if self.dynamic_root.min_route_idx < best_idx
+            && (self.dynamic_root.method_mask & req_mask) != 0
+        {
+            self.dynamic_root
+                .search_best(routes, method, req_mask, segs.get(), 0, &mut best_idx);
+        }
+
+        if best_idx != usize::MAX {
+            let entry = &routes[best_idx];
+            let params = if entry.is_static {
+                MatchedParams::None
+            } else {
+                extract_matched_params(entry, segs.get())
+            };
+            return Ok((entry, params));
+        }
+
+        if static_bucket.is_some() {
+            return Err(405);
+        }
+        if self.dynamic_root.min_route_idx != usize::MAX
+            && self.dynamic_root.matches_any_method(segs.get(), 0)
+        {
+            return Err(405);
+        }
+        Err(404)
+    }
+}
+
+struct PathSegCache<'a> {
+    trimmed: &'a str,
+    stack: [&'a str; 16],
+    overflow: Vec<&'a str>,
+    count: Option<usize>,
+}
+
+impl<'a> PathSegCache<'a> {
+    #[inline]
+    fn new(trimmed: &'a str) -> Self {
+        Self {
+            trimmed,
+            stack: [""; 16],
+            overflow: Vec::new(),
+            count: None,
+        }
+    }
+
+    #[inline]
+    fn get(&mut self) -> &[&'a str] {
+        let n = match self.count {
+            Some(n) => n,
+            None => {
+                let n = split_path_segs(self.trimmed, &mut self.stack, &mut self.overflow);
+                self.count = Some(n);
+                n
+            }
+        };
+        if self.overflow.is_empty() {
+            &self.stack[..n]
+        } else {
+            &self.overflow[..]
+        }
+    }
 }
 
 #[inline]
@@ -1078,13 +1539,12 @@ pub fn reason_phrase(status: i64) -> &'static str {
     }
 }
 
-pub fn write_http_response_ext<W: Write>(
+pub fn write_http_response_head<W: Write>(
     writer: &mut W,
     status: i64,
-    body: &str,
+    content_length: u64,
     headers: Option<&OrderedMap>,
     keep_alive: bool,
-    head_only: bool,
 ) -> io::Result<()> {
     if !(100..=999).contains(&status) {
         return Err(io::Error::new(
@@ -1116,7 +1576,7 @@ pub fn write_http_response_ext<W: Write>(
         "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: {}\r\n",
         status,
         reason_phrase(status),
-        body.len(),
+        content_length,
         if keep_alive { "keep-alive" } else { "close" }
     )?;
     if let Some(map) = headers {
@@ -1133,9 +1593,61 @@ pub fn write_http_response_ext<W: Write>(
             }
         }
     }
-    writer.write_all(b"\r\n")?;
+    writer.write_all(b"\r\n")
+}
+
+pub fn write_http_response_ext<W: Write>(
+    writer: &mut W,
+    status: i64,
+    body: &str,
+    headers: Option<&OrderedMap>,
+    keep_alive: bool,
+    head_only: bool,
+) -> io::Result<()> {
+    write_http_response_head(writer, status, body.len() as u64, headers, keep_alive)?;
     if !head_only {
         writer.write_all(body.as_bytes())?;
+    }
+    writer.flush()
+}
+
+pub fn write_http_file_response<W: Write>(
+    writer: &mut W,
+    status: i64,
+    file: Option<&mut std::fs::File>,
+    len: u64,
+    headers: Option<&OrderedMap>,
+    keep_alive: bool,
+    head_only: bool,
+) -> io::Result<()> {
+    write_http_response_head(writer, status, len, headers, keep_alive)?;
+    if !head_only && len > 0 {
+        let Some(file) = file else {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "missing static file handle",
+            ));
+        };
+        let mut remaining = len;
+        let mut buf = vec![0u8; (len as usize).min(64 * 1024)];
+        while remaining > 0 {
+            let want = (remaining as usize).min(buf.len());
+            let read_res = loop {
+                match file.read(&mut buf[..want]) {
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    other => break other,
+                }
+            };
+            let n = read_res?;
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "static file truncated while streaming",
+                ));
+            }
+            writer.write_all(&buf[..n])?;
+            remaining -= n as u64;
+        }
     }
     writer.flush()
 }
@@ -1144,7 +1656,14 @@ pub fn write_error_response(stream: &mut BufWriter<TcpStream>, status: i64, body
     let _ = write_http_response_ext(stream, status, body, None, false, false);
 }
 
-#[cfg_attr(windows, allow(dead_code))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 pub(crate) fn format_error_response_bytes(status: i64, body: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(128 + body.len());
     let _ = write_http_response_ext(&mut out, status, body, None, false, false);
@@ -2472,5 +2991,311 @@ mod tests {
         }
         assert_eq!(ra.headers[3].0.as_str(), "x-custom-header");
         assert!(!Arc::ptr_eq(&ra.headers[3].0, &rb.headers[3].0));
+    }
+
+    #[test]
+    fn static_file_resolution_and_wire_streaming_preserves_binary_and_skips_head_read() {
+        let tmp = std::env::temp_dir().join(format!("conduit_static_bin_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("sub")).unwrap();
+
+        let mut png_bytes: Vec<u8> = vec![
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0xFF, 0xFE, 0x80, 0x9F,
+        ];
+        png_bytes.extend((0..1024).map(|i| ((i * 37 + 13) & 0xFF) as u8));
+        assert!(std::str::from_utf8(&png_bytes).is_err());
+        std::fs::write(tmp.join("sub/icon.png"), &png_bytes).unwrap();
+        std::fs::write(tmp.join("sub/app.woff"), b"\x00\x01\xff\x80woff").unwrap();
+
+        let statics: Vec<(Box<str>, Box<str>)> =
+            vec![("/assets".into(), tmp.to_string_lossy().as_ref().into())];
+
+        // Traversal, NUL, empty segment, and non-GET/HEAD methods are rejected.
+        assert!(resolve_static_file(&statics, "POST", "/assets/sub/icon.png").is_none());
+        assert!(resolve_static_file(&statics, "GET", "/assets/../sub/icon.png").is_none());
+        assert!(resolve_static_file(&statics, "GET", "/assets/./sub/icon.png").is_none());
+        assert!(resolve_static_file(&statics, "GET", "/assets/sub/icon.png\0").is_none());
+
+        // HEAD reads metadata only, returns HeadOnly with exact Content-Length.
+        let head_res = resolve_static_file(&statics, "HEAD", "/assets/sub/icon.png").unwrap();
+        assert_eq!(head_res.content_type, "image/png");
+        assert_eq!(head_res.len(), png_bytes.len() as u64);
+        assert!(matches!(head_res.body, StaticFileBody::HeadOnly { len } if len == png_bytes.len() as u64));
+
+        let mut hdrs = OrderedMap::new();
+        hdrs.set(
+            MapKey::Str(header_key("content-type")),
+            MapVal::Obj(Obj::str(head_res.content_type)),
+        );
+        let mut head_wire = Vec::new();
+        write_http_file_response(
+            &mut head_wire,
+            200,
+            None,
+            head_res.len(),
+            Some(&hdrs),
+            true,
+            true,
+        )
+        .unwrap();
+        let head_txt = String::from_utf8(head_wire).unwrap();
+        let expected_hdr_end = head_txt.find("\r\n\r\n").unwrap() + 4;
+        assert_eq!(head_txt.len(), expected_hdr_end);
+        assert!(head_txt.contains(&format!("Content-Length: {}\r\n", png_bytes.len())));
+        assert!(head_txt.contains("content-type: image/png\r\n"));
+
+        // GET opens file and streams exact binary bytes without lossy UTF-8 conversion.
+        let get_res = resolve_static_file(&statics, "GET", "/assets/sub/icon.png").unwrap();
+        assert_eq!(get_res.content_type, "image/png");
+        let StaticFileBody::File { mut file, len } = get_res.body else {
+            panic!("expected StaticFileBody::File");
+        };
+        assert_eq!(len, png_bytes.len() as u64);
+        let mut get_wire = Vec::new();
+        write_http_file_response(
+            &mut get_wire,
+            200,
+            Some(&mut file),
+            len,
+            Some(&hdrs),
+            true,
+            false,
+        )
+        .unwrap();
+        let split = find_crlf_crlf(&get_wire).unwrap();
+        let wire_head = std::str::from_utf8(&get_wire[..split]).unwrap();
+        assert!(wire_head.contains(&format!("Content-Length: {}\r\n", png_bytes.len())));
+        assert_eq!(&get_wire[split..], png_bytes.as_slice());
+
+        // Truncated file (requested len > actual bytes) yields UnexpectedEof.
+        let mut trunc_file = std::fs::File::open(tmp.join("sub/app.woff")).unwrap();
+        let mut trunc_wire = Vec::new();
+        let err = write_http_file_response(
+            &mut trunc_wire,
+            200,
+            Some(&mut trunc_file),
+            1024,
+            Some(&hdrs),
+            true,
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+
+        let font_res = resolve_static_file(&statics, "HEAD", "/assets/sub/app.woff").unwrap();
+        assert_eq!(font_res.content_type, "font/woff");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn route_index_matches_linear_lookup_across_precedence_and_edge_cases() {
+        fn params_vec(p: MatchedParams) -> Vec<(String, String)> {
+            match p {
+                MatchedParams::None => Vec::new(),
+                MatchedParams::One(k, v) => vec![(k.as_str().to_string(), v.format_obj())],
+                MatchedParams::Many(entries) => entries
+                    .into_iter()
+                    .map(|(k, v)| match (k, v) {
+                        (MapKey::Str(ks), MapVal::Obj(vo)) => {
+                            (ks.as_str().to_string(), vo.format_obj())
+                        }
+                        _ => unreachable!(),
+                    })
+                    .collect(),
+            }
+        }
+
+        let mut router = RouterState::default();
+        let defs = [
+            // Dynamic registered before static: must win over later static on /users/me.
+            ("GET", "/users/:id"),
+            ("GET", "/users/me"),
+            // Static registered before dynamic: must win over later dynamic on /health.
+            ("GET", "/health"),
+            ("GET", "/:slug"),
+            // Wildcard registered before specific static & param.
+            ("GET", "/files/*rest"),
+            ("GET", "/files/static"),
+            ("GET", "/files/:name/meta"),
+            // ANY (`*`) interleaved with specific methods.
+            ("*", "/any-first"),
+            ("POST", "/any-first"),
+            ("POST", "/post-first"),
+            ("*", "/post-first"),
+            // Duplicate static routes (earlier wins).
+            ("GET", "/dup"),
+            ("GET", "/dup"),
+            // Multi-param and deep (>16 segment) route.
+            ("PATCH", "/orgs/:org/repos/:repo/issues/:num"),
+            (
+                "GET",
+                "/d/1/2/3/4/5/6/7/8/9/10/11/12/13/14/15/16/17/:tail",
+            ),
+            // Custom method + root + static empty segment pattern.
+            ("PROPFIND", "/dav/:item"),
+            ("PROPFIND", "/dav-static"),
+            ("GET", "/"),
+        ];
+        for (i, &(m, p)) in defs.iter().enumerate() {
+            router.push_route(RouteEntry::new(m, p, Obj::Func(i as u32)));
+        }
+        // Append extra routes up to 1,000 total to exercise large static + dynamic tables.
+        for i in 0..982 {
+            if i % 2 == 0 {
+                router.push_route(RouteEntry::new(
+                    "GET",
+                    &format!("/api/v1/resource_{i}"),
+                    Obj::Func((defs.len() + i) as u32),
+                ));
+            } else {
+                router.push_route(RouteEntry::new(
+                    "GET",
+                    &format!("/api/v1/item_{i}/:id"),
+                    Obj::Func((defs.len() + i) as u32),
+                ));
+            }
+        }
+
+        let probes = [
+            ("GET", "/users/me"),
+            ("GET", "/users/42"),
+            ("POST", "/users/42"),
+            ("GET", "/health"),
+            ("POST", "/health"),
+            ("GET", "/other"),
+            ("GET", "/files"),
+            ("GET", "/files/"),
+            ("GET", "/files/static"),
+            ("GET", "/files/static/nested/a.png"),
+            ("GET", "/files/img/meta"),
+            ("GET", "/any-first"),
+            ("POST", "/any-first"),
+            ("*", "/any-first"),
+            ("*", "/health"),
+            ("GET", "/post-first"),
+            ("POST", "/post-first"),
+            ("GET", "/dup"),
+            ("patch", "/orgs/acme/repos/conduit/issues/99"),
+            ("GET", "/d/1/2/3/4/5/6/7/8/9/10/11/12/13/14/15/16/17/end"),
+            ("GET", "/orgs//repos/conduit/issues/99"),
+            ("propfind", "/dav/folder"),
+            ("MKCOL", "/dav/folder"),
+            ("PROPFIND", "/dav-static"),
+            ("GET", "/dav-static"),
+            ("GET", "/"),
+            ("DELETE", "/"),
+            ("GET", "/api/v1/resource_980"),
+            ("GET", "/api/v1/item_981/xyz"),
+            ("POST", "/api/v1/item_981/xyz"),
+            ("GET", "/does/not/exist"),
+        ];
+
+        for &(method, path) in &probes {
+            let expected = lookup_route(&router.routes, method, path);
+            let actual = router.lookup_route(method, path);
+            match (expected, actual) {
+                (Ok((er, ep)), Ok((ar, ap))) => {
+                    assert!(
+                        std::ptr::eq(er, ar),
+                        "route mismatch for {method} {path}: expected {} vs actual {}",
+                        er.trimmed_pattern,
+                        ar.trimmed_pattern
+                    );
+                    assert_eq!(params_vec(ep), params_vec(ap), "params mismatch for {method} {path}");
+                }
+                (Err(es), Err(as_)) => {
+                    assert_eq!(es, as_, "status mismatch for {method} {path}");
+                }
+                (l, r) => panic!(
+                    "result mismatch for {method} {path}: linear={} indexed={}",
+                    l.is_ok(),
+                    r.is_ok()
+                ),
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_lookup_route_linear_vs_indexed() {
+        use std::hint::black_box;
+
+        fn measure_median_us(mut f: impl FnMut() -> usize) -> f64 {
+            const SERIES: usize = 9;
+            const ITERS: usize = 50_000;
+            let mut medians_us = Vec::with_capacity(SERIES);
+            let mut sink = 0usize;
+            for _ in 0..SERIES {
+                let start = Instant::now();
+                for _ in 0..ITERS {
+                    sink = sink.wrapping_add(f());
+                }
+                let per_call_us = start.elapsed().as_secs_f64() * 1_000_000.0 / (ITERS as f64);
+                medians_us.push(per_call_us);
+            }
+            black_box(sink);
+            medians_us.sort_by(|a, b| a.total_cmp(b));
+            medians_us[SERIES / 2]
+        }
+
+        for &n_routes in &[10usize, 100, 1000] {
+            let mut router = RouterState::default();
+            for i in 0..n_routes {
+                router.push_route(RouteEntry::new(
+                    "GET",
+                    &format!("/api/v1/route_{i}"),
+                    Obj::Func(i as u32),
+                ));
+            }
+            let target = format!("/api/v1/route_{}", n_routes - 1);
+            let linear_us = measure_median_us(|| {
+                match lookup_route(black_box(&router.routes), black_box("GET"), black_box(&target)) {
+                    Ok((r, _)) => r.trimmed_pattern.len(),
+                    Err(s) => s as usize,
+                }
+            });
+            let indexed_us = measure_median_us(|| {
+                match router.lookup_route(black_box("GET"), black_box(&target)) {
+                    Ok((r, _)) => r.trimmed_pattern.len(),
+                    Err(s) => s as usize,
+                }
+            });
+            eprintln!(
+                "[bench static routes N={n_routes}] linear median={linear_us:.3}us | indexed median={indexed_us:.3}us"
+            );
+        }
+
+        let mut mixed = RouterState::default();
+        for i in 0..500usize {
+            mixed.push_route(RouteEntry::new(
+                "GET",
+                &format!("/s/v1/item_{i}"),
+                Obj::Func(i as u32),
+            ));
+        }
+        for i in 0..500usize {
+            mixed.push_route(RouteEntry::new(
+                "GET",
+                &format!("/d/v1/group_{i}/:id"),
+                Obj::Func((500 + i) as u32),
+            ));
+        }
+        let target_dyn = "/d/v1/group_499/12345";
+        let linear_mixed_us = measure_median_us(|| {
+            match lookup_route(black_box(&mixed.routes), black_box("GET"), black_box(target_dyn)) {
+                Ok((r, _)) => r.trimmed_pattern.len(),
+                Err(s) => s as usize,
+            }
+        });
+        let indexed_mixed_us = measure_median_us(|| {
+            match mixed.lookup_route(black_box("GET"), black_box(target_dyn)) {
+                Ok((r, _)) => r.trimmed_pattern.len(),
+                Err(s) => s as usize,
+            }
+        });
+        eprintln!(
+            "[bench mixed routes N=1000] linear median={linear_mixed_us:.3}us | indexed median={indexed_mixed_us:.3}us"
+        );
     }
 }

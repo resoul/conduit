@@ -1,4 +1,5 @@
 import * as cache from "cdt.cache"
+import * as crypto from "cdt.crypto"
 import * as fs from "cdt.fs"
 import * as http from "cdt.http"
 import * as json from "cdt.json"
@@ -7,13 +8,20 @@ import * as lock from "cdt.lock"
 import * as path from "cdt.path"
 import * as process from "cdt.process"
 import * as time from "cdt.time"
-import { Claims, TokenReply, build_auth_router, setup_state } from "./main"
+import { AuthConfig, Claims, TokenReply, build_auth_router, setup_state } from "./main"
+
+func login(r: http.Router, body: String) -> http.Response {
+    empty := Map<String, String>()
+    return r.dispatch(http.Request(method: "POST", path: "/auth/login", body: body, headers: empty, query: empty, params: empty))
+}
 
 test "auth_api login validation, JWT auth middleware, and rate limiting" {
     pid := process.pid()
     dir := path.join("/tmp", "conduit_auth_api_test1_{pid}")
     fs.mkdir_all(dir)?
-    setup_state(dir, 2)?
+    secret := crypto.random_bytes_hex(32)?
+    hash := crypto.hash_password("hunter2")?
+    setup_state(dir, 4, AuthConfig(jwt_secret: secret, email: "alice@conduit.dev", password_hash: hash))?
 
     r := build_auth_router()
     empty := Map<String, String>()
@@ -33,20 +41,23 @@ test "auth_api login validation, JWT auth middleware, and rate limiting" {
     unauth := r.dispatch(http.Request(method: "GET", path: "/api/me", body: "", headers: empty, query: empty, params: empty))
     assert_eq(unauth.status, 401)
 
-    // Valid login returns JWT token
-    login_ok := r.dispatch(http.Request(
-        method: "POST",
-        path: "/auth/login",
-        body: "{\"email\":\"alice@conduit.dev\",\"password\":\"hunter2\",\"role\":\"admin\"}",
-        headers: empty,
-        query: empty,
-        params: empty,
-    ))
+    extra_role := login(r, "{\"email\":\"alice@conduit.dev\",\"password\":\"hunter2\",\"role\":\"admin\"}")
+    assert_eq(extra_role.status, 400)
+
+    wrong := login(r, "{\"email\":\"alice@conduit.dev\",\"password\":\"incorrect\"}")
+    unknown := login(r, "{\"email\":\"bob@conduit.dev\",\"password\":\"hunter2\"}")
+    assert_eq(wrong.status, 401)
+    assert_eq(unknown.status, 401)
+    assert_eq(wrong.body, unknown.body)
+
+    // Valid login returns a token with the configured identity and role
+    credentials := "{\"email\":\"alice@conduit.dev\",\"password\":\"hunter2\"}"
+    login_ok := login(r, credentials)
     assert_eq(login_ok.status, 200)
     reply := json.decode<TokenReply>(login_ok.body)?
-    claims := jwt.verify<Claims>(reply.token, "dev-conduit-jwt-secret-0123456789abcdef")?
+    claims := jwt.verify<Claims>(reply.token, secret)?
     assert_eq(claims.sub, "alice@conduit.dev")
-    assert_eq(claims.role, "admin")
+    assert_eq(claims.role, "member")
 
     // Verify background spawn telemetry captured login asynchronously
     tel := cache.open("auth_api_telemetry")
@@ -76,24 +87,10 @@ test "auth_api login validation, JWT auth middleware, and rate limiting" {
     audit_txt := fs.read_text(path.join(dir, "audit.log"))?
     assert(audit_txt.contains("audit entry 1"))
 
-    // Second login allowed (limit=2), third hits 429 rate_limited
-    login_2 := r.dispatch(http.Request(
-        method: "POST",
-        path: "/auth/login",
-        body: "{\"email\":\"bob@conduit.dev\",\"password\":\"hunter2\"}",
-        headers: empty,
-        query: empty,
-        params: empty,
-    ))
+    // The two failed credential checks also count toward the limit
+    login_2 := login(r, credentials)
     assert_eq(login_2.status, 200)
-    login_3 := r.dispatch(http.Request(
-        method: "POST",
-        path: "/auth/login",
-        body: "{\"email\":\"cy@conduit.dev\",\"password\":\"hunter2\"}",
-        headers: empty,
-        query: empty,
-        params: empty,
-    ))
+    login_3 := login(r, credentials)
     assert_eq(login_3.status, 429)
 
     _d := cache.drop("auth_api_wal")

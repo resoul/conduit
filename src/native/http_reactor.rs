@@ -7,7 +7,8 @@
     all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))
 ))]
 mod imp {
-    use std::collections::HashMap;
+    use std::cmp::Reverse;
+    use std::collections::{BinaryHeap, HashMap};
     use std::io::{self, ErrorKind, Read, Write};
     use std::net::{IpAddr, TcpListener, TcpStream};
     use std::os::unix::io::{AsRawFd, RawFd};
@@ -27,6 +28,7 @@ mod imp {
     const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
     const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
     const READ_CHUNK_SIZE: usize = 16 * 1024;
+    const FILE_WRITE_CHUNK_SIZE: usize = 64 * 1024;
 
     pub(crate) struct ReactorJob {
         pub conn_id: u64,
@@ -35,9 +37,15 @@ mod imp {
         pub keep_alive: bool,
     }
 
+    pub(crate) struct ReactorFileBody {
+        pub file: std::fs::File,
+        pub remaining: u64,
+    }
+
     pub(crate) struct ReactorResponse {
         pub conn_id: u64,
         pub bytes: Vec<u8>,
+        pub file_body: Option<ReactorFileBody>,
         pub keep_alive: bool,
     }
 
@@ -634,7 +642,83 @@ mod imp {
         }
     }
 
-    // ── Connection State Machine ─────────────────────────────────────────────
+    // ── Connection State Machine & Deadline Queue ───────────────────────────
+
+    #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+    struct DeadlineEntry {
+        deadline: Instant,
+        token: u64,
+        generation: u64,
+    }
+
+    struct DeadlineQueue {
+        heap: BinaryHeap<Reverse<DeadlineEntry>>,
+    }
+
+    impl DeadlineQueue {
+        fn new() -> Self {
+            Self {
+                heap: BinaryHeap::new(),
+            }
+        }
+
+        fn push(&mut self, token: u64, generation: u64, deadline: Instant) {
+            self.heap.push(Reverse(DeadlineEntry {
+                deadline,
+                token,
+                generation,
+            }));
+        }
+
+        fn clear(&mut self) {
+            self.heap.clear();
+        }
+
+        #[cfg(test)]
+        fn len(&self) -> usize {
+            self.heap.len()
+        }
+
+        fn maybe_compact(
+            &mut self,
+            live_conns: usize,
+            rebuild: impl FnOnce() -> Vec<Reverse<DeadlineEntry>>,
+        ) {
+            if self.heap.len() > live_conns.saturating_mul(4).max(256) {
+                self.heap = BinaryHeap::from(rebuild());
+            }
+        }
+
+        fn peek_earliest(
+            &mut self,
+            is_live: impl Fn(u64, u64, Instant) -> bool,
+        ) -> Option<Instant> {
+            while let Some(&Reverse(entry)) = self.heap.peek() {
+                if is_live(entry.token, entry.generation, entry.deadline) {
+                    return Some(entry.deadline);
+                }
+                self.heap.pop();
+            }
+            None
+        }
+
+        fn pop_next_expired(
+            &mut self,
+            now: Instant,
+            is_live: impl Fn(u64, u64, Instant) -> bool,
+        ) -> Option<u64> {
+            while let Some(&Reverse(entry)) = self.heap.peek() {
+                if entry.deadline > now {
+                    return None;
+                }
+                self.heap.pop();
+                if is_live(entry.token, entry.generation, entry.deadline) {
+                    return Some(entry.token);
+                }
+            }
+            None
+        }
+    }
 
     enum ConnPhase {
         ReadingHead {
@@ -652,6 +736,7 @@ mod imp {
         Writing {
             buf: Vec<u8>,
             written: usize,
+            file_body: Option<ReactorFileBody>,
             keep_alive: bool,
             deadline: Instant,
         },
@@ -665,22 +750,78 @@ mod imp {
         pending_read: Vec<u8>,
         armed_read: bool,
         armed_write: bool,
+        deadline_gen: u64,
         phase: ConnPhase,
+    }
+
+    impl<P> ReactorConn<P> {
+        #[inline]
+        fn current_deadline(&self) -> Option<Instant> {
+            match &self.phase {
+                ConnPhase::ReadingHead { deadline, .. }
+                | ConnPhase::ReadingBody { deadline, .. }
+                | ConnPhase::Writing { deadline, .. } => Some(*deadline),
+                ConnPhase::Dispatching => None,
+            }
+        }
     }
 
     struct Reactor<P> {
         poller: Poller,
         conns: HashMap<u64, ReactorConn<P>, FxBuildHasher>,
+        deadlines: DeadlineQueue,
         cfg: ReactorConfig,
         next_token: u64,
         in_flight: usize,
     }
 
     impl<P> Reactor<P> {
+        #[inline]
+        fn is_deadline_live(conn: &ReactorConn<P>, generation: u64, deadline: Instant) -> bool {
+            conn.deadline_gen == generation && conn.current_deadline() == Some(deadline)
+        }
+
+        fn maybe_compact_deadlines(&mut self) {
+            let conns = &self.conns;
+            self.deadlines.maybe_compact(conns.len(), || {
+                conns
+                    .iter()
+                    .filter_map(|(&token, conn)| {
+                        conn.current_deadline().map(|deadline| {
+                            Reverse(DeadlineEntry {
+                                deadline,
+                                token,
+                                generation: conn.deadline_gen,
+                            })
+                        })
+                    })
+                    .collect()
+            });
+        }
+
+        fn arm_deadline(&mut self, token: u64, deadline: Instant) {
+            if let Some(conn) = self.conns.get_mut(&token) {
+                conn.deadline_gen = conn.deadline_gen.wrapping_add(1);
+                self.deadlines.push(token, conn.deadline_gen, deadline);
+                self.maybe_compact_deadlines();
+            }
+        }
+
+        fn clear_deadline(&mut self, token: u64) {
+            if let Some(conn) = self.conns.get_mut(&token) {
+                conn.deadline_gen = conn.deadline_gen.wrapping_add(1);
+            }
+        }
+
         fn close_conn(&mut self, token: u64) {
             if let Some(conn) = self.conns.remove(&token) {
                 self.poller
                     .deregister(conn.fd, conn.armed_read, conn.armed_write);
+                if self.conns.is_empty() {
+                    self.deadlines.clear();
+                } else {
+                    self.maybe_compact_deadlines();
+                }
             }
         }
 
@@ -706,24 +847,29 @@ mod imp {
             true
         }
 
+        #[allow(clippy::too_many_arguments)]
         fn start_writing(
             &mut self,
             token: u64,
             bytes: Vec<u8>,
+            file_body: Option<ReactorFileBody>,
             keep_alive: bool,
             now: Instant,
             stop_flag: &AtomicBool,
             job_tx: &mpsc::SyncSender<ReactorJob>,
         ) {
+            let write_dl = now + WRITE_TIMEOUT;
             let Some(conn) = self.conns.get_mut(&token) else {
                 return;
             };
             conn.phase = ConnPhase::Writing {
                 buf: bytes,
                 written: 0,
+                file_body,
                 keep_alive,
-                deadline: now + WRITE_TIMEOUT,
+                deadline: write_dl,
             };
+            self.arm_deadline(token, write_dl);
             self.drive_write(token, now, stop_flag, job_tx);
         }
 
@@ -737,7 +883,7 @@ mod imp {
             job_tx: &mpsc::SyncSender<ReactorJob>,
         ) {
             let bytes = format_error_response_bytes(status, body);
-            self.start_writing(token, bytes, false, now, stop_flag, job_tx);
+            self.start_writing(token, bytes, None, false, now, stop_flag, job_tx);
         }
 
         fn dispatch_request(
@@ -769,6 +915,7 @@ mod imp {
             if let Some(conn) = self.conns.get_mut(&token) {
                 conn.phase = ConnPhase::Dispatching;
             }
+            self.clear_deadline(token);
             match job_tx.try_send(ReactorJob {
                 conn_id: token,
                 raw,
@@ -803,7 +950,7 @@ mod imp {
             job_tx: &mpsc::SyncSender<ReactorJob>,
         ) {
             enum Step {
-                Continue,
+                Continue(Option<Instant>),
                 Close,
                 Error(i64, String),
                 Dispatch(ParsedHttpHead, Vec<u8>),
@@ -821,8 +968,11 @@ mod imp {
                             idle_until,
                             deadline,
                         } => {
+                            let mut armed_dl = None;
                             if idle_until.take().is_some() {
-                                *deadline = now + self.cfg.header_timeout;
+                                let dl = now + self.cfg.header_timeout;
+                                *deadline = dl;
+                                armed_dl = Some(dl);
                             }
                             let prev_len = buf.len();
                             let prev_byte = buf.last().copied();
@@ -871,13 +1021,14 @@ mod imp {
                                                     if remaining == 0 {
                                                         Step::Dispatch(head, body)
                                                     } else {
+                                                        let body_dl = now + self.cfg.body_timeout;
                                                         conn.phase = ConnPhase::ReadingBody {
                                                             head,
                                                             body,
                                                             remaining,
-                                                            deadline: now + self.cfg.body_timeout,
+                                                            deadline: body_dl,
                                                         };
-                                                        Step::Continue
+                                                        Step::Continue(Some(body_dl))
                                                     }
                                                 }
                                             }
@@ -895,7 +1046,7 @@ mod imp {
                                     Step::Error(413, "Payload Too Large".to_string())
                                 } else {
                                     slice = rest;
-                                    Step::Continue
+                                    Step::Continue(armed_dl)
                                 }
                             }
                         }
@@ -923,7 +1074,7 @@ mod imp {
                                     _ => unreachable!(),
                                 }
                             } else {
-                                Step::Continue
+                                Step::Continue(None)
                             }
                         }
                         _ => break,
@@ -931,7 +1082,11 @@ mod imp {
                 };
 
                 match step {
-                    Step::Continue => {}
+                    Step::Continue(new_dl) => {
+                        if let Some(dl) = new_dl {
+                            self.arm_deadline(token, dl);
+                        }
+                    }
                     Step::Close => {
                         self.close_conn(token);
                         return;
@@ -1015,6 +1170,48 @@ mod imp {
             }
         }
 
+        fn finish_write(
+            &mut self,
+            token: u64,
+            keep_alive: bool,
+            now: Instant,
+            stop_flag: &AtomicBool,
+            job_tx: &mpsc::SyncSender<ReactorJob>,
+        ) {
+            let can_keep_alive = {
+                let Some(conn) = self.conns.get(&token) else {
+                    return;
+                };
+                keep_alive
+                    && !stop_flag.load(Ordering::Acquire)
+                    && conn.req_count < self.cfg.max_keepalive_requests
+            };
+            if can_keep_alive {
+                let next_dl = if let Some(conn) = self.conns.get_mut(&token) {
+                    let has_pending = !conn.pending_read.is_empty();
+                    let deadline = if has_pending {
+                        now + self.cfg.header_timeout
+                    } else {
+                        now + self.cfg.idle_timeout
+                    };
+                    conn.phase = ConnPhase::ReadingHead {
+                        buf: Vec::new(),
+                        idle_until: (!has_pending).then(|| now + self.cfg.idle_timeout),
+                        deadline,
+                    };
+                    Some(deadline)
+                } else {
+                    None
+                };
+                if let Some(dl) = next_dl {
+                    self.arm_deadline(token, dl);
+                }
+                self.drive_read(token, now, stop_flag, job_tx);
+            } else {
+                self.close_conn(token);
+            }
+        }
+
         fn drive_write(
             &mut self,
             token: u64,
@@ -1022,7 +1219,80 @@ mod imp {
             stop_flag: &AtomicBool,
             job_tx: &mpsc::SyncSender<ReactorJob>,
         ) {
+            enum ChunkState {
+                Ready,
+                Done(bool),
+                TruncatedOrErr,
+            }
+
+            enum WriteProgress {
+                Continue(Option<Instant>),
+                Done(bool),
+                Close,
+            }
+
             loop {
+                let chunk_state = {
+                    let Some(conn) = self.conns.get_mut(&token) else {
+                        return;
+                    };
+                    let ConnPhase::Writing {
+                        buf,
+                        written,
+                        file_body,
+                        keep_alive,
+                        ..
+                    } = &mut conn.phase
+                    else {
+                        return;
+                    };
+                    if *written >= buf.len() {
+                        if let Some(fb) = file_body.as_mut() {
+                            if fb.remaining == 0 {
+                                *file_body = None;
+                                ChunkState::Done(*keep_alive)
+                            } else {
+                                let want = (fb.remaining as usize).min(FILE_WRITE_CHUNK_SIZE);
+                                buf.resize(want, 0);
+                                let read_res = loop {
+                                    match fb.file.read(&mut buf[..want]) {
+                                        Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                                        other => break other,
+                                    }
+                                };
+                                match read_res {
+                                    Ok(0) | Err(_) => ChunkState::TruncatedOrErr,
+                                    Ok(got) => {
+                                        buf.truncate(got);
+                                        fb.remaining -= got as u64;
+                                        *written = 0;
+                                        if fb.remaining == 0 {
+                                            *file_body = None;
+                                        }
+                                        ChunkState::Ready
+                                    }
+                                }
+                            }
+                        } else {
+                            ChunkState::Done(*keep_alive)
+                        }
+                    } else {
+                        ChunkState::Ready
+                    }
+                };
+
+                match chunk_state {
+                    ChunkState::Ready => {}
+                    ChunkState::Done(keep_alive) => {
+                        self.finish_write(token, keep_alive, now, stop_flag, job_tx);
+                        return;
+                    }
+                    ChunkState::TruncatedOrErr => {
+                        self.close_conn(token);
+                        return;
+                    }
+                }
+
                 let res = {
                     let Some(conn) = self.conns.get_mut(&token) else {
                         return;
@@ -1030,71 +1300,61 @@ mod imp {
                     let ConnPhase::Writing { buf, written, .. } = &mut conn.phase else {
                         return;
                     };
-                    if *written >= buf.len() {
-                        Ok(0usize)
-                    } else {
-                        conn.stream.write(&buf[*written..])
-                    }
+                    conn.stream.write(&buf[*written..])
                 };
 
                 match res {
                     Ok(n) => {
-                        let done = {
+                        let progress = {
                             let Some(conn) = self.conns.get_mut(&token) else {
                                 return;
                             };
                             let ConnPhase::Writing {
                                 buf,
                                 written,
+                                file_body,
                                 keep_alive,
-                                ..
+                                deadline,
                             } = &mut conn.phase
                             else {
                                 return;
                             };
                             if n == 0 && *written < buf.len() {
-                                None
+                                WriteProgress::Close
                             } else {
                                 *written += n;
-                                if *written >= buf.len() {
-                                    Some(*keep_alive)
+                                let has_more_file =
+                                    file_body.as_ref().is_some_and(|fb| fb.remaining > 0);
+                                let mut refreshed_dl = None;
+                                if n > 0
+                                    && has_more_file
+                                    && deadline.saturating_duration_since(now) < WRITE_TIMEOUT / 2
+                                {
+                                    let dl = now + WRITE_TIMEOUT;
+                                    *deadline = dl;
+                                    refreshed_dl = Some(dl);
+                                }
+                                if *written < buf.len() || has_more_file {
+                                    WriteProgress::Continue(refreshed_dl)
                                 } else {
-                                    continue;
+                                    *file_body = None;
+                                    WriteProgress::Done(*keep_alive)
                                 }
                             }
                         };
-                        match done {
-                            None => {
+                        match progress {
+                            WriteProgress::Continue(dl) => {
+                                if let Some(dl) = dl {
+                                    self.arm_deadline(token, dl);
+                                }
+                                continue;
+                            }
+                            WriteProgress::Close => {
                                 self.close_conn(token);
                                 return;
                             }
-                            Some(keep_alive) => {
-                                let can_keep_alive = {
-                                    let Some(conn) = self.conns.get(&token) else {
-                                        return;
-                                    };
-                                    keep_alive
-                                        && !stop_flag.load(Ordering::Acquire)
-                                        && conn.req_count < self.cfg.max_keepalive_requests
-                                };
-                                if can_keep_alive {
-                                    if let Some(conn) = self.conns.get_mut(&token) {
-                                        let has_pending = !conn.pending_read.is_empty();
-                                        conn.phase = ConnPhase::ReadingHead {
-                                            buf: Vec::new(),
-                                            idle_until: (!has_pending)
-                                                .then(|| now + self.cfg.idle_timeout),
-                                            deadline: if has_pending {
-                                                now + self.cfg.header_timeout
-                                            } else {
-                                                now + self.cfg.idle_timeout
-                                            },
-                                        };
-                                    }
-                                    self.drive_read(token, now, stop_flag, job_tx);
-                                } else {
-                                    self.close_conn(token);
-                                }
+                            WriteProgress::Done(keep_alive) => {
+                                self.finish_write(token, keep_alive, now, stop_flag, job_tx);
                                 return;
                             }
                         }
@@ -1118,71 +1378,59 @@ mod imp {
             stop_flag: &AtomicBool,
             job_tx: &mpsc::SyncSender<ReactorJob>,
         ) {
-            enum TimeoutAction {
-                Close,
-                Send408,
-            }
-            let mut expired: Vec<(u64, TimeoutAction)> = Vec::new();
-            for (&token, conn) in &self.conns {
-                match &conn.phase {
-                    ConnPhase::ReadingHead {
-                        buf,
-                        idle_until,
-                        deadline,
-                    } => {
-                        if idle_until.is_some() && buf.is_empty() && now >= *deadline {
-                            expired.push((token, TimeoutAction::Close));
-                        } else if now >= *deadline {
-                            expired.push((token, TimeoutAction::Send408));
-                        }
+            loop {
+                let expired_token = {
+                    let conns = &self.conns;
+                    self.deadlines.pop_next_expired(now, |tok, generation, dl| {
+                        conns
+                            .get(&tok)
+                            .is_some_and(|c| Self::is_deadline_live(c, generation, dl))
+                    })
+                };
+                let Some(token) = expired_token else {
+                    break;
+                };
+                let close_without_408 = match self.conns.get(&token).map(|c| &c.phase) {
+                    Some(ConnPhase::ReadingHead { buf, idle_until, .. }) => {
+                        idle_until.is_some() && buf.is_empty()
                     }
-                    ConnPhase::ReadingBody { deadline, .. } if now >= *deadline => {
-                        expired.push((token, TimeoutAction::Send408));
-                    }
-                    ConnPhase::Writing { deadline, .. } if now >= *deadline => {
-                        expired.push((token, TimeoutAction::Close));
-                    }
-                    _ => {}
-                }
-            }
-
-            for (token, action) in expired {
-                match action {
-                    TimeoutAction::Close => self.close_conn(token),
-                    TimeoutAction::Send408 => {
-                        self.queue_http_error(
-                            token,
-                            408,
-                            "Request Timeout",
-                            now,
-                            stop_flag,
-                            job_tx,
-                        );
-                    }
+                    Some(ConnPhase::ReadingBody { .. }) => false,
+                    Some(ConnPhase::Writing { .. }) => true,
+                    Some(ConnPhase::Dispatching) | None => continue,
+                };
+                if close_without_408 {
+                    self.close_conn(token);
+                } else {
+                    self.queue_http_error(
+                        token,
+                        408,
+                        "Request Timeout",
+                        now,
+                        stop_flag,
+                        job_tx,
+                    );
                 }
             }
         }
 
         fn next_poll_timeout_ms(
-            &self,
+            &mut self,
             now: Instant,
             shutdown_deadline: Option<Instant>,
         ) -> Option<u64> {
-            let mut earliest = shutdown_deadline;
-            for conn in self.conns.values() {
-                let dl = match &conn.phase {
-                    ConnPhase::ReadingHead { deadline, .. }
-                    | ConnPhase::ReadingBody { deadline, .. }
-                    | ConnPhase::Writing { deadline, .. } => Some(*deadline),
-                    ConnPhase::Dispatching => None,
-                };
-                if let Some(d) = dl {
-                    earliest = Some(match earliest {
-                        Some(cur) => cur.min(d),
-                        None => d,
-                    });
-                }
-            }
+            let earliest_conn = {
+                let conns = &self.conns;
+                self.deadlines.peek_earliest(|tok, generation, dl| {
+                    conns
+                        .get(&tok)
+                        .is_some_and(|c| Self::is_deadline_live(c, generation, dl))
+                })
+            };
+            let earliest = match (shutdown_deadline, earliest_conn) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (Some(a), None) | (None, Some(a)) => Some(a),
+                (None, None) => None,
+            };
             let cap_ms = if shutdown_deadline.is_some() { 50 } else { 250 };
             let ms = match earliest {
                 Some(dl) => (dl.saturating_duration_since(now).as_millis() as u64).min(cap_ms),
@@ -1228,6 +1476,7 @@ mod imp {
         let mut reactor = Reactor {
             poller,
             conns: HashMap::with_hasher(FxBuildHasher),
+            deadlines: DeadlineQueue::new(),
             cfg,
             next_token: FIRST_CLIENT_TOKEN,
             in_flight: 0,
@@ -1311,6 +1560,7 @@ mod imp {
                                     if reactor.poller.register_read(fd, token).is_err() {
                                         continue;
                                     }
+                                    let accept_dl = now + reactor.cfg.header_timeout;
                                     reactor.conns.insert(
                                         token,
                                         ReactorConn {
@@ -1321,13 +1571,16 @@ mod imp {
                                             pending_read: Vec::new(),
                                             armed_read: true,
                                             armed_write: false,
+                                            deadline_gen: 1,
                                             phase: ConnPhase::ReadingHead {
                                                 buf: Vec::new(),
                                                 idle_until: None,
-                                                deadline: now + reactor.cfg.header_timeout,
+                                                deadline: accept_dl,
                                             },
                                         },
                                     );
+                                    reactor.deadlines.push(token, 1, accept_dl);
+                                    reactor.maybe_compact_deadlines();
                                 }
                                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                                 Err(e) if e.kind() == ErrorKind::Interrupted => continue,
@@ -1383,6 +1636,7 @@ mod imp {
                     reactor.start_writing(
                         resp.conn_id,
                         resp.bytes,
+                        resp.file_body,
                         resp.keep_alive,
                         now,
                         &stop_flag,
@@ -1403,6 +1657,218 @@ mod imp {
         }
         reactor.poller.deregister(wake_r, true, false);
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn deadline_queue_ordering_invalidation_and_compaction() {
+            let t0 = Instant::now();
+            let mut active: HashMap<u64, (u64, Instant), FxBuildHasher> =
+                HashMap::with_hasher(FxBuildHasher);
+            let mut q = DeadlineQueue::new();
+
+            for (tok, offset_ms) in [(10u64, 500u64), (11, 100), (12, 300)] {
+                let dl = t0 + Duration::from_millis(offset_ms);
+                active.insert(tok, (1, dl));
+                q.push(tok, 1, dl);
+            }
+
+            // Update token 11 deadline later; old generation 1 must be ignored.
+            let updated_11 = t0 + Duration::from_millis(450);
+            active.insert(11, (2, updated_11));
+            q.push(11, 2, updated_11);
+
+            // Clear token 12 deadline (e.g., closed/dispatching).
+            active.remove(&12);
+
+            let earliest = q
+                .peek_earliest(|tok, g, dl| {
+                    active.get(&tok).is_some_and(|&(cg, cdl)| cg == g && cdl == dl)
+                })
+                .unwrap();
+            assert_eq!(earliest, updated_11);
+
+            let expired_at_450 = q.pop_next_expired(updated_11, |tok, g, dl| {
+                active.get(&tok).is_some_and(|&(cg, cdl)| cg == g && cdl == dl)
+            });
+            assert_eq!(expired_at_450, Some(11));
+            active.remove(&11);
+
+            assert_eq!(
+                q.pop_next_expired(t0 + Duration::from_millis(499), |tok, g, dl| {
+                    active.get(&tok).is_some_and(|&(cg, cdl)| cg == g && cdl == dl)
+                }),
+                None
+            );
+            assert_eq!(
+                q.pop_next_expired(t0 + Duration::from_millis(500), |tok, g, dl| {
+                    active.get(&tok).is_some_and(|&(cg, cdl)| cg == g && cdl == dl)
+                }),
+                Some(10)
+            );
+            active.remove(&10);
+            assert!(q.peek_earliest(|tok, g, dl| {
+                active.get(&tok).is_some_and(|&(cg, cdl)| cg == g && cdl == dl)
+            })
+            .is_none());
+
+            // Compaction bounds stale entries after many re-arms across 64 connections.
+            let mut conns: HashMap<u64, (u64, Instant), FxBuildHasher> =
+                HashMap::with_hasher(FxBuildHasher);
+            for tok in 0..64u64 {
+                let dl = t0 + Duration::from_millis(1000 + tok);
+                conns.insert(tok, (1, dl));
+                q.push(tok, 1, dl);
+            }
+            for step in 0..10_000u64 {
+                let tok = step % 64;
+                let entry = conns.get_mut(&tok).unwrap();
+                entry.0 += 1;
+                entry.1 = t0 + Duration::from_millis(2000 + step);
+                q.push(tok, entry.0, entry.1);
+                q.maybe_compact(conns.len(), || {
+                    conns
+                        .iter()
+                        .map(|(&t, &(g, dl))| {
+                            Reverse(DeadlineEntry {
+                                deadline: dl,
+                                token: t,
+                                generation: g,
+                            })
+                        })
+                        .collect()
+                });
+            }
+            assert!(q.len() <= conns.len() * 4, "heap len={}", q.len());
+        }
+
+        #[test]
+        #[ignore]
+        fn bench_reactor_deadlines_scan_vs_heap() {
+            let t0 = Instant::now();
+            let iters = 20_000usize;
+            for &n_conns in &[1_000usize, 4_000, 8_000] {
+                let mut scan_conns: HashMap<u64, (u64, Instant), FxBuildHasher> =
+                    HashMap::with_hasher(FxBuildHasher);
+                let mut heap_conns: HashMap<u64, (u64, Instant), FxBuildHasher> =
+                    HashMap::with_hasher(FxBuildHasher);
+                let mut queue = DeadlineQueue::new();
+                for i in 0..n_conns as u64 {
+                    let dl = t0 + Duration::from_millis(3_000 + (i % 500));
+                    scan_conns.insert(i, (1, dl));
+                    heap_conns.insert(i, (1, dl));
+                    queue.push(i, 1, dl);
+                }
+
+                // Baseline: double O(N) scan per iteration
+                let mut scan_iter_ns = Vec::with_capacity(iters);
+                let scan_start = Instant::now();
+                let mut sink_scan = 0u64;
+                for step in 0..iters {
+                    let now = t0 + Duration::from_micros((step as u64) * 50);
+                    let it_start = Instant::now();
+                    let active_tok = (step as u64) % (n_conns as u64);
+                    if let Some(v) = scan_conns.get_mut(&active_tok) {
+                        v.0 += 1;
+                        v.1 = now + Duration::from_millis(3_000);
+                    }
+                    let mut earliest: Option<Instant> = None;
+                    for &(_, dl) in scan_conns.values() {
+                        earliest = Some(match earliest {
+                            Some(cur) => cur.min(dl),
+                            None => dl,
+                        });
+                    }
+                    if let Some(e) = earliest {
+                        sink_scan = sink_scan.wrapping_add(
+                            e.saturating_duration_since(now).as_millis() as u64,
+                        );
+                    }
+                    let mut expired = Vec::new();
+                    for (&tok, &(_, dl)) in &scan_conns {
+                        if now >= dl {
+                            expired.push(tok);
+                        }
+                    }
+                    for tok in expired {
+                        if let Some(v) = scan_conns.get_mut(&tok) {
+                            v.1 = now + Duration::from_millis(3_000);
+                        }
+                    }
+                    scan_iter_ns.push(it_start.elapsed().as_nanos() as u64);
+                }
+                let scan_total = scan_start.elapsed();
+
+                // Heap: DeadlineQueue
+                let mut heap_iter_ns = Vec::with_capacity(iters);
+                let heap_start = Instant::now();
+                let mut sink_heap = 0u64;
+                for step in 0..iters {
+                    let now = t0 + Duration::from_micros((step as u64) * 50);
+                    let it_start = Instant::now();
+                    let active_tok = (step as u64) % (n_conns as u64);
+                    if let Some(v) = heap_conns.get_mut(&active_tok) {
+                        v.0 += 1;
+                        v.1 = now + Duration::from_millis(3_000);
+                        queue.push(active_tok, v.0, v.1);
+                        let count = heap_conns.len();
+                        queue.maybe_compact(count, || {
+                            heap_conns
+                                .iter()
+                                .map(|(&t, &(g, dl))| {
+                                    Reverse(DeadlineEntry {
+                                        deadline: dl,
+                                        token: t,
+                                        generation: g,
+                                    })
+                                })
+                                .collect()
+                        });
+                    }
+                    if let Some(e) = queue.peek_earliest(|t, g, dl| {
+                        heap_conns
+                            .get(&t)
+                            .is_some_and(|&(cg, cdl)| cg == g && cdl == dl)
+                    }) {
+                        sink_heap = sink_heap.wrapping_add(
+                            e.saturating_duration_since(now).as_millis() as u64,
+                        );
+                    }
+                    while let Some(tok) = queue.pop_next_expired(now, |t, g, dl| {
+                        heap_conns
+                            .get(&t)
+                            .is_some_and(|&(cg, cdl)| cg == g && cdl == dl)
+                    }) {
+                        if let Some(v) = heap_conns.get_mut(&tok) {
+                            v.0 += 1;
+                            v.1 = now + Duration::from_millis(3_000);
+                            queue.push(tok, v.0, v.1);
+                        }
+                    }
+                    heap_iter_ns.push(it_start.elapsed().as_nanos() as u64);
+                }
+                let heap_total = heap_start.elapsed();
+
+                scan_iter_ns.sort_unstable();
+                heap_iter_ns.sort_unstable();
+                let p50 = iters / 2;
+                let p99 = (iters * 99) / 100;
+                eprintln!(
+                    "[bench deadlines N={n_conns}] scan total={:.2}ms (p50={:.3}us p99={:.3}us) | heap total={:.2}ms (p50={:.3}us p99={:.3}us) | sink={}/{}",
+                    scan_total.as_secs_f64() * 1000.0,
+                    scan_iter_ns[p50] as f64 / 1000.0,
+                    scan_iter_ns[p99] as f64 / 1000.0,
+                    heap_total.as_secs_f64() * 1000.0,
+                    heap_iter_ns[p50] as f64 / 1000.0,
+                    heap_iter_ns[p99] as f64 / 1000.0,
+                    sink_scan,
+                    sink_heap,
+                );
+            }
+        }
+    }
 }
 
 #[cfg(any(
@@ -1411,5 +1877,5 @@ mod imp {
     all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))
 ))]
 pub(crate) use imp::{
-    ReactorConfig, ReactorJob, ReactorResponse, ReactorWakePair, run_http_reactor,
+    ReactorConfig, ReactorFileBody, ReactorJob, ReactorResponse, ReactorWakePair, run_http_reactor,
 };

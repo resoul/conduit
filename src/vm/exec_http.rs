@@ -5,13 +5,31 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::ir::Module;
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+use crate::native::http::{format_error_response_bytes, write_http_response_head};
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+use crate::native::http_reactor::ReactorFileBody;
 use crate::native::http::{
     HttpClientState, MatchedParams, RouteEntry, RouterServerOptions, RouterState,
-    format_error_response_bytes, header_key, http_client_bytes_request,
-    http_client_pooled_request_with_options, http_client_request, http_client_request_with_timeout,
-    lookup_route, make_http_client_obj, make_http_error, make_response_obj,
-    make_response_with_body_obj, make_router_obj, resolve_client_url, route_prefix_matches,
-    try_serve_static, write_http_response_ext,
+    StaticFileBody, header_key, http_client_bytes_request,
+    http_client_pooled_request_with_options, http_client_request,
+    http_client_request_with_timeout, make_http_client_obj, make_http_error, make_response_obj,
+    make_response_with_body_obj, make_router_obj, resolve_client_url, resolve_static_file,
+    route_prefix_matches, write_http_response_ext,
 };
 #[cfg(not(any(
     target_os = "macos",
@@ -20,8 +38,10 @@ use crate::native::http::{
 )))]
 use crate::native::http::{
     ReadHttpError, deadline_reader_writer_pair, read_http_request_deadline, write_error_response,
+    write_http_file_response,
 };
 use crate::vm::exec_cold::err_msg;
+use crate::vm::string::VmString;
 use crate::vm::value::{
     FxBuildHasher, ListStorage, MapKey, MapVal, Obj, OrderedMap, SCHEMA_HTTP_CLIENT,
     SCHEMA_HTTP_REQUEST, SCHEMA_HTTP_RESPONSE, SCHEMA_HTTP_ROUTER, StructData,
@@ -91,6 +111,17 @@ struct HttpServerConfig {
     header_timeout: Duration,
     body_timeout: Duration,
     max_conns_per_ip: usize,
+    #[cfg_attr(
+        not(any(
+            target_os = "macos",
+            target_os = "ios",
+            all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )),
+        allow(dead_code)
+    )]
     max_conns: usize,
     trusted_proxies: Vec<IpNet>,
 }
@@ -482,18 +513,68 @@ fn dispatch_one_reactor_job(
     req_obj: Obj,
     head_only: bool,
     keep_alive: bool,
-) -> (Vec<u8>, bool) {
-    let Ok(resp_obj) = vm.dispatch_router_request(module, 0, 0, rid, req_obj) else {
-        return (format_error_response_bytes(500, "Internal Server Error"), false);
+) -> (Vec<u8>, Option<ReactorFileBody>, bool) {
+    let Ok(dispatched) = vm.dispatch_router_request_inner(module, 0, 0, rid, req_obj, true) else {
+        return (
+            format_error_response_bytes(500, "Internal Server Error"),
+            None,
+            false,
+        );
     };
-    let Ok((status, body, headers)) = vm.extract_response_fields(&resp_obj) else {
-        return (format_error_response_bytes(500, "Internal Server Error"), false);
-    };
-    let mut out = Vec::with_capacity(256 + body.len());
-    if write_http_response_ext(&mut out, status, body, headers, keep_alive, head_only).is_err() {
-        return (format_error_response_bytes(500, "Internal Server Error"), false);
+    match dispatched {
+        DispatchedHttpResponse::Obj(resp_obj) => {
+            let Ok((status, body, headers)) = vm.extract_response_fields(&resp_obj) else {
+                return (
+                    format_error_response_bytes(500, "Internal Server Error"),
+                    None,
+                    false,
+                );
+            };
+            let mut out = Vec::with_capacity(256 + body.len());
+            if write_http_response_ext(&mut out, status, body, headers, keep_alive, head_only)
+                .is_err()
+            {
+                return (
+                    format_error_response_bytes(500, "Internal Server Error"),
+                    None,
+                    false,
+                );
+            }
+            (out, None, keep_alive)
+        }
+        DispatchedHttpResponse::StaticFile {
+            status,
+            headers,
+            file,
+            len,
+        } => {
+            let file_body = if head_only || len == 0 {
+                None
+            } else {
+                let Some(file) = file else {
+                    return (
+                        format_error_response_bytes(500, "Internal Server Error"),
+                        None,
+                        false,
+                    );
+                };
+                Some(ReactorFileBody {
+                    file,
+                    remaining: len,
+                })
+            };
+            let mut out = Vec::with_capacity(256);
+            if write_http_response_head(&mut out, status, len, Some(&headers), keep_alive).is_err()
+            {
+                return (
+                    format_error_response_bytes(500, "Internal Server Error"),
+                    None,
+                    false,
+                );
+            }
+            (out, file_body, keep_alive)
+        }
     }
-    (out, keep_alive)
 }
 
 #[cfg(any(
@@ -580,19 +661,24 @@ fn serve_http_listener_impl(
                             keep_alive,
                         )
                     }));
-                    let (bytes, keep_alive) = match result {
-                        Ok(pair) => pair,
+                    let (bytes, file_body, keep_alive) = match result {
+                        Ok(triple) => triple,
                         Err(_) => {
                             eprintln!("[http] worker recovered from request panic");
                             worker_vm.frame_depth = 0;
                             let obj_len = worker_vm.objs.len();
                             worker_vm.clear_obj_range(0, obj_len);
-                            (format_error_response_bytes(500, "Internal Server Error"), false)
+                            (
+                                format_error_response_bytes(500, "Internal Server Error"),
+                                None,
+                                false,
+                            )
                         }
                     };
                     let _ = res_tx.send(ReactorResponse {
                         conn_id,
                         bytes,
+                        file_body,
                         keep_alive,
                     });
                     waker.wake();
@@ -787,6 +873,16 @@ fn serve_http_listener_impl(
     });
 }
 
+enum DispatchedHttpResponse {
+    Obj(Obj),
+    StaticFile {
+        status: i64,
+        headers: OrderedMap,
+        file: Option<std::fs::File>,
+        len: u64,
+    },
+}
+
 #[inline]
 fn set_matched_params_on_record(req: &mut StructData, params: MatchedParams) {
     let params = match params {
@@ -931,8 +1027,23 @@ impl Vm {
         s_top: usize,
         o_top: usize,
         router_id: usize,
-        mut req_obj: Obj,
+        req_obj: Obj,
     ) -> Result<Obj, RuntimeError> {
+        match self.dispatch_router_request_inner(module, s_top, o_top, router_id, req_obj, false)? {
+            DispatchedHttpResponse::Obj(obj) => Ok(obj),
+            DispatchedHttpResponse::StaticFile { .. } => unreachable!(),
+        }
+    }
+
+    fn dispatch_router_request_inner(
+        &mut self,
+        module: &Module,
+        s_top: usize,
+        o_top: usize,
+        router_id: usize,
+        mut req_obj: Obj,
+        allow_file_stream: bool,
+    ) -> Result<DispatchedHttpResponse, RuntimeError> {
         let source = match &req_obj {
             Obj::Record(rec) if rec.schema_id == SCHEMA_HTTP_REQUEST => Arc::clone(rec),
             _ => return Err(err_msg("Expected Request")),
@@ -949,7 +1060,9 @@ impl Vm {
         let cors_origin = self.host.routers[router_id].cors_origin.clone();
         let mut resp = if req_method == "OPTIONS"
             && cors_origin.is_some()
-            && lookup_route(&self.host.routers[router_id].routes, req_method, req_path).is_err()
+            && self.host.routers[router_id]
+                .lookup_route(req_method, req_path)
+                .is_err()
         {
             let mut hdrs = OrderedMap::with_capacity(3);
             hdrs.set(
@@ -995,22 +1108,20 @@ impl Vm {
         }
 
         let mut cached_to_restore: Option<(Arc<StructData>, Arc<StructData>)> = None;
+        let mut static_passthrough: Option<(Arc<VmString>, Option<std::fs::File>, u64)> = None;
         let mut resp = match resp {
             Some(r) => r,
             None => {
-                let matched = {
-                    let routes = &self.host.routers[router_id].routes;
-                    match lookup_route(routes, req_method, req_path) {
-                        Ok((entry, params)) => Ok((
-                            entry.handler.clone(),
-                            entry.query_plan,
-                            entry.body_json_plan,
-                            entry.guard.clone(),
-                            entry.auto_resp_kind,
-                            params,
-                        )),
-                        Err(status) => Err(status),
-                    }
+                let matched = match self.host.routers[router_id].lookup_route(req_method, req_path) {
+                    Ok((entry, params)) => Ok((
+                        entry.handler.clone(),
+                        entry.query_plan,
+                        entry.body_json_plan,
+                        entry.guard.clone(),
+                        entry.auto_resp_kind,
+                        params,
+                    )),
+                    Err(status) => Err(status),
                 };
                 match matched {
                     Ok((handler, query_plan, body_plan, guard, auto_resp_kind, MatchedParams::None)) => self
@@ -1066,12 +1177,77 @@ impl Vm {
                         )?
                     }
                     Err(status) => {
-                        if let Some(static_resp) = try_serve_static(
+                        if let Some(resolved) = resolve_static_file(
                             &self.host.routers[router_id].statics,
                             req_method,
                             req_path,
                         ) {
-                            static_resp
+                            let len = resolved.len();
+                            let has_matching_after =
+                                self.host.routers[router_id].after.iter().any(|(prefix, _)| {
+                                    prefix
+                                        .as_ref()
+                                        .is_none_or(|p| route_prefix_matches(p, req_path))
+                                });
+                            if allow_file_stream && !has_matching_after {
+                                let mut headers = OrderedMap::with_capacity(if cors_origin.is_some() { 2 } else { 1 });
+                                headers.set(
+                                    MapKey::Str(header_key("content-type")),
+                                    MapVal::Obj(Obj::str(resolved.content_type)),
+                                );
+                                if let Some(origin) = cors_origin {
+                                    headers.set(
+                                        MapKey::Str(header_key("access-control-allow-origin")),
+                                        MapVal::Obj(Obj::str(origin.as_ref())),
+                                    );
+                                }
+                                if cached_to_restore.is_some() {
+                                    self.host.cached_http_req = cached_to_restore;
+                                }
+                                let file = match resolved.body {
+                                    StaticFileBody::File { file, .. } => Some(file),
+                                    StaticFileBody::HeadOnly { .. } => None,
+                                };
+                                return Ok(DispatchedHttpResponse::StaticFile {
+                                    status: 200,
+                                    headers,
+                                    file,
+                                    len,
+                                });
+                            } else if allow_file_stream {
+                                let file_opt = match resolved.body {
+                                    StaticFileBody::HeadOnly { .. } => None,
+                                    StaticFileBody::File { file, .. } => Some(file),
+                                };
+                                let sentinel_str = Arc::new(VmString::from(""));
+                                static_passthrough = Some((Arc::clone(&sentinel_str), file_opt, len));
+                                make_response_with_body_obj(
+                                    200,
+                                    Obj::Str(sentinel_str),
+                                    Some(resolved.content_type),
+                                )
+                            } else {
+                                match resolved.body {
+                                    StaticFileBody::HeadOnly { .. } => {
+                                        make_response_obj(200, "", Some(resolved.content_type))
+                                    }
+                                    StaticFileBody::File { mut file, len } => {
+                                        let mut bytes = Vec::with_capacity(
+                                            (len as usize).min(crate::native::http::MAX_BODY),
+                                        );
+                                        if std::io::Read::read_to_end(&mut file, &mut bytes).is_ok() {
+                                            let body = String::from_utf8_lossy(&bytes).into_owned();
+                                            make_response_obj(200, body, Some(resolved.content_type))
+                                        } else {
+                                            make_response_obj(
+                                                404,
+                                                "Not Found",
+                                                Some("text/plain; charset=utf-8"),
+                                            )
+                                        }
+                                    }
+                                }
+                            }
                         } else if status == 405 {
                             make_response_obj(405, "Method Not Allowed", Some("text/plain; charset=utf-8"))
                         } else {
@@ -1119,7 +1295,32 @@ impl Vm {
         if cached_to_restore.is_some() {
             self.host.cached_http_req = cached_to_restore;
         }
-        Ok(resp)
+        if let Some((sentinel_str, file_opt, static_len)) = static_passthrough
+            && let Obj::Record(ref rec) = resp
+            && rec.schema_id == SCHEMA_HTTP_RESPONSE
+            && matches!(rec.raw_obj(0), Obj::Str(s) if Arc::ptr_eq(s, &sentinel_str))
+        {
+            let status = rec.get_scalar(0) as i64;
+            let headers = match rec.get_obj(1) {
+                Obj::Map(m) => (**m).clone(),
+                _ => OrderedMap::new(),
+            };
+            if status == 204 || status == 304 {
+                return Ok(DispatchedHttpResponse::StaticFile {
+                    status,
+                    headers,
+                    file: None,
+                    len: 0,
+                });
+            }
+            return Ok(DispatchedHttpResponse::StaticFile {
+                status,
+                headers,
+                file: file_opt,
+                len: static_len,
+            });
+        }
+        Ok(DispatchedHttpResponse::Obj(resp))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1326,8 +1527,7 @@ impl Vm {
                     _ => "*",
                 };
                 self.host.routers[rid]
-                    .routes
-                    .push(RouteEntry::new(method, &pattern, handler));
+                    .push_route(RouteEntry::new(method, &pattern, handler));
             }
             HTTP_ROUTE_BEFORE => {
                 let rid = self.extract_router_id(&self.objs[o_base + a as usize])?;
@@ -2118,8 +2318,8 @@ fn serve_connection(
                 let head_only = raw.method.eq_ignore_ascii_case("HEAD");
                 let keep_alive = raw.keep_alive && req_count < HTTP_MAX_KEEPALIVE_REQUESTS;
                 let req_obj = raw.into_request_obj();
-                match vm.dispatch_router_request(module, 0, 0, rid, req_obj) {
-                    Ok(resp_obj) => {
+                match vm.dispatch_router_request_inner(module, 0, 0, rid, req_obj, true) {
+                    Ok(DispatchedHttpResponse::Obj(resp_obj)) => {
                         let Ok((status, body, headers)) = vm.extract_response_fields(&resp_obj) else {
                             write_error_response(&mut writer, 500, "Internal Server Error");
                             break;
@@ -2129,6 +2329,27 @@ fn serve_connection(
                             status,
                             body,
                             headers,
+                            keep_alive,
+                            head_only,
+                        ) {
+                            if err.kind() == std::io::ErrorKind::InvalidInput {
+                                write_error_response(&mut writer, 500, "Internal Server Error");
+                            }
+                            break;
+                        }
+                    }
+                    Ok(DispatchedHttpResponse::StaticFile {
+                        status,
+                        headers,
+                        mut file,
+                        len,
+                    }) => {
+                        if let Err(err) = write_http_file_response(
+                            &mut writer,
+                            status,
+                            file.as_mut(),
+                            len,
+                            Some(&headers),
                             keep_alive,
                             head_only,
                         ) {
@@ -2480,6 +2701,10 @@ mod tests {
         assert_eq!(default_cfg.idle_timeout, DEFAULT_IDLE_TIMEOUT);
         assert_eq!(default_cfg.header_timeout, DEFAULT_HEADER_TIMEOUT);
         assert_eq!(default_cfg.body_timeout, DEFAULT_BODY_TIMEOUT);
+        assert_eq!(
+            default_cfg.max_conns,
+            (default_cfg.workers * 128).clamp(512, 8192)
+        );
         assert!(default_cfg.trusted_proxies.is_empty());
 
         let router_opts = RouterServerOptions {
@@ -2496,6 +2721,7 @@ mod tests {
         assert_eq!(router_cfg.header_timeout, Duration::from_millis(4000));
         assert_eq!(router_cfg.body_timeout, Duration::from_millis(12_000));
         assert_eq!(router_cfg.max_conns_per_ip, 0);
+        assert_eq!(router_cfg.max_conns, 1536);
         assert_eq!(router_cfg.trusted_proxies.len(), 2);
 
         let env_cfg = HttpServerConfig::resolve_with_env(&router_opts, |k| match k {
@@ -2504,6 +2730,7 @@ mod tests {
             "CONDUIT_HTTP_HEADER_TIMEOUT_MS" => Some("9000".into()),
             "CONDUIT_HTTP_BODY_TIMEOUT_MS" => Some("45000".into()),
             "CONDUIT_HTTP_MAX_CONNS_PER_IP" => Some("16".into()),
+            "CONDUIT_HTTP_MAX_CONNS" => Some("2048".into()),
             "CONDUIT_HTTP_TRUSTED_PROXIES" => Some("".into()),
             _ => None,
         });
@@ -2512,6 +2739,7 @@ mod tests {
         assert_eq!(env_cfg.header_timeout, Duration::from_millis(9000));
         assert_eq!(env_cfg.body_timeout, Duration::from_millis(45_000));
         assert_eq!(env_cfg.max_conns_per_ip, 16);
+        assert_eq!(env_cfg.max_conns, 2048);
         assert!(env_cfg.trusted_proxies.is_empty());
     }
 
@@ -2640,5 +2868,184 @@ mod tests {
         srv_thread.join().unwrap();
         stopped_cleanly.store(true, Ordering::Release);
         assert!(stopped_cleanly.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn http_static_binary_streaming_and_head_loopback_e2e() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+
+        let tmp = std::env::temp_dir().join(format!("conduit_static_e2e_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let mut png_bytes: Vec<u8> = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\xff\xfe\xfd\x80".to_vec();
+        let target_len = 140 * 1024;
+        png_bytes.reserve(target_len);
+        for i in 0..(target_len - png_bytes.len()) {
+            png_bytes.push(((i * 73 + 0xA5) & 0xFF) as u8);
+        }
+        assert!(std::str::from_utf8(&png_bytes).is_err());
+
+        let font_bytes: Vec<u8> = vec![b'w', b'O', b'F', b'2', 0x00, 0xFF, 0xFE, 0x81, 0x99, 0x00];
+        std::fs::write(tmp.join("logo.png"), &png_bytes).unwrap();
+        std::fs::write(tmp.join("font.woff2"), &font_bytes).unwrap();
+        std::fs::write(tmp.join("blocked.png"), b"\x89PNGblocked").unwrap();
+
+        let dir_str = tmp.to_string_lossy().replace('\\', "/");
+        let src = format!(
+            r#"
+            import * as http from "cdt.http"
+
+            func tag_static(req: http.Request, resp: http.Response) -> http.Response {{
+                if req.path == "/assets/blocked.png" {{
+                    return http.response(403, "Forbidden")
+                }}
+                hdrs := resp.headers
+                hdrs.set("x-static-hook", "yes")
+                return http.response_with(resp.status, resp.body, hdrs)
+            }}
+
+            router StaticApi {{
+                cors "*"
+                static "/assets" => "{dir_str}"
+                after tag_static
+            }}
+
+            export func setup_static_router() -> http.Router {{
+                r := http.build<StaticApi>()
+                r.workers(2)
+                return r
+            }}
+        "#
+        );
+
+        let module = crate::frontend::compile_source(&src).expect("compile static router");
+        let setup_fid = module.func_id("setup_static_router").unwrap();
+        let mut init_vm = Vm::new();
+        let router_obj = init_vm.call_obj(&module, setup_fid, &[], &[]).unwrap();
+        let Obj::Record(sd) = router_obj else {
+            panic!("expected Router");
+        };
+        let rid = sd.get_scalar(0) as usize;
+        let stop_flag = Arc::clone(&init_vm.host.routers[rid].stop_flag);
+        let routers = init_vm.host.routers.clone();
+        let spawn_tracker = Arc::clone(&init_vm.host.spawn_tracker);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shared_mod = Arc::new(module);
+
+        let srv_stop = Arc::clone(&stop_flag);
+        let srv_thread = std::thread::spawn(move || {
+            serve_http_listener(
+                shared_mod,
+                routers,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                spawn_tracker,
+                None,
+                rid,
+                listener,
+                srv_stop,
+                false,
+            );
+        });
+
+        // 1 & 2. Keep-alive HEAD followed by >128 KiB binary GET on the same socket.
+        {
+            let mut conn = TcpStream::connect(addr).unwrap();
+            conn.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            conn.write_all(b"HEAD /assets/logo.png HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                .unwrap();
+
+            let mut head_buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            let head_end = loop {
+                let n = conn.read(&mut chunk).unwrap();
+                assert!(n > 0, "unexpected EOF waiting for HEAD headers");
+                head_buf.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = crate::native::http::find_crlf_crlf(&head_buf) {
+                    break pos;
+                }
+            };
+            assert_eq!(
+                head_buf.len(),
+                head_end,
+                "HEAD response must not include body bytes"
+            );
+            let head_lower = String::from_utf8_lossy(&head_buf[..head_end]).to_ascii_lowercase();
+            assert!(head_lower.starts_with("http/1.1 200 ok\r\n"), "{head_lower}");
+            assert!(head_lower.contains("content-type: image/png\r\n"), "{head_lower}");
+            assert!(
+                head_lower.contains(&format!("content-length: {}\r\n", png_bytes.len())),
+                "{head_lower}"
+            );
+            assert!(head_lower.contains("x-static-hook: yes\r\n"), "{head_lower}");
+            assert!(
+                head_lower.contains("access-control-allow-origin: *\r\n"),
+                "{head_lower}"
+            );
+
+            conn.write_all(
+                b"GET /assets/logo.png HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+            let mut raw_get = Vec::new();
+            conn.read_to_end(&mut raw_get).unwrap();
+            let split = crate::native::http::find_crlf_crlf(&raw_get).unwrap();
+            let get_head_lower = String::from_utf8_lossy(&raw_get[..split]).to_ascii_lowercase();
+            assert!(get_head_lower.starts_with("http/1.1 200 ok\r\n"), "{get_head_lower}");
+            assert!(
+                get_head_lower.contains(&format!("content-length: {}\r\n", png_bytes.len())),
+                "{get_head_lower}"
+            );
+            assert!(get_head_lower.contains("x-static-hook: yes\r\n"), "{get_head_lower}");
+            assert!(
+                get_head_lower.contains("access-control-allow-origin: *\r\n"),
+                "{get_head_lower}"
+            );
+            assert_eq!(&raw_get[split..], png_bytes.as_slice());
+        }
+
+        // 3. Binary woff2 font file preserves MIME type and exact bytes.
+        {
+            let mut conn = TcpStream::connect(addr).unwrap();
+            conn.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            conn.write_all(
+                b"GET /assets/font.woff2 HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+            let mut raw = Vec::new();
+            conn.read_to_end(&mut raw).unwrap();
+            let split = crate::native::http::find_crlf_crlf(&raw).unwrap();
+            let head_lower = String::from_utf8_lossy(&raw[..split]).to_ascii_lowercase();
+            assert!(head_lower.starts_with("http/1.1 200 ok\r\n"), "{head_lower}");
+            assert!(head_lower.contains("content-type: font/woff2\r\n"), "{head_lower}");
+            assert_eq!(&raw[split..], font_bytes.as_slice());
+        }
+
+        // 4. `after` hook can override static response status/body cleanly.
+        {
+            let mut conn = TcpStream::connect(addr).unwrap();
+            conn.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            conn.write_all(
+                b"GET /assets/blocked.png HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+            let mut raw = Vec::new();
+            conn.read_to_end(&mut raw).unwrap();
+            let text = String::from_utf8(raw).unwrap();
+            assert!(text.starts_with("HTTP/1.1 403 Forbidden\r\n"), "{text}");
+            assert!(text.ends_with("\r\n\r\nForbidden"), "{text}");
+        }
+
+        stop_flag.store(true, Ordering::Release);
+        wake_socket_addr(addr);
+        srv_thread.join().unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
