@@ -18,7 +18,7 @@ use crate::native::fs::{
 };
 use crate::native::path::{
     PATH_BASENAME, PATH_DIRNAME, PATH_EXT, PATH_IS_ABS, PATH_JOIN, PATH_JOIN_ALL, PATH_NORMALIZE,
-    PATH_STEM, PATH_WITH_EXT,
+    PATH_SAFE_JOIN, PATH_STEM, PATH_WITH_EXT,
 };
 use crate::native::process::{
     PROC_CWD, PROC_EXIT, PROC_PID, PROC_PIPE, PROC_RUN, PROC_SET_CWD, PROC_STATUS,
@@ -795,8 +795,12 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
 
     pub(crate) fn lower_path_call(&mut self, sym: &str, args: &[Expr]) -> Result<u16, String> {
         match sym {
-            "join" | "with_ext" => {
-                let aux = if sym == "join" { PATH_JOIN } else { PATH_WITH_EXT };
+            "join" | "with_ext" | "safe_join" => {
+                let aux = match sym {
+                    "join" => PATH_JOIN,
+                    "with_ext" => PATH_WITH_EXT,
+                    _ => PATH_SAFE_JOIN,
+                };
                 let b = self.lower_obj(&args[0])?;
                 let c = self.lower_obj(&args[1])?;
                 let a = self.alloc_temp_o();
@@ -1761,6 +1765,59 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                     c: 0,
                 });
                 Ok(dst_o)
+            }
+            ("Router", "workers") => {
+                let count_s = self.lower_scalar(&args[0])?;
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_HTTP_OP,
+                    aux: HTTP_ROUTER_WORKERS,
+                    a: router_o,
+                    b: count_s,
+                    c: 0,
+                });
+                Ok(router_o)
+            }
+            ("Router", "timeouts") => {
+                let idle_s = self.lower_scalar(&args[0])?;
+                let header_s = self.lower_scalar(&args[1])?;
+                let body_s = self.lower_scalar(&args[2])?;
+                let desc_idx = self.mc.intern_record_desc(RecordDesc {
+                    schema_id: SCHEMA_HTTP_ROUTER,
+                    scalar_regs: Box::new([idle_s, header_s, body_s]),
+                    obj_regs: Box::new([]),
+                })?;
+                let packed = self.alloc_temp_o();
+                self.ops.push(Op::NewRecord { dst_obj: packed, desc_idx });
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_HTTP_OP,
+                    aux: HTTP_ROUTER_TIMEOUTS,
+                    a: router_o,
+                    b: packed,
+                    c: 0,
+                });
+                Ok(router_o)
+            }
+            ("Router", "max_conns_per_ip") => {
+                let limit_s = self.lower_scalar(&args[0])?;
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_HTTP_OP,
+                    aux: HTTP_ROUTER_MAX_CONNS_PER_IP,
+                    a: router_o,
+                    b: limit_s,
+                    c: 0,
+                });
+                Ok(router_o)
+            }
+            ("Router", "trusted_proxies") => {
+                let cidrs_o = self.lower_obj(&args[0])?;
+                self.ops.push(Op::ExtOp {
+                    kind: EXT_HTTP_OP,
+                    aux: HTTP_ROUTER_TRUSTED_PROXIES,
+                    a: router_o,
+                    b: cidrs_o,
+                    c: 0,
+                });
+                Ok(router_o)
             }
             _ => Err(format!("Unsupported http.{} method '.{}()'", type_name, method)),
         }

@@ -135,10 +135,20 @@ impl<'a, 'b> FnLowerer<'a, 'b> {
                     self.ops.push(Op::LoadBool { dst: r, val: false });
                     r
                 };
+                let iss_o = if let Some(iss) = args.get(idx + 4) {
+                    self.lower_obj(iss)?
+                } else {
+                    self.load_const_str_reg("")?
+                };
+                let aud_o = if let Some(aud) = args.get(idx + 5) {
+                    self.lower_obj(aud)?
+                } else {
+                    self.load_const_str_reg("")?
+                };
                 let packed = self.pack_record(
                     SCHEMA_JWT_ERROR,
                     &[plan_s, leeway_s, req_exp_s],
-                    &[alg_o, token_o, secret_o],
+                    &[alg_o, token_o, secret_o, iss_o, aud_o],
                 )?;
                 let dst = self.alloc_temp_o();
                 self.ops.push(Op::ExtOp {

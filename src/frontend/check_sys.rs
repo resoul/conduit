@@ -30,6 +30,21 @@ impl Checker<'_> {
                 }
                 Ok(Type::String)
             }
+            "safe_join" => {
+                if args.len() != 2 {
+                    return Err("path.safe_join(root, rel) expects 2 String arguments".to_string());
+                }
+                let (a0, a1) = args.split_at_mut(1);
+                self.check_expr(&mut a0[0], Some(&Type::String))?;
+                if a0[0].ty != Type::String {
+                    return Err(format!("path.safe_join expects String root, got {}", a0[0].ty));
+                }
+                self.check_expr(&mut a1[0], Some(&Type::String))?;
+                if a1[0].ty != Type::String {
+                    return Err(format!("path.safe_join expects String rel, got {}", a1[0].ty));
+                }
+                Ok(Type::Optional(Box::new(Type::String)))
+            }
             "join_all" => {
                 if args.len() != 1 {
                     return Err("path.join_all(parts) expects 1 [String] argument".to_string());
@@ -1196,6 +1211,67 @@ impl Checker<'_> {
             ("Router", "stop") => {
                 if !args.is_empty() {
                     return Err("Router.stop() takes 0 arguments".to_string());
+                }
+                Ok(Type::Void)
+            }
+            ("Router", "workers") => {
+                if args.len() != 1 {
+                    return Err("Router.workers(count: Int) expects 1 Int argument".to_string());
+                }
+                self.check_expr(&mut args[0], Some(&Type::Int))?;
+                if args[0].ty != Type::Int {
+                    return Err(format!("Router.workers expects Int, got {}", args[0].ty));
+                }
+                Ok(Type::Void)
+            }
+            ("Router", "timeouts") => {
+                if args.len() != 3 {
+                    return Err(
+                        "Router.timeouts(idle_ms: Int, header_ms: Int, body_ms: Int) expects 3 Int arguments"
+                            .to_string(),
+                    );
+                }
+                for (i, arg) in args.iter_mut().enumerate() {
+                    self.check_expr(arg, Some(&Type::Int))?;
+                    if arg.ty != Type::Int {
+                        return Err(format!(
+                            "Router.timeouts argument {} expects Int, got {}",
+                            i + 1,
+                            arg.ty
+                        ));
+                    }
+                }
+                Ok(Type::Void)
+            }
+            ("Router", "max_conns_per_ip") => {
+                if args.len() != 1 {
+                    return Err(
+                        "Router.max_conns_per_ip(limit: Int) expects 1 Int argument".to_string()
+                    );
+                }
+                self.check_expr(&mut args[0], Some(&Type::Int))?;
+                if args[0].ty != Type::Int {
+                    return Err(format!(
+                        "Router.max_conns_per_ip expects Int, got {}",
+                        args[0].ty
+                    ));
+                }
+                Ok(Type::Void)
+            }
+            ("Router", "trusted_proxies") => {
+                if args.len() != 1 {
+                    return Err(
+                        "Router.trusted_proxies(cidrs: [String]) expects 1 [String] argument"
+                            .to_string(),
+                    );
+                }
+                let expected = Type::List(Box::new(Type::String));
+                self.check_expr(&mut args[0], Some(&expected))?;
+                if args[0].ty != expected {
+                    return Err(format!(
+                        "Router.trusted_proxies expects [String], got {}",
+                        args[0].ty
+                    ));
                 }
                 Ok(Type::Void)
             }

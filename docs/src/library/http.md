@@ -103,6 +103,20 @@ api.close()
 | `dispatch` | `r.dispatch(req: Request) -> Response` | Dispatches a `Request` in-memory (returns `404`/`405` automatically). |
 | `serve` | `r.serve(addr: String) -> Void \| HttpError` | Starts a blocking HTTP/1.1 server on `addr` (e.g. `"127.0.0.1:8080"`) with `SIGINT`/`SIGTERM` graceful shutdown. |
 | `stop` | `r.stop() -> Void` | Signals `r.serve(...)` to stop accepting new connections and shut down gracefully after in-flight requests finish. |
+| `workers` | `r.workers(count: Int) -> Void` | Configures the HTTP server worker thread count (`1..=256`). Overridden by `CONDUIT_HTTP_WORKERS`. |
+| `timeouts` | `r.timeouts(idle_ms: Int, header_ms: Int, body_ms: Int) -> Void` | Configures keep-alive idle (`100..=300000` ms), header read (`500..=300000` ms), and body read (`500..=600000` ms) deadlines (non-positive keeps default). Overridden by `CONDUIT_HTTP_*_TIMEOUT_MS`. |
+| `max_conns_per_ip` | `r.max_conns_per_ip(limit: Int) -> Void` | Configures max concurrent connections per remote IPv4 address / IPv6 `/64` prefix (`0` disables per-IP limit). Overridden by `CONDUIT_HTTP_MAX_CONNS_PER_IP`. |
+| `trusted_proxies` | `r.trusted_proxies(cidrs: [String]) -> Void` | List of proxy IP/CIDR ranges (e.g. `["10.0.0.0/8", "172.16.0.0/12"]`) exempt from per-IP connection limits. Overridden by `CONDUIT_HTTP_TRUSTED_PROXIES`. |
+
+### Server Configuration Precedence
+
+Server settings resolve with **`CONDUIT_HTTP_*` environment variables > `Router` methods > built-in defaults**:
+- `CONDUIT_HTTP_WORKERS` (`1..=256`; default `clamp(cpus, 4, 16)`)
+- `CONDUIT_HTTP_IDLE_TIMEOUT_MS` (`100..=300000`; default `3000`)
+- `CONDUIT_HTTP_HEADER_TIMEOUT_MS` (`500..=300000`; default `10000`)
+- `CONDUIT_HTTP_BODY_TIMEOUT_MS` (`500..=600000`; default `30000`)
+- `CONDUIT_HTTP_MAX_CONNS_PER_IP` (default `max(workers / 2, 4)`; `0` disables)
+- `CONDUIT_HTTP_TRUSTED_PROXIES` (comma-separated IPs/CIDRs; setting `""` overrides router-configured proxies to empty)
 
 ## `Request` Helper Methods
 

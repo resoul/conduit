@@ -57,7 +57,7 @@ pub const NATIVE_MODULES: &[NativeModuleSpec] = &[
         name: "cdt.path",
         fns: &[
             "join", "join_all", "dirname", "basename", "ext", "stem", "normalize", "is_abs",
-            "with_ext",
+            "with_ext", "safe_join",
         ],
         types: &[],
     },

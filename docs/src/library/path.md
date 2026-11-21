@@ -29,3 +29,4 @@ func main() -> Void {
 | `normalize` | `(p: String) -> String` | Lexically resolves `.` and `..` |
 | `is_abs` | `(p: String) -> Bool` | `true` if `p` is an absolute path |
 | `with_ext` | `(p: String, ext: String) -> String` | Replaces or appends file extension |
+| `safe_join` | `(root: String, rel: String) -> String?` | Safely joins `rel` under canonical `root`, resolving symlinks step-by-step against the filesystem and returning `nil` on `..` traversal, absolute/prefixed paths, NUL bytes, dangling symlinks, or symlink escapes (allows not-yet-created nested files inside an existing `root`) |

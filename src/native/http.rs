@@ -75,6 +75,16 @@ impl RouteEntry {
 }
 
 #[derive(Debug, Default, Clone)]
+pub struct RouterServerOptions {
+    pub workers: Option<usize>,
+    pub idle_timeout_ms: Option<u64>,
+    pub header_timeout_ms: Option<u64>,
+    pub body_timeout_ms: Option<u64>,
+    pub max_conns_per_ip: Option<usize>,
+    pub trusted_proxies: Vec<String>,
+}
+
+#[derive(Debug, Default, Clone)]
 pub struct RouterState {
     pub routes: Vec<RouteEntry>,
     pub before: Vec<(Option<Box<str>>, Obj)>,
@@ -83,6 +93,7 @@ pub struct RouterState {
     pub on_stop: Vec<Obj>,
     pub statics: Vec<(Box<str>, Box<str>)>,
     pub cors_origin: Option<Box<str>>,
+    pub server_opts: RouterServerOptions,
     pub stop_flag: Arc<AtomicBool>,
     pub listen_addr: Arc<std::sync::Mutex<Option<std::net::SocketAddr>>>,
 }
@@ -355,28 +366,74 @@ pub fn make_router_obj(handle: i64) -> Obj {
     Obj::Record(Arc::new(s))
 }
 
-pub(crate) fn header_key(name: &str) -> Arc<VmString> {
-    macro_rules! common_headers {
-        ($($key:literal => $slot:ident),+ $(,)?) => {{
-            $(static $slot: LazyLock<Arc<VmString>> = LazyLock::new(|| Arc::new(VmString::from($key)));)+
+macro_rules! define_common_headers {
+    ($($key:literal => $slot:ident),+ $(,)?) => {
+        $(static $slot: LazyLock<Arc<VmString>> = LazyLock::new(|| Arc::new(VmString::from($key)));)+
+
+        pub(crate) fn header_key(name: &str) -> Arc<VmString> {
             match name {
                 $($key => Arc::clone(&$slot),)+
                 _ => Arc::new(VmString::from(name)),
             }
+        }
+
+        pub(crate) fn header_key_bytes(name: &[u8]) -> Arc<VmString> {
+            $(
+                if name.eq_ignore_ascii_case($key.as_bytes()) {
+                    return Arc::clone(&$slot);
+                }
+            )+
+            Arc::new(VmString::from(String::from_utf8_lossy(name).to_ascii_lowercase()))
+        }
+    };
+}
+
+define_common_headers!(
+    "accept" => HDR_ACCEPT,
+    "accept-encoding" => HDR_ACCEPT_ENCODING,
+    "accept-language" => HDR_ACCEPT_LANGUAGE,
+    "authorization" => HDR_AUTHORIZATION,
+    "cache-control" => HDR_CACHE_CONTROL,
+    "connection" => HDR_CONNECTION,
+    "content-length" => HDR_CONTENT_LENGTH,
+    "content-type" => HDR_CONTENT_TYPE,
+    "cookie" => HDR_COOKIE,
+    "host" => HDR_HOST,
+    "if-modified-since" => HDR_IF_MODIFIED_SINCE,
+    "if-none-match" => HDR_IF_NONE_MATCH,
+    "location" => HDR_LOCATION,
+    "origin" => HDR_ORIGIN,
+    "referer" => HDR_REFERER,
+    "upgrade-insecure-requests" => HDR_UPGRADE_INSECURE_REQUESTS,
+    "user-agent" => HDR_USER_AGENT,
+    "x-forwarded-for" => HDR_X_FORWARDED_FOR,
+    "x-forwarded-host" => HDR_X_FORWARDED_HOST,
+    "x-forwarded-proto" => HDR_X_FORWARDED_PROTO,
+    "x-real-ip" => HDR_X_REAL_IP,
+    "x-request-id" => HDR_X_REQUEST_ID,
+    "access-control-allow-headers" => HDR_CORS_HEADERS,
+    "access-control-allow-methods" => HDR_CORS_METHODS,
+    "access-control-allow-origin" => HDR_CORS_ORIGIN,
+);
+
+pub(crate) fn intern_http_method(method: &str) -> Arc<VmString> {
+    macro_rules! common_methods {
+        ($($m:literal => $slot:ident),+ $(,)?) => {{
+            $(static $slot: LazyLock<Arc<VmString>> = LazyLock::new(|| Arc::new(VmString::from($m)));)+
+            match method {
+                $($m => Arc::clone(&$slot),)+
+                _ => Arc::new(VmString::from(method)),
+            }
         }};
     }
-    common_headers!(
-        "accept" => ACCEPT,
-        "authorization" => AUTHORIZATION,
-        "connection" => CONNECTION,
-        "content-length" => CONTENT_LENGTH,
-        "content-type" => CONTENT_TYPE,
-        "host" => HOST,
-        "location" => LOCATION,
-        "user-agent" => USER_AGENT,
-        "access-control-allow-headers" => CORS_HEADERS,
-        "access-control-allow-methods" => CORS_METHODS,
-        "access-control-allow-origin" => CORS_ORIGIN,
+    common_methods!(
+        "GET" => METHOD_GET,
+        "POST" => METHOD_POST,
+        "PUT" => METHOD_PUT,
+        "DELETE" => METHOD_DELETE,
+        "PATCH" => METHOD_PATCH,
+        "HEAD" => METHOD_HEAD,
+        "OPTIONS" => METHOD_OPTIONS,
     )
 }
 
@@ -495,10 +552,10 @@ pub fn make_request_obj(
 }
 
 pub struct RawHttpRequest {
-    pub method: String,
+    pub method: Arc<VmString>,
     pub path: String,
     pub query: String,
-    pub headers: Vec<(String, Vec<u8>)>,
+    pub headers: Vec<(Arc<VmString>, Vec<u8>)>,
     pub body: Vec<u8>,
     pub keep_alive: bool,
 }
@@ -506,7 +563,7 @@ pub struct RawHttpRequest {
 impl RawHttpRequest {
     pub(crate) fn into_request_obj(self) -> Obj {
         let mut req = StructData::new(SCHEMA_HTTP_REQUEST, 0, 8);
-        req.set_obj(0, Obj::str(self.method));
+        req.set_obj(0, Obj::Str(self.method));
         req.set_obj(1, Obj::str(self.path));
         let body = Arc::new(self.body);
         let text = Arc::clone(&body);
@@ -532,7 +589,7 @@ impl RawHttpRequest {
     }
 }
 
-fn build_request_headers(headers: &[(String, Vec<u8>)], binary: bool) -> Obj {
+fn build_request_headers(headers: &[(Arc<VmString>, Vec<u8>)], binary: bool) -> Obj {
     let mut map = OrderedMap::with_capacity(headers.len());
     for (key, value) in headers {
         let value = if binary {
@@ -540,7 +597,7 @@ fn build_request_headers(headers: &[(String, Vec<u8>)], binary: bool) -> Obj {
         } else {
             Obj::str(String::from_utf8_lossy(value).into_owned())
         };
-        map.set(MapKey::Str(header_key(key)), MapVal::Obj(value));
+        map.set(MapKey::Str(Arc::clone(key)), MapVal::Obj(value));
     }
     Obj::Map(Arc::new(map))
 }
@@ -844,7 +901,8 @@ where
     let mut headers = Vec::new();
     let mut content_length: usize = 0;
     let mut saw_content_length = false;
-    let mut conn_header: Option<String> = None;
+    let mut conn_close = false;
+    let mut conn_keep_alive = false;
     while !rem.is_empty() {
         let Some(line) = next_crlf_line(&mut rem) else {
             break;
@@ -868,9 +926,6 @@ where
         if name.is_empty() || !name.iter().copied().all(is_http_tchar) {
             return Err(ReadHttpError::Bad("Invalid HTTP header name".to_string()));
         }
-        let name = std::str::from_utf8(name)
-            .map_err(|_| ReadHttpError::Bad("Invalid HTTP header name".to_string()))?;
-        let lname = name.to_ascii_lowercase();
         let mut val = &line[colon + 1..];
         while val.first().is_some_and(|&b| matches!(b, b' ' | b'\t')) {
             val = &val[1..];
@@ -881,11 +936,11 @@ where
         if val.iter().any(|&b| (b < b' ' && b != b'\t') || b == 127) {
             return Err(ReadHttpError::Bad("Invalid HTTP header value".to_string()));
         }
-        if lname == "transfer-encoding" {
+        if name.eq_ignore_ascii_case(b"transfer-encoding") {
             return Err(ReadHttpError::Bad(
                 "Transfer-Encoding is not supported".to_string(),
             ));
-        } else if lname == "content-length" {
+        } else if name.eq_ignore_ascii_case(b"content-length") {
             if saw_content_length {
                 return Err(ReadHttpError::Bad("Duplicate Content-Length header".to_string()));
             }
@@ -901,10 +956,23 @@ where
             if content_length > MAX_BODY {
                 return Err(ReadHttpError::TooLarge);
             }
-        } else if lname == "connection" {
-            conn_header = Some(String::from_utf8_lossy(val).to_ascii_lowercase());
+        } else if name.eq_ignore_ascii_case(b"connection") {
+            for part in val.split(|&b| b == b',') {
+                let mut tok = part;
+                while tok.first().is_some_and(|&b| matches!(b, b' ' | b'\t')) {
+                    tok = &tok[1..];
+                }
+                while tok.last().is_some_and(|&b| matches!(b, b' ' | b'\t')) {
+                    tok = &tok[..tok.len() - 1];
+                }
+                if tok.eq_ignore_ascii_case(b"close") {
+                    conn_close = true;
+                } else if tok.eq_ignore_ascii_case(b"keep-alive") {
+                    conn_keep_alive = true;
+                }
+            }
         }
-        headers.push((lname, val.to_vec()));
+        headers.push((header_key_bytes(name), val.to_vec()));
     }
 
     on_headers_done(reader);
@@ -932,13 +1000,13 @@ where
     }
 
     let keep_alive = if version == "HTTP/1.0" {
-        conn_header.as_deref().is_some_and(|c| c.contains("keep-alive"))
+        conn_keep_alive && !conn_close
     } else {
-        !conn_header.as_deref().is_some_and(|c| c.contains("close"))
+        !conn_close
     };
 
     Ok(RawHttpRequest {
-        method: method.to_string(),
+        method: intern_http_method(method),
         path: raw_path.to_string(),
         query: raw_query.to_owned(),
         headers,
@@ -2362,5 +2430,19 @@ mod tests {
         assert!(r2.keep_alive);
         let r3 = read_http_request(&mut br).unwrap();
         assert_eq!(r3.path, "/three");
+    }
+
+    #[test]
+    fn http_request_interns_common_headers_and_methods() {
+        let raw_a = b"GET /a HTTP/1.1\r\nHost: one.local\r\nX-Forwarded-For: 10.0.0.1\r\nContent-Type: application/json\r\nX-Custom-Header: val\r\n\r\n";
+        let raw_b = b"GET /b HTTP/1.1\r\nhost: two.local\r\nx-forwarded-for: 10.0.0.2\r\nCONTENT-TYPE: text/plain\r\nx-custom-header: val2\r\n\r\n";
+        let ra = read_http_request(&mut raw_a.as_slice()).unwrap();
+        let rb = read_http_request(&mut raw_b.as_slice()).unwrap();
+        assert!(Arc::ptr_eq(&ra.method, &rb.method));
+        for i in 0..3 {
+            assert!(Arc::ptr_eq(&ra.headers[i].0, &rb.headers[i].0), "header {i} not interned");
+        }
+        assert_eq!(ra.headers[3].0.as_str(), "x-custom-header");
+        assert!(!Arc::ptr_eq(&ra.headers[3].0, &rb.headers[3].0));
     }
 }

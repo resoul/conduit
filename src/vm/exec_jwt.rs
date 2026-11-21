@@ -55,6 +55,22 @@ impl Vm {
                 let plan_idx = packed.get_scalar(0) as usize;
                 let leeway_secs = packed.get_scalar(1) as i64;
                 let require_exp = packed.scalar_len >= 3 && packed.get_scalar(2) != 0;
+                let expected_iss = if packed.obj_len >= 4 {
+                    let Obj::Str(s) = packed.get_obj(3) else {
+                        return Err(err_msg("Expected String expected_iss in jwt.verify()"));
+                    };
+                    if s.is_empty() { None } else { Some(s.as_str()) }
+                } else {
+                    None
+                };
+                let expected_aud = if packed.obj_len >= 5 {
+                    let Obj::Str(s) = packed.get_obj(4) else {
+                        return Err(err_msg("Expected String expected_aud in jwt.verify()"));
+                    };
+                    if s.is_empty() { None } else { Some(s.as_str()) }
+                } else {
+                    None
+                };
                 let Some(plan) = module.json_plans.get(plan_idx) else {
                     return Err(err_msg("JSON decode plan out of bounds in jwt.verify()"));
                 };
@@ -64,6 +80,8 @@ impl Vm {
                     secret.as_str(),
                     leeway_secs,
                     require_exp,
+                    expected_iss,
+                    expected_aud,
                     plan,
                 );
             }

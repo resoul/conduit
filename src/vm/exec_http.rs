@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use crate::ir::Module;
 use crate::native::http::{
-    HttpClientState, MatchedParams, ReadHttpError, RouteEntry, RouterState,
+    HttpClientState, MatchedParams, ReadHttpError, RouteEntry, RouterServerOptions, RouterState,
     deadline_reader_writer_pair, header_key, http_client_bytes_request,
     http_client_pooled_request_with_options, http_client_request, http_client_request_with_timeout,
     lookup_route, make_http_client_obj, make_http_error, make_response_obj,
@@ -87,48 +87,76 @@ struct HttpServerConfig {
     trusted_proxies: Vec<IpNet>,
 }
 
-fn parse_env_duration_ms(var: &str, min_ms: u64, max_ms: u64, default: Duration) -> Duration {
-    std::env::var(var)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .map(|ms| Duration::from_millis(ms.clamp(min_ms, max_ms)))
-        .unwrap_or(default)
+fn resolve_duration_ms<F: Fn(&str) -> Option<String>>(
+    get_env: &F,
+    var: &str,
+    router_ms: Option<u64>,
+    min_ms: u64,
+    max_ms: u64,
+    default: Duration,
+) -> Duration {
+    if let Some(val) = get_env(var)
+        && let Ok(ms) = val.trim().parse::<u64>()
+    {
+        return Duration::from_millis(ms.clamp(min_ms, max_ms));
+    }
+    if let Some(ms) = router_ms {
+        return Duration::from_millis(ms.clamp(min_ms, max_ms));
+    }
+    default
 }
 
 impl HttpServerConfig {
-    fn from_env() -> Self {
+    fn resolve(opts: &RouterServerOptions) -> Self {
+        Self::resolve_with_env(opts, |k| std::env::var(k).ok())
+    }
+
+    fn resolve_with_env<F: Fn(&str) -> Option<String>>(
+        opts: &RouterServerOptions,
+        get_env: F,
+    ) -> Self {
         let default_workers = std::thread::available_parallelism()
             .map(|n| n.get().clamp(4, 16))
             .unwrap_or(8);
-        let workers = std::env::var("CONDUIT_HTTP_WORKERS")
-            .ok()
+        let workers = get_env("CONDUIT_HTTP_WORKERS")
             .and_then(|v| v.trim().parse::<usize>().ok())
+            .or(opts.workers)
             .map(|n| n.clamp(1, 256))
             .unwrap_or(default_workers);
-        let max_conns_per_ip = std::env::var("CONDUIT_HTTP_MAX_CONNS_PER_IP")
-            .ok()
+        let max_conns_per_ip = get_env("CONDUIT_HTTP_MAX_CONNS_PER_IP")
             .and_then(|v| v.trim().parse::<usize>().ok())
+            .or(opts.max_conns_per_ip)
             .unwrap_or_else(|| (workers / 2).max(4));
-        let trusted_proxies = std::env::var("CONDUIT_HTTP_TRUSTED_PROXIES")
-            .ok()
-            .map(|raw| raw.split(',').filter_map(IpNet::parse).collect())
-            .unwrap_or_default();
+        let trusted_proxies = match get_env("CONDUIT_HTTP_TRUSTED_PROXIES") {
+            Some(raw) => raw.split(',').filter_map(IpNet::parse).collect(),
+            None => opts
+                .trusted_proxies
+                .iter()
+                .filter_map(|s| IpNet::parse(s))
+                .collect(),
+        };
         Self {
             workers,
-            idle_timeout: parse_env_duration_ms(
+            idle_timeout: resolve_duration_ms(
+                &get_env,
                 "CONDUIT_HTTP_IDLE_TIMEOUT_MS",
+                opts.idle_timeout_ms,
                 100,
                 300_000,
                 DEFAULT_IDLE_TIMEOUT,
             ),
-            header_timeout: parse_env_duration_ms(
+            header_timeout: resolve_duration_ms(
+                &get_env,
                 "CONDUIT_HTTP_HEADER_TIMEOUT_MS",
+                opts.header_timeout_ms,
                 500,
                 300_000,
                 DEFAULT_HEADER_TIMEOUT,
             ),
-            body_timeout: parse_env_duration_ms(
+            body_timeout: resolve_duration_ms(
+                &get_env,
                 "CONDUIT_HTTP_BODY_TIMEOUT_MS",
+                opts.body_timeout_ms,
                 500,
                 600_000,
                 DEFAULT_BODY_TIMEOUT,
@@ -324,6 +352,10 @@ pub const HTTP_CLIENT_POOL_STATS: u8 = 49;
 pub const HTTP_ROUTE_ON_START: u8 = 50;
 pub const HTTP_ROUTE_ON_STOP: u8 = 51;
 pub const HTTP_CLIENT_DENY_PRIVATE: u8 = 52;
+pub const HTTP_ROUTER_WORKERS: u8 = 53;
+pub const HTTP_ROUTER_TIMEOUTS: u8 = 54;
+pub const HTTP_ROUTER_MAX_CONNS_PER_IP: u8 = 55;
+pub const HTTP_ROUTER_TRUSTED_PROXIES: u8 = 56;
 
 pub static SIGNAL_STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -403,7 +435,7 @@ pub(crate) fn serve_http_listener(
         SIGNAL_STOP.store(false, Ordering::Release);
         install_signal_handlers();
     }
-    let cfg = HttpServerConfig::from_env();
+    let cfg = HttpServerConfig::resolve(&routers[rid].server_opts);
     let workers = cfg.workers;
     let idle_timeout = cfg.idle_timeout;
     let header_timeout = cfg.header_timeout;
@@ -1112,6 +1144,54 @@ impl Vm {
                 let rid = self.extract_router_id(&self.objs[o_base + a as usize])?;
                 let origin = self.sys_str(o_base, b, "router cors")?.as_str().into();
                 self.host.routers[rid].cors_origin = Some(origin);
+            }
+            HTTP_ROUTER_WORKERS => {
+                let rid = self.extract_router_id(&self.objs[o_base + a as usize])?;
+                let count = self.scalars[s_base + b as usize] as i64;
+                self.host.routers[rid].server_opts.workers = if count > 0 {
+                    Some((count as usize).clamp(1, 256))
+                } else {
+                    None
+                };
+            }
+            HTTP_ROUTER_TIMEOUTS => {
+                let rid = self.extract_router_id(&self.objs[o_base + a as usize])?;
+                let Obj::Record(packed) = &self.objs[o_base + b as usize] else {
+                    return Err(err_msg("Expected packed args for Router.timeouts()"));
+                };
+                let idle_ms = packed.get_scalar(0) as i64;
+                let header_ms = packed.get_scalar(1) as i64;
+                let body_ms = packed.get_scalar(2) as i64;
+                let opts = &mut self.host.routers[rid].server_opts;
+                opts.idle_timeout_ms =
+                    (idle_ms > 0).then(|| (idle_ms as u64).clamp(100, 300_000));
+                opts.header_timeout_ms =
+                    (header_ms > 0).then(|| (header_ms as u64).clamp(500, 300_000));
+                opts.body_timeout_ms =
+                    (body_ms > 0).then(|| (body_ms as u64).clamp(500, 600_000));
+            }
+            HTTP_ROUTER_MAX_CONNS_PER_IP => {
+                let rid = self.extract_router_id(&self.objs[o_base + a as usize])?;
+                let limit = self.scalars[s_base + b as usize] as i64;
+                self.host.routers[rid].server_opts.max_conns_per_ip = if limit >= 0 {
+                    Some(limit as usize)
+                } else {
+                    None
+                };
+            }
+            HTTP_ROUTER_TRUSTED_PROXIES => {
+                let rid = self.extract_router_id(&self.objs[o_base + a as usize])?;
+                let Obj::List(ListStorage::Obj(items)) = &self.objs[o_base + b as usize] else {
+                    return Err(err_msg("Expected [String] in Router.trusted_proxies()"));
+                };
+                let mut cidrs = Vec::with_capacity(items.len());
+                for item in items.iter() {
+                    let Obj::Str(s) = item else {
+                        return Err(err_msg("Expected [String] in Router.trusted_proxies()"));
+                    };
+                    cidrs.push(s.as_str().to_string());
+                }
+                self.host.routers[rid].server_opts.trusted_proxies = cidrs;
             }
             HTTP_ROUTE_TYPED_BODY => {
                 let rid = self.extract_router_id(&self.objs[o_base + a as usize])?;
@@ -2155,5 +2235,46 @@ mod tests {
         let _u1 = proxied_limiter.try_acquire(untrusted_ip).unwrap();
         let _u2 = proxied_limiter.try_acquire(untrusted_ip).unwrap();
         assert!(proxied_limiter.try_acquire(untrusted_ip).is_none());
+    }
+
+    #[test]
+    fn http_server_config_precedence_env_over_router_over_default() {
+        let default_cfg = HttpServerConfig::resolve_with_env(&RouterServerOptions::default(), |_| None);
+        assert_eq!(default_cfg.idle_timeout, DEFAULT_IDLE_TIMEOUT);
+        assert_eq!(default_cfg.header_timeout, DEFAULT_HEADER_TIMEOUT);
+        assert_eq!(default_cfg.body_timeout, DEFAULT_BODY_TIMEOUT);
+        assert!(default_cfg.trusted_proxies.is_empty());
+
+        let router_opts = RouterServerOptions {
+            workers: Some(12),
+            idle_timeout_ms: Some(1500),
+            header_timeout_ms: Some(4000),
+            body_timeout_ms: Some(12_000),
+            max_conns_per_ip: Some(0),
+            trusted_proxies: vec!["10.0.0.0/8".into(), "172.16.0.0/12".into()],
+        };
+        let router_cfg = HttpServerConfig::resolve_with_env(&router_opts, |_| None);
+        assert_eq!(router_cfg.workers, 12);
+        assert_eq!(router_cfg.idle_timeout, Duration::from_millis(1500));
+        assert_eq!(router_cfg.header_timeout, Duration::from_millis(4000));
+        assert_eq!(router_cfg.body_timeout, Duration::from_millis(12_000));
+        assert_eq!(router_cfg.max_conns_per_ip, 0);
+        assert_eq!(router_cfg.trusted_proxies.len(), 2);
+
+        let env_cfg = HttpServerConfig::resolve_with_env(&router_opts, |k| match k {
+            "CONDUIT_HTTP_WORKERS" => Some("24".into()),
+            "CONDUIT_HTTP_IDLE_TIMEOUT_MS" => Some("7500".into()),
+            "CONDUIT_HTTP_HEADER_TIMEOUT_MS" => Some("9000".into()),
+            "CONDUIT_HTTP_BODY_TIMEOUT_MS" => Some("45000".into()),
+            "CONDUIT_HTTP_MAX_CONNS_PER_IP" => Some("16".into()),
+            "CONDUIT_HTTP_TRUSTED_PROXIES" => Some("".into()),
+            _ => None,
+        });
+        assert_eq!(env_cfg.workers, 24);
+        assert_eq!(env_cfg.idle_timeout, Duration::from_millis(7500));
+        assert_eq!(env_cfg.header_timeout, Duration::from_millis(9000));
+        assert_eq!(env_cfg.body_timeout, Duration::from_millis(45_000));
+        assert_eq!(env_cfg.max_conns_per_ip, 16);
+        assert!(env_cfg.trusted_proxies.is_empty());
     }
 }

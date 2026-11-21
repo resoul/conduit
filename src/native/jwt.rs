@@ -5,11 +5,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const MIN_JWT_SECRET_BYTES: usize = 32;
 pub const MAX_JWT_BYTES: usize = 16 * 1024;
 
-use crate::native::crypto::{constant_time_eq, hmac_sha256_bytes};
+use crate::native::crypto::{constant_time_eq, hmac_sha256_bytes, sha256_bytes};
 use crate::native::json_decode::decode_json_with_plan;
 use crate::native::json_encode::encode_json_obj;
+use crate::native::tls::asn1::DerReader;
+use crate::native::tls::crypto::p256::ecdsa_p256_verify_rs;
+use crate::native::tls::crypto::p384::ecdsa_p384_verify_rs;
+use crate::native::tls::crypto::rsa::{RsaHashAlg, RsaPublicKey};
+use crate::native::tls::crypto::sha2::sha384_bytes;
+use crate::native::tls::pem::decode_pem_block;
+use crate::native::tls::x509::{SubjectPublicKey, parse_spki, parse_x509};
 use crate::native::{JsonDecodePlan, StructSchema};
 use crate::vm::value::{Obj, SCHEMA_JWT_ERROR, StructData};
+
+pub const MAX_JWT_KEY_PEM_BYTES: usize = 64 * 1024;
 
 pub const JWT_SIGN: u8 = 0;
 pub const JWT_VERIFY: u8 = 1;
@@ -599,12 +608,12 @@ fn inject_iat_exp(payload_json: &str, now: i64, ttl_secs: Option<i64>) -> Result
 // ── Public JWT Sign / Verify / Decode API ───────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum JwtAlg {
+enum JwtSignAlg {
     Hs256,
     Hs512,
 }
 
-impl JwtAlg {
+impl JwtSignAlg {
     fn parse(raw: &str) -> Option<Self> {
         match raw {
             "HS256" => Some(Self::Hs256),
@@ -620,30 +629,94 @@ impl JwtAlg {
         }
     }
 
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Hs256 => "HS256",
-            Self::Hs512 => "HS512",
-        }
-    }
-
-    fn verify_mac(self, key: &[u8], data: &[u8], sig: &[u8]) -> bool {
-        match self {
-            Self::Hs256 => {
-                let expected = hmac_sha256_bytes(key, data);
-                constant_time_eq(&expected, sig)
-            }
-            Self::Hs512 => {
-                let expected = hmac_sha512_bytes(key, data);
-                constant_time_eq(&expected, sig)
-            }
-        }
-    }
-
     fn sign_b64url(self, key: &[u8], data: &[u8]) -> String {
         match self {
             Self::Hs256 => b64url_encode(&hmac_sha256_bytes(key, data)),
             Self::Hs512 => b64url_encode(&hmac_sha512_bytes(key, data)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JwtVerifyAlg {
+    Hs256,
+    Hs512,
+    Rs256,
+    Rs384,
+    Rs512,
+    Ps256,
+    Es256,
+    Es384,
+}
+
+impl JwtVerifyAlg {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "HS256" => Some(Self::Hs256),
+            "HS512" => Some(Self::Hs512),
+            "RS256" => Some(Self::Rs256),
+            "RS384" => Some(Self::Rs384),
+            "RS512" => Some(Self::Rs512),
+            "PS256" => Some(Self::Ps256),
+            "ES256" => Some(Self::Es256),
+            "ES384" => Some(Self::Es384),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Hs256 => "HS256",
+            Self::Hs512 => "HS512",
+            Self::Rs256 => "RS256",
+            Self::Rs384 => "RS384",
+            Self::Rs512 => "RS512",
+            Self::Ps256 => "PS256",
+            Self::Es256 => "ES256",
+            Self::Es384 => "ES384",
+        }
+    }
+}
+
+enum PreparedVerifyKey<'a> {
+    Hs256(&'a [u8]),
+    Hs512(&'a [u8]),
+    Rsa {
+        hash: RsaHashAlg,
+        pss: bool,
+        key: RsaPublicKey,
+    },
+    EcP256(Vec<u8>),
+    EcP384(Vec<u8>),
+}
+
+impl PreparedVerifyKey<'_> {
+    fn verify(&self, signing_input: &[u8], sig: &[u8]) -> bool {
+        match self {
+            Self::Hs256(secret) => constant_time_eq(&hmac_sha256_bytes(secret, signing_input), sig),
+            Self::Hs512(secret) => constant_time_eq(&hmac_sha512_bytes(secret, signing_input), sig),
+            Self::Rsa { hash, pss, key } => {
+                let digest = hash.hash(signing_input);
+                if *pss {
+                    key.verify_pss(*hash, &digest, sig)
+                } else {
+                    key.verify_pkcs1_v15(*hash, &digest, sig)
+                }
+            }
+            Self::EcP256(pub_bytes) => {
+                if sig.len() != 64 {
+                    return false;
+                }
+                let digest = sha256_bytes(signing_input);
+                ecdsa_p256_verify_rs(pub_bytes, &digest, &sig[..32], &sig[32..])
+            }
+            Self::EcP384(pub_bytes) => {
+                if sig.len() != 96 {
+                    return false;
+                }
+                let digest = sha384_bytes(signing_input);
+                ecdsa_p384_verify_rs(pub_bytes, &digest, &sig[..48], &sig[48..])
+            }
         }
     }
 }
@@ -662,6 +735,160 @@ fn validate_hmac_secret(secret: &str) -> Result<(), Obj> {
     Ok(())
 }
 
+fn parse_jwt_public_key_pem(pem_str: &str) -> Result<SubjectPublicKey, String> {
+    if pem_str.trim().is_empty() {
+        return Err("Empty public key PEM".to_string());
+    }
+    if pem_str.len() > MAX_JWT_KEY_PEM_BYTES {
+        return Err(format!(
+            "JWT public key PEM exceeds maximum size of {} bytes",
+            MAX_JWT_KEY_PEM_BYTES
+        ));
+    }
+    let pem_bytes = pem_str.as_bytes();
+    if let Some(der) = decode_pem_block(pem_bytes, "PUBLIC KEY").map_err(|e| e.to_string())? {
+        let mut reader = DerReader::new(&der);
+        let spki = parse_spki(&mut reader).map_err(|e| e.to_string())?;
+        if !reader.is_empty() {
+            return Err("Trailing DER bytes in SubjectPublicKeyInfo".to_string());
+        }
+        return Ok(spki);
+    }
+    if let Some(der) = decode_pem_block(pem_bytes, "RSA PUBLIC KEY").map_err(|e| e.to_string())? {
+        let mut reader = DerReader::new(&der);
+        let mut seq = reader.read_sequence().map_err(|e| e.to_string())?;
+        let n = seq
+            .read_positive_integer_be()
+            .map_err(|e| e.to_string())?
+            .to_vec();
+        let e = seq
+            .read_positive_integer_be()
+            .map_err(|e| e.to_string())?
+            .to_vec();
+        if !seq.is_empty() || !reader.is_empty() {
+            return Err("Trailing DER bytes in PKCS#1 RSA PUBLIC KEY".to_string());
+        }
+        return Ok(SubjectPublicKey::Rsa { n, e });
+    }
+    if let Some(der) = decode_pem_block(pem_bytes, "CERTIFICATE").map_err(|e| e.to_string())? {
+        let cert = parse_x509(&der).map_err(|e| e.to_string())?;
+        return Ok(cert.spki);
+    }
+    Err("Expected PEM-encoded PUBLIC KEY, RSA PUBLIC KEY, or CERTIFICATE".to_string())
+}
+
+fn prepare_verify_key<'a>(alg: JwtVerifyAlg, key: &'a str) -> Result<PreparedVerifyKey<'a>, Obj> {
+    match alg {
+        JwtVerifyAlg::Hs256 => {
+            validate_hmac_secret(key)?;
+            Ok(PreparedVerifyKey::Hs256(key.as_bytes()))
+        }
+        JwtVerifyAlg::Hs512 => {
+            validate_hmac_secret(key)?;
+            Ok(PreparedVerifyKey::Hs512(key.as_bytes()))
+        }
+        JwtVerifyAlg::Rs256 | JwtVerifyAlg::Rs384 | JwtVerifyAlg::Rs512 | JwtVerifyAlg::Ps256 => {
+            let spki = parse_jwt_public_key_pem(key)
+                .map_err(|e| make_jwt_error("invalid_key", e))?;
+            let SubjectPublicKey::Rsa { n, e } = spki else {
+                return Err(make_jwt_error(
+                    "invalid_key",
+                    format!("Algorithm '{}' requires an RSA public key", alg.as_str()),
+                ));
+            };
+            let Some(rsa) = RsaPublicKey::from_components(&n, &e) else {
+                return Err(make_jwt_error(
+                    "invalid_key",
+                    "RSA public key must be 2048..=8192 bits with a valid exponent >= 65537",
+                ));
+            };
+            let (hash, pss) = match alg {
+                JwtVerifyAlg::Rs256 => (RsaHashAlg::Sha256, false),
+                JwtVerifyAlg::Rs384 => (RsaHashAlg::Sha384, false),
+                JwtVerifyAlg::Rs512 => (RsaHashAlg::Sha512, false),
+                JwtVerifyAlg::Ps256 => (RsaHashAlg::Sha256, true),
+                _ => unreachable!(),
+            };
+            Ok(PreparedVerifyKey::Rsa {
+                hash,
+                pss,
+                key: rsa,
+            })
+        }
+        JwtVerifyAlg::Es256 => {
+            let spki = parse_jwt_public_key_pem(key)
+                .map_err(|e| make_jwt_error("invalid_key", e))?;
+            let SubjectPublicKey::EcP256(pub_bytes) = spki else {
+                return Err(make_jwt_error(
+                    "invalid_key",
+                    "Algorithm 'ES256' requires a P-256 EC public key",
+                ));
+            };
+            if pub_bytes.len() != 65 || pub_bytes[0] != 0x04 {
+                return Err(make_jwt_error(
+                    "invalid_key",
+                    "Invalid uncompressed P-256 EC public key point",
+                ));
+            }
+            Ok(PreparedVerifyKey::EcP256(pub_bytes))
+        }
+        JwtVerifyAlg::Es384 => {
+            let spki = parse_jwt_public_key_pem(key)
+                .map_err(|e| make_jwt_error("invalid_key", e))?;
+            let SubjectPublicKey::EcP384(pub_bytes) = spki else {
+                return Err(make_jwt_error(
+                    "invalid_key",
+                    "Algorithm 'ES384' requires a P-384 EC public key",
+                ));
+            };
+            if pub_bytes.len() != 97 || pub_bytes[0] != 0x04 {
+                return Err(make_jwt_error(
+                    "invalid_key",
+                    "Invalid uncompressed P-384 EC public key point",
+                ));
+            }
+            Ok(PreparedVerifyKey::EcP384(pub_bytes))
+        }
+    }
+}
+
+fn json_aud_matches(pay_str: &str, expected: &str) -> Result<bool, String> {
+    let Some(raw) = json_obj_get_raw_field(pay_str, "aud")? else {
+        return Ok(false);
+    };
+    let bytes = raw.as_bytes();
+    if bytes.first() == Some(&b'"') {
+        return Ok(parse_json_str_at(raw, 0)
+            .is_some_and(|(val, end)| end == raw.len() && val == expected));
+    }
+    if bytes.first() == Some(&b'[') {
+        let mut pos = skip_ws_bytes(bytes, 1);
+        if bytes.get(pos) == Some(&b']') {
+            return Ok(false);
+        }
+        let mut matched = false;
+        loop {
+            pos = skip_ws_bytes(bytes, pos);
+            let Some((item, after)) = parse_json_str_at(raw, pos) else {
+                return Ok(false);
+            };
+            if item == expected {
+                matched = true;
+            }
+            pos = skip_ws_bytes(bytes, after);
+            match bytes.get(pos) {
+                Some(b',') => pos += 1,
+                Some(b']') => {
+                    let end = skip_ws_bytes(bytes, pos + 1);
+                    return Ok(matched && end == raw.len());
+                }
+                _ => return Ok(false),
+            }
+        }
+    }
+    Ok(false)
+}
+
 pub fn jwt_sign(
     alg_str: &str,
     claims_obj: &Obj,
@@ -672,10 +899,10 @@ pub fn jwt_sign(
     if let Err(err) = validate_hmac_secret(secret) {
         return err;
     }
-    let Some(alg) = JwtAlg::parse(alg_str) else {
+    let Some(alg) = JwtSignAlg::parse(alg_str) else {
         return make_jwt_error(
             "unsupported_alg",
-            format!("Unsupported JWT algorithm '{}' (expected HS256 or HS512)", alg_str),
+            format!("Unsupported JWT signing algorithm '{}' (expected HS256 or HS512)", alg_str),
         );
     };
     if let Some(ttl) = ttl_secs
@@ -726,25 +953,29 @@ fn split_jwt(token: &str) -> Result<(&str, &str, &str), Obj> {
     Ok((p0, p1, p2))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn jwt_verify(
     expected_alg_str: &str,
     token: &str,
-    secret: &str,
+    key: &str,
     leeway_secs: i64,
     require_exp: bool,
+    expected_iss: Option<&str>,
+    expected_aud: Option<&str>,
     plan: &JsonDecodePlan,
 ) -> Obj {
-    if let Err(err) = validate_hmac_secret(secret) {
-        return err;
-    }
-    let Some(alg) = JwtAlg::parse(expected_alg_str) else {
+    let Some(alg) = JwtVerifyAlg::parse(expected_alg_str) else {
         return make_jwt_error(
             "unsupported_alg",
             format!(
-                "Unsupported JWT algorithm '{}' (expected HS256 or HS512)",
+                "Unsupported JWT algorithm '{}' (expected HS256, HS512, RS256, RS384, RS512, PS256, ES256, or ES384)",
                 expected_alg_str
             ),
         );
+    };
+    let prepared_key = match prepare_verify_key(alg, key) {
+        Ok(k) => k,
+        Err(err) => return err,
     };
     if leeway_secs < 0 {
         return make_jwt_error("invalid_input", "JWT leeway_secs must be non-negative");
@@ -790,7 +1021,7 @@ pub fn jwt_verify(
     };
     let signing_len = p0.len() + 1 + p1.len();
     let signing_input = &token.as_bytes()[..signing_len];
-    if !alg.verify_mac(secret.as_bytes(), signing_input, &sig_bytes) {
+    if !prepared_key.verify(signing_input, &sig_bytes) {
         return make_jwt_error("invalid_signature", "JWT signature verification failed");
     }
 
@@ -828,6 +1059,26 @@ pub fn jwt_verify(
         }
         Ok(None) => {}
         Err(e) => return make_jwt_error("malformed", e),
+    }
+    if let Some(exp_iss) = expected_iss
+        && json_obj_get_string(&pay_str, "iss").as_deref() != Some(exp_iss)
+    {
+        return make_jwt_error(
+            "invalid_issuer",
+            format!("JWT 'iss' claim does not match expected '{}'", exp_iss),
+        );
+    }
+    if let Some(exp_aud) = expected_aud {
+        match json_aud_matches(&pay_str, exp_aud) {
+            Ok(true) => {}
+            Ok(false) => {
+                return make_jwt_error(
+                    "invalid_audience",
+                    format!("JWT 'aud' claim does not include expected '{}'", exp_aud),
+                );
+            }
+            Err(e) => return make_jwt_error("malformed", e),
+        }
     }
 
     match decode_json_with_plan(&pay_str, plan) {
@@ -940,12 +1191,12 @@ mod tests {
         assert_eq!(sd.get_obj(0).format_obj(), "weak_secret");
 
         let valid_secret = "0123456789abcdef0123456789abcdef";
-        let err_verify = jwt_verify("HS256", "a.b.c", "short", 0, false, &plan);
+        let err_verify = jwt_verify("HS256", "a.b.c", "short", 0, false, None, None, &plan);
         let Obj::Record(sd_v) = err_verify else { panic!("expected JwtError") };
         assert_eq!(sd_v.get_obj(0).format_obj(), "weak_secret");
 
         let huge_tok = format!("{}.{}.sig", "a".repeat(MAX_JWT_BYTES), "b");
-        let err_big = jwt_verify("HS256", &huge_tok, valid_secret, 0, false, &plan);
+        let err_big = jwt_verify("HS256", &huge_tok, valid_secret, 0, false, None, None, &plan);
         let Obj::Record(sd_big) = err_big else { panic!("expected JwtError") };
         assert_eq!(sd_big.get_obj(0).format_obj(), "too_large");
 
@@ -955,7 +1206,7 @@ mod tests {
         let input = format!("{hdr}.{pay}");
         let sig = b64url_encode(&hmac_sha256_bytes(valid_secret.as_bytes(), input.as_bytes()));
         let dup_tok = format!("{input}.{sig}");
-        let err_dup = jwt_verify("HS256", &dup_tok, valid_secret, 0, false, &plan);
+        let err_dup = jwt_verify("HS256", &dup_tok, valid_secret, 0, false, None, None, &plan);
         let Obj::Record(sd_dup) = err_dup else { panic!("expected JwtError") };
         assert_eq!(sd_dup.get_obj(0).format_obj(), "malformed");
 
@@ -963,8 +1214,243 @@ mod tests {
         let bad_typ_hdr = b64url_encode(br#"{"alg":"HS256","typ":123}"#);
         let input2 = format!("{bad_typ_hdr}.{pay}");
         let sig2 = b64url_encode(&hmac_sha256_bytes(valid_secret.as_bytes(), input2.as_bytes()));
-        let err_typ = jwt_verify("HS256", &format!("{input2}.{sig2}"), valid_secret, 0, false, &plan);
+        let err_typ = jwt_verify("HS256", &format!("{input2}.{sig2}"), valid_secret, 0, false, None, None, &plan);
         let Obj::Record(sd_typ) = err_typ else { panic!("expected JwtError") };
         assert_eq!(sd_typ.get_obj(0).format_obj(), "malformed");
+    }
+
+    #[test]
+    fn jwt_verifies_asymmetric_openssl_vectors_and_iss_aud_claims() {
+        const ES256_PUB: &str = "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEX2/s+nZGKG7ObgRuzlUTP3A/R4zp\nqNI9BldXja25TdPbm4EAfZST633+UBHz2KmDlGUpOof0UKf6micOu2YnyA==\n-----END PUBLIC KEY-----\n";
+        const ES256_TOK: &str = "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1NDIiLCJyb2xlIjoiYWRtaW4iLCJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZS5jb20iLCJhdWQiOlsid2ViIiwiYXBpIl0sImV4cCI6NDEwMjQ0NDgwMH0.UgvS1tVi8mx4ysVN3sh2nFtLbRMuNvFnJq03NCYemle60ee23tGeAZVrbaYpGbOT0r4eQOq5jgLZTTgWr7IdPw";
+
+        const ES384_PUB: &str = "-----BEGIN PUBLIC KEY-----\nMHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEiL6XhSJno+EtoJ2aI8qlBqfnYzomV1Xw\nWggNaDdxhCLijNigFcyPavfLNE1HHw/1IJ2/gVpJSye8B9ls0TEViaXvDXQ3KdLw\nZGACrRFXuTLGDGiRg1U/VbkXXvqU1iYP\n-----END PUBLIC KEY-----\n";
+        const ES384_TOK: &str = "eyJhbGciOiJFUzM4NCIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1NDIiLCJyb2xlIjoiYWRtaW4iLCJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZS5jb20iLCJhdWQiOlsid2ViIiwiYXBpIl0sImV4cCI6NDEwMjQ0NDgwMH0.5sr3xxU6zoh-86LsJrrRMKJojSHEkCLt7H5OoumZ1zbPfo_mpn8hNhpnsMO9BV7zeVRHJPWRzoNYP7wbqmJYfHo6bvEIkZ5Lixq5TK3lc8jHVYkvzXLgVZ5dc1QkXILs";
+
+        const RSA_PUB: &str = "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA4H+SvBx/EjBweI9CHluq\nbZr4AbLM/WgbzpZ6vOjj9POIOxgzSrJsSHfJi+tFr82GKViotuYSMBd9b0haurHq\neudJgj2Y+fw2OCVxKl8/Uql0cz1ghfsUMETeVCMCbSwr21XyZ4trlSNlTchuteDJ\n2oNIHu5EG7UWEDOqIrQYb5Xn6thcB3qCJGc0KOl3UoSis+un8t4GxbyocmofsR51\nw1kduAb/IzG2/EHqbg9jvHPuPqZGTZ+Z7reODKIo0ORJuRLUzhFs23FYQFBRGVH0\nMbfBOCsQSnToUApCG9fioyAISUnz+emuFUrUXAOC0DP2Y33JNAEpzvKSOjH9+ubL\n2wIDAQAB\n-----END PUBLIC KEY-----\n";
+        const RS256_TOK: &str = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1NDIiLCJyb2xlIjoiYWRtaW4iLCJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZS5jb20iLCJhdWQiOlsid2ViIiwiYXBpIl0sImV4cCI6NDEwMjQ0NDgwMH0.qUXfCUDWOno-w2YssFQZyopGlZ4XQoTHZYj_MH31KJy7z-Q5VDGms6P0hh5FpUKY_HAfNuUUn2zVHG_TaEZva_PiJ-I1v1892NhCcfgOquyUnC2uMv9b2-jRoclUI8h5qvMO9VWNag_w74JRbTpDlaEOaANJaTkbSqz_vWZwbEUomQBJWNN44c9zo3pk1-XooQOMoGCduUV5GlozJ4V1wYuiYoNeX9YsLZlwmr6rnt0ec5ReCly1hXOJJFdyE3Hkb6FRuYLICLz27n8wHPmn5sHC7FcRXJFeXYeoE8Kz0RHzs1IdCWx5ET4ySIDYIrd4OWIPDFvyaQ6RAH_e0fov6w";
+        const PS256_TOK: &str = "eyJhbGciOiJQUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1NDIiLCJyb2xlIjoiYWRtaW4iLCJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZS5jb20iLCJhdWQiOlsid2ViIiwiYXBpIl0sImV4cCI6NDEwMjQ0NDgwMH0.LlaoidgBFPbr2meuJAIZ2cZiM6Gl0Qbaukz3emYKqdha5bJNL1MiLpjG5Ig8znSWIj3Auyp1aYQ7IPZ10dHBAzTo5ex6pALx2IvQ8FvWtxvzFWG7Zi5wrRfC0Cz00xoLci1sWE0fBz2K7SqejIQUbo-X9x8TyF7WZwIuQUuQaBzbsBe__NMgzZVfws9FZcvJeznaJ-2JCzmYiG0cvbxVhViEjjSXUAfP0TUqEPtOWjRFrVohZBHb1hjQmr0B9tKDCY0_zj6K21QmtSZDMttQoxFSzg4N1efnjGCMtUN1h1PRPV8uVJUeluQqnxGFnrrwqkduFNTtGdRv8FKhQEZ9DQ";
+
+        let schema = StructSchema::new(
+            9999,
+            "C",
+            vec![
+                crate::native::StructFieldDef {
+                    name: "sub".to_string(),
+                    json_name: "sub".to_string(),
+                    ty: crate::native::JsonType::String,
+                },
+                crate::native::StructFieldDef {
+                    name: "role".to_string(),
+                    json_name: "role".to_string(),
+                    ty: crate::native::JsonType::String,
+                },
+                crate::native::StructFieldDef {
+                    name: "iss".to_string(),
+                    json_name: "iss".to_string(),
+                    ty: crate::native::JsonType::Optional(Box::new(crate::native::JsonType::String)),
+                },
+                crate::native::StructFieldDef {
+                    name: "aud".to_string(),
+                    json_name: "aud".to_string(),
+                    ty: crate::native::JsonType::Optional(Box::new(crate::native::JsonType::List(
+                        Box::new(crate::native::JsonType::String),
+                    ))),
+                },
+                crate::native::StructFieldDef {
+                    name: "exp".to_string(),
+                    json_name: "exp".to_string(),
+                    ty: crate::native::JsonType::Optional(Box::new(crate::native::JsonType::Int)),
+                },
+            ],
+        );
+        let plan = JsonDecodePlan::compile(&crate::native::JsonType::Struct(9999), &[schema]);
+        let str_aud_schema = StructSchema::new(
+            9998,
+            "S",
+            vec![
+                crate::native::StructFieldDef {
+                    name: "sub".to_string(),
+                    json_name: "sub".to_string(),
+                    ty: crate::native::JsonType::String,
+                },
+                crate::native::StructFieldDef {
+                    name: "role".to_string(),
+                    json_name: "role".to_string(),
+                    ty: crate::native::JsonType::String,
+                },
+                crate::native::StructFieldDef {
+                    name: "aud".to_string(),
+                    json_name: "aud".to_string(),
+                    ty: crate::native::JsonType::Optional(Box::new(crate::native::JsonType::String)),
+                },
+            ],
+        );
+        let str_aud_plan =
+            JsonDecodePlan::compile(&crate::native::JsonType::Struct(9998), &[str_aud_schema]);
+
+        let err_kind = |obj: Obj| -> String {
+            let Obj::Record(sd) = obj else {
+                panic!("expected JwtError, got {:?}", obj.format_obj());
+            };
+            assert_eq!(sd.schema_id, SCHEMA_JWT_ERROR);
+            sd.get_obj(0).format_obj()
+        };
+
+        for (alg, tok, pubkey) in [
+            ("ES256", ES256_TOK, ES256_PUB),
+            ("ES384", ES384_TOK, ES384_PUB),
+            ("RS256", RS256_TOK, RSA_PUB),
+            ("PS256", PS256_TOK, RSA_PUB),
+        ] {
+            let ok = jwt_verify(
+                alg,
+                tok,
+                pubkey,
+                0,
+                true,
+                Some("https://auth.example.com"),
+                Some("api"),
+                &plan,
+            );
+            let Obj::Record(sd) = ok else {
+                panic!("{alg} failed");
+            };
+            assert_ne!(sd.schema_id, SCHEMA_JWT_ERROR, "{alg}: {}", sd.get_obj(1).format_obj());
+            assert_eq!(sd.get_obj(0).format_obj(), "u42");
+            assert_eq!(sd.get_obj(1).format_obj(), "admin");
+
+            // Tampered signature byte must fail with invalid_signature
+            let mut tampered = tok.as_bytes().to_vec();
+            let last = tampered.len() - 2;
+            tampered[last] = if tampered[last] == b'A' { b'B' } else { b'A' };
+            let bad_sig = jwt_verify(
+                alg,
+                std::str::from_utf8(&tampered).unwrap(),
+                pubkey,
+                0,
+                false,
+                None,
+                None,
+                &plan,
+            );
+            assert_eq!(err_kind(bad_sig), "invalid_signature", "{alg}");
+
+            // Wrong issuer / audience
+            assert_eq!(
+                err_kind(jwt_verify(
+                    alg,
+                    tok,
+                    pubkey,
+                    0,
+                    false,
+                    Some("https://evil.example.com"),
+                    None,
+                    &plan,
+                )),
+                "invalid_issuer"
+            );
+            assert_eq!(
+                err_kind(jwt_verify(
+                    alg,
+                    tok,
+                    pubkey,
+                    0,
+                    false,
+                    Some("https://auth.example.com"),
+                    Some("mobile"),
+                    &plan,
+                )),
+                "invalid_audience"
+            );
+        }
+
+        // Key-type confusion & garbage PEM -> invalid_key
+        assert_eq!(
+            err_kind(jwt_verify("ES256", ES256_TOK, RSA_PUB, 0, false, None, None, &plan)),
+            "invalid_key"
+        );
+        assert_eq!(
+            err_kind(jwt_verify("ES384", ES384_TOK, ES256_PUB, 0, false, None, None, &plan)),
+            "invalid_key"
+        );
+        assert_eq!(
+            err_kind(jwt_verify("RS256", RS256_TOK, ES256_PUB, 0, false, None, None, &plan)),
+            "invalid_key"
+        );
+        assert_eq!(
+            err_kind(jwt_verify("RS256", RS256_TOK, "not-a-pem", 0, false, None, None, &plan)),
+            "invalid_key"
+        );
+
+        // Algorithm mismatch against token header (including HS256 downgrade with pubkey)
+        assert_eq!(
+            err_kind(jwt_verify("RS256", ES256_TOK, RSA_PUB, 0, false, None, None, &plan)),
+            "unsupported_alg"
+        );
+        assert_eq!(
+            err_kind(jwt_verify("HS256", ES256_TOK, RSA_PUB, 0, false, None, None, &plan)),
+            "unsupported_alg"
+        );
+
+        // String aud + mixed array aud rejection
+        let secret = "0123456789abcdef0123456789abcdef";
+        let hdr = b64url_encode(br#"{"alg":"HS256","typ":"JWT"}"#);
+        let pay_str_aud = b64url_encode(br#"{"sub":"s1","role":"user","aud":"my-app"}"#);
+        let in_str = format!("{hdr}.{pay_str_aud}");
+        let tok_str = format!(
+            "{in_str}.{}",
+            b64url_encode(&hmac_sha256_bytes(secret.as_bytes(), in_str.as_bytes()))
+        );
+        assert_eq!(
+            match jwt_verify(
+                "HS256",
+                &tok_str,
+                secret,
+                0,
+                false,
+                None,
+                Some("my-app"),
+                &str_aud_plan
+            ) {
+                Obj::Record(sd) => sd.get_obj(0).format_obj(),
+                _ => panic!(),
+            },
+            "s1"
+        );
+        assert_eq!(
+            err_kind(jwt_verify(
+                "HS256",
+                &tok_str,
+                secret,
+                0,
+                false,
+                None,
+                Some("other"),
+                &str_aud_plan
+            )),
+            "invalid_audience"
+        );
+
+        // Mixed array containing non-string element ("aud":["my-app", 123]) must be rejected
+        let pay_bad_aud = b64url_encode(br#"{"sub":"s1","role":"user","aud":["my-app",123]}"#);
+        let in_bad = format!("{hdr}.{pay_bad_aud}");
+        let tok_bad = format!(
+            "{in_bad}.{}",
+            b64url_encode(&hmac_sha256_bytes(secret.as_bytes(), in_bad.as_bytes()))
+        );
+        assert_eq!(
+            err_kind(jwt_verify(
+                "HS256",
+                &tok_bad,
+                secret,
+                0,
+                false,
+                None,
+                Some("my-app"),
+                &str_aud_plan
+            )),
+            "invalid_audience"
+        );
     }
 }

@@ -1005,13 +1005,16 @@ impl Module {
                                 }
                             }
                             crate::vm::opcode::EXT_PATH_OP => {
+                                if aux > 9 {
+                                    return Err(format!("{}: invalid path sub-op {}", ctx, aux));
+                                }
                                 if aux == 7 {
                                     check_s(a, &ctx)?;
                                 } else {
                                     check_o(a, &ctx)?;
                                 }
                                 check_o(b, &ctx)?;
-                                if matches!(aux, 0 | 8) {
+                                if matches!(aux, 0 | 8 | 9) {
                                     check_o(c, &ctx)?;
                                 }
                             }
@@ -1195,6 +1198,14 @@ impl Module {
                                     check_o(a, &ctx)?;
                                     check_o(b, &ctx)?;
                                     check_s(c, &ctx)?;
+                                }
+                                53 | 55 => {
+                                    check_o(a, &ctx)?;
+                                    check_s(b, &ctx)?;
+                                }
+                                54 | 56 => {
+                                    check_o(a, &ctx)?;
+                                    check_o(b, &ctx)?;
                                 }
                                 _ => return Err(format!("Invalid http aux {}", aux)),
                             },

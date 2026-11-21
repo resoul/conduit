@@ -411,7 +411,7 @@ pub(crate) fn parse_pss_params(reader: &mut DerReader<'_>) -> Result<SigAlg, Tls
     Ok(SigAlg::RsaPss { hash, salt_len })
 }
 
-fn parse_spki(reader: &mut DerReader<'_>) -> Result<SubjectPublicKey, TlsError> {
+pub(crate) fn parse_spki(reader: &mut DerReader<'_>) -> Result<SubjectPublicKey, TlsError> {
     let mut spki_seq = reader.read_sequence()?;
     let mut alg_seq = spki_seq.read_sequence()?;
     let alg_oid = alg_seq.read_oid()?;

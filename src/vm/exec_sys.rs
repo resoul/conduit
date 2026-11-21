@@ -9,8 +9,8 @@ use crate::native::crypto::{
 };
 use crate::native::path::{
     PATH_BASENAME, PATH_DIRNAME, PATH_EXT, PATH_IS_ABS, PATH_JOIN, PATH_JOIN_ALL, PATH_NORMALIZE,
-    PATH_STEM, PATH_WITH_EXT, path_basename, path_dirname, path_ext, path_is_abs, path_join,
-    path_join_all, path_normalize, path_stem, path_with_ext,
+    PATH_SAFE_JOIN, PATH_STEM, PATH_WITH_EXT, path_basename, path_dirname, path_ext, path_is_abs,
+    path_join, path_join_all, path_normalize, path_safe_join, path_stem, path_with_ext,
 };
 use crate::native::process::{
     PROC_CWD, PROC_EXIT, PROC_PID, PROC_PIPE, PROC_RUN, PROC_SET_CWD, PROC_STATUS,
@@ -92,6 +92,11 @@ impl Vm {
                 let p = self.sys_str(o_base, b, "path.with_ext()")?;
                 let ext = self.sys_str(o_base, c, "path.with_ext()")?;
                 self.objs[o_base + a as usize] = path_with_ext(&p, &ext);
+            }
+            PATH_SAFE_JOIN => {
+                let root = self.sys_str(o_base, b, "path.safe_join()")?;
+                let rel = self.sys_str(o_base, c, "path.safe_join()")?;
+                self.objs[o_base + a as usize] = path_safe_join(&root, &rel);
             }
             _ => return Err(err_msg("Unknown path sub-op")),
         }

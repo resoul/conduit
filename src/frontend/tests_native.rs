@@ -1018,6 +1018,48 @@ fn cdt_path_process_and_crypto_e2e() {
 }
 
 #[test]
+fn cdt_path_safe_join_e2e_and_bundle() {
+    let base = std::env::temp_dir().join(format!("conduit_safe_join_e2e_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let root = base.join("root");
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    std::fs::write(root.join("sub/existing.txt"), "ok").unwrap();
+
+    let canon_root = std::fs::canonicalize(&root).unwrap();
+    let expected_existing = canon_root.join("sub/existing.txt").to_string_lossy().into_owned();
+    let expected_new = canon_root.join("sub/new/nested.txt").to_string_lossy().into_owned();
+    let root_lit = root.to_str().unwrap().replace('\\', "/");
+
+    let src = format!(
+        r#"
+        import * as path from "cdt.path"
+
+        export func run() -> String {{
+            ok1 := path.safe_join("{root_lit}", "sub/existing.txt") ?? "nil"
+            ok2 := path.safe_join("{root_lit}", "sub/new/nested.txt") ?? "nil"
+            bad_trav := path.safe_join("{root_lit}", "../outside") ?? "nil"
+            bad_abs := path.safe_join("{root_lit}", "/etc/passwd") ?? "nil"
+            return "{{ok1}}|{{ok2}}|{{bad_trav}}|{{bad_abs}}"
+        }}
+        "#
+    );
+
+    let module = crate::frontend::compile_source(&src).expect("compile path.safe_join");
+    let fid = module.func_id("run").unwrap();
+    let bundle = crate::ir::bundle::encode_bundle(&module, fid, crate::ir::bundle::RET_OBJ).unwrap();
+    let (decoded, entry, _) = crate::ir::bundle::decode_bundle(&bundle).unwrap();
+    decoded.validate().unwrap();
+
+    let expected = format!("{expected_existing}|{expected_new}|nil|nil");
+    for m in [&module, &decoded] {
+        let f = if std::ptr::eq(m, &module) { fid } else { entry };
+        let mut vm = Vm::new();
+        assert_eq!(vm.call_obj(m, f, &[], &[]).unwrap(), Obj::str(&expected));
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
 fn cdt_process_pipe_e2e_and_errors() {
     let src = if cfg!(windows) {
         r#"
@@ -1336,6 +1378,39 @@ fn cdt_http_router_e2e() {
     assert_eq!(res, Obj::str("200:hi:42|200:{\"ok\":true}|201:a/b.txt|405|404|patched:9|204|ok:PUT|401:1"));
     let decl_res = vm.call_obj(&module, decl_fid, &[], &[]).unwrap();
     assert_eq!(decl_res, Obj::str("hi:ada|post:42|403:denied|yes"));
+}
+
+#[test]
+fn cdt_http_router_server_config_methods_and_bundle_e2e() {
+    let src = r#"
+        import * as http from "cdt.http"
+
+        export func run() -> String {
+            r := http.router()
+            r.workers(4)
+            r.timeouts(2000, 5000, 15000)
+            r.max_conns_per_ip(0)
+            r.trusted_proxies(["10.0.0.0/8", "172.16.0.0/12"])
+            r.get("/ping", (_req: http.Request) -> http.Response => {
+                return http.text("pong")
+            })
+            empty := Map.from([("k", "v")])
+            empty.remove("k")
+            resp := r.dispatch(http.Request(method: "GET", path: "/ping", body: "", headers: empty, query: empty, params: empty))
+            return "{resp.status}:{resp.body}"
+        }
+    "#;
+    let module = crate::frontend::compile_source(src).expect("compile router config");
+    let fid = module.func_id("run").unwrap();
+    let bundle = crate::ir::bundle::encode_bundle(&module, fid, crate::ir::bundle::RET_OBJ).unwrap();
+    let (decoded, entry, _) = crate::ir::bundle::decode_bundle(&bundle).unwrap();
+    decoded.validate().unwrap();
+
+    for m in [&module, &decoded] {
+        let f = if std::ptr::eq(m, &module) { fid } else { entry };
+        let mut vm = Vm::new();
+        assert_eq!(vm.call_obj(m, f, &[], &[]).unwrap(), Obj::str("200:pong"));
+    }
 }
 
 #[test]
@@ -2398,6 +2473,95 @@ fn cdt_jwt_sign_verify_hs256_hs512_expiry_and_bundle_e2e() {
             out,
             Obj::str("u42:admin:true|u99|weak_secret:weak_secret|invalid_signature:unsupported_alg:unsupported_alg|expired:old|not_before|missing_exp:u42|u99")
         );
+    }
+}
+
+#[test]
+fn cdt_jwt_asymmetric_and_iss_aud_bundle_e2e() {
+    let es256_pub = concat!(
+        "-----BEGIN PUBLIC KEY-----\n",
+        "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEX2/s+nZGKG7ObgRuzlUTP3A/R4zp\n",
+        "qNI9BldXja25TdPbm4EAfZST633+UBHz2KmDlGUpOof0UKf6micOu2YnyA==\n",
+        "-----END PUBLIC KEY-----\n"
+    );
+    let es256_tok = "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1NDIiLCJyb2xlIjoiYWRtaW4iLCJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZS5jb20iLCJhdWQiOlsid2ViIiwiYXBpIl0sImV4cCI6NDEwMjQ0NDgwMH0.UgvS1tVi8mx4ysVN3sh2nFtLbRMuNvFnJq03NCYemle60ee23tGeAZVrbaYpGbOT0r4eQOq5jgLZTTgWr7IdPw";
+
+    let rsa_pub = concat!(
+        "-----BEGIN PUBLIC KEY-----\n",
+        "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA4H+SvBx/EjBweI9CHluq\n",
+        "bZr4AbLM/WgbzpZ6vOjj9POIOxgzSrJsSHfJi+tFr82GKViotuYSMBd9b0haurHq\n",
+        "eudJgj2Y+fw2OCVxKl8/Uql0cz1ghfsUMETeVCMCbSwr21XyZ4trlSNlTchuteDJ\n",
+        "2oNIHu5EG7UWEDOqIrQYb5Xn6thcB3qCJGc0KOl3UoSis+un8t4GxbyocmofsR51\n",
+        "w1kduAb/IzG2/EHqbg9jvHPuPqZGTZ+Z7reODKIo0ORJuRLUzhFs23FYQFBRGVH0\n",
+        "MbfBOCsQSnToUApCG9fioyAISUnz+emuFUrUXAOC0DP2Y33JNAEpzvKSOjH9+ubL\n",
+        "2wIDAQAB\n",
+        "-----END PUBLIC KEY-----\n"
+    );
+    let rs256_tok = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1NDIiLCJyb2xlIjoiYWRtaW4iLCJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZS5jb20iLCJhdWQiOlsid2ViIiwiYXBpIl0sImV4cCI6NDEwMjQ0NDgwMH0.qUXfCUDWOno-w2YssFQZyopGlZ4XQoTHZYj_MH31KJy7z-Q5VDGms6P0hh5FpUKY_HAfNuUUn2zVHG_TaEZva_PiJ-I1v1892NhCcfgOquyUnC2uMv9b2-jRoclUI8h5qvMO9VWNag_w74JRbTpDlaEOaANJaTkbSqz_vWZwbEUomQBJWNN44c9zo3pk1-XooQOMoGCduUV5GlozJ4V1wYuiYoNeX9YsLZlwmr6rnt0ec5ReCly1hXOJJFdyE3Hkb6FRuYLICLz27n8wHPmn5sHC7FcRXJFeXYeoE8Kz0RHzs1IdCWx5ET4ySIDYIrd4OWIPDFvyaQ6RAH_e0fov6w";
+
+    let es256_pub_escaped = es256_pub.replace('\n', "\\n");
+    let rsa_pub_escaped = rsa_pub.replace('\n', "\\n");
+
+    let src = format!(
+        r#"
+    import * as jwt from "cdt.jwt"
+
+    struct Claims {{
+        sub: String
+        role: String
+        iss: String? = nil
+        aud: [String]? = nil
+        iat: Int? = nil
+        exp: Int? = nil
+    }}
+
+    export func run() -> String | jwt.JwtError {{
+        es_pub := "{es256_pub_escaped}"
+        es_tok := "{es256_tok}"
+        rsa_pub := "{rsa_pub_escaped}"
+        rs_tok := "{rs256_tok}"
+
+        c1 := jwt.verify_alg<Claims>("ES256", es_tok, es_pub, 0, true, "https://auth.example.com", "web")?
+        c2 := jwt.verify_alg<Claims>("RS256", rs_tok, rsa_pub, 0, true, "", "api")?
+
+        var bad_iss = ""
+        switch jwt.verify_alg<Claims>("ES256", es_tok, es_pub, 0, false, "https://wrong.example.com") {{
+            case jwt.JwtError(e): bad_iss = e.kind
+            case Claims(_): bad_iss = "unexpected"
+        }}
+
+        var bad_aud = ""
+        switch jwt.verify_alg<Claims>("RS256", rs_tok, rsa_pub, 0, false, "https://auth.example.com", "mobile") {{
+            case jwt.JwtError(e): bad_aud = e.kind
+            case Claims(_): bad_aud = "unexpected"
+        }}
+
+        var bad_key = ""
+        switch jwt.verify_alg<Claims>("ES256", es_tok, rsa_pub) {{
+            case jwt.JwtError(e): bad_key = e.kind
+            case Claims(_): bad_key = "unexpected"
+        }}
+
+        secret := "s3cr3t-hmac-key-0123456789abcdef"
+        hs_tok := jwt.sign(Claims(sub: "s1", role: "dev", iss: "svc"), secret, 60)?
+        c_hs := jwt.verify<Claims>(hs_tok, secret, 0, true, "svc")?
+
+        return "{{c1.sub}}:{{c2.role}}|{{bad_iss}}|{{bad_aud}}|{{bad_key}}|{{c_hs.sub}}"
+    }}
+    "#
+    );
+
+    let module = compile_source(&src).expect("compile jwt asymmetric");
+    let fid = module.func_id("run").unwrap();
+    let bundle = crate::ir::bundle::encode_bundle(&module, fid, crate::ir::bundle::RET_OBJ).unwrap();
+    let (decoded, entry, _) = crate::ir::bundle::decode_bundle(&bundle).unwrap();
+    decoded.validate().unwrap();
+
+    for m in [&module, &decoded] {
+        let f = if std::ptr::eq(m, &module) { fid } else { entry };
+        let mut vm = Vm::new();
+        let out = vm.call_obj(m, f, &[], &[]).unwrap();
+        assert_eq!(out, Obj::str("u42:admin|invalid_issuer|invalid_audience|invalid_key|s1"));
     }
 }
 
